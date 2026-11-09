@@ -1,0 +1,27 @@
+/* Linker script for Elecrow ThinkNode M1 (Nordic nRF52840) */
+/* Standard layout matching the factory Adafruit UF2 Bootloader (flash offset 0x26000) */
+
+MEMORY
+{
+    /* 
+     * FLASH layout:
+     * 0x00000000 - 0x00001000 : MBR
+     * 0x00001000 - 0x00026000 : SoftDevice / Bootloader reserved area
+     * 0x00026000 - 0x000ED000 : Application Flash (~796 KB)
+     * 0x000ED000 - 0x00100000 : Bootloader code & settings (~76 KB)
+     */
+    FLASH (rx)  : ORIGIN = 0x00026000, LENGTH = 0x000ED000 - 0x00026000
+
+    /* 
+     * RAM layout:
+     * 0x20000000 - 0x20006000 : SoftDevice / Bootloader reserved RAM (24 KB)
+     * 0x20006000 - 0x20040000 : Application RAM (232 KB)
+     */
+    RAM   (rwx) : ORIGIN = 0x20006000, LENGTH = 0x20040000 - 0x20006000
+}
+
+/* 
+ * NOTE: If flashing baremetal via SWD (e.g. J-Link / CMSIS-DAP) with full chip erase:
+ * FLASH (rx)  : ORIGIN = 0x00000000, LENGTH = 1024K
+ * RAM   (rwx) : ORIGIN = 0x20000000, LENGTH = 256K
+ */
