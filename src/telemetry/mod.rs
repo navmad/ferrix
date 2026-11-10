@@ -24,3 +24,4 @@ mod tests {
         assert_eq!(millivolts_to_percentage(3200), 0);
     }
 }
+

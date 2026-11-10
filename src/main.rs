@@ -1,11 +1,12 @@
 #![no_std]
 #![no_main]
 
-pub mod pins;
-pub mod radio;
+pub mod boards;
 pub mod companion;
 pub mod display;
 pub mod gps;
+pub mod input;
+pub mod radio;
 pub mod telemetry;
 
 use defmt::info;
@@ -17,37 +18,43 @@ use embassy_nrf::bind_interrupts;
 use embassy_nrf::peripherals;
 use embassy_nrf::spim::{self, Spim};
 use embassy_time::Timer;
+#[cfg(feature = "thinknode-m1")]
 use static_cell::StaticCell;
 
+use crate::boards::{Board, CurrentBoard};
 use crate::companion::protocol::CompanionNode;
-use crate::display::{render_dashboard, EpdFrameBuffer, Ssd1681};
-use crate::radio::{Sx1262, Sx1262Config};
+#[cfg(feature = "thinknode-m1")]
+use crate::display::{EpdFrameBuffer, NodeDisplay, Ssd1681, ThinkNodeDisplay};
+use crate::input::{InputDevice, InputEvent};
+use crate::radio::{LoraConfig, Sx1262};
 
 bind_interrupts!(struct Irqs {
     TWISPI0 => spim::InterruptHandler<peripherals::TWISPI0>;
     TWISPI1 => spim::InterruptHandler<peripherals::TWISPI1>;
 });
 
-// Static allocations for peripherals
+// Static allocations for display framebuffer
+#[cfg(feature = "thinknode-m1")]
 static EPD_FRAMEBUFFER: StaticCell<EpdFrameBuffer> = StaticCell::new();
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     let p = embassy_nrf::init(Default::default());
-    let mut board = pins::BoardPins::init(p);
+    let mut board = CurrentBoard::init(p);
 
     info!("====================================================");
-    info!(" Elecrow ThinkNode M1 - MeshCore Companion Firmware ");
+    info!(" MeshCore Companion Firmware (ferrix) ");
+    info!(" Active Board: {} ", CurrentBoard::NAME);
     info!(" Runtime: Embassy async no_std (nRF52840 Cortex-M4) ");
     info!("====================================================");
 
     // Initial node companion state
-    let mut node = CompanionNode::new("THINKNODE-M1");
+    let mut node = CompanionNode::new(CurrentBoard::NAME, CurrentBoard::NAME, CurrentBoard::CAPABILITIES);
 
-    // Initialize Blue status LED (active low)
+    // Turn blue LED on during boot
     board.telemetry.blue_led.set_low();
 
-    // 1. Initialize SPI0 for SX1262 LoRa Radio (8 MHz)
+    // 1. Initialize SPI0 for LoRa Radio (8 MHz)
     let mut spim0_config = spim::Config::default();
     spim0_config.frequency = spim::Frequency::M8;
     spim0_config.mode = spim::MODE_0;
@@ -70,51 +77,54 @@ async fn main(_spawner: Spawner) {
         board.lora.rf_sw,
     );
 
-    let lora_config = Sx1262Config {
-        frequency_hz: 915_000_000, // 915 MHz US mesh band
-        tx_power_dbm: 22,
-        spreading_factor: 9,
-        bandwidth_khz: 125,
-        coding_rate: 1,
-        preamble_length: 16,
-    };
+    let lora_config = LoraConfig::default();
 
     if lora.init(&lora_config).await.is_ok() {
         info!("LoRa radio online! Starting continuous RX...");
         lora.start_receive().await;
     } else {
-        defmt::error!("Failed to initialize SX1262 radio!");
+        defmt::error!("Failed to initialize LoRa radio!");
     }
 
-    // 2. Initialize SPI1 for SSD1681 1.54" E-Paper Display (4 MHz)
-    let mut spim1_config = spim::Config::default();
-    spim1_config.frequency = spim::Frequency::M4;
-    spim1_config.mode = spim::MODE_0;
+    // 2. Initialize Display via generic NodeDisplay trait
+    #[cfg(feature = "thinknode-m1")]
+    let mut display = if CurrentBoard::HAS_DISPLAY {
+        if let Some(disp) = board.display {
+            let mut spim1_config = spim::Config::default();
+            spim1_config.frequency = spim::Frequency::M4;
+            spim1_config.mode = spim::MODE_0;
 
-    let spim1 = Spim::new_txonly(
-        board.spim1,
-        Irqs,
-        board.display.sclk,
-        board.display.mosi,
-        spim1_config,
-    );
+            let spim1 = Spim::new_txonly(
+                board.spim1,
+                Irqs,
+                disp.sclk,
+                disp.mosi,
+                spim1_config,
+            );
 
-    let mut epd = Ssd1681::new(
-        spim1,
-        board.display.cs,
-        board.display.dc,
-        board.display.reset,
-        board.display.busy,
-        board.display.backlight,
-    );
+            let epd = Ssd1681::new(
+                spim1,
+                disp.cs,
+                disp.dc,
+                disp.reset,
+                disp.busy,
+                disp.backlight,
+            );
 
-    let fb = EPD_FRAMEBUFFER.init(EpdFrameBuffer::new());
+            let fb = EPD_FRAMEBUFFER.init(EpdFrameBuffer::new());
+            let mut d = ThinkNodeDisplay::new(epd, fb);
 
-    info!("Initializing E-Paper Display and drawing MeshCore Dashboard...");
-    epd.init().await;
-    render_dashboard(&node, fb);
-    epd.display_frame(fb).await;
-    info!("Dashboard rendered on 1.54\" E-Paper display!");
+            info!("Initializing display and drawing MeshCore Dashboard...");
+            d.init().await.ok();
+            d.render_dashboard(&node).await.ok();
+            info!("Dashboard rendered successfully!");
+            Some(d)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     // Turn blue LED off after boot
     board.telemetry.blue_led.set_high();
@@ -131,30 +141,40 @@ async fn main(_spawner: Spawner) {
             board.telemetry.blue_led.set_high();
         }
 
-        // Check buttons
-        if board.buttons.function_btn.is_low() {
-            info!("Function button (FK) pressed! Sending self advertisement ping...");
-            board.telemetry.blue_led.set_low();
-            let ping_packet = b"MESHCORE_BEACON:THINKNODE-M1";
-            let _ = lora.transmit(ping_packet).await;
-            lora.start_receive().await;
-            board.telemetry.blue_led.set_high();
-            Timer::after_millis(300).await; // Debounce
+        // Poll semantic input events (buttons, D-pads, gestures)
+        if let Some(event) = board.inputs.poll_event().await {
+            match event {
+                InputEvent::NextPage => {
+                    info!("Input: Next Page requested");
+                    node.unread_messages = node.unread_messages.saturating_add(1);
+                    #[cfg(feature = "thinknode-m1")]
+                    if let Some(d) = &mut display {
+                        d.render_dashboard(&node).await.ok();
+                    }
+                }
+                InputEvent::ActionPrimary => {
+                    info!("Input: Primary Action (sending beacon)...");
+                    board.telemetry.blue_led.set_low();
+                    let mut beacon_buf = [0u8; 64];
+                    let beacon_prefix = b"MESHCORE_BEACON:";
+                    beacon_buf[..beacon_prefix.len()].copy_from_slice(beacon_prefix);
+                    let name_bytes = CurrentBoard::NAME.as_bytes();
+                    let total_len = beacon_prefix.len() + name_bytes.len();
+                    beacon_buf[beacon_prefix.len()..total_len].copy_from_slice(name_bytes);
+
+                    let _ = lora.transmit(&beacon_buf[..total_len]).await;
+                    lora.start_receive().await;
+                    board.telemetry.blue_led.set_high();
+                }
+                _ => {}
+            }
         }
 
-        if board.buttons.page_btn.is_low() {
-            info!("Page turn button (TK) pressed! Refreshing display...");
-            node.unread_messages = node.unread_messages.saturating_add(1);
-            render_dashboard(&node, fb);
-            epd.display_frame(fb).await;
-            Timer::after_millis(300).await; // Debounce
-        }
-
-        Timer::after_millis(50).await;
+        Timer::after_millis(20).await;
         tick = tick.wrapping_add(1);
 
         // Heartbeat LED flash every 2 seconds
-        if tick % 40 == 0 {
+        if tick % 100 == 0 {
             board.telemetry.blue_led.set_low();
             Timer::after_millis(15).await;
             board.telemetry.blue_led.set_high();

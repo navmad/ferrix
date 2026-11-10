@@ -68,3 +68,4 @@ pub const TCXO_CTRL_2_4V: u8 = 0x04;
 pub const TCXO_CTRL_2_7V: u8 = 0x05;
 pub const TCXO_CTRL_3_0V: u8 = 0x06;
 pub const TCXO_CTRL_3_3V: u8 = 0x07;
+

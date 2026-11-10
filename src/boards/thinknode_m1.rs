@@ -1,87 +1,106 @@
-//! Hardware Pin Definitions for Elecrow ThinkNode M1
+//! Elecrow ThinkNode M1 Board Support Package
 //!
 //! Target MCU: Nordic Semiconductor nRF52840 (ARM Cortex-M4F @ 64 MHz)
 //! Subsystems:
-//! - Semtech SX1262 LoRa Transceiver (SPI + Interrupts)
-//! - 1.54" SSD1681 Monochrome E-Paper Display (SPI + Control)
-//! - Quectel L76K Multi-GNSS / GPS Receiver (UARTE)
-//! - On-board Buttons, Battery Voltage ADC Sense, and Status LEDs
+//! - Semtech SX1262 LoRa Transceiver (SPI0)
+//! - 1.54" SSD1681 Monochrome E-Paper Display (SPI1)
+//! - Quectel L76K Multi-GNSS / GPS Receiver (UARTE0)
+//! - User Buttons (FK, TK), Battery ADC (P0.04), and Dual Status LEDs
 
 use embassy_nrf::gpio::{Input, Level, Output, OutputDrive, Pull};
 use embassy_nrf::peripherals;
 
+use crate::boards::Board;
+use crate::companion::protocol::{CAP_BLE, CAP_CLIENT, CAP_EPD, CAP_GPS};
+use crate::input::{InputDevice, InputEvent};
+
 /// Semtech SX1262 LoRa Radio Pin Configuration
 pub struct LoraPins {
-    /// SPI Clock (P0.19)
     pub sck: peripherals::P0_19,
-    /// SPI MOSI - Master Out Slave In (P0.22)
     pub mosi: peripherals::P0_22,
-    /// SPI MISO - Master In Slave Out (P0.23)
     pub miso: peripherals::P0_23,
-    /// SPI Chip Select / NSS (P0.24, Active Low)
     pub cs: Output<'static>,
-    /// Hardware Reset (P0.25, Active Low)
     pub reset: Output<'static>,
-    /// Radio Busy status line (P0.17, Active High)
     pub busy: Input<'static>,
-    /// Radio DIO1 Interrupt line (P0.20, TX/RX Done, Timeout)
     pub dio1: Input<'static>,
-    /// Radio DIO3 / RF Switch / TCXO Power Control (P0.21)
     pub rf_sw: Output<'static>,
 }
 
 /// 1.54" 200x200 Monochrome E-Paper Display (SSD1681) Pin Configuration
 pub struct DisplayPins {
-    /// SPI Clock (P0.31)
     pub sclk: peripherals::P0_31,
-    /// SPI MOSI / DIN (P0.29)
     pub mosi: peripherals::P0_29,
-    /// Display Chip Select (P0.30, Active Low)
     pub cs: Output<'static>,
-    /// Data / Command selection (P0.28, High = Data, Low = Command)
     pub dc: Output<'static>,
-    /// Display Reset (P0.02, Active Low)
     pub reset: Output<'static>,
-    /// Display Busy indicator (P0.03, High = Busy)
     pub busy: Input<'static>,
-    /// Front-light / E-Ink backlight enable (P1.11, High = On)
     pub backlight: Output<'static>,
 }
 
 /// Quectel L76K GNSS / GPS Module Pin Configuration
 pub struct GpsPins {
-    /// MCU Transmit -> GPS Receive (P1.08)
     pub tx: peripherals::P1_08,
-    /// MCU Receive <- GPS Transmit (P1.09)
     pub rx: peripherals::P1_09,
-    /// GPS Standby control line (P1.02)
     pub standby: Output<'static>,
-    /// GPS Reinitialization / Reset line (P1.05)
     pub reinit: Output<'static>,
 }
 
-/// Physical User Controls (Buttons)
-pub struct ButtonPins {
-    /// Function Button (FK / P1.07, Active Low with internal pull-up)
+/// Physical User Controls (ThinkNode M1 Buttons mapping to semantic InputEvents)
+pub struct ThinkNodeInputs {
     pub function_btn: Input<'static>,
-    /// Page Turn Button (TK / P1.10, Active Low with internal pull-up)
     pub page_btn: Input<'static>,
+    last_fk: bool,
+    last_tk: bool,
+}
+
+impl ThinkNodeInputs {
+    pub fn new(function_btn: Input<'static>, page_btn: Input<'static>) -> Self {
+        Self {
+            function_btn,
+            page_btn,
+            last_fk: false,
+            last_tk: false,
+        }
+    }
+}
+
+impl InputDevice for ThinkNodeInputs {
+    async fn poll_event(&mut self) -> Option<InputEvent> {
+        let fk_active = self.function_btn.is_low();
+        let tk_active = self.page_btn.is_low();
+
+        // Edge detection for Function button (FK) -> ActionPrimary
+        if fk_active && !self.last_fk {
+            self.last_fk = true;
+            return Some(InputEvent::ActionPrimary);
+        } else if !fk_active {
+            self.last_fk = false;
+        }
+
+        // Edge detection for Page button (TK) -> NextPage
+        if tk_active && !self.last_tk {
+            self.last_tk = true;
+            return Some(InputEvent::NextPage);
+        } else if !tk_active {
+            self.last_tk = false;
+        }
+
+        None
+    }
 }
 
 /// Status and Telemetry Pins
 pub struct TelemetryPins {
-    /// Blue Data / Status LED (P0.13, Active Low)
     pub blue_led: Output<'static>,
-    /// Red Power / Charging LED (P1.04, Active Low)
     pub red_led: Output<'static>,
 }
 
-/// Combined Board Peripherals struct
+/// Combined Board Peripherals struct for ThinkNode M1
 pub struct BoardPins {
     pub lora: LoraPins,
-    pub display: DisplayPins,
-    pub gps: GpsPins,
-    pub buttons: ButtonPins,
+    pub display: Option<DisplayPins>,
+    pub gps: Option<GpsPins>,
+    pub inputs: ThinkNodeInputs,
     pub telemetry: TelemetryPins,
     pub spim0: peripherals::TWISPI0,
     pub spim1: peripherals::TWISPI1,
@@ -90,9 +109,18 @@ pub struct BoardPins {
     pub bat_adc_pin: peripherals::P0_04,
 }
 
-impl BoardPins {
-    /// Initialize all hardware pins according to ThinkNode M1 hardware specs.
-    pub fn init(p: embassy_nrf::Peripherals) -> Self {
+pub struct ThinkNodeM1;
+
+impl Board for ThinkNodeM1 {
+    const NAME: &'static str = "ThinkNode M1";
+    const HAS_DISPLAY: bool = true;
+    const HAS_GPS: bool = true;
+    const HAS_BATTERY_ADC: bool = true;
+    const CAPABILITIES: u32 = CAP_CLIENT | CAP_GPS | CAP_EPD | CAP_BLE;
+
+    type Pins = BoardPins;
+
+    fn init(p: embassy_nrf::Peripherals) -> Self::Pins {
         // --- LoRa SX1262 Pins ---
         let lora_cs = Output::new(p.P0_24, Level::High, OutputDrive::Standard);
         let lora_reset = Output::new(p.P0_25, Level::High, OutputDrive::Standard);
@@ -139,14 +167,10 @@ impl BoardPins {
             reinit: gps_reinit,
         };
 
-        // --- Buttons ---
+        // --- Buttons & User Inputs ---
         let function_btn = Input::new(p.P1_07, Pull::Up);
         let page_btn = Input::new(p.P1_10, Pull::Up);
-
-        let buttons = ButtonPins {
-            function_btn,
-            page_btn,
-        };
+        let inputs = ThinkNodeInputs::new(function_btn, page_btn);
 
         // --- Telemetry & LEDs ---
         let blue_led = Output::new(p.P0_13, Level::High, OutputDrive::Standard);
@@ -157,11 +181,11 @@ impl BoardPins {
             red_led,
         };
 
-        Self {
+        BoardPins {
             lora,
-            display,
-            gps,
-            buttons,
+            display: Some(display),
+            gps: Some(gps),
+            inputs,
             telemetry,
             spim0: p.TWISPI0,
             spim1: p.TWISPI1,
@@ -171,3 +195,4 @@ impl BoardPins {
         }
     }
 }
+

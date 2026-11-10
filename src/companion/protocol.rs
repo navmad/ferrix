@@ -32,9 +32,11 @@ pub const CAP_GPS: u32 = 1 << 2;
 pub const CAP_EPD: u32 = 1 << 3;
 pub const CAP_BLE: u32 = 1 << 4;
 
-/// ThinkNode M1 Companion Node State
+/// MeshCore Companion Node State
 pub struct CompanionNode {
     pub callsign: &'static str,
+    pub hw_model: &'static str,
+    pub capabilities: u32,
     pub public_key: [u8; 32],
     pub battery_millivolts: u16,
     pub battery_percentage: u8,
@@ -46,13 +48,17 @@ pub struct CompanionNode {
 }
 
 impl CompanionNode {
-    pub fn new(callsign: &'static str) -> Self {
+    pub fn new(callsign: &'static str, hw_model: &'static str, capabilities: u32) -> Self {
         let mut key = [0u8; 32];
-        // Placeholder unique key derived from device identifier
-        key[0..8].copy_from_slice(b"TN-M1-RS");
+        // Unique key derived from hardware model
+        let model_bytes = hw_model.as_bytes();
+        let copy_len = model_bytes.len().min(32);
+        key[..copy_len].copy_from_slice(&model_bytes[..copy_len]);
 
         Self {
             callsign,
+            hw_model,
+            capabilities,
             public_key: key,
             battery_millivolts: 4120, // 4.12V default nominal
             battery_percentage: 95,
@@ -80,19 +86,18 @@ impl CompanionNode {
                 // Payload: [RESP_CODE, hardware_model, firmware_version, capabilities_u32_le]
                 resp.push(RESP_CODE_DEVICE_INFO).ok()?;
                 
-                // Hardware identifier: "ThinkNode-M1-Rust"
-                let hw = b"ThinkNode-M1-RS";
+                // Hardware identifier
+                let hw = self.hw_model.as_bytes();
                 resp.push(hw.len() as u8).ok()?;
                 resp.extend_from_slice(hw).ok()?;
 
-                // Firmware version: "0.1.0"
+                // Firmware version: "0.1.0-embassy"
                 let fw = b"0.1.0-embassy";
                 resp.push(fw.len() as u8).ok()?;
                 resp.extend_from_slice(fw).ok()?;
 
-                // Device capabilities: CLIENT | GPS | EPD | BLE
-                let caps = CAP_CLIENT | CAP_GPS | CAP_EPD | CAP_BLE;
-                resp.extend_from_slice(&caps.to_le_bytes()).ok()?;
+                // Dynamic board capabilities
+                resp.extend_from_slice(&self.capabilities.to_le_bytes()).ok()?;
                 Some(resp)
             }
 
@@ -158,3 +163,4 @@ impl CompanionNode {
         }
     }
 }
+

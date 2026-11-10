@@ -12,3 +12,4 @@ rustflags = [
 
 [env]
 DEFMT_LOG = "debug"
+

@@ -207,3 +207,4 @@ impl<'a, T: embassy_nrf::spim::Instance> Ssd1681<'a, T> {
         self.send_data(&[0x01]).await;
     }
 }
+

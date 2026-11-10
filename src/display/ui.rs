@@ -71,3 +71,4 @@ pub fn render_dashboard(node: &CompanionNode, fb: &mut EpdFrameBuffer) {
 
     let _ = Text::new("FK: Ping | TK: Next Page", Point::new(12, 194), text_style).draw(fb);
 }
+

@@ -1,12 +1,47 @@
-# ThinkNode M1 MeshCore Companion Firmware (Rust)
+# Ferrix
 
-A native `no_std` embedded Rust companion firmware for the **Elecrow ThinkNode M1** running the **MeshCore** protocol.
+A generic, native `no_std` embedded Rust companion firmware for **MeshCore** LoRa mesh nodes.
 
-Built on the **Embassy** asynchronous runtime for the Nordic **nRF52840** ARM Cortex-M4F microcontroller.
+Built on the **Embassy** asynchronous runtime for the Nordic **nRF52840** ARM Cortex-M4F microcontroller, with a modular board abstraction layer and extensible Semtech transceiver support (`LoraRadio`).
 
 ---
 
-## Hardware Architecture & Pinout
+## Supported Boards
+
+| Board Target | Feature Flag | MCU | Radio | Display | GNSS / GPS |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **Elecrow ThinkNode M1** | `thinknode-m1` (default) | nRF52840 | Semtech SX1262 | 1.54" SSD1681 E-Paper | Quectel L76K |
+
+---
+
+## Architecture
+
+The firmware decouples application logic from board-specific pinouts and radio hardware:
+
+```text
+src/
+├── main.rs                  <-- Generic application loop & state machine
+├── radio/
+│   ├── mod.rs               <-- LoraRadio async trait & LoraConfig
+│   ├── sx1262.rs            <-- Semtech SX1262 transceiver driver
+│   └── commands.rs          <-- Semtech SX126x opcode definitions
+├── boards/                  <-- BOARD SUPPORT LAYER
+│   ├── mod.rs               <-- Board trait, capability flags, & feature gating
+│   ├── thinknode_m1.rs      <-- ThinkNode M1 hardware pinout & peripherals
+│   └── rak4631.rs           <-- RAKwireless WisBlock Core pinout
+├── companion/               <-- MeshCore USB CDC-ACM & BLE packet framing & protocol
+├── display/                 <-- 1.54" SSD1681 driver & dashboard UI (conditional)
+├── gps/                     <-- Quectel L76K NMEA driver (conditional)
+└── telemetry/               <-- Battery voltage ADC monitoring & health
+```
+
+### Adding a New Radio or Board
+1. **New Radio**: Implement the `LoraRadio` async trait in [`src/radio/`](file:///Users/navmad/Projects/embedded-projects/ferrix/src/radio).
+2. **New Board**: Add a board module to [`src/boards/`](file:///Users/navmad/Projects/embedded-projects/ferrix/src/boards) and define its pinout, radio type, and capability flags (`HAS_DISPLAY`, `HAS_GPS`).
+
+---
+
+## Hardware Pinout Reference (ThinkNode M1)
 
 | Subsystem | Signal Name | nRF52840 Pin | Function / Description |
 | :--- | :--- | :--- | :--- |
@@ -40,7 +75,7 @@ Built on the **Embassy** asynchronous runtime for the Nordic **nRF52840** ARM Co
 
 ## MeshCore Companion Protocol
 
-The firmware connects to the official MeshCore companion apps (iOS/Android/Web/CLI):
+The firmware connects to official MeshCore companion apps (iOS / Android / Web / CLI):
 
 1. **BLE Transport**:
    - **Service UUID**: `6E400001-B5A3-F393-E0A9-E50E24DCCA9E` (Nordic UART Service)
@@ -62,25 +97,29 @@ The firmware connects to the official MeshCore companion apps (iOS/Android/Web/C
 ## Building and Flashing
 
 ### 1. Build UF2 Package (Drag-and-Drop)
-The easiest way to flash your ThinkNode M1 without an external debugger:
+
+The build script compiles the release binary and packages it into a UF2 container with family ID `0xADA52840`:
 
 ```bash
-# From within thinknode-m1-node directory
-./tools/build_uf2.sh release
+# Build for ThinkNode M1 (default):
+./tools/build_uf2.sh thinknode-m1 release
 ```
 
-This compiles the release ELF, extracts the raw binary with `llvm-objcopy`, and packages it into `target/thumbv7em-none-eabihf/release/thinknode-m1-node.uf2` with family ID `0xADA52840` and flash offset `0x00026000`.
+Output UF2 packages are placed in:
+`target/thumbv7em-none-eabihf/release/ferrix-<board>.uf2`
 
 ### 2. Flash to Device
-1. Connect your ThinkNode M1 to your Mac/PC using a USB-C data cable.
-2. **Double-click** the reset button on the side of the ThinkNode M1.
-3. A USB mass storage drive named **`THINKNODE`** or **`NRF52BOOT`** will mount automatically.
-4. Drag and drop `thinknode-m1-node.uf2` onto that drive.
-5. The device will flash and reboot into your Rust MeshCore Companion firmware!
+
+1. Connect your node to your computer using a USB-C data cable.
+2. **Double-click** the reset button on your device.
+3. A USB mass-storage drive will mount automatically (e.g. `THINKNODE`, `RAK4631`, or `NRF52BOOT`).
+4. Drag and drop the corresponding `.uf2` file onto that drive.
+5. The device will flash and reboot into your MeshCore firmware.
 
 ### 3. Flash via SWD Debug Probe (Optional)
+
 If using a J-Link, CMSIS-DAP, or ST-Link:
 ```bash
-cargo run --release
+cargo run --release --features thinknode-m1
 ```
 *(Configured with `probe-rs run --chip nRF52840_xxAA`)*

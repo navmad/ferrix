@@ -9,29 +9,10 @@ use embassy_time::Timer;
 use defmt::{debug, error, info};
 
 use crate::radio::commands::*;
+use crate::radio::{LoraConfig, LoraRadio};
 
-/// SX1262 LoRa Radio Configuration
-pub struct Sx1262Config {
-    pub frequency_hz: u32,
-    pub tx_power_dbm: i8,
-    pub spreading_factor: u8, // 7..12
-    pub bandwidth_khz: u32,   // 125, 250, 500
-    pub coding_rate: u8,      // 1 = 4/5, 2 = 4/6, etc.
-    pub preamble_length: u16, // 8..65535
-}
-
-impl Default for Sx1262Config {
-    fn default() -> Self {
-        Self {
-            frequency_hz: 915_000_000, // US915 default
-            tx_power_dbm: 22,          // Maximum allowed for SX1262
-            spreading_factor: 9,       // Balanced range/rate
-            bandwidth_khz: 125,
-            coding_rate: 1,            // CR 4/5
-            preamble_length: 16,
-        }
-    }
-}
+/// Backward-compatible alias
+pub type Sx1262Config = LoraConfig;
 
 /// Asynchronous SX1262 Transceiver Driver
 pub struct Sx1262<'a, T: embassy_nrf::spim::Instance> {
@@ -306,5 +287,25 @@ impl<'a, T: embassy_nrf::spim::Instance> Sx1262<'a, T> {
         self.start_receive().await;
 
         Some((payload_len, -85, 9)) // Nominal telemetry placeholder
+    }
+}
+
+impl<'a, T: embassy_nrf::spim::Instance> LoraRadio for Sx1262<'a, T> {
+    type Error = ();
+
+    async fn init(&mut self, config: &LoraConfig) -> Result<(), Self::Error> {
+        self.init(config).await
+    }
+
+    async fn transmit(&mut self, payload: &[u8]) -> Result<(), Self::Error> {
+        self.transmit(payload).await
+    }
+
+    async fn start_receive(&mut self) {
+        self.start_receive().await;
+    }
+
+    async fn poll_receive(&mut self, buf: &mut [u8]) -> Option<(usize, i16, i8)> {
+        self.poll_receive(buf).await
     }
 }
