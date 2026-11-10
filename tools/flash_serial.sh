@@ -109,18 +109,18 @@ echo "==> Generating Nordic DFU package (.zip)..."
     "${ZIP}"
 
 echo "==> Checking device state..."
-# If MeshCore companion firmware is running, trigger 1200-baud touch and wait for bootloader
+# If MeshCore companion firmware is running, trigger 1200-baud touch via stty to enter bootloader
 if ioreg -p IOUSB -l -w 0 2>/dev/null | grep -q "MeshCore"; then
     echo "==> MeshCore application active. Sending 1200-baud touch to enter bootloader..."
-    python3 -c "import serial; s = serial.Serial('${PORT}', 1200); s.close()" 2>/dev/null || true
-    sleep 1.5
-    # Auto-detect the bootloader port
-    for p in /dev/cu.usbmodem*; do
-        if [ -e "${p}" ] && [[ "${p}" != *HA0F* ]]; then
-            PORT="${p}"
+    stty -f "${PORT}" 1200 2>/dev/null || true
+    sleep 0.5
+    for i in $(seq 1 30); do
+        if ioreg -p IOUSB -l -w 0 2>/dev/null | grep -q "ThinkNodeM1"; then
             break
         fi
+        sleep 0.2
     done
+    sleep 1.0
     echo "==> Bootloader active on ${PORT}"
 fi
 
