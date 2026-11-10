@@ -102,6 +102,7 @@ pub struct BoardPins {
     pub gps: Option<GpsPins>,
     pub inputs: ThinkNodeInputs,
     pub telemetry: TelemetryPins,
+    pub power_en: Output<'static>,
     pub spim0: peripherals::TWISPI0,
     pub spim1: peripherals::TWISPI1,
     pub uarte0: peripherals::UARTE0,
@@ -121,6 +122,10 @@ impl Board for ThinkNodeM1 {
     type Pins = BoardPins;
 
     fn init(p: embassy_nrf::Peripherals) -> Self::Pins {
+        // --- Peripheral Power Enable (P0.12) ---
+        // Powers on EPD display, LoRa, GPS, and sensors
+        let power_en = Output::new(p.P0_12, Level::High, OutputDrive::Standard);
+
         // --- LoRa SX1262 Pins ---
         let lora_cs = Output::new(p.P0_24, Level::High, OutputDrive::Standard);
         let lora_reset = Output::new(p.P0_25, Level::High, OutputDrive::Standard);
@@ -144,7 +149,8 @@ impl Board for ThinkNodeM1 {
         let epd_dc = Output::new(p.P0_28, Level::Low, OutputDrive::Standard);
         let epd_reset = Output::new(p.P0_02, Level::High, OutputDrive::Standard);
         let epd_busy = Input::new(p.P0_03, Pull::None);
-        let epd_backlight = Output::new(p.P1_11, Level::Low, OutputDrive::Standard);
+        // Backlight (P1.11): Active-high (High = ON)
+        let epd_backlight = Output::new(p.P1_11, Level::High, OutputDrive::Standard);
 
         let display = DisplayPins {
             sclk: p.P0_31,
@@ -168,14 +174,16 @@ impl Board for ThinkNodeM1 {
         };
 
         // --- Buttons & User Inputs ---
-        let function_btn = Input::new(p.P1_07, Pull::Up);
-        let page_btn = Input::new(p.P1_10, Pull::Up);
+        // P1.07 is PIN_BUTTON2 (Main / Page Turn button)
+        // P1.10 is PIN_BUTTON1 (Aux / Function button)
+        let page_btn = Input::new(p.P1_07, Pull::Up);
+        let function_btn = Input::new(p.P1_10, Pull::Up);
         let inputs = ThinkNodeInputs::new(function_btn, page_btn);
 
         // --- Telemetry & LEDs ---
-        // Blue LED (DATA_LED, P0.13) is active-low: High = OFF
-        let blue_led = Output::new(p.P0_13, Level::High, OutputDrive::Standard);
-        // Red LED (PWR_LED, P1.04) is active-high: Low = OFF
+        // Blue LED (DATA_LED, P0.13) is active-high: Low = OFF, High = ON
+        let blue_led = Output::new(p.P0_13, Level::Low, OutputDrive::Standard);
+        // Red LED (PWR_LED, P1.04) is active-high: Low = OFF, High = ON
         let red_led = Output::new(p.P1_04, Level::Low, OutputDrive::Standard);
 
         let telemetry = TelemetryPins {
@@ -189,6 +197,7 @@ impl Board for ThinkNodeM1 {
             gps: Some(gps),
             inputs,
             telemetry,
+            power_en,
             spim0: p.TWISPI0,
             spim1: p.TWISPI1,
             uarte0: p.UARTE0,

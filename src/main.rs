@@ -72,9 +72,9 @@ async fn main(_spawner: Spawner) {
 
     // Visual Boot Confirmation: 3 fast blue blinks indicate successful MCU & runtime start
     for _ in 0..3 {
-        board.telemetry.blue_led.set_low(); // ON
+        board.telemetry.blue_led.set_high(); // ON (active-high)
         Timer::after_millis(70).await;
-        board.telemetry.blue_led.set_high(); // OFF
+        board.telemetry.blue_led.set_low(); // OFF
         Timer::after_millis(70).await;
     }
 
@@ -150,8 +150,8 @@ async fn main(_spawner: Spawner) {
         None
     };
 
-    // Turn blue LED off after boot
-    board.telemetry.blue_led.set_high();
+    // Ensure blue LED is OFF after boot (active-high: Low = OFF)
+    board.telemetry.blue_led.set_low();
 
     let mut rx_buf = [0u8; 256];
     let mut tick = 0u32;
@@ -160,9 +160,9 @@ async fn main(_spawner: Spawner) {
         // Poll for incoming LoRa packets
         if let Some((len, rssi, snr)) = lora.poll_receive(&mut rx_buf).await {
             info!("Received LoRa packet: {} bytes, RSSI: {} dBm, SNR: {} dB", len, rssi, snr);
-            board.telemetry.blue_led.set_low();
+            board.telemetry.blue_led.set_high(); // ON
             Timer::after_millis(50).await;
-            board.telemetry.blue_led.set_high();
+            board.telemetry.blue_led.set_low(); // OFF
         }
 
         // Poll semantic input events (buttons, D-pads, gestures)
@@ -178,7 +178,7 @@ async fn main(_spawner: Spawner) {
                 }
                 InputEvent::ActionPrimary => {
                     info!("Input: Primary Action (sending beacon)...");
-                    board.telemetry.blue_led.set_low();
+                    board.telemetry.blue_led.set_high(); // ON during transmission
                     let mut beacon_buf = [0u8; 64];
                     let beacon_prefix = b"MESHCORE_BEACON:";
                     beacon_buf[..beacon_prefix.len()].copy_from_slice(beacon_prefix);
@@ -188,7 +188,7 @@ async fn main(_spawner: Spawner) {
 
                     let _ = lora.transmit(&beacon_buf[..total_len]).await;
                     lora.start_receive().await;
-                    board.telemetry.blue_led.set_high();
+                    board.telemetry.blue_led.set_low(); // OFF when done
                 }
                 _ => {}
             }
@@ -199,9 +199,9 @@ async fn main(_spawner: Spawner) {
 
         // Heartbeat LED flash every 2 seconds
         if tick % 100 == 0 {
-            board.telemetry.blue_led.set_low();
-            Timer::after_millis(15).await;
-            board.telemetry.blue_led.set_high();
+            board.telemetry.blue_led.set_high(); // ON
+            Timer::after_millis(20).await;
+            board.telemetry.blue_led.set_low(); // OFF
         }
     }
 }

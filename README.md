@@ -108,15 +108,29 @@ The build script compiles the release binary and packages it into a UF2 containe
 Output UF2 packages are placed in:
 `target/thumbv7em-none-eabihf/release/ferrix-<board>.uf2`
 
-### 2. Flash to Device
+### 2. Flash to Device (Drag-and-Drop UF2)
 
 1. Connect your node to your computer using a USB-C data cable.
-2. **Double-click** the reset button on your device.
-3. A USB mass-storage drive will mount automatically (e.g. `THINKNODE`, `RAK4631`, or `NRF52BOOT`).
+2. **Double-click** the reset button (inside the bottom pinhole on ThinkNode M1).
+3. A USB mass-storage drive will mount automatically (e.g. `THINKNODE`, `THINKNODEM1`, or `NRF52BOOT`).
 4. Drag and drop the corresponding `.uf2` file onto that drive.
 5. The device will flash and reboot into your MeshCore firmware.
 
-### 3. Flash via SWD Debug Probe (Optional)
+### 3. Flash to Device Serially (Nordic Serial DFU)
+
+To flash without dragging and dropping or pressing buttons:
+
+```bash
+# Auto-detects port, sends 1200-baud touch, packages DFU zip, and flashes:
+./tools/flash_serial.sh
+
+# Or specify your device's port:
+./tools/flash_serial.sh /dev/cu.usbmodem1101
+```
+
+*(Requires `adafruit-nrfutil`, installed via `uv tool install adafruit-nrfutil`)*
+
+### 4. Flash via SWD Debug Probe (Optional)
 
 If using a J-Link, CMSIS-DAP, or ST-Link:
 ```bash

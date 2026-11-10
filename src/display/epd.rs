@@ -143,9 +143,9 @@ impl<'a, T: embassy_nrf::spim::Instance> Ssd1681<'a, T> {
     /// Hardware reset sequence
     pub async fn reset(&mut self) {
         self.reset.set_low();
-        Timer::after_millis(10).await;
+        Timer::after_millis(20).await;
         self.reset.set_high();
-        Timer::after_millis(10).await;
+        Timer::after_millis(20).await;
         let _ = self.wait_idle().await;
     }
 
@@ -175,7 +175,7 @@ impl<'a, T: embassy_nrf::spim::Instance> Ssd1681<'a, T> {
         self.send_cmd(0x45).await?;
         self.send_data(&[0x00, 0x00, 0xC7, 0x00]).await?;
 
-        // Border waveform control
+        // Border waveform control: actively drive border white
         self.send_cmd(0x3C).await?;
         self.send_data(&[0x05]).await?;
 
@@ -190,6 +190,14 @@ impl<'a, T: embassy_nrf::spim::Instance> Ssd1681<'a, T> {
 
     /// Push framebuffer contents to SSD1681 RAM and trigger display update
     pub async fn display_frame(&mut self, fb: &EpdFrameBuffer) -> Result<(), ()> {
+        // Set RAM X address boundaries: 0x00 to 0x18
+        self.send_cmd(0x44).await?;
+        self.send_data(&[0x00, 0x18]).await?;
+
+        // Set RAM Y address boundaries: 0x0000 to 0x00C7
+        self.send_cmd(0x45).await?;
+        self.send_data(&[0x00, 0x00, 0xC7, 0x00]).await?;
+
         // Set RAM X address counter to 0
         self.send_cmd(0x4E).await?;
         self.send_data(&[0x00]).await?;
@@ -198,8 +206,12 @@ impl<'a, T: embassy_nrf::spim::Instance> Ssd1681<'a, T> {
         self.send_cmd(0x4F).await?;
         self.send_data(&[0x00, 0x00]).await?;
 
-        // Write Black/White RAM
+        // Write Black/White RAM (current frame)
         self.send_cmd(0x24).await?;
+        self.send_data(&fb.buffer).await?;
+
+        // Write Red/Previous RAM (required for SSD1681 full-screen refresh OTP LUT)
+        self.send_cmd(0x26).await?;
         self.send_data(&fb.buffer).await?;
 
         // Display Update Control 2: Load LUT from OTP and trigger display mode 1

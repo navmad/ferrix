@@ -104,9 +104,9 @@ impl<'a, T: embassy_nrf::spim::Instance> Sx1262<'a, T> {
         // 1. Enter Standby RC mode
         self.write_cmd(CMD_SET_STANDBY, &[STDBY_RC]).await?;
 
-        // 2. Configure TCXO on DIO3 @ 1.8V with 5ms startup delay (0x0140)
-        info!("Enabling TCXO power via DIO3 (1.8V)...");
-        self.write_cmd(CMD_SET_DIO3_AS_TCXO_CTRL, &[TCXO_CTRL_1_8V, 0x01, 0x40]).await?;
+        // 2. Configure TCXO on DIO3 @ 3.3V with 5ms startup delay (0x0140) per ThinkNode M1 variant
+        info!("Enabling TCXO power via DIO3 (3.3V)...");
+        self.write_cmd(CMD_SET_DIO3_AS_TCXO_CTRL, &[TCXO_CTRL_3_3V, 0x01, 0x40]).await?;
 
         // 3. Calibrate devices
         self.write_cmd(CMD_CALIBRATE, &[0x7F]).await?;
