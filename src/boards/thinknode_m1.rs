@@ -111,6 +111,7 @@ pub struct BoardPins {
     pub uarte0: peripherals::UARTE0,
     pub saadc: peripherals::SAADC,
     pub bat_adc_pin: peripherals::P0_04,
+    pub usbd: peripherals::USBD,
 }
 
 pub struct ThinkNodeM1;
@@ -206,6 +207,7 @@ impl Board for ThinkNodeM1 {
             uarte0: p.UARTE0,
             saadc: p.SAADC,
             bat_adc_pin: p.P0_04,
+            usbd: p.USBD,
         }
     }
 }

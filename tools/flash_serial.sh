@@ -102,7 +102,7 @@ FLASH_LOG=$(mktemp)
 # Check if device is in normal mode or bootloader mode.
 # If normal mode, touch at 1200 baud first to enter DFU mode.
 TOUCH_FLAG=""
-if ioreg -p IOUSB -l -w 0 2>/dev/null | grep -q "the reference firmware Companion\|MeshCore"; then
+if ioreg -p IOUSB -l -w 0 2>/dev/null | grep -q "MeshCore\|ThinkNode\|the reference firmware"; then
     echo "==> Sending 1200-baud touch to enter DFU bootloader..."
     TOUCH_FLAG="--touch 1200"
 fi

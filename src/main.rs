@@ -16,6 +16,7 @@ use embassy_executor::Spawner;
 use embassy_nrf::bind_interrupts;
 use embassy_nrf::peripherals;
 use embassy_nrf::spim::{self, Spim};
+use embassy_nrf::usb::{self, vbus_detect::HardwareVbusDetect};
 use embassy_time::Timer;
 #[cfg(feature = "thinknode-m1")]
 use static_cell::StaticCell;
@@ -28,6 +29,8 @@ use crate::input::{InputDevice, InputEvent};
 use crate::radio::{LoraConfig, Sx1262};
 
 bind_interrupts!(struct Irqs {
+    USBD => usb::InterruptHandler<peripherals::USBD>;
+    CLOCK_POWER => usb::vbus_detect::InterruptHandler;
     TWISPI0 => spim::InterruptHandler<peripherals::TWISPI0>;
     TWISPI1 => spim::InterruptHandler<peripherals::TWISPI1>;
 });
@@ -57,9 +60,15 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 }
 
 #[embassy_executor::main]
-async fn main(_spawner: Spawner) {
+async fn main(spawner: Spawner) {
     let p = embassy_nrf::init(Default::default());
     let mut board = CurrentBoard::init(p);
+
+    // 0. Initialize USB CDC-ACM Serial & 1200-baud DFU Auto-Reset
+    let usb_driver = usb::Driver::new(board.usbd, Irqs, HardwareVbusDetect::new(Irqs));
+    let (usb_dev, cdc_class) = crate::companion::usb::init_usb(usb_driver);
+    spawner.spawn(crate::companion::usb::usb_task(usb_dev)).unwrap();
+    spawner.spawn(crate::companion::usb::cdc_acm_task(cdc_class)).unwrap();
 
     info!("====================================================");
     info!(" MeshCore Companion Firmware (ferrix) ");
