@@ -47,7 +47,18 @@ if [ -z "${PORT}" ]; then
         fi
     done
 
-    if [ ${#VALID_PORTS[@]} -eq 1 ]; then
+    # Filter for ThinkNode / MeshCore port if multiple ports detected
+    MESH_PORTS=()
+    for p in "${VALID_PORTS[@]}"; do
+        if [[ "${p}" =~ MESH|1101 ]]; then
+            MESH_PORTS+=("${p}")
+        fi
+    done
+
+    if [ ${#MESH_PORTS[@]} -eq 1 ]; then
+        PORT="${MESH_PORTS[0]}"
+        echo "==> Auto-detected ThinkNode M1 port: ${PORT}"
+    elif [ ${#VALID_PORTS[@]} -eq 1 ]; then
         PORT="${VALID_PORTS[0]}"
         echo "==> Auto-detected serial port: ${PORT}"
     elif [ ${#VALID_PORTS[@]} -gt 1 ]; then
