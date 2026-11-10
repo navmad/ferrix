@@ -45,6 +45,11 @@ pub struct CompanionNode {
     pub gps_fix: bool,
     pub latitude: f32,
     pub longitude: f32,
+    pub tx_beacons: u32,
+    pub rx_packets: u32,
+    pub last_rssi: i16,
+    pub last_snr: i8,
+    pub current_page: u8,
 }
 
 impl CompanionNode {
@@ -67,6 +72,11 @@ impl CompanionNode {
             gps_fix: false,
             latitude: 0.0,
             longitude: 0.0,
+            tx_beacons: 0,
+            rx_packets: 0,
+            last_rssi: 0,
+            last_snr: 0,
+            current_page: 0,
         }
     }
 

@@ -19,11 +19,11 @@ pub struct LoraConfig {
 impl Default for LoraConfig {
     fn default() -> Self {
         Self {
-            frequency_hz: 915_000_000, // US915 mesh default
+            frequency_hz: 910_525_000, // US PNW (Puget / Portland / Cascadia) MeshCore default
             tx_power_dbm: 22,
-            spreading_factor: 9,
-            bandwidth_khz: 125,
-            coding_rate: 1,
+            spreading_factor: 7,
+            bandwidth_khz: 62,
+            coding_rate: 1, // CR 4/5
             preamble_length: 16,
         }
     }

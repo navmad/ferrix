@@ -9,6 +9,7 @@
 
 use embassy_nrf::gpio::{Input, Level, Output, OutputDrive, Pull};
 use embassy_nrf::peripherals;
+use embassy_time::Timer;
 
 use crate::boards::Board;
 use crate::companion::protocol::{CAP_BLE, CAP_CLIENT, CAP_EPD, CAP_GPS};
@@ -72,6 +73,7 @@ impl InputDevice for ThinkNodeInputs {
         // Edge detection for Function button (FK) -> ActionPrimary
         if fk_active && !self.last_fk {
             self.last_fk = true;
+            Timer::after_millis(80).await; // Debounce
             return Some(InputEvent::ActionPrimary);
         } else if !fk_active {
             self.last_fk = false;
@@ -80,6 +82,7 @@ impl InputDevice for ThinkNodeInputs {
         // Edge detection for Page button (TK) -> NextPage
         if tk_active && !self.last_tk {
             self.last_tk = true;
+            Timer::after_millis(80).await; // Debounce
             return Some(InputEvent::NextPage);
         } else if !tk_active {
             self.last_tk = false;

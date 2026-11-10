@@ -132,6 +132,7 @@ impl<'a, T: embassy_nrf::spim::Instance> Sx1262<'a, T> {
 
         // 10. Set Modulation Parameters
         let bw = match config.bandwidth_khz {
+            62 | 63 => 0x03, // 62.5 kHz (US PNW standard)
             250 => 0x05,
             500 => 0x06,
             _ => 0x04, // 125 kHz default

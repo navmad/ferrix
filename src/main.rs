@@ -161,6 +161,10 @@ async fn main(_spawner: Spawner) {
         if let Some((len, rssi, snr)) = lora.poll_receive(&mut rx_buf).await {
             info!("Received LoRa packet: {} bytes, RSSI: {} dBm, SNR: {} dB", len, rssi, snr);
             board.telemetry.blue_led.set_high(); // ON
+            node.rx_packets = node.rx_packets.saturating_add(1);
+            node.unread_messages = node.unread_messages.saturating_add(1);
+            node.last_rssi = rssi;
+            node.last_snr = snr;
             Timer::after_millis(50).await;
             board.telemetry.blue_led.set_low(); // OFF
         }
@@ -170,7 +174,8 @@ async fn main(_spawner: Spawner) {
             match event {
                 InputEvent::NextPage => {
                     info!("Input: Next Page requested");
-                    node.unread_messages = node.unread_messages.saturating_add(1);
+                    // Cycle through pages: 0 -> 1 -> 2 -> 0
+                    node.current_page = (node.current_page + 1) % 3;
                     #[cfg(feature = "thinknode-m1")]
                     if let Some(d) = &mut display {
                         d.render_dashboard(&node).await.ok();
@@ -178,7 +183,16 @@ async fn main(_spawner: Spawner) {
                 }
                 InputEvent::ActionPrimary => {
                     info!("Input: Primary Action (sending beacon)...");
-                    board.telemetry.blue_led.set_high(); // ON during transmission
+                    node.tx_beacons = node.tx_beacons.saturating_add(1);
+
+                    // Quick double-flash on blue LED to give immediate visual feedback
+                    for _ in 0..2 {
+                        board.telemetry.blue_led.set_high();
+                        Timer::after_millis(40).await;
+                        board.telemetry.blue_led.set_low();
+                        Timer::after_millis(40).await;
+                    }
+
                     let mut beacon_buf = [0u8; 64];
                     let beacon_prefix = b"MESHCORE_BEACON:";
                     beacon_buf[..beacon_prefix.len()].copy_from_slice(beacon_prefix);
@@ -188,7 +202,7 @@ async fn main(_spawner: Spawner) {
 
                     let _ = lora.transmit(&beacon_buf[..total_len]).await;
                     lora.start_receive().await;
-                    board.telemetry.blue_led.set_low(); // OFF when done
+                    // No EPD refresh needed here: immediate, responsive LoRa beaconing!
                 }
                 _ => {}
             }
