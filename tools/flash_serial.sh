@@ -108,21 +108,28 @@ echo "==> Generating Nordic DFU package (.zip)..."
     --application "${HEX}" \
     "${ZIP}"
 
-echo "==> Flashing to ${PORT} over Serial DFU..."
-FLASH_LOG=$(mktemp)
-# Check if device is in normal mode or bootloader mode.
-# If normal mode, touch at 1200 baud first to enter DFU mode.
-TOUCH_FLAG=""
-if ioreg -p IOUSB -l -w 0 2>/dev/null | grep -q "MeshCore\|ThinkNode\|the reference firmware"; then
-    echo "==> Sending 1200-baud touch to enter DFU bootloader..."
-    TOUCH_FLAG="--touch 1200"
+echo "==> Checking device state..."
+# If MeshCore companion firmware is running, trigger 1200-baud touch and wait for bootloader
+if ioreg -p IOUSB -l -w 0 2>/dev/null | grep -q "MeshCore"; then
+    echo "==> MeshCore application active. Sending 1200-baud touch to enter bootloader..."
+    python3 -c "import serial; s = serial.Serial('${PORT}', 1200); s.close()" 2>/dev/null || true
+    sleep 1.5
+    # Auto-detect the bootloader port
+    for p in /dev/cu.usbmodem*; do
+        if [ -e "${p}" ] && [[ "${p}" != *HA0F* ]]; then
+            PORT="${p}"
+            break
+        fi
+    done
+    echo "==> Bootloader active on ${PORT}"
 fi
 
+echo "==> Flashing to ${PORT} over Serial DFU..."
+FLASH_LOG=$(mktemp)
 if ! "${NRFUTIL}" --verbose dfu serial \
     --package "${ZIP}" \
     -p "${PORT}" \
-    -b 115200 \
-    ${TOUCH_FLAG} 2>&1 | tee "${FLASH_LOG}"; then
+    -b 115200 2>&1 | tee "${FLASH_LOG}"; then
     rm -f "${FLASH_LOG}"
     echo "ERROR: Serial flashing failed!" >&2
     exit 1

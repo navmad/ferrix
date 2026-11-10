@@ -88,7 +88,9 @@ pub fn init_usb(
     let mut config = Config::new(0x239A, 0x8029);
     config.manufacturer = Some("MeshCore");
     config.product = Some("ThinkNode M1 Companion");
-    config.serial_number = Some("MESH-M1-001");
+    // Omit serial number so macOS uses USB location ID (/dev/cu.usbmodem1101),
+    // matching the bootloader port name for seamless 1200-baud touch flashing!
+    config.serial_number = None;
     config.max_power = 100;
     config.max_packet_size_0 = 64;
 
