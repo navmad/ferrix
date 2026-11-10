@@ -45,16 +45,23 @@ impl<'a, T: embassy_nrf::spim::Instance> Sx1262<'a, T> {
         }
     }
 
-    /// Wait until the SX1262 BUSY pin goes low
-    async fn wait_busy(&mut self) {
+    /// Wait until the SX1262 BUSY pin goes low (with 50ms timeout)
+    async fn wait_busy(&mut self) -> Result<(), ()> {
+        let mut count = 0;
         while self.busy.is_high() {
             Timer::after_micros(20).await;
+            count += 1;
+            if count > 2500 {
+                defmt::warn!("SX1262 BUSY timeout");
+                return Err(());
+            }
         }
+        Ok(())
     }
 
     /// Execute a write command over SPI
-    async fn write_cmd(&mut self, cmd: u8, data: &[u8]) {
-        self.wait_busy().await;
+    async fn write_cmd(&mut self, cmd: u8, data: &[u8]) -> Result<(), ()> {
+        self.wait_busy().await?;
         self.cs.set_low();
 
         let header = [cmd];
@@ -64,11 +71,12 @@ impl<'a, T: embassy_nrf::spim::Instance> Sx1262<'a, T> {
         }
 
         self.cs.set_high();
+        Ok(())
     }
 
     /// Execute a read command over SPI
-    async fn read_cmd(&mut self, cmd: u8, out: &mut [u8]) {
-        self.wait_busy().await;
+    async fn read_cmd(&mut self, cmd: u8, out: &mut [u8]) -> Result<(), ()> {
+        self.wait_busy().await?;
         self.cs.set_low();
 
         let header = [cmd, 0x00]; // Command + NOP status byte
@@ -76,6 +84,7 @@ impl<'a, T: embassy_nrf::spim::Instance> Sx1262<'a, T> {
         let _ = self.spim.read(out).await;
 
         self.cs.set_high();
+        Ok(())
     }
 
     /// Hardware reset pulse
@@ -84,7 +93,7 @@ impl<'a, T: embassy_nrf::spim::Instance> Sx1262<'a, T> {
         Timer::after_millis(5).await;
         self.reset.set_high();
         Timer::after_millis(20).await;
-        self.wait_busy().await;
+        let _ = self.wait_busy().await;
     }
 
     /// Initialize the radio with ThinkNode M1 hardware parameters
@@ -93,44 +102,49 @@ impl<'a, T: embassy_nrf::spim::Instance> Sx1262<'a, T> {
         self.reset().await;
 
         // 1. Enter Standby RC mode
-        self.write_cmd(CMD_SET_STANDBY, &[STDBY_RC]).await;
+        self.write_cmd(CMD_SET_STANDBY, &[STDBY_RC]).await?;
 
-        // 2. Configure TCXO on DIO3 @ 3.3V with 5ms startup delay (0x0140)
-        info!("Enabling TCXO power via DIO3 (3.3V)...");
-        self.write_cmd(CMD_SET_DIO3_AS_TCXO_CTRL, &[TCXO_CTRL_3_3V, 0x01, 0x40]).await;
+        // 2. Configure TCXO on DIO3 @ 1.8V with 5ms startup delay (0x0140)
+        info!("Enabling TCXO power via DIO3 (1.8V)...");
+        self.write_cmd(CMD_SET_DIO3_AS_TCXO_CTRL, &[TCXO_CTRL_1_8V, 0x01, 0x40]).await?;
 
-        // 3. Set packet type to LoRa
-        self.write_cmd(CMD_SET_PACKET_TYPE, &[PACKET_TYPE_LORA]).await;
+        // 3. Calibrate devices
+        self.write_cmd(CMD_CALIBRATE, &[0x7F]).await?;
+        let _ = self.wait_busy().await;
 
-        // 4. Configure RF Frequency
-        self.set_frequency(config.frequency_hz).await;
+        // 4. Configure DIO2 as RF Switch control
+        self.write_cmd(CMD_SET_DIO2_AS_RF_SWITCH_CTRL, &[0x01]).await?;
 
-        // 5. Configure PA for SX1262 (+22dBm capable)
-        self.write_cmd(CMD_SET_PA_CONFIG, &[0x04, 0x07, 0x00, 0x01]).await;
+        // 5. Set packet type to LoRa
+        self.write_cmd(CMD_SET_PACKET_TYPE, &[PACKET_TYPE_LORA]).await?;
 
-        // 6. Set TX output power
-        self.set_tx_power(config.tx_power_dbm).await;
+        // 6. Configure RF Frequency
+        self.set_frequency(config.frequency_hz).await?;
 
-        // 7. Set buffer base addresses (TX at 0x00, RX at 0x00)
-        self.write_cmd(CMD_SET_BUFFER_BASE_ADDRESS, &[0x00, 0x00]).await;
+        // 7. Configure PA for SX1262 (+22dBm capable)
+        self.write_cmd(CMD_SET_PA_CONFIG, &[0x04, 0x07, 0x00, 0x01]).await?;
 
-        // 8. Set Modulation Parameters
-        // Bandwidth: 125kHz=0x04, 250kHz=0x05, 500kHz=0x06
+        // 8. Set TX output power
+        self.set_tx_power(config.tx_power_dbm).await?;
+
+        // 9. Set buffer base addresses (TX at 0x00, RX at 0x00)
+        self.write_cmd(CMD_SET_BUFFER_BASE_ADDRESS, &[0x00, 0x00]).await?;
+
+        // 10. Set Modulation Parameters
         let bw = match config.bandwidth_khz {
             250 => 0x05,
             500 => 0x06,
             _ => 0x04, // 125 kHz default
         };
-        // LowDataRateOptimize = 0x00 (Off for SF7..9)
         let ldro = if config.spreading_factor >= 11 { 0x01 } else { 0x00 };
         self.write_cmd(CMD_SET_MODULATION_PARAMS, &[
             config.spreading_factor,
             bw,
             config.coding_rate,
             ldro,
-        ]).await;
+        ]).await?;
 
-        // 9. Set Packet Parameters
+        // 11. Set Packet Parameters
         let preamble_high = (config.preamble_length >> 8) as u8;
         let preamble_low = (config.preamble_length & 0xFF) as u8;
         self.write_cmd(CMD_SET_PACKET_PARAMS, &[
@@ -140,9 +154,9 @@ impl<'a, T: embassy_nrf::spim::Instance> Sx1262<'a, T> {
             0xFF, // Max payload length (255)
             0x01, // CRC on
             0x00, // Standard IQ
-        ]).await;
+        ]).await?;
 
-        // 10. Route IRQs to DIO1 (TX_DONE | RX_DONE | TIMEOUT)
+        // 12. Route IRQs to DIO1 (TX_DONE | RX_DONE | TIMEOUT)
         let irq_mask = IRQ_TX_DONE | IRQ_RX_DONE | IRQ_TIMEOUT;
         self.write_cmd(CMD_SET_DIO_IRQ_PARAMS, &[
             (irq_mask >> 8) as u8,
@@ -151,9 +165,9 @@ impl<'a, T: embassy_nrf::spim::Instance> Sx1262<'a, T> {
             (irq_mask & 0xFF) as u8,
             0x00, 0x00, // DIO2 mask
             0x00, 0x00, // DIO3 mask
-        ]).await;
+        ]).await?;
 
-        // 11. Clear all IRQs
+        // 13. Clear all IRQs
         self.clear_irq(IRQ_ALL).await;
 
         info!("SX1262 LoRa successfully initialized at {} MHz!", config.frequency_hz / 1_000_000);
@@ -161,32 +175,29 @@ impl<'a, T: embassy_nrf::spim::Instance> Sx1262<'a, T> {
     }
 
     /// Set RF Frequency in Hz
-    pub async fn set_frequency(&mut self, freq_hz: u32) {
-        // Frequency step = 32MHz / 2^25 = 0.953674 Hz
-        // Steps = freq_hz / (32_000_000 / 2^25) = (freq_hz * 2^25) / 32_000_000
+    pub async fn set_frequency(&mut self, freq_hz: u32) -> Result<(), ()> {
         let steps = (((freq_hz as u64) << 25) / 32_000_000) as u32;
         let bytes = steps.to_be_bytes();
-        self.write_cmd(CMD_SET_RF_FREQUENCY, &bytes).await;
+        self.write_cmd(CMD_SET_RF_FREQUENCY, &bytes).await
     }
 
     /// Set Output TX Power in dBm (-9 to +22)
-    pub async fn set_tx_power(&mut self, power_dbm: i8) {
+    pub async fn set_tx_power(&mut self, power_dbm: i8) -> Result<(), ()> {
         let pwr = power_dbm.clamp(-9, 22) as u8;
-        // Ramp time: 0x02 = 40us
-        self.write_cmd(CMD_SET_TX_PARAMS, &[pwr, 0x02]).await;
+        self.write_cmd(CMD_SET_TX_PARAMS, &[pwr, 0x02]).await
     }
 
     /// Read IRQ status flags
     pub async fn get_irq_status(&mut self) -> u16 {
         let mut status = [0u8; 2];
-        self.read_cmd(CMD_GET_IRQ_STATUS, &mut status).await;
+        let _ = self.read_cmd(CMD_GET_IRQ_STATUS, &mut status).await;
         u16::from_be_bytes(status)
     }
 
     /// Clear IRQ flags
     pub async fn clear_irq(&mut self, mask: u16) {
         let bytes = mask.to_be_bytes();
-        self.write_cmd(CMD_CLEAR_IRQ_STATUS, &bytes).await;
+        let _ = self.write_cmd(CMD_CLEAR_IRQ_STATUS, &bytes).await;
     }
 
     /// Transmit a packet asynchronously
@@ -196,13 +207,13 @@ impl<'a, T: embassy_nrf::spim::Instance> Sx1262<'a, T> {
         }
 
         // Put radio in standby
-        self.write_cmd(CMD_SET_STANDBY, &[STDBY_RC]).await;
+        let _ = self.write_cmd(CMD_SET_STANDBY, &[STDBY_RC]).await;
 
         // Enable RF switch for TX
         self.rf_sw.set_high();
 
         // Write payload to buffer at offset 0x00
-        self.wait_busy().await;
+        let _ = self.wait_busy().await;
         self.cs.set_low();
         let header = [CMD_WRITE_BUFFER, 0x00];
         let _ = self.spim.write(&header).await;
@@ -210,7 +221,7 @@ impl<'a, T: embassy_nrf::spim::Instance> Sx1262<'a, T> {
         self.cs.set_high();
 
         // Update packet length parameter
-        self.write_cmd(CMD_SET_PACKET_PARAMS, &[
+        let _ = self.write_cmd(CMD_SET_PACKET_PARAMS, &[
             0x00, 0x10, // 16 preamble symbols
             0x00,       // Variable header
             data.len() as u8,
@@ -221,10 +232,10 @@ impl<'a, T: embassy_nrf::spim::Instance> Sx1262<'a, T> {
         self.clear_irq(IRQ_ALL).await;
 
         // Trigger TX with timeout 0 (no timeout)
-        self.write_cmd(CMD_SET_TX, &[0x00, 0x00, 0x00]).await;
+        let _ = self.write_cmd(CMD_SET_TX, &[0x00, 0x00, 0x00]).await;
 
-        // Wait for TX_DONE IRQ
-        loop {
+        // Wait for TX_DONE IRQ with 1s timeout
+        for _ in 0..200 {
             let irq = self.get_irq_status().await;
             if (irq & IRQ_TX_DONE) != 0 {
                 self.clear_irq(IRQ_TX_DONE).await;
@@ -240,6 +251,9 @@ impl<'a, T: embassy_nrf::spim::Instance> Sx1262<'a, T> {
             }
             Timer::after_millis(5).await;
         }
+        self.rf_sw.set_low();
+        error!("Packet transmission loop timed out");
+        Err(())
     }
 
     /// Start listening for incoming packets
@@ -247,7 +261,7 @@ impl<'a, T: embassy_nrf::spim::Instance> Sx1262<'a, T> {
         self.rf_sw.set_low();
         self.clear_irq(IRQ_ALL).await;
         // 0xFFFFFF = Continuous RX mode
-        self.write_cmd(CMD_SET_RX, &[0xFF, 0xFF, 0xFF]).await;
+        let _ = self.write_cmd(CMD_SET_RX, &[0xFF, 0xFF, 0xFF]).await;
     }
 
     /// Check if a packet has been received, and if so, read it into `out`.
@@ -267,7 +281,9 @@ impl<'a, T: embassy_nrf::spim::Instance> Sx1262<'a, T> {
 
         // Read RX buffer status: [payload_len, buffer_start_offset]
         let mut rx_status = [0u8; 2];
-        self.read_cmd(CMD_GET_RX_BUFFER_STATUS, &mut rx_status).await;
+        if self.read_cmd(CMD_GET_RX_BUFFER_STATUS, &mut rx_status).await.is_err() {
+            return None;
+        }
         let payload_len = rx_status[0] as usize;
         let offset = rx_status[1];
 
@@ -276,7 +292,9 @@ impl<'a, T: embassy_nrf::spim::Instance> Sx1262<'a, T> {
         }
 
         // Read payload from buffer
-        self.wait_busy().await;
+        if self.wait_busy().await.is_err() {
+            return None;
+        }
         self.cs.set_low();
         let header = [CMD_READ_BUFFER, offset, 0x00];
         let _ = self.spim.write(&header).await;

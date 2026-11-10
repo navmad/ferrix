@@ -11,7 +11,6 @@ pub mod telemetry;
 
 use defmt::info;
 use defmt_rtt as _;
-use panic_probe as _;
 
 use embassy_executor::Spawner;
 use embassy_nrf::bind_interrupts;
@@ -37,6 +36,26 @@ bind_interrupts!(struct Irqs {
 #[cfg(feature = "thinknode-m1")]
 static EPD_FRAMEBUFFER: StaticCell<EpdFrameBuffer> = StaticCell::new();
 
+/// Custom panic handler: Blinks Red LED (P1.04) continuously to indicate fatal state without hard-faulting
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    defmt::error!("FATAL PANIC OCCURRED!");
+    // Directly toggle P1.04 (Red LED) in a loop
+    let p1_outset = (0x5000_0800 + 0x508) as *mut u32;
+    let p1_outclr = (0x5000_0800 + 0x50C) as *mut u32;
+    let p1_dirset = (0x5000_0800 + 0x518) as *mut u32;
+
+    unsafe {
+        p1_dirset.write_volatile(1 << 4);
+        loop {
+            p1_outset.write_volatile(1 << 4);
+            cortex_m::asm::delay(2_000_000);
+            p1_outclr.write_volatile(1 << 4);
+            cortex_m::asm::delay(2_000_000);
+        }
+    }
+}
+
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     let p = embassy_nrf::init(Default::default());
@@ -51,8 +70,13 @@ async fn main(_spawner: Spawner) {
     // Initial node companion state
     let mut node = CompanionNode::new(CurrentBoard::NAME, CurrentBoard::NAME, CurrentBoard::CAPABILITIES);
 
-    // Turn blue LED on during boot
-    board.telemetry.blue_led.set_low();
+    // Visual Boot Confirmation: 3 fast blue blinks indicate successful MCU & runtime start
+    for _ in 0..3 {
+        board.telemetry.blue_led.set_low(); // ON
+        Timer::after_millis(70).await;
+        board.telemetry.blue_led.set_high(); // OFF
+        Timer::after_millis(70).await;
+    }
 
     // 1. Initialize SPI0 for LoRa Radio (8 MHz)
     let mut spim0_config = spim::Config::default();

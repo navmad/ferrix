@@ -173,8 +173,10 @@ impl Board for ThinkNodeM1 {
         let inputs = ThinkNodeInputs::new(function_btn, page_btn);
 
         // --- Telemetry & LEDs ---
+        // Blue LED (DATA_LED, P0.13) is active-low: High = OFF
         let blue_led = Output::new(p.P0_13, Level::High, OutputDrive::Standard);
-        let red_led = Output::new(p.P1_04, Level::High, OutputDrive::Standard);
+        // Red LED (PWR_LED, P1.04) is active-high: Low = OFF
+        let red_led = Output::new(p.P1_04, Level::Low, OutputDrive::Standard);
 
         let telemetry = TelemetryPins {
             blue_led,

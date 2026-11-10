@@ -42,18 +42,15 @@ impl<'a, T: embassy_nrf::spim::Instance> NodeDisplay for ThinkNodeDisplay<'a, T>
     type Error = ();
 
     async fn init(&mut self) -> Result<(), Self::Error> {
-        self.epd.init().await;
-        Ok(())
+        self.epd.init().await
     }
 
     async fn render_dashboard(&mut self, node: &CompanionNode) -> Result<(), Self::Error> {
         ui::render_dashboard(node, self.fb);
-        self.epd.display_frame(self.fb).await;
-        Ok(())
+        self.epd.display_frame(self.fb).await
     }
 
     async fn sleep(&mut self) -> Result<(), Self::Error> {
-        self.epd.sleep().await;
-        Ok(())
+        self.epd.sleep().await
     }
 }

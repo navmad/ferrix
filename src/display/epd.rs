@@ -97,29 +97,38 @@ impl<'a, T: embassy_nrf::spim::Instance> Ssd1681<'a, T> {
         }
     }
 
-    /// Wait until EPD BUSY signal goes low
-    async fn wait_idle(&mut self) {
+    /// Wait until EPD BUSY signal goes low (with 2s timeout)
+    async fn wait_idle(&mut self) -> Result<(), ()> {
+        let mut count = 0;
         while self.busy.is_high() {
-            Timer::after_millis(10).await;
+            Timer::after_millis(5).await;
+            count += 1;
+            if count > 400 {
+                defmt::warn!("SSD1681 BUSY timeout");
+                return Err(());
+            }
         }
+        Ok(())
     }
 
     /// Send a command byte to SSD1681
-    async fn send_cmd(&mut self, cmd: u8) {
-        self.wait_idle().await;
+    async fn send_cmd(&mut self, cmd: u8) -> Result<(), ()> {
+        self.wait_idle().await?;
         self.dc.set_low();
         self.cs.set_low();
         let _ = self.spim.write(&[cmd]).await;
         self.cs.set_high();
+        Ok(())
     }
 
     /// Send data bytes to SSD1681
-    async fn send_data(&mut self, data: &[u8]) {
-        self.wait_idle().await;
+    async fn send_data(&mut self, data: &[u8]) -> Result<(), ()> {
+        self.wait_idle().await?;
         self.dc.set_high();
         self.cs.set_low();
         let _ = self.spim.write(data).await;
         self.cs.set_high();
+        Ok(())
     }
 
     /// Toggle backlight state
@@ -137,74 +146,77 @@ impl<'a, T: embassy_nrf::spim::Instance> Ssd1681<'a, T> {
         Timer::after_millis(10).await;
         self.reset.set_high();
         Timer::after_millis(10).await;
-        self.wait_idle().await;
+        let _ = self.wait_idle().await;
     }
 
     /// Initialize SSD1681 display registers
-    pub async fn init(&mut self) {
+    pub async fn init(&mut self) -> Result<(), ()> {
         info!("Initializing SSD1681 E-Paper Display...");
         self.reset().await;
 
         // Software reset
-        self.send_cmd(0x12).await;
+        self.send_cmd(0x12).await?;
         Timer::after_millis(20).await;
-        self.wait_idle().await;
+        self.wait_idle().await?;
 
         // Driver Output control (200 mux lines, Gate scan sequence)
-        self.send_cmd(0x01).await;
-        self.send_data(&[0xC7, 0x00, 0x00]).await; // (200 - 1) = 199 = 0xC7
+        self.send_cmd(0x01).await?;
+        self.send_data(&[0xC7, 0x00, 0x00]).await?; // (200 - 1) = 199 = 0xC7
 
         // Data Entry mode: X increment, Y increment
-        self.send_cmd(0x11).await;
-        self.send_data(&[0x03]).await;
+        self.send_cmd(0x11).await?;
+        self.send_data(&[0x03]).await?;
 
         // Set RAM X address boundaries: 0x00 to 0x18 (25 bytes = 200 pixels)
-        self.send_cmd(0x44).await;
-        self.send_data(&[0x00, 0x18]).await;
+        self.send_cmd(0x44).await?;
+        self.send_data(&[0x00, 0x18]).await?;
 
         // Set RAM Y address boundaries: 0x0000 to 0x00C7 (200 lines)
-        self.send_cmd(0x45).await;
-        self.send_data(&[0x00, 0x00, 0xC7, 0x00]).await;
+        self.send_cmd(0x45).await?;
+        self.send_data(&[0x00, 0x00, 0xC7, 0x00]).await?;
 
         // Border waveform control
-        self.send_cmd(0x3C).await;
-        self.send_data(&[0x05]).await;
+        self.send_cmd(0x3C).await?;
+        self.send_data(&[0x05]).await?;
 
         // Temperature sensor control (internal sensor)
-        self.send_cmd(0x18).await;
-        self.send_data(&[0x80]).await;
+        self.send_cmd(0x18).await?;
+        self.send_data(&[0x80]).await?;
 
-        self.wait_idle().await;
+        self.wait_idle().await?;
         info!("SSD1681 E-Paper Display initialized!");
+        Ok(())
     }
 
     /// Push framebuffer contents to SSD1681 RAM and trigger display update
-    pub async fn display_frame(&mut self, fb: &EpdFrameBuffer) {
+    pub async fn display_frame(&mut self, fb: &EpdFrameBuffer) -> Result<(), ()> {
         // Set RAM X address counter to 0
-        self.send_cmd(0x4E).await;
-        self.send_data(&[0x00]).await;
+        self.send_cmd(0x4E).await?;
+        self.send_data(&[0x00]).await?;
 
         // Set RAM Y address counter to 0
-        self.send_cmd(0x4F).await;
-        self.send_data(&[0x00, 0x00]).await;
+        self.send_cmd(0x4F).await?;
+        self.send_data(&[0x00, 0x00]).await?;
 
         // Write Black/White RAM
-        self.send_cmd(0x24).await;
-        self.send_data(&fb.buffer).await;
+        self.send_cmd(0x24).await?;
+        self.send_data(&fb.buffer).await?;
 
         // Display Update Control 2: Load LUT from OTP and trigger display mode 1
-        self.send_cmd(0x22).await;
-        self.send_data(&[0xF7]).await;
+        self.send_cmd(0x22).await?;
+        self.send_data(&[0xF7]).await?;
 
         // Master Activation (refresh screen)
-        self.send_cmd(0x20).await;
-        self.wait_idle().await;
+        self.send_cmd(0x20).await?;
+        self.wait_idle().await?;
+        Ok(())
     }
 
     /// Enter deep sleep mode to conserve battery
-    pub async fn sleep(&mut self) {
-        self.send_cmd(0x10).await; // Deep sleep mode
-        self.send_data(&[0x01]).await;
+    pub async fn sleep(&mut self) -> Result<(), ()> {
+        self.send_cmd(0x10).await?; // Deep sleep mode
+        self.send_data(&[0x01]).await?;
+        Ok(())
     }
 }
 
