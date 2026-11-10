@@ -109,8 +109,8 @@ echo "==> Generating Nordic DFU package (.zip)..."
     "${ZIP}"
 
 echo "==> Checking device state..."
-# If MeshCore companion firmware is running, trigger 1200-baud touch via stty to enter bootloader
-if ioreg -p IOUSB -l -w 0 2>/dev/null | grep -q "MeshCore"; then
+# If MeshCore/the reference firmware companion firmware is running, trigger 1200-baud touch via stty to enter bootloader
+if ioreg -p IOUSB -l -w 0 2>/dev/null | grep -E -q "MeshCore|the reference firmware"; then
     echo "==> MeshCore application active. Sending 1200-baud touch to enter bootloader..."
     stty -f "${PORT}" 1200 2>/dev/null || true
     sleep 0.5

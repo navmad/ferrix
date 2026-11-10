@@ -6,6 +6,7 @@ pub mod companion;
 pub mod display;
 pub mod gps;
 pub mod input;
+pub mod meshcore;
 pub mod radio;
 pub mod telemetry;
 
@@ -26,6 +27,7 @@ use crate::companion::protocol::CompanionNode;
 #[cfg(feature = "thinknode-m1")]
 use crate::display::{EpdFrameBuffer, NodeDisplay, Ssd1681, ThinkNodeDisplay};
 use crate::input::{InputDevice, InputEvent};
+use crate::meshcore::{InboundAction, LocalIdentity, MeshEngine, Packet};
 use crate::radio::{LoraConfig, Sx1262};
 
 bind_interrupts!(struct Irqs {
@@ -81,6 +83,10 @@ async fn main(spawner: Spawner) {
 
     // Initial node companion state
     let mut node = CompanionNode::new(CurrentBoard::NAME, CurrentBoard::NAME, CurrentBoard::CAPABILITIES);
+
+    // Initialize native MeshCore Routing Engine & Local Cryptographic Identity
+    let local_id = LocalIdentity::new(CurrentBoard::NAME, CurrentBoard::NAME);
+    let mut mesh = MeshEngine::new(local_id, true);
 
     // Visual Boot Confirmation: 3 fast blue blinks indicate successful MCU & runtime start
     for _ in 0..3 {
@@ -175,9 +181,38 @@ async fn main(spawner: Spawner) {
             info!("Received LoRa packet: {} bytes, RSSI: {} dBm, SNR: {} dB", len, rssi, snr);
             board.telemetry.blue_led.set_high(); // ON
             node.rx_packets = node.rx_packets.saturating_add(1);
-            node.unread_messages = node.unread_messages.saturating_add(1);
             node.last_rssi = rssi;
             node.last_snr = snr;
+
+            // Deserialize and dispatch through MeshCore Network Engine
+            if let Ok(pkt) = Packet::read_from(&rx_buf[..len]) {
+                match mesh.handle_inbound_packet(pkt) {
+                    InboundAction::ReceivedAdvert(adv) => {
+                        info!("MeshCore Advert from: {}", adv.callsign.as_str());
+                    }
+                    InboundAction::ReceivedGroupText(grp) => {
+                        info!("MeshCore Group Text [ch {}]: <{}> {}", grp.channel_hash, grp.sender.as_str(), grp.message.as_str());
+                        node.unread_messages = node.unread_messages.saturating_add(1);
+                    }
+                    InboundAction::ReceivedDirectText(msg) => {
+                        info!("MeshCore Direct Msg: {}", msg.text.as_str());
+                        node.unread_messages = node.unread_messages.saturating_add(1);
+                    }
+                    InboundAction::ReceivedAck(_ack) => {
+                        info!("MeshCore ACK received");
+                    }
+                    InboundAction::DropDuplicate => {
+                        info!("MeshCore: dropped duplicate packet");
+                    }
+                    InboundAction::DropHopLimitExceeded => {
+                        info!("MeshCore: dropped packet exceeding hop limit");
+                    }
+                    _ => {}
+                }
+            } else {
+                info!("Received non-MeshCore or legacy beacon frame");
+            }
+
             Timer::after_millis(50).await;
             board.telemetry.blue_led.set_low(); // OFF
         }
@@ -202,7 +237,7 @@ async fn main(spawner: Spawner) {
                     }
                 }
                 InputEvent::ActionPrimary => {
-                    info!("Input: Primary Action (sending beacon)...");
+                    info!("Input: Primary Action (broadcasting MeshCore Advert)...");
                     node.tx_beacons = node.tx_beacons.saturating_add(1);
 
                     // Quick double-flash on blue LED to give immediate visual feedback
@@ -213,18 +248,25 @@ async fn main(spawner: Spawner) {
                         Timer::after_millis(40).await;
                     }
 
-                    let mut beacon_buf = [0u8; 64];
-                    let beacon_prefix = b"MESHCORE_BEACON:";
-                    beacon_buf[..beacon_prefix.len()].copy_from_slice(beacon_prefix);
-                    let name_bytes = CurrentBoard::NAME.as_bytes();
-                    let total_len = beacon_prefix.len() + name_bytes.len();
-                    beacon_buf[beacon_prefix.len()..total_len].copy_from_slice(name_bytes);
-
-                    let _ = lora.transmit(&beacon_buf[..total_len]).await;
-                    lora.start_receive().await;
-                    // No EPD refresh needed here: immediate, responsive LoRa beaconing!
+                    // Queue standard MeshCore Advertisement packet over LoRa
+                    let _ = mesh.queue_advert(
+                        node.epoch_time as u32,
+                        node.latitude,
+                        node.longitude,
+                        node.battery_percentage,
+                    );
                 }
                 _ => {}
+            }
+        }
+
+        // Transmit any pending packets from MeshEngine tx queue (adverts, text, repeats)
+        while let Some(out_pkt) = mesh.tx_queue.pop() {
+            let mut wire_buf = [0u8; 256];
+            if let Ok(wire_len) = out_pkt.write_to(&mut wire_buf) {
+                info!("Transmitting MeshCore packet: {} bytes (type: {})", wire_len, out_pkt.payload_type());
+                let _ = lora.transmit(&wire_buf[..wire_len]).await;
+                lora.start_receive().await;
             }
         }
 
