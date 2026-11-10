@@ -19,8 +19,11 @@ pub trait NodeDisplay {
     /// Initialize the display controller
     async fn init(&mut self) -> Result<(), Self::Error>;
 
-    /// Render and flush the dashboard to the screen
+    /// Render and flush the dashboard to the screen (fast differential refresh)
     async fn render_dashboard(&mut self, node: &CompanionNode) -> Result<(), Self::Error>;
+
+    /// Render full dashboard with full OTP clearing refresh (for boot / calibration)
+    async fn render_dashboard_full(&mut self, node: &CompanionNode) -> Result<(), Self::Error>;
 
     /// Put the display into ultra-low-power sleep
     async fn sleep(&mut self) -> Result<(), Self::Error>;
@@ -47,7 +50,12 @@ impl<'a, T: embassy_nrf::spim::Instance> NodeDisplay for ThinkNodeDisplay<'a, T>
 
     async fn render_dashboard(&mut self, node: &CompanionNode) -> Result<(), Self::Error> {
         ui::render_dashboard(node, self.fb);
-        self.epd.display_frame(self.fb).await
+        self.epd.display_frame_fast(self.fb).await
+    }
+
+    async fn render_dashboard_full(&mut self, node: &CompanionNode) -> Result<(), Self::Error> {
+        ui::render_dashboard(node, self.fb);
+        self.epd.display_frame_full(self.fb).await
     }
 
     async fn sleep(&mut self) -> Result<(), Self::Error> {

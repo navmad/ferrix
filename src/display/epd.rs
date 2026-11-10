@@ -188,8 +188,11 @@ impl<'a, T: embassy_nrf::spim::Instance> Ssd1681<'a, T> {
         Ok(())
     }
 
-    /// Push framebuffer contents to SSD1681 RAM and trigger display update
-    pub async fn display_frame(&mut self, fb: &EpdFrameBuffer) -> Result<(), ()> {
+    /// Push framebuffer contents to SSD1681 RAM and trigger a full screen refresh (Mode 1, OTP LUT 0xF7).
+    ///
+    /// Clears any particle ghosting with full black/white cycling (~2s).
+    /// Recommended for boot and periodic calibration.
+    pub async fn display_frame_full(&mut self, fb: &EpdFrameBuffer) -> Result<(), ()> {
         // Set RAM X address boundaries: 0x00 to 0x18
         self.send_cmd(0x44).await?;
         self.send_data(&[0x00, 0x18]).await?;
@@ -210,11 +213,11 @@ impl<'a, T: embassy_nrf::spim::Instance> Ssd1681<'a, T> {
         self.send_cmd(0x24).await?;
         self.send_data(&fb.buffer).await?;
 
-        // Write Red/Previous RAM (required for SSD1681 full-screen refresh OTP LUT)
+        // Write Red/Previous RAM (base frame)
         self.send_cmd(0x26).await?;
         self.send_data(&fb.buffer).await?;
 
-        // Display Update Control 2: Load LUT from OTP and trigger display mode 1
+        // Display Update Control 2: Load LUT from OTP and trigger display mode 1 (Full Refresh 0xF7)
         self.send_cmd(0x22).await?;
         self.send_data(&[0xF7]).await?;
 
@@ -222,6 +225,56 @@ impl<'a, T: embassy_nrf::spim::Instance> Ssd1681<'a, T> {
         self.send_cmd(0x20).await?;
         self.wait_idle().await?;
         Ok(())
+    }
+
+    /// Push framebuffer contents to SSD1681 RAM and trigger a fast differential refresh (Mode 2, OTP LUT 0xFC).
+    ///
+    /// Fast update (~400ms) with NO black/white flicker. Writes new data to RAM 0x24 while comparing
+    /// against previous data in RAM 0x26, then syncs RAM 0x26 for subsequent differential updates.
+    pub async fn display_frame_fast(&mut self, fb: &EpdFrameBuffer) -> Result<(), ()> {
+        // Set RAM X address boundaries: 0x00 to 0x18
+        self.send_cmd(0x44).await?;
+        self.send_data(&[0x00, 0x18]).await?;
+
+        // Set RAM Y address boundaries: 0x0000 to 0x00C7
+        self.send_cmd(0x45).await?;
+        self.send_data(&[0x00, 0x00, 0xC7, 0x00]).await?;
+
+        // Set RAM X address counter to 0
+        self.send_cmd(0x4E).await?;
+        self.send_data(&[0x00]).await?;
+
+        // Set RAM Y address counter to 0
+        self.send_cmd(0x4F).await?;
+        self.send_data(&[0x00, 0x00]).await?;
+
+        // Write Black/White RAM (current frame)
+        self.send_cmd(0x24).await?;
+        self.send_data(&fb.buffer).await?;
+
+        // Display Update Control 2: Fast partial/differential refresh (0xFC)
+        self.send_cmd(0x22).await?;
+        self.send_data(&[0xFC]).await?;
+
+        // Master Activation (refresh screen)
+        self.send_cmd(0x20).await?;
+        self.wait_idle().await?;
+
+        // Synchronize Red/Previous RAM (0x26) with current buffer so the next differential
+        // update has the correct baseline image
+        self.send_cmd(0x4E).await?;
+        self.send_data(&[0x00]).await?;
+        self.send_cmd(0x4F).await?;
+        self.send_data(&[0x00, 0x00]).await?;
+        self.send_cmd(0x26).await?;
+        self.send_data(&fb.buffer).await?;
+
+        Ok(())
+    }
+
+    /// Push framebuffer contents to SSD1681 RAM (defaults to fast differential refresh)
+    pub async fn display_frame(&mut self, fb: &EpdFrameBuffer) -> Result<(), ()> {
+        self.display_frame_fast(fb).await
     }
 
     /// Enter deep sleep mode to conserve battery

@@ -147,9 +147,9 @@ async fn main(spawner: Spawner) {
             let fb = EPD_FRAMEBUFFER.init(EpdFrameBuffer::new());
             let mut d = ThinkNodeDisplay::new(epd, fb);
 
-            info!("Initializing display and drawing MeshCore Dashboard...");
+            info!("Initializing display and drawing MeshCore Dashboard (Full calibration refresh)...");
             d.init().await.ok();
-            d.render_dashboard(&node).await.ok();
+            d.render_dashboard_full(&node).await.ok();
             info!("Dashboard rendered successfully!");
             Some(d)
         } else {
