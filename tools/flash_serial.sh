@@ -120,7 +120,7 @@ if ioreg -p IOUSB -l -w 0 2>/dev/null | grep -q "MeshCore"; then
         fi
         sleep 0.2
     done
-    sleep 1.0
+    sleep 2.0
     echo "==> Bootloader active on ${PORT}"
 fi
 

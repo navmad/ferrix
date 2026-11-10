@@ -39,6 +39,9 @@ bind_interrupts!(struct Irqs {
 #[cfg(feature = "thinknode-m1")]
 static EPD_FRAMEBUFFER: StaticCell<EpdFrameBuffer> = StaticCell::new();
 
+/// Number of page turns between full screen refreshes (clears e-ink ghosting)
+const EPD_FULL_REFRESH_INTERVAL: u32 = 9;
+
 /// Custom panic handler: Blinks Red LED (P1.04) continuously to indicate fatal state without hard-faulting
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
@@ -164,6 +167,7 @@ async fn main(spawner: Spawner) {
 
     let mut rx_buf = [0u8; 256];
     let mut tick = 0u32;
+    let mut page_turns = 0u32;
 
     loop {
         // Poll for incoming LoRa packets
@@ -185,9 +189,16 @@ async fn main(spawner: Spawner) {
                     info!("Input: Next Page requested");
                     // Cycle through pages: 0 -> 1 -> 2 -> 0
                     node.current_page = (node.current_page + 1) % 3;
+                    page_turns = page_turns.wrapping_add(1);
+
                     #[cfg(feature = "thinknode-m1")]
                     if let Some(d) = &mut display {
-                        d.render_dashboard(&node).await.ok();
+                        if page_turns % EPD_FULL_REFRESH_INTERVAL == 0 {
+                            info!("Page turn #{}: performing periodic full screen refresh to clear ghosting", page_turns);
+                            d.render_dashboard_full(&node).await.ok();
+                        } else {
+                            d.render_dashboard(&node).await.ok();
+                        }
                     }
                 }
                 InputEvent::ActionPrimary => {
