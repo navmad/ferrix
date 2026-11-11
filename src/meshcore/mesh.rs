@@ -122,8 +122,25 @@ impl MeshEngine {
                 }
             }
             PAYLOAD_TYPE_GRP_TXT => {
-                if let Ok(grp) = GrpTextPacket::decode(&pkt.payload[..pkt.payload_len]) {
-                    InboundAction::ReceivedGroupText(grp)
+                if pkt.payload_len > 0 {
+                    let ch_hash = pkt.payload[0];
+                    let mut matched = None;
+                    crate::companion::usb::CHANNELS.lock(|chs| {
+                        let list = chs.borrow();
+                        for ch in list.iter() {
+                            if crate::meshcore::crypto::channel_hash(&ch.secret) == ch_hash {
+                                if let Ok(grp) = GrpTextPacket::decode_encrypted(&pkt.payload[..pkt.payload_len], &ch.secret) {
+                                    matched = Some(grp);
+                                    break;
+                                }
+                            }
+                        }
+                    });
+                    if let Some(grp) = matched {
+                        InboundAction::ReceivedGroupText(grp)
+                    } else {
+                        InboundAction::Unhandled
+                    }
                 } else {
                     InboundAction::Unhandled
                 }
@@ -175,10 +192,10 @@ impl MeshEngine {
         Ok(pkt)
     }
 
-    /// Construct and queue a channel group text message
-    pub fn queue_group_text(&mut self, channel_hash: u8, message: &str, timestamp: u32) -> Result<Packet, ()> {
+    /// Construct and queue an encrypted channel group text message
+    pub fn queue_group_text(&mut self, channel_hash: u8, channel_secret: &[u8], message: &str, timestamp: u32) -> Result<Packet, ()> {
         let grp = GrpTextPacket::new(channel_hash, self.identity.callsign(), message, timestamp);
-        let pkt = grp.to_packet(ROUTE_TYPE_FLOOD)?;
+        let pkt = grp.to_packet(channel_secret, ROUTE_TYPE_FLOOD)?;
         let _ = self.tx_queue.push(pkt.clone());
         Ok(pkt)
     }

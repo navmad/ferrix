@@ -355,10 +355,20 @@ async fn main(spawner: Spawner) {
                         node.battery_percentage,
                     );
                 }
-                UsbCommand::SendGroupText { channel_idx: _, text } => {
-                    info!("Queuing MeshCore Group Text: {}", text.as_str());
+                UsbCommand::SendGroupText { channel_idx, text } => {
+                    info!("Queuing MeshCore Group Text on ch {}: {}", channel_idx, text.as_str());
+                    let (ch_hash, secret) = crate::companion::usb::CHANNELS.lock(|chs| {
+                        let list = chs.borrow();
+                        if (channel_idx as usize) < list.len() {
+                            let sec = list[channel_idx as usize].secret;
+                            (crate::meshcore::crypto::channel_hash(&sec), sec)
+                        } else {
+                            (0, [0u8; 16])
+                        }
+                    });
+                    let time = crate::companion::usb::get_device_time();
                     node.tx_beacons = node.tx_beacons.saturating_add(1);
-                    let _ = mesh.queue_group_text(0, text.as_str(), node.epoch_time as u32);
+                    let _ = mesh.queue_group_text(ch_hash, &secret, text.as_str(), time);
                 }
                 UsbCommand::SendDirectText { dest_hash, text } => {
                     info!("Queuing MeshCore Direct Text to {:?}: {}", dest_hash, text.as_str());

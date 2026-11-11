@@ -226,17 +226,14 @@ impl Packet {
     }
 
     /// Calculate a fast 4-byte packet hash for deduplication and acknowledgment tracking
+    /// Calculates the 4-byte MeshCore packet hash (SHA-256 over payload type + payload)
     pub fn calculate_packet_hash(&self) -> [u8; 4] {
-        // FNV-1a 32-bit hash over header + payload
-        let mut hash = 0x811c9dc5u32;
-        hash ^= self.header as u32;
-        hash = hash.wrapping_mul(0x01000193);
-
-        for &b in &self.payload[..self.payload_len] {
-            hash ^= b as u32;
-            hash = hash.wrapping_mul(0x01000193);
-        }
-
-        hash.to_le_bytes()
+        use sha2::{Digest, Sha256};
+        let t = self.payload_type();
+        let mut hasher = Sha256::new();
+        hasher.update(&[t]);
+        hasher.update(&self.payload[..self.payload_len]);
+        let full: [u8; 32] = hasher.finalize().into();
+        [full[0], full[1], full[2], full[3]]
     }
 }
