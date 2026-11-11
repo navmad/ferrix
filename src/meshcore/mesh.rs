@@ -121,22 +121,22 @@ impl MeshEngine {
             return InboundAction::DropHopLimitExceeded;
         }
 
-        // 2. If configured as a repeater and packet is flood-routed, re-broadcast (if not already seen)
         let is_dupe = self.seen_filter.check_and_mark(&pkt);
+        let already_in_path = pkt.contains_hop(self.identity.pub_key());
 
-        if self.is_repeater && pkt.is_flood() && !is_dupe {
-            let mut repeat_pkt = pkt.clone();
-            repeat_pkt.append_hop_bytes(self.identity.pub_key());
-            let _ = self.tx_queue.push(repeat_pkt);
-        }
-
-        // 3. Dispatch based on payload type
+        // 2. Dispatch based on payload type
         match pkt.payload_type() {
             PAYLOAD_TYPE_ADVERT => {
                 if is_dupe {
                     return InboundAction::DropDuplicate;
                 }
                 if let Ok(adv) = AdvertPacket::decode(&pkt.payload[..pkt.payload_len]) {
+                    // Only repeat adverts from other nodes
+                    if self.is_repeater && pkt.is_flood() && !already_in_path && adv.pub_key != *self.identity.pub_key() {
+                        let mut repeat_pkt = pkt.clone();
+                        repeat_pkt.append_hop_bytes(self.identity.pub_key());
+                        let _ = self.tx_queue.push(repeat_pkt);
+                    }
                     InboundAction::ReceivedAdvert(adv)
                 } else {
                     InboundAction::Unhandled
@@ -161,6 +161,7 @@ impl MeshEngine {
 
                     if let Some((ch_idx, grp)) = matched {
                         if grp.sender.as_str() == self.identity.callsign() {
+                            // Our own message echoed by repeater! NEVER re-broadcast our own message
                             if pkt.path_hash_count() >= 1 {
                                 InboundAction::ReceivedRepeaterEcho {
                                     pkt_hash: pkt.calculate_packet_hash(),
@@ -169,13 +170,22 @@ impl MeshEngine {
                             } else {
                                 InboundAction::DropDuplicate
                             }
-                        } else if is_dupe {
-                            InboundAction::DropDuplicate
                         } else {
-                            InboundAction::ReceivedGroupText {
-                                channel_idx: ch_idx,
-                                path_len: pkt.path_len,
-                                packet: grp,
+                            // Message from other node: repeat if configured as repeater
+                            if self.is_repeater && pkt.is_flood() && !is_dupe && !already_in_path {
+                                let mut repeat_pkt = pkt.clone();
+                                repeat_pkt.append_hop_bytes(self.identity.pub_key());
+                                let _ = self.tx_queue.push(repeat_pkt);
+                            }
+
+                            if is_dupe {
+                                InboundAction::DropDuplicate
+                            } else {
+                                InboundAction::ReceivedGroupText {
+                                    channel_idx: ch_idx,
+                                    path_len: pkt.path_len,
+                                    packet: grp,
+                                }
                             }
                         }
                     } else if is_dupe {
@@ -188,6 +198,11 @@ impl MeshEngine {
                 }
             }
             PAYLOAD_TYPE_TXT_MSG => {
+                if self.is_repeater && pkt.is_flood() && !is_dupe && !already_in_path {
+                    let mut repeat_pkt = pkt.clone();
+                    repeat_pkt.append_hop_bytes(self.identity.pub_key());
+                    let _ = self.tx_queue.push(repeat_pkt);
+                }
                 if is_dupe {
                     return InboundAction::DropDuplicate;
                 }
@@ -233,6 +248,7 @@ impl MeshEngine {
 
         let mut pkt = adv.to_packet(ROUTE_TYPE_FLOOD)?;
         pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
+        self.seen_filter.mark_seen(pkt.calculate_packet_hash());
         let _ = self.tx_queue.push(pkt.clone());
         Ok(pkt)
     }
@@ -242,6 +258,7 @@ impl MeshEngine {
         let grp = GrpTextPacket::new(channel_hash, self.identity.callsign(), message, timestamp);
         let mut pkt = grp.to_packet(channel_secret, ROUTE_TYPE_FLOOD)?;
         pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
+        self.seen_filter.mark_seen(pkt.calculate_packet_hash());
         let _ = self.tx_queue.push(pkt.clone());
         Ok(pkt)
     }
@@ -252,6 +269,7 @@ impl MeshEngine {
         let msg = TxtMsgPacket::new(dest_hash, src_hash, text, timestamp);
         let mut pkt = msg.to_packet(ROUTE_TYPE_FLOOD)?;
         pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
+        self.seen_filter.mark_seen(pkt.calculate_packet_hash());
         let _ = self.tx_queue.push(pkt.clone());
         Ok(pkt)
     }
@@ -262,6 +280,7 @@ impl MeshEngine {
         let ack = AckPacket::new(dest_hash, src_hash, ack_packet_hash, timestamp);
         let mut pkt = ack.to_packet(ROUTE_TYPE_FLOOD)?;
         pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
+        self.seen_filter.mark_seen(pkt.calculate_packet_hash());
         let _ = self.tx_queue.push(pkt.clone());
         Ok(pkt)
     }

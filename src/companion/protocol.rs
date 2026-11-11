@@ -422,9 +422,16 @@ impl CompanionNode {
             }
 
             CMD_SET_PATH_HASH_MODE => {
-                // Inbound: [0x3D, 0, mode]
-                if payload.len() >= 3 && payload[1] == 0 {
-                    let mode = payload[2];
+                // Inbound: [0x3D, 0, mode] or [0x3D, mode]
+                let mode_opt = if payload.len() >= 3 && payload[1] == 0 {
+                    Some(payload[2])
+                } else if payload.len() >= 2 {
+                    Some(payload[1])
+                } else {
+                    None
+                };
+
+                if let Some(mode) = mode_opt {
                     if mode <= 2 {
                         self.path_hash_mode = mode;
                         crate::storage::set_path_hash_mode(mode);

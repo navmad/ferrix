@@ -144,7 +144,7 @@ async fn main(spawner: Spawner) {
     };
     let pub_key = local_id.pub_key_bytes();
     let priv_key = local_id.signing_key_bytes();
-    let mut mesh = MeshEngine::new(local_id, true);
+    let mut mesh = MeshEngine::new(local_id, false);
 
     // 0. Initialize USB CDC-ACM Serial & 1200-baud DFU Auto-Reset FIRST
     // This guarantees serial CLI, packet logging, and DFU auto-reset are always available.
@@ -378,6 +378,7 @@ async fn main(spawner: Spawner) {
                     }
                     InboundAction::ReceivedRepeaterEcho { pkt_hash, hops } => {
                         info!("MeshCore Message echoed by repeater! ({} hops, pkt_hash: {:?})", hops, pkt_hash);
+                        handle_direct_message_confirmed(pkt_hash);
                     }
                     InboundAction::ReceivedAck(ack) => {
                         info!("MeshCore ACK received for packet {:?}", ack.ack_packet_hash);

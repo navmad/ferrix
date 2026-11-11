@@ -44,7 +44,7 @@ pub static RADIO_SETTINGS: Mutex<CriticalSectionRawMutex, RefCell<RadioSettings>
     sf: 7,
     bw_khz: 62,
     cr: 5,
-    is_repeater: true,
+    is_repeater: false,
     path_hash_mode: 0,
 }));
 

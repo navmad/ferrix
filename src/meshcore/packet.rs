@@ -166,6 +166,25 @@ impl Packet {
         }
     }
 
+    /// Checks if a node hash is already present in the path to detect loops
+    pub fn contains_hop(&self, node_hash: &[u8]) -> bool {
+        let count = self.path_hash_count();
+        let size = self.path_hash_size();
+        let check_len = node_hash.len().min(size);
+        if check_len == 0 {
+            return false;
+        }
+        for i in 0..count {
+            let offset = i * size;
+            if offset + check_len <= MAX_PATH_SIZE {
+                if &self.path[offset..offset + check_len] == &node_hash[..check_len] {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     /// Serialize packet into raw wire format:
     /// `[header] [transport_codes (opt: 4 bytes)] [path_len] [path...] [payload...]`
     pub fn write_to(&self, dest: &mut [u8]) -> Result<usize, ()> {
