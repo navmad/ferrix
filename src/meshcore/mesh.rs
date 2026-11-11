@@ -25,9 +25,9 @@ pub struct DiscoveredContact {
     pub last_seen_epoch: u32,
     pub rssi: i16,
     pub snr: i8,
-    pub battery_percentage: u8,
-    pub latitude: f32,
-    pub longitude: f32,
+    pub latitude: i32,       // Changed from f32 to i32 (degrees * 1,000,000)
+    pub longitude: i32,      // Changed from f32 to i32 (degrees * 1,000,000)
+    pub flags: u8,           // New: advert flags bitmask
 }
 
 /// Recently received message entry for message history / inbox
@@ -131,6 +131,10 @@ impl MeshEngine {
                     return InboundAction::DropDuplicate;
                 }
                 if let Ok(adv) = AdvertPacket::decode(&pkt.payload[..pkt.payload_len]) {
+                    // Verify Ed25519 signature before trusting this advert
+                    if !adv.verify_signature() {
+                        return InboundAction::DropDuplicate; // or a new DropInvalidSignature variant
+                    }
                     // Only repeat adverts from other nodes
                     if self.is_repeater && pkt.is_flood() && !already_in_path && adv.pub_key != *self.identity.pub_key() {
                         let mut repeat_pkt = pkt.clone();
@@ -235,16 +239,33 @@ impl MeshEngine {
     }
 
     /// Construct and queue an advertisement packet for transmission
-    pub fn queue_advert(&mut self, timestamp: u32, lat: f32, lon: f32, bat: u8) -> Result<Packet, ()> {
+    /// Construct, sign, and queue an advertisement packet for transmission
+    pub fn queue_advert(&mut self, timestamp: u32, lat_f32: f32, lon_f32: f32) -> Result<Packet, ()> {
+        // Convert f32 GPS to integer (degrees * 1,000,000)
+        let lat_int = (lat_f32 * 1_000_000.0) as i32;
+        let lon_int = (lon_f32 * 1_000_000.0) as i32;
+
+        // Build flags: this node is a chat node + has location + has name
+        let mut flags = AdvertPacket::ADV_FLAG_IS_CHAT;
+        if self.is_repeater {
+            flags |= AdvertPacket::ADV_FLAG_IS_REPEATER;
+        }
+        if lat_f32 != 0.0 || lon_f32 != 0.0 {
+            flags |= AdvertPacket::ADV_FLAG_HAS_LOCATION;
+        }
+        flags |= AdvertPacket::ADV_FLAG_HAS_NAME;
+
         let mut adv = AdvertPacket::new(
             *self.identity.pub_key(),
-            self.identity.callsign(),
-            1, // ADV_TYPE_CHAT
             timestamp,
+            flags,
+            lat_int,
+            lon_int,
+            self.identity.callsign(),
         );
-        adv.latitude = lat;
-        adv.longitude = lon;
-        adv.battery_percentage = bat;
+
+        // Sign the advert with our private key
+        adv.sign(&self.identity);
 
         let mut pkt = adv.to_packet(ROUTE_TYPE_FLOOD)?;
         pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);

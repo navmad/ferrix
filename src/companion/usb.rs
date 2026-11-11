@@ -623,10 +623,10 @@ async fn handle_text_cli(
                     let mut s = heapless::String::<128>::new();
                     let _ = write!(
                         s,
-                        "  -> {:02x}{:02x}{:02x}{:02x}  {:<14}  {:>4}dBm  {:>3}dB  {:>3}%  {}s\r\n",
+                        "  -> {:02x}{:02x}{:02x}{:02x}  {:<14}  {:>4}dBm  {:>3}dB  {:>3}% {:>3}%  {}s\r\n",
                         c.node_id[0], c.node_id[1], c.node_id[2], c.node_id[3],
                         c.callsign.as_str(),
-                        c.rssi, c.snr, c.battery_percentage, c.last_seen_epoch
+                        c.rssi, c.snr, c.latitude, c.longitude, c.last_seen_epoch
                     );
                     let _ = write_all(sender, s.as_bytes()).await;
                 }

@@ -288,21 +288,21 @@ async fn main(spawner: Spawner) {
             if let Ok(pkt) = Packet::read_from(&rx_buf[..len]) {
                 match mesh.handle_inbound_packet(pkt) {
                     InboundAction::ReceivedAdvert(adv) => {
-                        info!("MeshCore Advert from: {}", adv.callsign.as_str());
+                        info!("MeshCore Advert from: {}", adv.name.as_str());
                         let node_id = [adv.pub_key[0], adv.pub_key[1], adv.pub_key[2], adv.pub_key[3]];
                         crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| {
                             let mut list = c.borrow_mut();
                             if let Some(existing) = list.iter_mut().find(|c| c.pub_key == adv.pub_key) {
-                                existing.callsign = adv.callsign.clone();
+                                existing.callsign = adv.name.clone();
                                 existing.last_seen_epoch = node.epoch_time as u32;
                                 existing.rssi = rssi;
                                 existing.snr = snr;
-                                existing.battery_percentage = adv.battery_percentage;
                                 existing.latitude = adv.latitude;
                                 existing.longitude = adv.longitude;
+                                existing.flags = adv.flags;
                             } else {
                                 let mut cs = heapless::String::new();
-                                let _ = cs.push_str(adv.callsign.as_str());
+                                let _ = cs.push_str(adv.name.as_str());
                                 let _ = list.push(crate::meshcore::mesh::DiscoveredContact {
                                     pub_key: adv.pub_key,
                                     callsign: cs,
@@ -310,9 +310,9 @@ async fn main(spawner: Spawner) {
                                     last_seen_epoch: node.epoch_time as u32,
                                     rssi,
                                     snr,
-                                    battery_percentage: adv.battery_percentage,
                                     latitude: adv.latitude,
                                     longitude: adv.longitude,
+                                    flags: adv.flags,
                                 });
                             }
                         });
@@ -431,7 +431,6 @@ async fn main(spawner: Spawner) {
                         time,
                         node.latitude,
                         node.longitude,
-                        node.battery_percentage,
                     );
                 }
                 UsbCommand::SendGroupText { channel_idx, timestamp, text } => {
@@ -521,7 +520,6 @@ async fn main(spawner: Spawner) {
                         node.epoch_time as u32,
                         node.latitude,
                         node.longitude,
-                        node.battery_percentage,
                     );
                 }
                 _ => {}
