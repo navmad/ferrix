@@ -18,6 +18,7 @@ pub const CMD_GET_BAT: u8 = 19;
 pub const CMD_DEVICE_QUERY: u8 = 22;
 pub const CMD_GET_CHANNEL: u8 = 31;
 pub const CMD_SET_CHANNEL: u8 = 32;
+pub const CMD_SET_PATH_HASH_MODE: u8 = 0x3D;
 pub const CMD_SEND_CHANNEL_DATA: u8 = 0x3E;
 
 pub const RESP_CODE_OK: u8 = 0;
@@ -66,6 +67,7 @@ pub struct CompanionNode {
     pub last_rssi: i16,
     pub last_snr: i8,
     pub current_page: u8,
+    pub path_hash_mode: u8,
 }
 
 impl CompanionNode {
@@ -97,6 +99,7 @@ impl CompanionNode {
             last_rssi: 0,
             last_snr: 0,
             current_page: 0,
+            path_hash_mode: crate::storage::get_path_hash_mode(),
         }
     }
 
@@ -114,10 +117,10 @@ impl CompanionNode {
             CMD_DEVICE_QUERY => {
                 // RESP_CODE_DEVICE_INFO (13)
                 // Protocol v3+ official layout:
-                // [code(13), firmware_ver(3), max_contacts_div_2(50), max_channels(8), ble_pin(u32_le), build_date(12), model(40), semver(20)]
+                // [code(13), firmware_ver(14), max_contacts_div_2(50), max_channels(8), ble_pin(u32_le), build_date(12), model(40), semver(20), offgrid(0), path_hash_mode(u8)]
                 let mut resp = Vec::<u8, 128>::new();
                 let _ = resp.push(RESP_CODE_DEVICE_INFO);
-                let _ = resp.push(3); // firmware_ver
+                let _ = resp.push(14); // firmware_ver: 14 (v10+ required for path_hash_mode in apps)
                 let _ = resp.push(50); // max_contacts_div_2 (100 contacts)
                 let _ = resp.push(8); // max_channels
                 let _ = resp.extend_from_slice(&123456u32.to_le_bytes()); // ble_pin: 123456
@@ -136,6 +139,9 @@ impl CompanionNode {
                 let s = b"0.1.0-embassy";
                 sver[..s.len()].copy_from_slice(s);
                 let _ = resp.extend_from_slice(&sver);
+
+                let _ = resp.push(0); // offgrid mode
+                let _ = resp.push(self.path_hash_mode); // path_hash_mode (0=1B, 1=2B, 2=3B)
 
                 emit(&resp);
             }
@@ -412,6 +418,25 @@ impl CompanionNode {
                 }
                 let mut resp = Vec::<u8, 4>::new();
                 let _ = resp.push(RESP_CODE_OK);
+                emit(&resp);
+            }
+
+            CMD_SET_PATH_HASH_MODE => {
+                // Inbound: [0x3D, 0, mode]
+                if payload.len() >= 3 && payload[1] == 0 {
+                    let mode = payload[2];
+                    if mode <= 2 {
+                        self.path_hash_mode = mode;
+                        crate::storage::set_path_hash_mode(mode);
+                        let _ = crate::companion::usb::USB_COMMAND_CHANNEL.try_send(crate::companion::usb::UsbCommand::SetPathHashMode(mode));
+                        let mut resp = Vec::<u8, 4>::new();
+                        let _ = resp.push(RESP_CODE_OK);
+                        emit(&resp);
+                        return;
+                    }
+                }
+                let mut resp = Vec::<u8, 4>::new();
+                let _ = resp.push(RESP_CODE_ERR);
                 emit(&resp);
             }
 

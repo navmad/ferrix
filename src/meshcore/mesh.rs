@@ -79,6 +79,7 @@ pub struct MeshEngine {
     pub tx_queue: PacketQueue,
     pub is_repeater: bool,
     pub max_hops: u8,
+    pub path_hash_mode: u8,
 }
 
 impl MeshEngine {
@@ -89,6 +90,7 @@ impl MeshEngine {
             tx_queue: PacketQueue::new(),
             is_repeater,
             max_hops: DEFAULT_MAX_HOPS,
+            path_hash_mode: crate::storage::get_path_hash_mode(),
         }
     }
 
@@ -96,6 +98,14 @@ impl MeshEngine {
     #[inline]
     pub fn set_callsign(&mut self, callsign: &str) {
         self.identity.set_callsign(callsign);
+    }
+
+    /// Set path hash mode (0: 1-byte, 1: 2-byte, 2: 3-byte)
+    #[inline]
+    pub fn set_path_hash_mode(&mut self, mode: u8) {
+        if mode <= 2 {
+            self.path_hash_mode = mode;
+        }
     }
 
     /// Update the local private key and derived public key
@@ -116,7 +126,7 @@ impl MeshEngine {
 
         if self.is_repeater && pkt.is_flood() && !is_dupe {
             let mut repeat_pkt = pkt.clone();
-            repeat_pkt.append_hop(self.identity.short_hash());
+            repeat_pkt.append_hop_bytes(self.identity.pub_key());
             let _ = self.tx_queue.push(repeat_pkt);
         }
 
@@ -221,7 +231,8 @@ impl MeshEngine {
         adv.longitude = lon;
         adv.battery_percentage = bat;
 
-        let pkt = adv.to_packet(ROUTE_TYPE_FLOOD)?;
+        let mut pkt = adv.to_packet(ROUTE_TYPE_FLOOD)?;
+        pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
         let _ = self.tx_queue.push(pkt.clone());
         Ok(pkt)
     }
@@ -229,7 +240,8 @@ impl MeshEngine {
     /// Construct and queue an encrypted channel group text message
     pub fn queue_group_text(&mut self, channel_hash: u8, channel_secret: &[u8], message: &str, timestamp: u32) -> Result<Packet, ()> {
         let grp = GrpTextPacket::new(channel_hash, self.identity.callsign(), message, timestamp);
-        let pkt = grp.to_packet(channel_secret, ROUTE_TYPE_FLOOD)?;
+        let mut pkt = grp.to_packet(channel_secret, ROUTE_TYPE_FLOOD)?;
+        pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
         let _ = self.tx_queue.push(pkt.clone());
         Ok(pkt)
     }
@@ -238,7 +250,8 @@ impl MeshEngine {
     pub fn queue_direct_text(&mut self, dest_hash: [u8; 4], text: &str, timestamp: u32) -> Result<Packet, ()> {
         let src_hash = self.identity.hash_u32().to_le_bytes();
         let msg = TxtMsgPacket::new(dest_hash, src_hash, text, timestamp);
-        let pkt = msg.to_packet(ROUTE_TYPE_FLOOD)?;
+        let mut pkt = msg.to_packet(ROUTE_TYPE_FLOOD)?;
+        pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
         let _ = self.tx_queue.push(pkt.clone());
         Ok(pkt)
     }
@@ -247,7 +260,8 @@ impl MeshEngine {
     pub fn queue_ack(&mut self, dest_hash: [u8; 4], ack_packet_hash: [u8; 4], timestamp: u32) -> Result<Packet, ()> {
         let src_hash = self.identity.hash_u32().to_le_bytes();
         let ack = AckPacket::new(dest_hash, src_hash, ack_packet_hash, timestamp);
-        let pkt = ack.to_packet(ROUTE_TYPE_FLOOD)?;
+        let mut pkt = ack.to_packet(ROUTE_TYPE_FLOOD)?;
+        pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
         let _ = self.tx_queue.push(pkt.clone());
         Ok(pkt)
     }

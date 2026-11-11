@@ -35,6 +35,7 @@ pub struct RadioSettings {
     pub bw_khz: u32,
     pub cr: u8,
     pub is_repeater: bool,
+    pub path_hash_mode: u8,
 }
 
 pub static RADIO_SETTINGS: Mutex<CriticalSectionRawMutex, RefCell<RadioSettings>> = Mutex::new(RefCell::new(RadioSettings {
@@ -44,6 +45,7 @@ pub static RADIO_SETTINGS: Mutex<CriticalSectionRawMutex, RefCell<RadioSettings>
     bw_khz: 62,
     cr: 5,
     is_repeater: true,
+    path_hash_mode: 0,
 }));
 
 pub static DISCOVERED_CONTACTS: Mutex<CriticalSectionRawMutex, RefCell<heapless::Vec<DiscoveredContact, 32>>> =
@@ -152,6 +154,7 @@ pub enum UsbCommand {
     SetSpreadingFactor(u8),
     SetBandwidth(u32),
     SetCodingRate(u8),
+    SetPathHashMode(u8),
 }
 
 #[inline]
@@ -320,12 +323,12 @@ async fn handle_text_cli(
             let _ = write_all(sender, s.as_bytes()).await;
         }
         "get radio" | "get freq" => {
-            let (f, sf, bw, cr, tx) = RADIO_SETTINGS.lock(|r| {
+            let (f, sf, bw, cr, tx, mode) = RADIO_SETTINGS.lock(|r| {
                 let cfg = r.borrow();
-                (cfg.frequency_hz, cfg.sf, cfg.bw_khz, cfg.cr, cfg.tx_power_dbm)
+                (cfg.frequency_hz, cfg.sf, cfg.bw_khz, cfg.cr, cfg.tx_power_dbm, cfg.path_hash_mode)
             });
             let mut s: heapless::String<128> = heapless::String::new();
-            let _ = write!(s, "  -> {:.3} MHz, SF{}, BW {} kHz, CR 4/{}, {} dBm\r\n", f as f32 / 1_000_000.0, sf, bw, cr, tx);
+            let _ = write!(s, "  -> {:.3} MHz, SF{}, BW {} kHz, CR 4/{}, {} dBm, hash-size {}B\r\n", f as f32 / 1_000_000.0, sf, bw, cr, tx, mode + 1);
             let _ = write_all(sender, s.as_bytes()).await;
         }
         s if s.starts_with("set freq ") => {
@@ -478,6 +481,51 @@ async fn handle_text_cli(
                 let _ = write_all(sender, s.as_bytes()).await;
             } else {
                 let _ = write_all(sender, b"  -> Error: supported CR values are 4/5, 4/6, 4/7, 4/8\r\n").await;
+            }
+        }
+        "get path.hash.mode" | "get hash-mode" | "get hash-size" => {
+            let mode = RADIO_SETTINGS.lock(|r| r.borrow().path_hash_mode);
+            let mut resp = heapless::String::<64>::new();
+            let _ = write!(resp, "  -> path.hash.mode = {} ({} bytes/hop)\r\n", mode, mode + 1);
+            let _ = write_all(sender, resp.as_bytes()).await;
+        }
+        s if s.starts_with("set path.hash.mode ") || s.starts_with("set hash-mode ") => {
+            let val_str = s.split_whitespace().last().unwrap_or("");
+            if let Ok(mode) = val_str.parse::<u8>() {
+                if mode <= 2 {
+                    RADIO_SETTINGS.lock(|r| {
+                        r.borrow_mut().path_hash_mode = mode;
+                    });
+                    crate::storage::request_save_config();
+                    let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetPathHashMode(mode));
+                    let mut resp = heapless::String::<64>::new();
+                    let _ = write!(resp, "  -> OK (path.hash.mode set to {}, {} bytes/hop)\r\n", mode, mode + 1);
+                    let _ = write_all(sender, resp.as_bytes()).await;
+                } else {
+                    let _ = write_all(sender, b"  -> Error: path.hash.mode must be 0 (1B), 1 (2B), or 2 (3B)\r\n").await;
+                }
+            } else {
+                let _ = write_all(sender, b"  -> Error: invalid number\r\n").await;
+            }
+        }
+        s if s.starts_with("set hash-size ") => {
+            let val_str = s.split_whitespace().last().unwrap_or("");
+            if let Ok(size) = val_str.parse::<u8>() {
+                if (1..=3).contains(&size) {
+                    let mode = size - 1;
+                    RADIO_SETTINGS.lock(|r| {
+                        r.borrow_mut().path_hash_mode = mode;
+                    });
+                    crate::storage::request_save_config();
+                    let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetPathHashMode(mode));
+                    let mut resp = heapless::String::<64>::new();
+                    let _ = write!(resp, "  -> OK (hash-size set to {} bytes, mode {})\r\n", size, mode);
+                    let _ = write_all(sender, resp.as_bytes()).await;
+                } else {
+                    let _ = write_all(sender, b"  -> Error: hash-size must be 1, 2, or 3 bytes\r\n").await;
+                }
+            } else {
+                let _ = write_all(sender, b"  -> Error: invalid number\r\n").await;
             }
         }
         "get repeat" | "get role" => {
@@ -734,7 +782,7 @@ async fn handle_text_cli(
             let _ = write_all(sender, b"  -> OK (Config save queued to flash)\r\n").await;
         }
         "help" => {
-            let _ = write_all(sender, b"  -> Commands:\r\n  ->   Identity: get/set name, get/set prv.key, get public.key\r\n  ->   Radio:    get/set freq, get/set tx, get/set sf, get/set bw, get/set cr, get/set repeat, stats-radio\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, advert, time, channels\r\n  ->   System:   save, ver, board, stats-core, stats-packets, clear stats/contacts/messages, reboot\r\n").await;
+            let _ = write_all(sender, b"  -> Commands:\r\n  ->   Identity: get/set name, get/set prv.key, get public.key\r\n  ->   Radio:    get/set freq, get/set tx, get/set sf, get/set bw, get/set cr, get/set repeat, get/set hash-mode, stats-radio\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, advert, time, channels\r\n  ->   System:   save, ver, board, stats-core, stats-packets, clear stats/contacts/messages, reboot\r\n").await;
         }
         _ => {
             let _ = write_all(sender, b"  -> Unknown command\r\n").await;

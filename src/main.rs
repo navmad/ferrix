@@ -476,6 +476,11 @@ async fn main(spawner: Spawner) {
                 UsbCommand::SetCodingRate(cr) => {
                     info!("CR updated to: 4/{}", cr);
                 }
+                UsbCommand::SetPathHashMode(mode) => {
+                    info!("Setting path.hash.mode to: {} ({} bytes/hop)", mode, mode + 1);
+                    mesh.set_path_hash_mode(mode);
+                    node.path_hash_mode = mode;
+                }
             }
         }
 

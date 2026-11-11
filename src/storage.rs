@@ -34,7 +34,8 @@ pub struct PersistentConfig {
     pub radio_tx_power: i8,
     pub radio_sf: u8,
     pub radio_cr: u8,
-    pub _reserved: [u8; 3],
+    pub path_hash_mode: u8,
+    pub _reserved: [u8; 2],
     pub radio_freq_hz: u32,
     pub radio_bw_khz: u32,
     pub channels: [ChannelData; 8],
@@ -80,6 +81,21 @@ pub fn read_config() -> Option<PersistentConfig> {
 /// Retrieve the active node callsign
 pub fn get_callsign() -> String<32> {
     NODE_CALLSIGN.lock(|c| c.borrow().clone())
+}
+
+/// Retrieve the active path hash mode (0: 1B, 1: 2B, 2: 3B)
+pub fn get_path_hash_mode() -> u8 {
+    crate::companion::usb::RADIO_SETTINGS.lock(|r| r.borrow().path_hash_mode)
+}
+
+/// Set a new path hash mode and queue a persistent flash save
+pub fn set_path_hash_mode(mode: u8) {
+    if mode <= 2 {
+        crate::companion::usb::RADIO_SETTINGS.lock(|r| {
+            r.borrow_mut().path_hash_mode = mode;
+        });
+        request_save_config();
+    }
 }
 
 /// Set a new node callsign and queue a persistent flash save
@@ -143,6 +159,7 @@ pub fn init_config() -> (String<32>, Option<[u8; 32]>) {
             s.bw_khz = cfg.radio_bw_khz;
             s.cr = cfg.radio_cr;
             s.is_repeater = cfg.is_repeater != 0;
+            s.path_hash_mode = if cfg.path_hash_mode <= 2 { cfg.path_hash_mode } else { 0 };
         });
 
         let priv_key = if cfg.has_custom_key != 0 {
@@ -172,9 +189,9 @@ pub fn assemble_current_config() -> PersistentConfig {
         callsign_bytes[..len].copy_from_slice(&s.as_bytes()[..len]);
     });
 
-    let (freq, tx, sf, bw, cr, is_rep) = crate::companion::usb::RADIO_SETTINGS.lock(|r| {
+    let (freq, tx, sf, bw, cr, is_rep, path_mode) = crate::companion::usb::RADIO_SETTINGS.lock(|r| {
         let s = r.borrow();
-        (s.frequency_hz, s.tx_power_dbm, s.sf, s.bw_khz, s.cr, s.is_repeater)
+        (s.frequency_hz, s.tx_power_dbm, s.sf, s.bw_khz, s.cr, s.is_repeater, s.path_hash_mode)
     });
 
     let channels = crate::companion::usb::CHANNELS.lock(|c| *c.borrow());
@@ -197,7 +214,8 @@ pub fn assemble_current_config() -> PersistentConfig {
         radio_tx_power: tx,
         radio_sf: sf,
         radio_cr: cr,
-        _reserved: [0; 3],
+        path_hash_mode: path_mode,
+        _reserved: [0; 2],
         radio_freq_hz: freq,
         radio_bw_khz: bw,
         channels,

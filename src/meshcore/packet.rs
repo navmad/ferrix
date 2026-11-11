@@ -144,13 +144,19 @@ impl Packet {
 
     /// Appends a node hash to the path if within capacity
     pub fn append_hop(&mut self, node_hash: u8) -> bool {
+        self.append_hop_bytes(&[node_hash])
+    }
+
+    /// Appends multi-byte node hash bytes to the path matching the packet's path_hash_size
+    pub fn append_hop_bytes(&mut self, hash_bytes: &[u8]) -> bool {
         let count = self.path_hash_count();
         let size = self.path_hash_size();
         let next_bytes = (count + 1) * size;
         if next_bytes <= MAX_PATH_SIZE {
             let offset = count * size;
-            self.path[offset] = node_hash;
-            for i in 1..size {
+            let copy_len = hash_bytes.len().min(size);
+            self.path[offset..offset + copy_len].copy_from_slice(&hash_bytes[..copy_len]);
+            for i in copy_len..size {
                 self.path[offset + i] = 0;
             }
             self.set_path_hash_size_and_count(size as u8, (count + 1) as u8);
