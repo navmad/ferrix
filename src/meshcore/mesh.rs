@@ -56,6 +56,12 @@ impl MeshEngine {
         }
     }
 
+    /// Update the local identity callsign
+    #[inline]
+    pub fn set_callsign(&mut self, callsign: &str) {
+        self.identity.set_callsign(callsign);
+    }
+
     /// Process a packet received over the LoRa radio interface
     pub fn handle_inbound_packet(&mut self, pkt: Packet) -> InboundAction {
         // 1. Check for duplicates; drop immediately if seen

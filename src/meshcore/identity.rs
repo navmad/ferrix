@@ -88,6 +88,12 @@ impl LocalIdentity {
         &self.base.callsign
     }
 
+    /// Update the local callsign name
+    pub fn set_callsign(&mut self, callsign: &str) {
+        self.base.callsign.clear();
+        let _ = self.base.callsign.push_str(callsign);
+    }
+
     #[inline]
     pub fn short_hash(&self) -> u8 {
         self.base.short_hash()

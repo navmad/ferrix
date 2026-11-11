@@ -3,7 +3,7 @@
 //! Handles command parsing from companion apps (Mobile/Desktop/Web)
 //! and generates protocol response frames.
 
-use heapless::Vec;
+use heapless::{String, Vec};
 
 pub const CMD_APP_START: u8 = 1;
 pub const CMD_SEND_MSG: u8 = 2;
@@ -34,7 +34,7 @@ pub const CAP_BLE: u32 = 1 << 4;
 
 /// MeshCore Companion Node State
 pub struct CompanionNode {
-    pub callsign: &'static str,
+    pub callsign: String<32>,
     pub hw_model: &'static str,
     pub capabilities: u32,
     pub public_key: [u8; 32],
@@ -53,15 +53,18 @@ pub struct CompanionNode {
 }
 
 impl CompanionNode {
-    pub fn new(callsign: &'static str, hw_model: &'static str, capabilities: u32) -> Self {
+    pub fn new(callsign: &str, hw_model: &'static str, capabilities: u32) -> Self {
         let mut key = [0u8; 32];
         // Unique key derived from hardware model
         let model_bytes = hw_model.as_bytes();
         let copy_len = model_bytes.len().min(32);
         key[..copy_len].copy_from_slice(&model_bytes[..copy_len]);
 
+        let mut cs = String::new();
+        let _ = cs.push_str(callsign);
+
         Self {
-            callsign,
+            callsign: cs,
             hw_model,
             capabilities,
             public_key: key,

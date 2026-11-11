@@ -27,7 +27,7 @@ pub fn render_page(page: u8, node: &CompanionNode, fb: &mut EpdFrameBuffer) {
     let header_title = match page {
         1 => "LoRa Radio PNW",
         2 => "GNSS / GPS",
-        _ => node.callsign,
+        _ => node.callsign.as_str(),
     };
     let _ = Text::new(header_title, Point::new(4, 14), title_style).draw(fb);
 

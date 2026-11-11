@@ -15,6 +15,8 @@ use defmt::{debug, info};
 use embassy_nrf::peripherals::USBD;
 use embassy_nrf::usb::vbus_detect::HardwareVbusDetect;
 use embassy_nrf::usb::Driver;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, Sender, State};
 use embassy_usb::{Builder, Config, UsbDevice};
 use static_cell::StaticCell;
@@ -22,6 +24,15 @@ use static_cell::StaticCell;
 use crate::boards::{Board, CurrentBoard};
 use crate::companion::framing::{encode_usb_frame, UsbFrameReader, USB_INBOUND_DELIMITER};
 use crate::companion::protocol::CompanionNode;
+
+#[derive(Clone, Debug)]
+pub enum UsbCommand {
+    SetName(heapless::String<32>),
+    SetTime(u64),
+    TriggerAdvert,
+}
+
+pub static USB_COMMAND_CHANNEL: Channel<CriticalSectionRawMutex, UsbCommand, 4> = Channel::new();
 
 pub type UsbDriver = Driver<'static, USBD, HardwareVbusDetect>;
 
@@ -70,8 +81,44 @@ async fn handle_text_cli(
     match trimmed {
         "get name" => {
             let mut s: heapless::String<64> = heapless::String::new();
-            let _ = write!(s, "  -> > {}\r\n", CurrentBoard::NAME);
+            let _ = write!(s, "  -> > {}\r\n", node.callsign.as_str());
             let _ = write_all(sender, s.as_bytes()).await;
+        }
+        "set name" | "name" => {
+            let _ = write_all(sender, b"  -> Error, bad chars\r\n").await;
+        }
+        s if s.starts_with("set name ") || s.starts_with("name ") => {
+            let new_name = if let Some(rest) = s.strip_prefix("set name ") {
+                rest.trim()
+            } else if let Some(rest) = s.strip_prefix("name ") {
+                rest.trim()
+            } else {
+                ""
+            };
+
+            let is_valid = !new_name.is_empty()
+                && new_name.len() <= 31
+                && !new_name.bytes().any(|b| {
+                    b < 0x20
+                        || b > 0x7E
+                        || b == b'['
+                        || b == b']'
+                        || b == b'\\'
+                        || b == b':'
+                        || b == b','
+                        || b == b'?'
+                        || b == b'*'
+                });
+
+            if is_valid {
+                node.callsign.clear();
+                let _ = node.callsign.push_str(new_name);
+                info!("Node callsign updated to: {}", new_name);
+                let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetName(node.callsign.clone()));
+                let _ = write_all(sender, b"  -> OK\r\n").await;
+            } else {
+                let _ = write_all(sender, b"  -> Error, bad chars\r\n").await;
+            }
         }
         "ver" => {
             let _ = write_all(sender, b"  -> 0.1.0-ferrix\r\n").await;
@@ -109,6 +156,7 @@ async fn handle_text_cli(
         }
         "advert" => {
             node.tx_beacons = node.tx_beacons.saturating_add(1);
+            let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::TriggerAdvert);
             let _ = write_all(sender, b"  -> OK (MeshCore Advert broadcast queued)\r\n").await;
         }
         "time" => {
@@ -125,6 +173,7 @@ async fn handle_text_cli(
                 }
             }
             node.epoch_time = epoch;
+            let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetTime(epoch));
             let _ = write_all(sender, b"  -> OK (Clock synchronized)\r\n").await;
         }
         "clock sync" | "sync_time" => {
@@ -136,7 +185,7 @@ async fn handle_text_cli(
             cortex_m::peripheral::SCB::sys_reset();
         }
         "help" => {
-            let _ = write_all(sender, b"  -> Available commands: ver, board, get name, get radio, get freq, get tx, get repeat, stats-radio, stats-core, stats-packets, advert, time, reboot\r\n").await;
+            let _ = write_all(sender, b"  -> Available commands: ver, board, get name, set name <name>, get radio, get freq, get tx, get repeat, stats-radio, stats-core, stats-packets, advert, time, reboot\r\n").await;
         }
         _ => {
             let _ = write_all(sender, b"  -> Unknown command\r\n").await;

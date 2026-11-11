@@ -24,6 +24,7 @@ use static_cell::StaticCell;
 
 use crate::boards::{Board, CurrentBoard};
 use crate::companion::protocol::CompanionNode;
+use crate::companion::usb::{UsbCommand, USB_COMMAND_CHANNEL};
 #[cfg(feature = "thinknode-m1")]
 use crate::display::{EpdFrameBuffer, NodeDisplay, Ssd1681, ThinkNodeDisplay};
 use crate::input::{InputDevice, InputEvent};
@@ -215,6 +216,35 @@ async fn main(spawner: Spawner) {
 
             Timer::after_millis(50).await;
             board.telemetry.blue_led.set_low(); // OFF
+        }
+
+        // Check for commands from USB CDC-ACM CLI (e.g. set name, time sync, manual advert trigger)
+        if let Ok(cmd) = USB_COMMAND_CHANNEL.try_receive() {
+            match cmd {
+                UsbCommand::SetName(new_name) => {
+                    info!("Updating node callsign to: {}", new_name.as_str());
+                    mesh.set_callsign(new_name.as_str());
+                    node.callsign = new_name;
+                    #[cfg(feature = "thinknode-m1")]
+                    if let Some(d) = &mut display {
+                        d.render_dashboard(&node).await.ok();
+                    }
+                }
+                UsbCommand::SetTime(epoch) => {
+                    info!("Node epoch time updated to: {}", epoch);
+                    node.epoch_time = epoch;
+                }
+                UsbCommand::TriggerAdvert => {
+                    info!("Queuing MeshCore Advert from USB CLI command...");
+                    node.tx_beacons = node.tx_beacons.saturating_add(1);
+                    let _ = mesh.queue_advert(
+                        node.epoch_time as u32,
+                        node.latitude,
+                        node.longitude,
+                        node.battery_percentage,
+                    );
+                }
+            }
         }
 
         // Poll semantic input events (buttons, D-pads, gestures)
