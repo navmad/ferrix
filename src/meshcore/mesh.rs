@@ -276,7 +276,7 @@ impl MeshEngine {
 
     /// Construct and queue an encrypted channel group text message
     pub fn queue_group_text(&mut self, channel_hash: u8, channel_secret: &[u8], message: &str, timestamp: u32) -> Result<Packet, ()> {
-        let grp = GrpTextPacket::new(channel_hash, self.identity.callsign(), message, timestamp);
+        let grp = GrpTextPacket::new(channel_hash, self.identity.callsign(), message, timestamp, GrpTextPacket::TXT_TYPE_PLAIN, 0);
         let mut pkt = grp.to_packet(channel_secret, ROUTE_TYPE_FLOOD)?;
         pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
         self.seen_filter.mark_seen(pkt.calculate_packet_hash());

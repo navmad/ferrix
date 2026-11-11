@@ -10,12 +10,21 @@ pub struct GrpTextPacket {
     pub channel_hash: u8,
     pub mac: [u8; 2],
     pub timestamp: u32,
+    pub txt_type: u8,
+    pub attempt: u8,
     pub sender: String<32>,
     pub message: String<96>,
 }
 
 impl GrpTextPacket {
-    pub fn new(channel_hash: u8, sender: &str, message: &str, timestamp: u32) -> Self {
+
+    /// Text type constants for GRP_TXT plaintext byte 4 (upper 6 bits)
+    pub const TXT_TYPE_PLAIN: u8 = 0x00;
+    pub const TXT_TYPE_CLI: u8 = 0x01;
+    pub const TXT_TYPE_SIGNED: u8 = 0x02;
+    pub const TXT_TYPE_CLI_CMD: u8 = 0x03;
+
+    pub fn new(channel_hash: u8, sender: &str, message: &str, timestamp: u32, txt_type: u8, attempt: u8) -> Self {
         let mut s = String::new();
         let _ = s.push_str(sender);
         let mut m = String::new();
@@ -25,6 +34,8 @@ impl GrpTextPacket {
             channel_hash,
             mac: [0, 0],
             timestamp,
+            txt_type: txt_type & 0x3F,    // NEW: mask to upper 6 bits
+            attempt: attempt & 0x03,      // NEW: mask to lower 2 bits
             sender: s,
             message: m,
         }
@@ -42,7 +53,7 @@ impl GrpTextPacket {
 
         let mut pt = [0u8; 192];
         pt[0..4].copy_from_slice(&self.timestamp.to_le_bytes());
-        pt[4] = 0; // TXT_TYPE_PLAIN
+        pt[4] = (self.txt_type << 2) | self.attempt;
 
         let mut offset = 5;
         let s_bytes = self.sender.as_bytes();
@@ -90,7 +101,9 @@ impl GrpTextPacket {
         }
 
         let timestamp = u32::from_le_bytes([pt[0], pt[1], pt[2], pt[3]]);
-        let _txt_type = pt[4];
+        let combined = pt[4];
+        let txt_type = combined >> 2;
+        let attempt = combined & 0x03;
 
         let text_slice = &pt[5..pt_len];
         let str_len = text_slice.iter().position(|&b| b == 0).unwrap_or(text_slice.len());
@@ -111,6 +124,8 @@ impl GrpTextPacket {
             channel_hash,
             mac,
             timestamp,
+            txt_type,
+            attempt,
             sender,
             message,
         })
