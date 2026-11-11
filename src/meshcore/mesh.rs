@@ -150,18 +150,24 @@ impl MeshEngine {
                 // Look up matching channel by channel_hash (pkt.payload[0])
                 if pkt.payload_len > 0 {
                     let ch_hash = pkt.payload[0];
+                    // Copy the channel array out of the lock before doing any crypto.
+                    // CHANNELS.lock() is a CriticalSectionRawMutex — it disables all interrupts
+                    // for the duration of the callback. Running SHA-256 hashing and AES-128
+                    // decryption with interrupts disabled will cause the Nordic BLE SoftDevice
+                    // (S140) to fault and freeze the device solid.
+                    //
+                    // The array ([ChannelData; 8] = 320 bytes) is copied by value here,
+                    // which is cheap compared to the crypto operations below.
+                    let channels = crate::companion::usb::CHANNELS.lock(|chs| *chs.borrow());
                     let mut matched = None;
-                    crate::companion::usb::CHANNELS.lock(|chs| {
-                        let list = chs.borrow();
-                        for (idx, ch) in list.iter().enumerate() {
-                            if crate::meshcore::crypto::channel_hash(&ch.secret) == ch_hash {
-                                if let Ok(grp) = GrpTextPacket::decode_encrypted(&pkt.payload[..pkt.payload_len], &ch.secret) {
-                                    matched = Some((idx as u8, grp));
-                                    break;
-                                }
+                    for (idx, ch) in channels.iter().enumerate() {
+                        if crate::meshcore::crypto::channel_hash(&ch.secret) == ch_hash {
+                            if let Ok(grp) = GrpTextPacket::decode_encrypted(&pkt.payload[..pkt.payload_len], &ch.secret) {
+                                matched = Some((idx as u8, grp));
+                                break;
                             }
                         }
-                    });
+                    }
 
                     if let Some((ch_idx, grp)) = matched {
                         if grp.sender.as_str() == self.identity.callsign() {
