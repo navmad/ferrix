@@ -12,9 +12,12 @@ pub const CMD_GET_CONTACTS: u8 = 4;
 pub const CMD_GET_DEVICE_TIME: u8 = 5;
 pub const CMD_SET_DEVICE_TIME: u8 = 6;
 pub const CMD_SEND_SELF_ADVERT: u8 = 7;
+pub const CMD_SYNC_NEXT_MESSAGE: u8 = 10;
 pub const CMD_GET_MSG: u8 = 11;
 pub const CMD_GET_BAT: u8 = 19;
 pub const CMD_DEVICE_QUERY: u8 = 22;
+pub const CMD_GET_CHANNEL: u8 = 31;
+pub const CMD_SET_CHANNEL: u8 = 32;
 
 pub const RESP_CODE_OK: u8 = 0;
 pub const RESP_CODE_ERR: u8 = 1;
@@ -22,10 +25,19 @@ pub const RESP_CODE_CONTACTS_START: u8 = 2;
 pub const RESP_CODE_CONTACT: u8 = 3;
 pub const RESP_CODE_END_OF_CONTACTS: u8 = 4;
 pub const RESP_CODE_SELF_INFO: u8 = 5;
+pub const RESP_CODE_CURR_TIME: u8 = 9;
+pub const RESP_CODE_NO_MORE_MESSAGES: u8 = 10;
 pub const RESP_CODE_DEVICE_INFO: u8 = 13;
+pub const RESP_CODE_CONTACT_MSG_V3: u8 = 0x10;
+pub const RESP_CODE_CHANNEL_MSG_V3: u8 = 0x11;
+pub const RESP_CODE_CHANNEL_INFO: u8 = 18;
 pub const RESP_CODE_BAT: u8 = 19;
 pub const RESP_CODE_TIME: u8 = 20;
 pub const RESP_CODE_MSG: u8 = 21;
+
+pub const PUSH_CODE_SEND_CONFIRMED: u8 = 0x82;
+pub const PUSH_CODE_MSG_WAITING: u8 = 0x83;
+pub const PUSH_CODE_LOG_RX_DATA: u8 = 0x88;
 
 /// Device capabilities bitmask
 pub const CAP_ROUTER: u32 = 1 << 0;
@@ -95,6 +107,7 @@ impl CompanionNode {
         }
 
         let cmd = payload[0];
+        defmt::info!("MeshCore Companion CMD: {} (len {})", cmd, payload.len());
 
         match cmd {
             CMD_DEVICE_QUERY => {
@@ -153,7 +166,8 @@ impl CompanionNode {
                 let _ = resp.extend_from_slice(&bw_hz.to_le_bytes()); // radio_bw in Hz
                 let _ = resp.push(sf);
                 let _ = resp.push(cr);
-                let _ = resp.extend_from_slice(self.callsign.as_bytes());
+                let active_name = crate::storage::get_callsign();
+                let _ = resp.extend_from_slice(active_name.as_bytes());
 
                 emit(&resp);
             }
@@ -169,23 +183,77 @@ impl CompanionNode {
             }
 
             CMD_GET_DEVICE_TIME => {
-                // RESP_CODE_TIME (20)
-                // Payload: [RESP_CODE, epoch_seconds_u64_le]
-                let mut resp = Vec::<u8, 16>::new();
-                let _ = resp.push(RESP_CODE_TIME);
-                let _ = resp.extend_from_slice(&self.epoch_time.to_le_bytes());
+                // RESP_CODE_CURR_TIME (9)
+                // Payload: [RESP_CODE(9), epoch_seconds_u32_le(4)]
+                let mut resp = Vec::<u8, 8>::new();
+                let _ = resp.push(RESP_CODE_CURR_TIME);
+                let epoch = crate::companion::usb::get_device_time();
+                let _ = resp.extend_from_slice(&epoch.to_le_bytes());
                 emit(&resp);
             }
 
             CMD_SET_DEVICE_TIME => {
-                // Extract time from payload: [CMD, epoch_seconds_u64_le]
-                if payload.len() >= 9 {
-                    let mut time_bytes = [0u8; 8];
-                    time_bytes.copy_from_slice(&payload[1..9]);
-                    self.epoch_time = u64::from_le_bytes(time_bytes);
+                // Payload from app: [CMD(6), epoch_seconds_u32_le(4)]
+                if payload.len() >= 5 {
+                    let mut time_bytes = [0u8; 4];
+                    time_bytes.copy_from_slice(&payload[1..5]);
+                    let epoch = u32::from_le_bytes(time_bytes);
+                    self.epoch_time = epoch as u64;
+                    crate::companion::usb::set_device_time(epoch);
                 }
                 let mut resp = Vec::<u8, 4>::new();
                 let _ = resp.push(RESP_CODE_OK);
+                emit(&resp);
+            }
+
+            CMD_GET_CHANNEL => {
+                // Inbound: [CMD(31 / 0x1F), channel_idx]
+                let channel_idx = if payload.len() > 1 { payload[1] } else { 0 };
+                let mut resp = Vec::<u8, 64>::new();
+                let _ = resp.push(RESP_CODE_CHANNEL_INFO); // 18 (0x12)
+                let _ = resp.push(channel_idx);
+
+                crate::companion::usb::CHANNELS.lock(|c| {
+                    let chs = c.borrow();
+                    if (channel_idx as usize) < chs.len() {
+                        let ch = &chs[channel_idx as usize];
+                        let _ = resp.extend_from_slice(&ch.name);
+                        let _ = resp.extend_from_slice(&ch.secret);
+                    } else {
+                        let empty_name = [0u8; 32];
+                        let empty_secret = [0u8; 16];
+                        let _ = resp.extend_from_slice(&empty_name);
+                        let _ = resp.extend_from_slice(&empty_secret);
+                    }
+                });
+
+                emit(&resp);
+            }
+
+            CMD_SET_CHANNEL => {
+                // Inbound: [CMD(32 / 0x20), channel_idx, name(32 bytes), secret(16 bytes)]
+                if payload.len() >= 50 {
+                    let channel_idx = payload[1] as usize;
+                    if channel_idx < 8 {
+                        let mut name = [0u8; 32];
+                        name.copy_from_slice(&payload[2..34]);
+                        let mut secret = [0u8; 16];
+                        secret.copy_from_slice(&payload[34..50]);
+                        crate::companion::usb::CHANNELS.lock(|c| {
+                            c.borrow_mut()[channel_idx] = crate::companion::usb::ChannelData { name, secret };
+                        });
+                        crate::storage::request_save_config();
+                    }
+                }
+                let mut resp = Vec::<u8, 4>::new();
+                let _ = resp.push(RESP_CODE_OK);
+                emit(&resp);
+            }
+
+            CMD_SYNC_NEXT_MESSAGE => {
+                // Return RESP_CODE_NO_MORE_MESSAGES (10) when queue is empty
+                let mut resp = Vec::<u8, 4>::new();
+                let _ = resp.push(RESP_CODE_NO_MORE_MESSAGES);
                 emit(&resp);
             }
 
@@ -237,14 +305,16 @@ impl CompanionNode {
             }
 
             CMD_SEND_CHANNEL_MSG => {
-                // Inbound channel message: [CMD(3), channel_idx, timestamp(4 bytes le), text...]
-                if payload.len() > 6 {
-                    let text_bytes = &payload[6..];
+                // Inbound channel message layout:
+                // [CMD(3), txt_type(1), channel_idx(1), timestamp(4 bytes le), text...]
+                if payload.len() > 7 {
+                    let channel_idx = payload[2];
+                    let text_bytes = &payload[7..];
                     if let Ok(msg_str) = core::str::from_utf8(text_bytes) {
                         let mut s = String::<128>::new();
                         let _ = s.push_str(msg_str);
                         let _ = crate::companion::usb::USB_COMMAND_CHANNEL.try_send(crate::companion::usb::UsbCommand::SendGroupText {
-                            channel_idx: 0,
+                            channel_idx,
                             text: s,
                         });
                     }

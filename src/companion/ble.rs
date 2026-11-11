@@ -4,6 +4,8 @@
 //! mobile apps (iOS & Android) to discover, pair, and communicate with ThinkNode M1.
 
 use defmt::{debug, error, info};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
 use heapless::Vec;
 use nrf_softdevice::ble::gatt_server;
 use nrf_softdevice::ble::peripheral;
@@ -38,6 +40,8 @@ pub struct MeshCoreGattServer {
     pub dis: DeviceInformationService,
     pub nus: NordicUartService,
 }
+
+pub static COMPANION_PUSH_CHANNEL: Channel<CriticalSectionRawMutex, Vec<u8, 256>, 4> = Channel::new();
 
 pub struct MeshCoreSecurityHandler;
 
@@ -82,8 +86,9 @@ pub async fn ble_companion_task(
 ) {
     info!("Starting MeshCore BLE companion advertising...");
 
+    let callsign = crate::storage::get_callsign();
     let mut node = CompanionNode::new(
-        CurrentBoard::NAME,
+        callsign.as_str(),
         CurrentBoard::NAME,
         CurrentBoard::CAPABILITIES,
         public_key,
@@ -148,7 +153,7 @@ pub async fn ble_companion_task(
             }
         };
 
-        let e = gatt_server::run(&conn, &server, |event| match event {
+        let gatt_fut = gatt_server::run(&conn, &server, |event| match event {
             MeshCoreGattServerEvent::Nus(NordicUartServiceEvent::RxWrite(data)) => {
                 debug!("BLE NUS received {} bytes", data.len());
                 node.handle_command(data.as_slice(), |resp| {
@@ -159,10 +164,26 @@ pub async fn ble_companion_task(
                 });
             }
             _ => {}
-        })
-        .await;
+        });
 
-        info!("BLE: Phone disconnected ({:?}), resuming advertising...", e);
+        let push_fut = async {
+            loop {
+                let msg = COMPANION_PUSH_CHANNEL.receive().await;
+                let mut vec = Vec::<u8, 256>::new();
+                let copy_len = msg.len().min(247);
+                let _ = vec.extend_from_slice(&msg[..copy_len]);
+                if let Err(e) = server.nus.tx_notify(&conn, &vec) {
+                    debug!("BLE NUS tx_notify push failed: {:?}", e);
+                }
+            }
+        };
+
+        match embassy_futures::select::select(gatt_fut, push_fut).await {
+            embassy_futures::select::Either::First(e) => {
+                info!("BLE: Phone disconnected ({:?}), resuming advertising...", e);
+            }
+            embassy_futures::select::Either::Second(_) => {}
+        }
     }
 }
 
