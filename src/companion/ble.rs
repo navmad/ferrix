@@ -12,7 +12,6 @@ use nrf_softdevice::ble::{Connection, PasskeyReply};
 use nrf_softdevice::Softdevice;
 
 use crate::boards::{Board, CurrentBoard};
-use crate::companion::framing::{encode_usb_frame, UsbFrameReader};
 use crate::companion::protocol::CompanionNode;
 
 #[nrf_softdevice::gatt_service(uuid = "180a")]
@@ -123,8 +122,6 @@ pub async fn ble_companion_task(
         scan_data: &scan_data[..2 + name.len()],
     };
 
-    let mut frame_reader = UsbFrameReader::new();
-
     let mut model = Vec::<u8, 32>::new();
     let _ = model.extend_from_slice(b"ThinkNode M1");
     let _ = server.dis.model_number_set(&model);
@@ -154,19 +151,12 @@ pub async fn ble_companion_task(
         let e = gatt_server::run(&conn, &server, |event| match event {
             MeshCoreGattServerEvent::Nus(NordicUartServiceEvent::RxWrite(data)) => {
                 debug!("BLE NUS received {} bytes", data.len());
-                for &b in data.iter() {
-                    if let Some(payload) = frame_reader.push_byte(b) {
-                        if let Some(resp) = node.handle_command(payload) {
-                            let mut out_frame = [0u8; 300];
-                            if let Ok(flen) = encode_usb_frame(&resp, &mut out_frame) {
-                                let mut vec = Vec::<u8, 256>::new();
-                                let copy_len = flen.min(256);
-                                let _ = vec.extend_from_slice(&out_frame[..copy_len]);
-                                let _ = server.nus.tx_notify(&conn, &vec);
-                            }
-                        }
-                    }
-                }
+                node.handle_command(data.as_slice(), |resp| {
+                    let mut vec = Vec::<u8, 256>::new();
+                    let copy_len = resp.len().min(247);
+                    let _ = vec.extend_from_slice(&resp[..copy_len]);
+                    let _ = server.nus.tx_notify(&conn, &vec);
+                });
             }
             _ => {}
         })

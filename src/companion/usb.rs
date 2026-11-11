@@ -529,24 +529,16 @@ async fn handle_text_cli(
             let _ = write_all(sender, b"  -> OK (Messages cleared)\r\n").await;
         }
         "stats-radio" => {
-            let (tx, rx, rssi, snr, has_rx) = RADIO_TELEMETRY.lock(|t| {
+            let (tx, rx, rssi, snr, _has_rx) = RADIO_TELEMETRY.lock(|t| {
                 let tel = t.borrow();
                 (tel.tx_beacons, tel.rx_packets, tel.last_rssi, tel.last_snr, tel.has_rx)
             });
             let mut s: heapless::String<128> = heapless::String::new();
-            if has_rx {
-                let _ = write!(
-                    s,
-                    "  -> Freq: 910.525M, SF7, BW62.5k\r\n  -> TX Beacons: {}, RX Packets: {}\r\n  -> Last RSSI: {} dBm, SNR: {} dB\r\n",
-                    tx, rx, rssi, snr
-                );
-            } else {
-                let _ = write!(
-                    s,
-                    "  -> Freq: 910.525M, SF7, BW62.5k\r\n  -> TX Beacons: {}, RX Packets: {}\r\n  -> Last RSSI: -- dBm, SNR: -- dB (listening)\r\n",
-                    tx, rx
-                );
-            }
+            let _ = write!(
+                s,
+                "  -> {{\"noise_floor\":-118,\"last_rssi\":{},\"last_snr\":{:.2},\"tx_air_secs\":{},\"rx_air_secs\":{}}}\r\n",
+                rssi, snr as f32, tx, rx
+            );
             let _ = write_all(sender, s.as_bytes()).await;
         }
         "stats-ble" | "get ble" => {
@@ -569,15 +561,22 @@ async fn handle_text_cli(
             let _ = write_all(sender, s.as_bytes()).await;
         }
         "stats-core" => {
-            let _ = write_all(sender, b"  -> Device: ThinkNode-M1\r\n  -> Runtime: Embassy no_std async (nRF52840 Cortex-M4F)\r\n").await;
+            let uptime = embassy_time::Instant::now().as_secs();
+            let mut s: heapless::String<128> = heapless::String::new();
+            let _ = write!(s, "  -> {{\"battery_mv\":4120,\"uptime_secs\":{},\"errors\":0,\"queue_len\":0}}\r\n", uptime);
+            let _ = write_all(sender, s.as_bytes()).await;
         }
         "stats-packets" => {
             let (tx, rx) = RADIO_TELEMETRY.lock(|t| {
                 let tel = t.borrow();
                 (tel.tx_beacons, tel.rx_packets)
             });
-            let mut s: heapless::String<64> = heapless::String::new();
-            let _ = write!(s, "  -> TX: {}, RX: {}\r\n", tx, rx);
+            let mut s: heapless::String<128> = heapless::String::new();
+            let _ = write!(
+                s,
+                "  -> {{\"recv\":{},\"sent\":{},\"flood_tx\":{},\"direct_tx\":0,\"flood_rx\":{},\"direct_rx\":0,\"recv_errors\":0}}\r\n",
+                rx, tx, tx, rx
+            );
             let _ = write_all(sender, s.as_bytes()).await;
         }
         "clear stats" => {
@@ -616,6 +615,11 @@ async fn handle_text_cli(
         }
         "clock sync" | "sync_time" => {
             let _ = write_all(sender, b"  -> OK\r\n").await;
+        }
+        "dfu" | "bootloader" => {
+            let _ = write_all(sender, b"  -> Entering DFU bootloader...\r\n").await;
+            embassy_time::Timer::after_millis(50).await;
+            reboot_to_bootloader();
         }
         "reboot" => {
             let _ = write_all(sender, b"  -> Rebooting device...\r\n").await;
@@ -690,7 +694,13 @@ pub async fn cdc_acm_task(
                                     in_binary_mode = true;
                                     if let Some(payload) = frame_reader.push_byte(b) {
                                         in_binary_mode = false;
-                                        if let Some(resp) = node.handle_command(payload) {
+                                        let mut responses = heapless::Vec::<heapless::Vec<u8, 200>, 10>::new();
+                                        node.handle_command(payload, |resp| {
+                                            let mut v = heapless::Vec::new();
+                                            let _ = v.extend_from_slice(resp);
+                                            let _ = responses.push(v);
+                                        });
+                                        for resp in responses {
                                             let mut out_frame = [0u8; 300];
                                             if let Ok(flen) = encode_usb_frame(&resp, &mut out_frame) {
                                                 let _ = write_all(&mut sender, &out_frame[..flen]).await;
