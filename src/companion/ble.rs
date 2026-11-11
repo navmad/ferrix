@@ -4,8 +4,11 @@
 //! mobile apps (iOS & Android) to discover, pair, and communicate with ThinkNode M1.
 
 use defmt::{debug, error, info};
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::channel::Channel;
+
+/// Shared raw mutex type — see usb.rs for documentation.
+type SharedRawMutex = ThreadModeRawMutex;
 use heapless::Vec;
 use nrf_softdevice::ble::gatt_server;
 use nrf_softdevice::ble::peripheral;
@@ -41,7 +44,7 @@ pub struct MeshCoreGattServer {
     pub nus: NordicUartService,
 }
 
-pub static COMPANION_PUSH_CHANNEL: Channel<CriticalSectionRawMutex, Vec<u8, 256>, 16> = Channel::new();
+pub static COMPANION_PUSH_CHANNEL: Channel<SharedRawMutex, Vec<u8, 256>, 16> = Channel::new();
 
 pub struct MeshCoreSecurityHandler;
 
@@ -142,8 +145,11 @@ pub async fn ble_companion_task(
     loop {
         info!("BLE: Waiting for pairable connection from MeshCore companion app (PIN 123456)...");
         let conn = match peripheral::advertise_pairable(sd, adv, &config, &SECURITY_HANDLER).await {
-            Ok(c) => {
+            Ok(mut c) => {
                 info!("BLE: Phone connected & pairing!");
+                // Request maximum BLE data length (251 bytes) instead of the default 27 bytes.
+                // This increases throughput for channel sync and other large responses.
+                let _ = c.data_length_update(None);
                 c
             }
             Err(e) => {
@@ -226,7 +232,7 @@ pub async fn ble_companion_supervisor_task(
             event_length: 24,
         }),
         conn_gatts: Some(nrf_softdevice::raw::ble_gatts_conn_cfg_t {
-            hvn_tx_queue_size: 4,
+            hvn_tx_queue_size: 16,
         }),
         conn_gatt: Some(nrf_softdevice::raw::ble_gatt_conn_cfg_t {
             att_mtu: 247,
