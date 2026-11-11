@@ -7,11 +7,23 @@ use defmt::{debug, error, info};
 use heapless::Vec;
 use nrf_softdevice::ble::gatt_server;
 use nrf_softdevice::ble::peripheral;
+use nrf_softdevice::ble::security::{IoCapabilities, SecurityHandler};
+use nrf_softdevice::ble::{Connection, PasskeyReply};
 use nrf_softdevice::Softdevice;
 
 use crate::boards::{Board, CurrentBoard};
 use crate::companion::framing::{encode_usb_frame, UsbFrameReader};
 use crate::companion::protocol::CompanionNode;
+
+#[nrf_softdevice::gatt_service(uuid = "180a")]
+pub struct DeviceInformationService {
+    #[characteristic(uuid = "2a24", read)]
+    pub model_number: Vec<u8, 32>,
+    #[characteristic(uuid = "2a26", read)]
+    pub firmware_revision: Vec<u8, 32>,
+    #[characteristic(uuid = "2a29", read)]
+    pub manufacturer_name: Vec<u8, 32>,
+}
 
 #[nrf_softdevice::gatt_service(uuid = "6e400001-b5a3-f393-e0a9-e50e24dcca9e")]
 pub struct NordicUartService {
@@ -24,8 +36,38 @@ pub struct NordicUartService {
 
 #[nrf_softdevice::gatt_server]
 pub struct MeshCoreGattServer {
+    pub dis: DeviceInformationService,
     pub nus: NordicUartService,
 }
+
+pub struct MeshCoreSecurityHandler;
+
+impl SecurityHandler for MeshCoreSecurityHandler {
+    fn io_capabilities(&self) -> IoCapabilities {
+        IoCapabilities::DisplayOnly
+    }
+
+    fn can_bond(&self, _conn: &Connection) -> bool {
+        false
+    }
+
+    fn request_mitm_protection(&self, _conn: &Connection) -> bool {
+        true
+    }
+
+    fn enter_passkey(&self, reply: PasskeyReply) {
+        info!("BLE: Replying with MeshCore default PIN 123456");
+        let _ = reply.reply(Some(b"123456"));
+    }
+
+    fn display_passkey(&self, passkey: &[u8; 6]) {
+        if let Ok(s) = core::str::from_utf8(passkey) {
+            info!("BLE: Passkey displayed: {}", s);
+        }
+    }
+}
+
+static SECURITY_HANDLER: MeshCoreSecurityHandler = MeshCoreSecurityHandler;
 
 #[embassy_executor::task]
 pub async fn softdevice_task(sd: &'static Softdevice) -> ! {
@@ -83,11 +125,23 @@ pub async fn ble_companion_task(
 
     let mut frame_reader = UsbFrameReader::new();
 
+    let mut model = Vec::<u8, 32>::new();
+    let _ = model.extend_from_slice(b"ThinkNode M1");
+    let _ = server.dis.model_number_set(&model);
+
+    let mut fw = Vec::<u8, 32>::new();
+    let _ = fw.extend_from_slice(b"0.1.0-embassy");
+    let _ = server.dis.firmware_revision_set(&fw);
+
+    let mut mfg = Vec::<u8, 32>::new();
+    let _ = mfg.extend_from_slice(b"Elecrow");
+    let _ = server.dis.manufacturer_name_set(&mfg);
+
     loop {
-        info!("BLE: Waiting for connection from MeshCore companion app...");
-        let conn = match peripheral::advertise_connectable(sd, adv, &config).await {
+        info!("BLE: Waiting for pairable connection from MeshCore companion app (PIN 123456)...");
+        let conn = match peripheral::advertise_pairable(sd, adv, &config, &SECURITY_HANDLER).await {
             Ok(c) => {
-                info!("BLE: Phone connected!");
+                info!("BLE: Phone connected & pairing!");
                 c
             }
             Err(e) => {
@@ -157,6 +211,9 @@ pub async fn ble_companion_supervisor_task(
         }),
         conn_gatts: Some(nrf_softdevice::raw::ble_gatts_conn_cfg_t {
             hvn_tx_queue_size: 4,
+        }),
+        conn_gatt: Some(nrf_softdevice::raw::ble_gatt_conn_cfg_t {
+            att_mtu: 247,
         }),
         gatts_attr_tab_size: Some(nrf_softdevice::raw::ble_gatts_cfg_attr_tab_size_t {
             attr_tab_size: 1408,
