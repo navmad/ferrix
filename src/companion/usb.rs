@@ -28,8 +28,19 @@ use crate::companion::protocol::CompanionNode;
 #[derive(Clone, Debug)]
 pub enum UsbCommand {
     SetName(heapless::String<32>),
+    SetPrivateKey([u8; 32]),
     SetTime(u64),
     TriggerAdvert,
+}
+
+#[inline]
+fn hex_to_nibble(b: u8) -> u8 {
+    match b {
+        b'0'..=b'9' => b - b'0',
+        b'a'..=b'f' => b - b'a' + 10,
+        b'A'..=b'F' => b - b'A' + 10,
+        _ => 0,
+    }
 }
 
 pub static USB_COMMAND_CHANNEL: Channel<CriticalSectionRawMutex, UsbCommand, 4> = Channel::new();
@@ -83,6 +94,43 @@ async fn handle_text_cli(
             let mut s: heapless::String<64> = heapless::String::new();
             let _ = write!(s, "  -> > {}\r\n", node.callsign.as_str());
             let _ = write_all(sender, s.as_bytes()).await;
+        }
+        "get public.key" | "get public_key" | "public.key" | "get pubkey" => {
+            let mut s: heapless::String<128> = heapless::String::new();
+            let _ = write!(s, "  -> ");
+            for b in &node.public_key {
+                let _ = write!(s, "{:02x}", b);
+            }
+            let _ = write!(s, "\r\n");
+            let _ = write_all(sender, s.as_bytes()).await;
+        }
+        "get prv.key" | "get private_key" | "prv.key" => {
+            let mut s: heapless::String<128> = heapless::String::new();
+            let _ = write!(s, "  -> ");
+            for b in &node.private_key {
+                let _ = write!(s, "{:02x}", b);
+            }
+            let _ = write!(s, "\r\n");
+            let _ = write_all(sender, s.as_bytes()).await;
+        }
+        s if s.starts_with("set prv.key ") => {
+            let hex_str = s[12..].trim();
+            if hex_str.len() == 64 && hex_str.bytes().all(|b| b.is_ascii_hexdigit()) {
+                let mut key = [0u8; 32];
+                for i in 0..32 {
+                    let hi = hex_to_nibble(hex_str.as_bytes()[i * 2]);
+                    let lo = hex_to_nibble(hex_str.as_bytes()[i * 2 + 1]);
+                    key[i] = (hi << 4) | lo;
+                }
+                node.private_key = key;
+                let signing_key = crate::meshcore::crypto::SigningKey::from_bytes(&key);
+                node.public_key = signing_key.verifying_key().to_bytes();
+                info!("Node private & public key updated via CLI");
+                let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetPrivateKey(key));
+                let _ = write_all(sender, b"  -> OK\r\n").await;
+            } else {
+                let _ = write_all(sender, b"  -> Error, bad hex\r\n").await;
+            }
         }
         "set name" | "name" => {
             let _ = write_all(sender, b"  -> Error, bad chars\r\n").await;
@@ -185,7 +233,7 @@ async fn handle_text_cli(
             cortex_m::peripheral::SCB::sys_reset();
         }
         "help" => {
-            let _ = write_all(sender, b"  -> Available commands: ver, board, get name, set name <name>, get radio, get freq, get tx, get repeat, stats-radio, stats-core, stats-packets, advert, time, reboot\r\n").await;
+            let _ = write_all(sender, b"  -> Available commands: ver, board, get name, set name <name>, get public.key, get prv.key, set prv.key <hex>, get radio, get freq, get tx, get repeat, stats-radio, stats-core, stats-packets, advert, time, reboot\r\n").await;
         }
         _ => {
             let _ = write_all(sender, b"  -> Unknown command\r\n").await;
@@ -199,9 +247,19 @@ pub async fn usb_task(mut usb: UsbDevice<'static, UsbDriver>) -> ! {
 }
 
 #[embassy_executor::task]
-pub async fn cdc_acm_task(class: CdcAcmClass<'static, UsbDriver>) -> ! {
+pub async fn cdc_acm_task(
+    class: CdcAcmClass<'static, UsbDriver>,
+    public_key: [u8; 32],
+    private_key: [u8; 32],
+) -> ! {
     let (mut sender, mut receiver, control) = class.split_with_control();
-    let mut node = CompanionNode::new(CurrentBoard::NAME, CurrentBoard::NAME, CurrentBoard::CAPABILITIES);
+    let mut node = CompanionNode::new(
+        CurrentBoard::NAME,
+        CurrentBoard::NAME,
+        CurrentBoard::CAPABILITIES,
+        public_key,
+        private_key,
+    );
 
     let mut frame_reader = UsbFrameReader::new();
     let mut text_line_buf = [0u8; 128];

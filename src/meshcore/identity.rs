@@ -59,6 +59,22 @@ impl Identity {
     }
 }
 
+/// Read nRF52840 factory-fused hardware unique ID (FICR) and derive a 32-byte cryptographic seed
+pub fn hardware_seed() -> [u8; 32] {
+    let id0 = unsafe { (0x1000_0060 as *const u32).read_volatile() };
+    let id1 = unsafe { (0x1000_0064 as *const u32).read_volatile() };
+    let addr0 = unsafe { (0x1000_00A4 as *const u32).read_volatile() };
+    let addr1 = unsafe { (0x1000_00A8 as *const u32).read_volatile() };
+
+    let mut buf = [0u8; 16];
+    buf[0..4].copy_from_slice(&id0.to_le_bytes());
+    buf[4..8].copy_from_slice(&id1.to_le_bytes());
+    buf[8..12].copy_from_slice(&addr0.to_le_bytes());
+    buf[12..16].copy_from_slice(&addr1.to_le_bytes());
+
+    sha256(&buf)
+}
+
 /// Local Node Identity containing Ed25519 signing key
 pub struct LocalIdentity {
     pub base: Identity,
@@ -66,16 +82,45 @@ pub struct LocalIdentity {
 }
 
 impl LocalIdentity {
-    /// Initialize local node identity with deterministic Ed25519 key generation from seed/hardware ID
-    pub fn new(callsign: &str, seed_str: &str) -> Self {
-        let seed = sha256(seed_str.as_bytes());
-        let signing_key = SigningKey::from_bytes(&seed);
+    /// Initialize local node identity from hardware unique ID
+    pub fn from_hardware(callsign: &str) -> Self {
+        let seed = hardware_seed();
+        Self::from_secret_key(callsign, &seed)
+    }
+
+    /// Initialize local node identity from a 32-byte secret key / seed
+    pub fn from_secret_key(callsign: &str, secret: &[u8; 32]) -> Self {
+        let signing_key = SigningKey::from_bytes(secret);
         let pub_key = signing_key.verifying_key().to_bytes();
 
         Self {
             base: Identity::new(pub_key, callsign),
             signing_key,
         }
+    }
+
+    /// Initialize local node identity with deterministic Ed25519 key generation from seed/hardware ID
+    pub fn new(callsign: &str, seed_str: &str) -> Self {
+        let seed = sha256(seed_str.as_bytes());
+        Self::from_secret_key(callsign, &seed)
+    }
+
+    /// Set a new 32-byte secret key, updating both private key and derived public key
+    pub fn set_secret_key(&mut self, secret: &[u8; 32]) {
+        self.signing_key = SigningKey::from_bytes(secret);
+        self.base.pub_key = self.signing_key.verifying_key().to_bytes();
+    }
+
+    /// Get the 32-byte private signing key bytes
+    #[inline]
+    pub fn signing_key_bytes(&self) -> [u8; 32] {
+        self.signing_key.to_bytes()
+    }
+
+    /// Get the 32-byte public key bytes
+    #[inline]
+    pub fn pub_key_bytes(&self) -> [u8; 32] {
+        self.base.pub_key
     }
 
     #[inline]

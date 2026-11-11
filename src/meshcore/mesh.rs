@@ -62,6 +62,12 @@ impl MeshEngine {
         self.identity.set_callsign(callsign);
     }
 
+    /// Update the local private key and derived public key
+    #[inline]
+    pub fn set_secret_key(&mut self, secret: &[u8; 32]) {
+        self.identity.set_secret_key(secret);
+    }
+
     /// Process a packet received over the LoRa radio interface
     pub fn handle_inbound_packet(&mut self, pkt: Packet) -> InboundAction {
         // 1. Check for duplicates; drop immediately if seen

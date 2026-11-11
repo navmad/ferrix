@@ -70,24 +70,32 @@ async fn main(spawner: Spawner) {
     let p = embassy_nrf::init(Default::default());
     let mut board = CurrentBoard::init(p);
 
+    // Initialize native MeshCore Routing Engine & Local Cryptographic Identity from hardware FICR
+    let local_id = LocalIdentity::from_hardware(CurrentBoard::NAME);
+    let pub_key = local_id.pub_key_bytes();
+    let priv_key = local_id.signing_key_bytes();
+    let mut mesh = MeshEngine::new(local_id, true);
+
+    // Initial node companion state
+    let mut node = CompanionNode::new(
+        CurrentBoard::NAME,
+        CurrentBoard::NAME,
+        CurrentBoard::CAPABILITIES,
+        pub_key,
+        priv_key,
+    );
+
     // 0. Initialize USB CDC-ACM Serial & 1200-baud DFU Auto-Reset
     let usb_driver = usb::Driver::new(board.usbd, Irqs, HardwareVbusDetect::new(Irqs));
     let (usb_dev, cdc_class) = crate::companion::usb::init_usb(usb_driver);
     spawner.spawn(crate::companion::usb::usb_task(usb_dev)).unwrap();
-    spawner.spawn(crate::companion::usb::cdc_acm_task(cdc_class)).unwrap();
+    spawner.spawn(crate::companion::usb::cdc_acm_task(cdc_class, pub_key, priv_key)).unwrap();
 
     info!("====================================================");
     info!(" MeshCore Companion Firmware (ferrix) ");
     info!(" Active Board: {} ", CurrentBoard::NAME);
     info!(" Runtime: Embassy async no_std (nRF52840 Cortex-M4) ");
     info!("====================================================");
-
-    // Initial node companion state
-    let mut node = CompanionNode::new(CurrentBoard::NAME, CurrentBoard::NAME, CurrentBoard::CAPABILITIES);
-
-    // Initialize native MeshCore Routing Engine & Local Cryptographic Identity
-    let local_id = LocalIdentity::new(CurrentBoard::NAME, CurrentBoard::NAME);
-    let mut mesh = MeshEngine::new(local_id, true);
 
     // Visual Boot Confirmation: 3 fast blue blinks indicate successful MCU & runtime start
     for _ in 0..3 {
@@ -229,6 +237,12 @@ async fn main(spawner: Spawner) {
                     if let Some(d) = &mut display {
                         d.render_dashboard(&node).await.ok();
                     }
+                }
+                UsbCommand::SetPrivateKey(priv_key) => {
+                    info!("Updating node private & public keys");
+                    mesh.set_secret_key(&priv_key);
+                    node.private_key = priv_key;
+                    node.public_key = *mesh.identity.pub_key();
                 }
                 UsbCommand::SetTime(epoch) => {
                     info!("Node epoch time updated to: {}", epoch);

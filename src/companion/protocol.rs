@@ -38,6 +38,7 @@ pub struct CompanionNode {
     pub hw_model: &'static str,
     pub capabilities: u32,
     pub public_key: [u8; 32],
+    pub private_key: [u8; 32],
     pub battery_millivolts: u16,
     pub battery_percentage: u8,
     pub epoch_time: u64,
@@ -53,13 +54,13 @@ pub struct CompanionNode {
 }
 
 impl CompanionNode {
-    pub fn new(callsign: &str, hw_model: &'static str, capabilities: u32) -> Self {
-        let mut key = [0u8; 32];
-        // Unique key derived from hardware model
-        let model_bytes = hw_model.as_bytes();
-        let copy_len = model_bytes.len().min(32);
-        key[..copy_len].copy_from_slice(&model_bytes[..copy_len]);
-
+    pub fn new(
+        callsign: &str,
+        hw_model: &'static str,
+        capabilities: u32,
+        public_key: [u8; 32],
+        private_key: [u8; 32],
+    ) -> Self {
         let mut cs = String::new();
         let _ = cs.push_str(callsign);
 
@@ -67,7 +68,8 @@ impl CompanionNode {
             callsign: cs,
             hw_model,
             capabilities,
-            public_key: key,
+            public_key,
+            private_key,
             battery_millivolts: 4120, // 4.12V default nominal
             battery_percentage: 95,
             epoch_time: 0,
