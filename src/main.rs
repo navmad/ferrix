@@ -193,6 +193,15 @@ async fn main(spawner: Spawner) {
             node.last_rssi = rssi;
             node.last_snr = snr;
 
+            // Synchronize real radio telemetry to shared USB CLI status
+            crate::companion::usb::RADIO_TELEMETRY.lock(|t| {
+                let mut tel = t.borrow_mut();
+                tel.rx_packets = tel.rx_packets.saturating_add(1);
+                tel.last_rssi = rssi;
+                tel.last_snr = snr;
+                tel.has_rx = true;
+            });
+
             // Deserialize and dispatch through MeshCore Network Engine
             if let Ok(pkt) = Packet::read_from(&rx_buf[..len]) {
                 match mesh.handle_inbound_packet(pkt) {
@@ -311,6 +320,10 @@ async fn main(spawner: Spawner) {
                 info!("Transmitting MeshCore packet: {} bytes (type: {})", wire_len, out_pkt.payload_type());
                 let _ = lora.transmit(&wire_buf[..wire_len]).await;
                 lora.start_receive().await;
+                crate::companion::usb::RADIO_TELEMETRY.lock(|t| {
+                    let mut tel = t.borrow_mut();
+                    tel.tx_beacons = tel.tx_beacons.saturating_add(1);
+                });
             }
         }
 

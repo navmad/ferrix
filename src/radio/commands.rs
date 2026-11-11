@@ -34,7 +34,7 @@ pub const CMD_SET_BUFFER_BASE_ADDRESS: u8 = 0x8F;
 pub const CMD_SET_LORA_SYMB_NUM_TIMEOUT: u8 = 0xA0;
 
 pub const CMD_GET_STATUS: u8 = 0xC0;
-pub const CMD_GET_RX_BUFFER_STATUS: u8 = 0x14;
+pub const CMD_GET_RX_BUFFER_STATUS: u8 = 0x13;
 pub const CMD_GET_PACKET_STATUS: u8 = 0x14;
 pub const CMD_GET_RSSI_INST: u8 = 0x15;
 

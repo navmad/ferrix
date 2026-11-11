@@ -292,6 +292,12 @@ impl<'a, T: embassy_nrf::spim::Instance> Sx1262<'a, T> {
             return None;
         }
 
+        // Read packet status (RSSI and SNR) from SX1262
+        let mut pkt_status = [0u8; 3];
+        let _ = self.read_cmd(CMD_GET_PACKET_STATUS, &mut pkt_status).await;
+        let rssi = -((pkt_status[0] as i16) / 2);
+        let snr = (pkt_status[1] as i8) / 4;
+
         // Read payload from buffer
         if self.wait_busy().await.is_err() {
             return None;
@@ -305,7 +311,7 @@ impl<'a, T: embassy_nrf::spim::Instance> Sx1262<'a, T> {
         // Re-enter continuous RX
         self.start_receive().await;
 
-        Some((payload_len, -85, 9)) // Nominal telemetry placeholder
+        Some((payload_len, rssi, snr))
     }
 }
 

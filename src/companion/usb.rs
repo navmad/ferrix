@@ -10,12 +10,14 @@
 //!    DFU bootloader (`GPREGRET = 0x57`) when flashing over serial, eliminating
 //!    physical reset button presses.
 
+use core::cell::RefCell;
 use core::fmt::Write;
 use defmt::{debug, info};
 use embassy_nrf::peripherals::USBD;
 use embassy_nrf::usb::vbus_detect::HardwareVbusDetect;
 use embassy_nrf::usb::Driver;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::channel::Channel;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, Sender, State};
 use embassy_usb::{Builder, Config, UsbDevice};
@@ -24,6 +26,23 @@ use static_cell::StaticCell;
 use crate::boards::{Board, CurrentBoard};
 use crate::companion::framing::{encode_usb_frame, UsbFrameReader, USB_INBOUND_DELIMITER};
 use crate::companion::protocol::CompanionNode;
+
+#[derive(Clone, Copy, Debug)]
+pub struct RadioTelemetry {
+    pub tx_beacons: u32,
+    pub rx_packets: u32,
+    pub last_rssi: i16,
+    pub last_snr: i8,
+    pub has_rx: bool,
+}
+
+pub static RADIO_TELEMETRY: Mutex<CriticalSectionRawMutex, RefCell<RadioTelemetry>> = Mutex::new(RefCell::new(RadioTelemetry {
+    tx_beacons: 0,
+    rx_packets: 0,
+    last_rssi: 0,
+    last_snr: 0,
+    has_rx: false,
+}));
 
 #[derive(Clone, Debug)]
 pub enum UsbCommand {
@@ -186,24 +205,52 @@ async fn handle_text_cli(
             let _ = write_all(sender, b"  -> on\r\n").await;
         }
         "stats-radio" => {
+            let (tx, rx, rssi, snr, has_rx) = RADIO_TELEMETRY.lock(|t| {
+                let tel = t.borrow();
+                (tel.tx_beacons, tel.rx_packets, tel.last_rssi, tel.last_snr, tel.has_rx)
+            });
             let mut s: heapless::String<128> = heapless::String::new();
-            let _ = write!(
-                s,
-                "  -> Freq: 910.525M, SF7, BW62.5k\r\n  -> TX Beacons: {}, RX Packets: {}\r\n  -> Last RSSI: {} dBm, SNR: {} dB\r\n",
-                node.tx_beacons, node.rx_packets, node.last_rssi, node.last_snr
-            );
+            if has_rx {
+                let _ = write!(
+                    s,
+                    "  -> Freq: 910.525M, SF7, BW62.5k\r\n  -> TX Beacons: {}, RX Packets: {}\r\n  -> Last RSSI: {} dBm, SNR: {} dB\r\n",
+                    tx, rx, rssi, snr
+                );
+            } else {
+                let _ = write!(
+                    s,
+                    "  -> Freq: 910.525M, SF7, BW62.5k\r\n  -> TX Beacons: {}, RX Packets: {}\r\n  -> Last RSSI: -- dBm, SNR: -- dB (listening)\r\n",
+                    tx, rx
+                );
+            }
             let _ = write_all(sender, s.as_bytes()).await;
         }
         "stats-core" => {
             let _ = write_all(sender, b"  -> Device: ThinkNode-M1\r\n  -> Runtime: Embassy no_std async (nRF52840 Cortex-M4F)\r\n").await;
         }
         "stats-packets" => {
+            let (tx, rx) = RADIO_TELEMETRY.lock(|t| {
+                let tel = t.borrow();
+                (tel.tx_beacons, tel.rx_packets)
+            });
             let mut s: heapless::String<64> = heapless::String::new();
-            let _ = write!(s, "  -> TX: {}, RX: {}\r\n", node.tx_beacons, node.rx_packets);
+            let _ = write!(s, "  -> TX: {}, RX: {}\r\n", tx, rx);
             let _ = write_all(sender, s.as_bytes()).await;
         }
+        "clear stats" => {
+            RADIO_TELEMETRY.lock(|t| {
+                let mut tel = t.borrow_mut();
+                tel.tx_beacons = 0;
+                tel.rx_packets = 0;
+                tel.has_rx = false;
+            });
+            let _ = write_all(sender, b"  -> OK\r\n").await;
+        }
         "advert" => {
-            node.tx_beacons = node.tx_beacons.saturating_add(1);
+            RADIO_TELEMETRY.lock(|t| {
+                let mut tel = t.borrow_mut();
+                tel.tx_beacons = tel.tx_beacons.saturating_add(1);
+            });
             let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::TriggerAdvert);
             let _ = write_all(sender, b"  -> OK (MeshCore Advert broadcast queued)\r\n").await;
         }
