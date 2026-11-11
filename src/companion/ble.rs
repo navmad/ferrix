@@ -63,15 +63,15 @@ impl SecurityHandler for MeshCoreSecurityHandler {
         true
     }
 
-    fn enter_passkey(&self, reply: PasskeyReply) {
-        info!("BLE: Replying with MeshCore default PIN 123456");
-        let _ = reply.reply(Some(b"123456"));
-    }
-
     fn display_passkey(&self, passkey: &[u8; 6]) {
         if let Ok(s) = core::str::from_utf8(passkey) {
             info!("BLE: Passkey displayed: {}", s);
         }
+    }
+
+    fn enter_passkey(&self, reply: PasskeyReply) {
+        info!("BLE: Replying with MeshCore default PIN 123456");
+        let _ = reply.reply(Some(b"123456"));
     }
 }
 
@@ -100,7 +100,13 @@ pub async fn ble_companion_task(
         private_key,
     );
 
-    let config = peripheral::Config::default();
+    // Use fast advertising initially (20ms interval) for faster discovery,
+    // then switch to slow (211ms) after the first connection to save power.
+    // Interval is in 625µs units: 20ms = 32, 211ms = 338.
+    let mut adv_config = peripheral::Config {
+        interval: 32, // 20ms fast advertising
+        ..peripheral::Config::default()
+    };
 
     // Nordic UART Service 128-bit UUID for advertisement
     // 6e400001-b5a3-f393-e0a9-e50e24dcca9e (reversed for little-endian wire format)
@@ -150,7 +156,7 @@ pub async fn ble_companion_task(
         // parameter updates until after the sync burst (matching the reference firmware behavior).
         let sync_done = AtomicBool::new(false);
 
-        let conn = match peripheral::advertise_pairable(sd, adv, &config, &SECURITY_HANDLER).await {
+        let conn = match peripheral::advertise_pairable(sd, adv, &adv_config, &SECURITY_HANDLER).await {
             Ok(mut c) => {
                 info!("BLE: Phone connected & pairing!");
                 // Request maximum BLE data length (251 bytes) instead of the default 27 bytes.
@@ -224,6 +230,11 @@ pub async fn ble_companion_task(
         match embassy_futures::select::select3(gatt_fut, push_fut, conn_params_fut).await {
             embassy_futures::select::Either3::First(e) => {
                 info!("BLE: Phone disconnected ({:?}), resuming advertising...", e);
+                // Switch to slow advertising (211ms) after the first connection to save power.
+                if adv_config.interval == 32 {
+                    adv_config.interval = 338; // 211ms slow advertising
+                    info!("BLE: Switched to slow advertising (211ms)");
+                }
             }
             embassy_futures::select::Either3::Second(_) => {}
             embassy_futures::select::Either3::Third(_) => {
