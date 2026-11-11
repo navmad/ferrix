@@ -33,6 +33,11 @@ pub const CMD_SET_CAD_PARAMS: u8 = 0x88;
 pub const CMD_SET_BUFFER_BASE_ADDRESS: u8 = 0x8F;
 pub const CMD_SET_LORA_SYMB_NUM_TIMEOUT: u8 = 0xA0;
 
+// LoRa Sync Word Registers
+pub const REG_LORA_SYNC_WORD_MSB: u16 = 0x0740;
+pub const REG_LORA_SYNC_WORD_LSB: u16 = 0x0741;
+pub const LORA_SYNC_WORD_PRIVATE: [u8; 2] = [0x14, 0x24];
+
 pub const CMD_GET_STATUS: u8 = 0xC0;
 pub const CMD_GET_RX_BUFFER_STATUS: u8 = 0x13;
 pub const CMD_GET_PACKET_STATUS: u8 = 0x14;

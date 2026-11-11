@@ -87,6 +87,17 @@ impl<'a, T: embassy_nrf::spim::Instance> Sx1262<'a, T> {
         Ok(())
     }
 
+    /// Write registers starting at 16-bit address
+    pub async fn write_register(&mut self, reg: u16, data: &[u8]) -> Result<(), ()> {
+        self.wait_busy().await?;
+        self.cs.set_low();
+        let header = [CMD_WRITE_REGISTER, (reg >> 8) as u8, (reg & 0xFF) as u8];
+        let _ = self.spim.write(&header).await;
+        let _ = self.spim.write(data).await;
+        self.cs.set_high();
+        Ok(())
+    }
+
     /// Hardware reset pulse
     pub async fn reset(&mut self) {
         self.reset.set_low();
@@ -99,6 +110,10 @@ impl<'a, T: embassy_nrf::spim::Instance> Sx1262<'a, T> {
     /// Initialize the radio with ThinkNode M1 hardware parameters
     pub async fn init(&mut self, config: &Sx1262Config) -> Result<(), ()> {
         info!("Initializing SX1262 LoRa radio...");
+        // Ensure SX126X_POWER_EN (P0.21) power rail is energized
+        self.rf_sw.set_high();
+        Timer::after_millis(10).await;
+
         self.reset().await;
 
         // 1. Enter Standby RC mode
@@ -118,19 +133,23 @@ impl<'a, T: embassy_nrf::spim::Instance> Sx1262<'a, T> {
         // 5. Set packet type to LoRa
         self.write_cmd(CMD_SET_PACKET_TYPE, &[PACKET_TYPE_LORA]).await?;
 
-        // 6. Configure RF Frequency
+        // 6. Configure LoRa Sync Word (0x12 Private Network standard for MeshCore)
+        self.write_register(REG_LORA_SYNC_WORD_MSB, &LORA_SYNC_WORD_PRIVATE).await?;
+        info!("Configured LoRa sync word: 0x12 (MeshCore private)");
+
+        // 7. Configure RF Frequency
         self.set_frequency(config.frequency_hz).await?;
 
-        // 7. Configure PA for SX1262 (+22dBm capable)
+        // 8. Configure PA for SX1262 (+22dBm capable)
         self.write_cmd(CMD_SET_PA_CONFIG, &[0x04, 0x07, 0x00, 0x01]).await?;
 
-        // 8. Set TX output power
+        // 9. Set TX output power
         self.set_tx_power(config.tx_power_dbm).await?;
 
-        // 9. Set buffer base addresses (TX at 0x00, RX at 0x00)
+        // 10. Set buffer base addresses (TX at 0x00, RX at 0x00)
         self.write_cmd(CMD_SET_BUFFER_BASE_ADDRESS, &[0x00, 0x00]).await?;
 
-        // 10. Set Modulation Parameters
+        // 11. Set Modulation Parameters
         let bw = match config.bandwidth_khz {
             62 | 63 => 0x03, // 62.5 kHz (US PNW standard)
             250 => 0x05,
@@ -240,26 +259,23 @@ impl<'a, T: embassy_nrf::spim::Instance> Sx1262<'a, T> {
             let irq = self.get_irq_status().await;
             if (irq & IRQ_TX_DONE) != 0 {
                 self.clear_irq(IRQ_TX_DONE).await;
-                self.rf_sw.set_low();
                 debug!("Packet transmitted successfully ({} bytes)", data.len());
                 return Ok(());
             }
             if (irq & IRQ_TIMEOUT) != 0 {
                 self.clear_irq(IRQ_TIMEOUT).await;
-                self.rf_sw.set_low();
                 error!("Packet transmission timed out");
                 return Err(());
             }
             Timer::after_millis(5).await;
         }
-        self.rf_sw.set_low();
         error!("Packet transmission loop timed out");
         Err(())
     }
 
     /// Start listening for incoming packets
     pub async fn start_receive(&mut self) {
-        self.rf_sw.set_low();
+        self.rf_sw.set_high(); // Ensure SX126X_POWER_EN remains active
         self.clear_irq(IRQ_ALL).await;
         // 0xFFFFFF = Continuous RX mode
         let _ = self.write_cmd(CMD_SET_RX, &[0xFF, 0xFF, 0xFF]).await;
@@ -277,6 +293,7 @@ impl<'a, T: embassy_nrf::spim::Instance> Sx1262<'a, T> {
 
         if (irq & IRQ_CRC_ERR) != 0 {
             debug!("Received packet with CRC error, dropping");
+            self.start_receive().await;
             return None;
         }
 

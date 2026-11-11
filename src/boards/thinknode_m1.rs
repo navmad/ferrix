@@ -135,7 +135,8 @@ impl Board for ThinkNodeM1 {
         let lora_reset = Output::new(p.P0_25, Level::High, OutputDrive::Standard);
         let lora_busy = Input::new(p.P0_17, Pull::None);
         let lora_dio1 = Input::new(p.P0_20, Pull::None);
-        let lora_rf_sw = Output::new(p.P0_21, Level::Low, OutputDrive::Standard);
+        // P0.21 is SX126X_POWER_EN (active-high power enable for the SX1262 transceiver rail)
+        let lora_rf_sw = Output::new(p.P0_21, Level::High, OutputDrive::Standard);
 
         let lora = LoraPins {
             sck: p.P0_19,
