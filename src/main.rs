@@ -29,7 +29,7 @@ use crate::companion::usb::{UsbCommand, USB_COMMAND_CHANNEL};
 use crate::display::{EpdFrameBuffer, NodeDisplay, Ssd1681, ThinkNodeDisplay};
 use crate::input::{InputDevice, InputEvent};
 use crate::meshcore::{InboundAction, LocalIdentity, MeshEngine, Packet};
-use crate::radio::{LoraConfig, Sx1262};
+use crate::radio::{lora_phy_task, LoraConfig, LoraPhyChannelRadio, LoraRadio};
 
 bind_interrupts!(struct Irqs {
     USBD => usb::InterruptHandler<peripherals::USBD>;
@@ -119,23 +119,19 @@ async fn main(spawner: Spawner) {
         spim0_config,
     );
 
-    let mut lora = Sx1262::new(
+    // Spawn background lora-phy radio task on ThinkNode M1 SX1262
+    spawner.spawn(lora_phy_task(
         spim0,
         board.lora.cs,
         board.lora.reset,
         board.lora.busy,
         board.lora.dio1,
         board.lora.rf_sw,
-    );
+    )).unwrap();
 
-    let lora_config = LoraConfig::default();
-
-    if lora.init(&lora_config).await.is_ok() {
-        info!("LoRa radio online! Starting continuous RX...");
-        lora.start_receive().await;
-    } else {
-        defmt::error!("Failed to initialize LoRa radio!");
-    }
+    let mut lora = LoraPhyChannelRadio::new();
+    let _ = lora.init(&LoraConfig::default()).await;
+    lora.start_receive().await;
 
     // 2. Initialize Display via generic NodeDisplay trait
     #[cfg(feature = "thinknode-m1")]

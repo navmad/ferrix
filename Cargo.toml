@@ -22,8 +22,10 @@ embassy-usb = { version = "0.4", features = ["defmt"] }
 
 embedded-hal = "1.0"
 embedded-hal-async = "1.0"
+embedded-hal-bus = { version = "0.2", features = ["async"] }
 embedded-io-async = { version = "0.6", features = ["defmt-03"] }
 embedded-graphics = "0.8"
+lora-phy = "3.0.1"
 
 heapless = { version = "0.8", features = ["defmt-03"] }
 static_cell = "2.1"

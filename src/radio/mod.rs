@@ -1,8 +1,10 @@
 //! Generic LoRa Radio Subsystem & Transceiver Drivers
 
 pub mod commands;
+pub mod lora_phy;
 pub mod sx1262;
 
+pub use lora_phy::{lora_phy_task, LoraPhyChannelRadio};
 pub use sx1262::Sx1262;
 
 /// Standard LoRa Modulation & RF Configuration
