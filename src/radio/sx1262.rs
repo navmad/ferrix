@@ -119,12 +119,18 @@ impl<'a, T: embassy_nrf::spim::Instance> Sx1262<'a, T> {
         // 1. Enter Standby RC mode
         self.write_cmd(CMD_SET_STANDBY, &[STDBY_RC]).await?;
 
-        // 2. Configure TCXO on DIO3 @ 3.3V with 5ms startup delay (0x0140) per ThinkNode M1 variant
+        // 2. Configure TCXO on DIO3 @ 3.3V with 5ms startup delay (0x0140 = 320 * 15.625us)
         info!("Enabling TCXO power via DIO3 (3.3V)...");
-        self.write_cmd(CMD_SET_DIO3_AS_TCXO_CTRL, &[TCXO_CTRL_3_3V, 0x01, 0x40]).await?;
+        self.write_cmd(CMD_SET_DIO3_AS_TCXO_CTRL, &[TCXO_CTRL_3_3V, 0x00, 0x01, 0x40]).await?;
 
-        // 3. Calibrate devices
+        // Switch to STDBY_XOSC to start TCXO oscillator
+        self.write_cmd(CMD_SET_STANDBY, &[STDBY_XOSC]).await?;
+        Timer::after_millis(10).await;
+
+        // 3. Calibrate devices & Calibrate Image for 902-928 MHz ISM band
         self.write_cmd(CMD_CALIBRATE, &[0x7F]).await?;
+        let _ = self.wait_busy().await;
+        self.write_cmd(CMD_CALIBRATE_IMAGE, &[0xE1, 0xE9]).await?;
         let _ = self.wait_busy().await;
 
         // 4. Configure DIO2 as RF Switch control
@@ -276,6 +282,14 @@ impl<'a, T: embassy_nrf::spim::Instance> Sx1262<'a, T> {
     /// Start listening for incoming packets
     pub async fn start_receive(&mut self) {
         self.rf_sw.set_high(); // Ensure SX126X_POWER_EN remains active
+        // Reset packet parameters for RX: explicit header, max payload 255, CRC on
+        let _ = self.write_cmd(CMD_SET_PACKET_PARAMS, &[
+            0x00, 0x10, // 16 preamble symbols
+            0x00,       // Variable length packet (explicit header)
+            0xFF,       // Max payload length (255)
+            0x01,       // CRC on
+            0x00,       // Standard IQ
+        ]).await;
         self.clear_irq(IRQ_ALL).await;
         // 0xFFFFFF = Continuous RX mode
         let _ = self.write_cmd(CMD_SET_RX, &[0xFF, 0xFF, 0xFF]).await;
