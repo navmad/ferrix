@@ -56,7 +56,7 @@ impl SecurityHandler for MeshCoreSecurityHandler {
     }
 
     fn can_bond(&self, _conn: &Connection) -> bool {
-        false
+        true
     }
 
     fn request_mitm_protection(&self, _conn: &Connection) -> bool {
