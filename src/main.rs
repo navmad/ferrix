@@ -40,6 +40,54 @@ bind_interrupts!(struct Irqs {
 
 static VBUS_DETECT: StaticCell<embassy_nrf::usb::vbus_detect::SoftwareVbusDetect> = StaticCell::new();
 
+#[derive(Clone, Copy, Debug)]
+pub struct PendingMessageAck {
+    pub pkt_hash: [u8; 4],
+    pub send_instant_ms: u64,
+}
+
+static PENDING_MESSAGE_ACKS: embassy_sync::blocking_mutex::Mutex<
+    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+    core::cell::RefCell<heapless::Vec<PendingMessageAck, 8>>,
+> = embassy_sync::blocking_mutex::Mutex::new(core::cell::RefCell::new(heapless::Vec::new()));
+
+fn track_outbound_packet(pkt: &Packet) {
+    let pkt_hash = pkt.calculate_packet_hash();
+    let now = embassy_time::Instant::now().as_millis();
+    PENDING_MESSAGE_ACKS.lock(|a| {
+        let mut list = a.borrow_mut();
+        if list.is_full() {
+            list.remove(0);
+        }
+        let _ = list.push(PendingMessageAck {
+            pkt_hash,
+            send_instant_ms: now,
+        });
+    });
+}
+
+fn handle_direct_message_confirmed(ack_hash: [u8; 4]) {
+    let now = embassy_time::Instant::now().as_millis();
+    let rtt_ms = PENDING_MESSAGE_ACKS.lock(|a| {
+        let mut list = a.borrow_mut();
+        if let Some(pos) = list.iter().position(|p| p.pkt_hash == ack_hash) {
+            let item = list.remove(pos);
+            now.saturating_sub(item.send_instant_ms) as u32
+        } else {
+            120
+        }
+    });
+
+    info!("MeshCore Direct Message Delivery ACK Confirmed! (RTT: {} ms)", rtt_ms);
+
+    // Push PUSH_CODE_SEND_CONFIRMED (0x82) to BLE companion app
+    let mut push_frame = heapless::Vec::<u8, 256>::new();
+    let _ = push_frame.push(crate::companion::protocol::PUSH_CODE_SEND_CONFIRMED);
+    let _ = push_frame.extend_from_slice(&ack_hash);
+    let _ = push_frame.extend_from_slice(&rtt_ms.to_le_bytes());
+    let _ = crate::companion::ble::COMPANION_PUSH_CHANNEL.try_send(push_frame);
+}
+
 // Static allocations for display framebuffer
 #[cfg(feature = "thinknode-m1")]
 static EPD_FRAMEBUFFER: StaticCell<EpdFrameBuffer> = StaticCell::new();
@@ -217,6 +265,16 @@ async fn main(spawner: Spawner) {
             node.last_rssi = rssi;
             node.last_snr = snr;
 
+            // Stream raw packet to companion app via PUSH_CODE_LOG_RX_DATA (0x88)
+            // Layout: [0x88, (snr * 4) as i8, rssi as i8, raw_lora_packet_bytes...]
+            let mut log_rx_push = heapless::Vec::<u8, 256>::new();
+            let _ = log_rx_push.push(crate::companion::protocol::PUSH_CODE_LOG_RX_DATA);
+            let _ = log_rx_push.push(snr.saturating_mul(4) as u8);
+            let _ = log_rx_push.push(rssi as i8 as u8);
+            let copy_lora_len = len.min(256 - 3);
+            let _ = log_rx_push.extend_from_slice(&rx_buf[..copy_lora_len]);
+            let _ = crate::companion::ble::COMPANION_PUSH_CHANNEL.try_send(log_rx_push);
+
             // Synchronize real radio telemetry to shared USB CLI status
             crate::companion::usb::RADIO_TELEMETRY.lock(|t| {
                 let mut tel = t.borrow_mut();
@@ -259,8 +317,8 @@ async fn main(spawner: Spawner) {
                             }
                         });
                     }
-                    InboundAction::ReceivedGroupText(grp) => {
-                        info!("MeshCore Group Text [ch {}]: <{}> {}", grp.channel_hash, grp.sender.as_str(), grp.message.as_str());
+                    InboundAction::ReceivedGroupText { channel_idx, path_len, packet: grp } => {
+                        info!("MeshCore Group Text [ch {}]: <{}> {}", channel_idx, grp.sender.as_str(), grp.message.as_str());
                         node.unread_messages = node.unread_messages.saturating_add(1);
                         crate::companion::usb::MESSAGE_LOG.lock(|m| {
                             let mut list = m.borrow_mut();
@@ -272,6 +330,8 @@ async fn main(spawner: Spawner) {
                             let mut s_text = heapless::String::new();
                             let _ = s_text.push_str(grp.message.as_str());
                             let _ = list.push(crate::meshcore::mesh::ReceivedMessage {
+                                channel_idx,
+                                path_len,
                                 sender: s_sender,
                                 text: s_text,
                                 timestamp: grp.timestamp,
@@ -280,6 +340,11 @@ async fn main(spawner: Spawner) {
                                 is_direct: false,
                             });
                         });
+
+                        // Prompt companion app with PUSH_CODE_MSG_WAITING (0x83)
+                        let mut msg_wait = heapless::Vec::<u8, 256>::new();
+                        let _ = msg_wait.push(crate::companion::protocol::PUSH_CODE_MSG_WAITING);
+                        let _ = crate::companion::ble::COMPANION_PUSH_CHANNEL.try_send(msg_wait);
                     }
                     InboundAction::ReceivedDirectText(msg) => {
                         info!("MeshCore Direct Msg: {}", msg.text.as_str());
@@ -295,6 +360,8 @@ async fn main(spawner: Spawner) {
                             let mut s_text = heapless::String::new();
                             let _ = s_text.push_str(msg.text.as_str());
                             let _ = list.push(crate::meshcore::mesh::ReceivedMessage {
+                                channel_idx: 0,
+                                path_len: 0,
                                 sender: s_sender,
                                 text: s_text,
                                 timestamp: msg.timestamp,
@@ -303,9 +370,18 @@ async fn main(spawner: Spawner) {
                                 is_direct: true,
                             });
                         });
+
+                        // Prompt companion app with PUSH_CODE_MSG_WAITING (0x83)
+                        let mut msg_wait = heapless::Vec::<u8, 256>::new();
+                        let _ = msg_wait.push(crate::companion::protocol::PUSH_CODE_MSG_WAITING);
+                        let _ = crate::companion::ble::COMPANION_PUSH_CHANNEL.try_send(msg_wait);
                     }
-                    InboundAction::ReceivedAck(_ack) => {
-                        info!("MeshCore ACK received");
+                    InboundAction::ReceivedRepeaterEcho { pkt_hash, hops } => {
+                        info!("MeshCore Message echoed by repeater! ({} hops, pkt_hash: {:?})", hops, pkt_hash);
+                    }
+                    InboundAction::ReceivedAck(ack) => {
+                        info!("MeshCore ACK received for packet {:?}", ack.ack_packet_hash);
+                        handle_direct_message_confirmed(ack.ack_packet_hash);
                     }
                     InboundAction::DropDuplicate => {
                         info!("MeshCore: dropped duplicate packet");
@@ -344,12 +420,14 @@ async fn main(spawner: Spawner) {
                 UsbCommand::SetTime(epoch) => {
                     info!("Node epoch time updated to: {}", epoch);
                     node.epoch_time = epoch;
+                    crate::companion::usb::set_device_time(epoch as u32);
                 }
                 UsbCommand::TriggerAdvert => {
                     info!("Queuing MeshCore Advert from USB CLI command...");
                     node.tx_beacons = node.tx_beacons.saturating_add(1);
+                    let time = crate::companion::usb::get_device_time();
                     let _ = mesh.queue_advert(
-                        node.epoch_time as u32,
+                        time,
                         node.latitude,
                         node.longitude,
                         node.battery_percentage,
@@ -368,12 +446,17 @@ async fn main(spawner: Spawner) {
                     });
                     let time = crate::companion::usb::get_device_time();
                     node.tx_beacons = node.tx_beacons.saturating_add(1);
-                    let _ = mesh.queue_group_text(ch_hash, &secret, text.as_str(), time);
+                    if let Ok(pkt) = mesh.queue_group_text(ch_hash, &secret, text.as_str(), time) {
+                        track_outbound_packet(&pkt);
+                    }
                 }
                 UsbCommand::SendDirectText { dest_hash, text } => {
                     info!("Queuing MeshCore Direct Text to {:?}: {}", dest_hash, text.as_str());
+                    let time = crate::companion::usb::get_device_time();
                     node.tx_beacons = node.tx_beacons.saturating_add(1);
-                    let _ = mesh.queue_direct_text(dest_hash, text.as_str(), node.epoch_time as u32);
+                    if let Ok(pkt) = mesh.queue_direct_text(dest_hash, text.as_str(), time) {
+                        track_outbound_packet(&pkt);
+                    }
                 }
                 UsbCommand::SetRepeat(rep) => {
                     info!("Setting repeater mode: {}", rep);

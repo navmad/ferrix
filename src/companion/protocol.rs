@@ -251,10 +251,49 @@ impl CompanionNode {
             }
 
             CMD_SYNC_NEXT_MESSAGE => {
-                // Return RESP_CODE_NO_MORE_MESSAGES (10) when queue is empty
-                let mut resp = Vec::<u8, 4>::new();
-                let _ = resp.push(RESP_CODE_NO_MORE_MESSAGES);
-                emit(&resp);
+                let next_msg = crate::companion::usb::MESSAGE_LOG.lock(|m| {
+                    let mut list = m.borrow_mut();
+                    if !list.is_empty() {
+                        Some(list.remove(0))
+                    } else {
+                        None
+                    }
+                });
+
+                if let Some(msg) = next_msg {
+                    let mut resp = Vec::<u8, 256>::new();
+                    if msg.is_direct {
+                        // V3 DM: [0x10, (snr*4), 0, 0, 6B pubkey, path_len, txt_type, 4B ts, text]
+                        let _ = resp.push(RESP_CODE_CONTACT_MSG_V3);
+                        let _ = resp.push((msg.snr * 4) as u8);
+                        let _ = resp.push(0);
+                        let _ = resp.push(0);
+                        let pk_prefix = [0u8; 6];
+                        let _ = resp.extend_from_slice(&pk_prefix);
+                        let _ = resp.push(msg.path_len);
+                        let _ = resp.push(0); // TXT_TYPE_PLAIN
+                        let _ = resp.extend_from_slice(&msg.timestamp.to_le_bytes());
+                        let _ = resp.extend_from_slice(msg.text.as_bytes());
+                    } else {
+                        // V3 Channel: [0x11, (snr*4), 0, 0, channel_idx, path_len, txt_type, 4B ts, text]
+                        let _ = resp.push(RESP_CODE_CHANNEL_MSG_V3);
+                        let _ = resp.push((msg.snr * 4) as u8);
+                        let _ = resp.push(0);
+                        let _ = resp.push(0);
+                        let _ = resp.push(msg.channel_idx);
+                        let _ = resp.push(msg.path_len);
+                        let _ = resp.push(0); // TXT_TYPE_PLAIN
+                        let _ = resp.extend_from_slice(&msg.timestamp.to_le_bytes());
+                        let _ = resp.extend_from_slice(msg.sender.as_bytes());
+                        let _ = resp.extend_from_slice(b": ");
+                        let _ = resp.extend_from_slice(msg.text.as_bytes());
+                    }
+                    emit(&resp);
+                } else {
+                    let mut resp = Vec::<u8, 4>::new();
+                    let _ = resp.push(RESP_CODE_NO_MORE_MESSAGES);
+                    emit(&resp);
+                }
             }
 
             CMD_GET_CONTACTS => {

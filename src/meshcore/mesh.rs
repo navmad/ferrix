@@ -33,6 +33,8 @@ pub struct DiscoveredContact {
 /// Recently received message entry for message history / inbox
 #[derive(Clone, Debug)]
 pub struct ReceivedMessage {
+    pub channel_idx: u8,
+    pub path_len: u8,
     pub sender: heapless::String<32>,
     pub text: heapless::String<128>,
     pub timestamp: u32,
@@ -50,7 +52,16 @@ pub enum InboundAction {
     /// Successfully decoded node advertisement
     ReceivedAdvert(AdvertPacket),
     /// Successfully decoded channel group broadcast
-    ReceivedGroupText(GrpTextPacket),
+    ReceivedGroupText {
+        channel_idx: u8,
+        path_len: u8,
+        packet: GrpTextPacket,
+    },
+    /// Received repeater echo of our own transmitted group message
+    ReceivedRepeaterEcho {
+        pkt_hash: [u8; 4],
+        hops: u8,
+    },
     /// Successfully decoded direct message addressed to this node
     ReceivedDirectText(TxtMsgPacket),
     /// Received message delivery acknowledgment
@@ -95,26 +106,26 @@ impl MeshEngine {
 
     /// Process a packet received over the LoRa radio interface
     pub fn handle_inbound_packet(&mut self, pkt: Packet) -> InboundAction {
-        // 1. Check for duplicates; drop immediately if seen
-        if self.seen_filter.check_and_mark(&pkt) {
-            return InboundAction::DropDuplicate;
-        }
-
-        // 2. Check hop limits
+        // 1. Check hop limits
         if pkt.path_len >= self.max_hops {
             return InboundAction::DropHopLimitExceeded;
         }
 
-        // 3. If configured as a repeater and packet is flood-routed, re-broadcast
-        if self.is_repeater && pkt.is_flood() {
+        // 2. If configured as a repeater and packet is flood-routed, re-broadcast (if not already seen)
+        let is_dupe = self.seen_filter.check_and_mark(&pkt);
+
+        if self.is_repeater && pkt.is_flood() && !is_dupe {
             let mut repeat_pkt = pkt.clone();
             repeat_pkt.append_hop(self.identity.short_hash());
             let _ = self.tx_queue.push(repeat_pkt);
         }
 
-        // 4. Dispatch based on payload type
+        // 3. Dispatch based on payload type
         match pkt.payload_type() {
             PAYLOAD_TYPE_ADVERT => {
+                if is_dupe {
+                    return InboundAction::DropDuplicate;
+                }
                 if let Ok(adv) = AdvertPacket::decode(&pkt.payload[..pkt.payload_len]) {
                     InboundAction::ReceivedAdvert(adv)
                 } else {
@@ -122,22 +133,43 @@ impl MeshEngine {
                 }
             }
             PAYLOAD_TYPE_GRP_TXT => {
+                // Look up matching channel by channel_hash (pkt.payload[0])
                 if pkt.payload_len > 0 {
                     let ch_hash = pkt.payload[0];
                     let mut matched = None;
                     crate::companion::usb::CHANNELS.lock(|chs| {
                         let list = chs.borrow();
-                        for ch in list.iter() {
+                        for (idx, ch) in list.iter().enumerate() {
                             if crate::meshcore::crypto::channel_hash(&ch.secret) == ch_hash {
                                 if let Ok(grp) = GrpTextPacket::decode_encrypted(&pkt.payload[..pkt.payload_len], &ch.secret) {
-                                    matched = Some(grp);
+                                    matched = Some((idx as u8, grp));
                                     break;
                                 }
                             }
                         }
                     });
-                    if let Some(grp) = matched {
-                        InboundAction::ReceivedGroupText(grp)
+
+                    if let Some((ch_idx, grp)) = matched {
+                        if grp.sender.as_str() == self.identity.callsign() {
+                            if pkt.path_len >= 1 {
+                                InboundAction::ReceivedRepeaterEcho {
+                                    pkt_hash: pkt.calculate_packet_hash(),
+                                    hops: pkt.path_len,
+                                }
+                            } else {
+                                InboundAction::DropDuplicate
+                            }
+                        } else if is_dupe {
+                            InboundAction::DropDuplicate
+                        } else {
+                            InboundAction::ReceivedGroupText {
+                                channel_idx: ch_idx,
+                                path_len: pkt.path_len,
+                                packet: grp,
+                            }
+                        }
+                    } else if is_dupe {
+                        InboundAction::DropDuplicate
                     } else {
                         InboundAction::Unhandled
                     }
@@ -146,8 +178,10 @@ impl MeshEngine {
                 }
             }
             PAYLOAD_TYPE_TXT_MSG => {
+                if is_dupe {
+                    return InboundAction::DropDuplicate;
+                }
                 if let Ok(msg) = TxtMsgPacket::decode(&pkt.payload[..pkt.payload_len]) {
-                    // Check if addressed to us or broadcast
                     if self.identity.base.matches_hash(&msg.dest_hash) {
                         InboundAction::ReceivedDirectText(msg)
                     } else {
