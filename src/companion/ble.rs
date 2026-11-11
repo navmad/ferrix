@@ -1,0 +1,210 @@
+//! MeshCore Bluetooth Low Energy (BLE) Companion Subsystem
+//!
+//! Exposes Nordic UART Service (NUS) over BLE GATT, enabling official MeshCore
+//! mobile apps (iOS & Android) to discover, pair, and communicate with ThinkNode M1.
+
+use defmt::{debug, error, info};
+use heapless::Vec;
+use nrf_softdevice::ble::gatt_server;
+use nrf_softdevice::ble::peripheral;
+use nrf_softdevice::Softdevice;
+
+use crate::boards::{Board, CurrentBoard};
+use crate::companion::framing::{encode_usb_frame, UsbFrameReader};
+use crate::companion::protocol::CompanionNode;
+
+#[nrf_softdevice::gatt_service(uuid = "6e400001-b5a3-f393-e0a9-e50e24dcca9e")]
+pub struct NordicUartService {
+    #[characteristic(uuid = "6e400002-b5a3-f393-e0a9-e50e24dcca9e", write, write_without_response)]
+    pub rx: Vec<u8, 256>,
+
+    #[characteristic(uuid = "6e400003-b5a3-f393-e0a9-e50e24dcca9e", notify)]
+    pub tx: Vec<u8, 256>,
+}
+
+#[nrf_softdevice::gatt_server]
+pub struct MeshCoreGattServer {
+    pub nus: NordicUartService,
+}
+
+#[embassy_executor::task]
+pub async fn softdevice_task(sd: &'static Softdevice) -> ! {
+    sd.run().await
+}
+
+#[embassy_executor::task]
+pub async fn ble_companion_task(
+    sd: &'static Softdevice,
+    server: MeshCoreGattServer,
+    public_key: [u8; 32],
+    private_key: [u8; 32],
+) {
+    info!("Starting MeshCore BLE companion advertising...");
+
+    let mut node = CompanionNode::new(
+        CurrentBoard::NAME,
+        CurrentBoard::NAME,
+        CurrentBoard::CAPABILITIES,
+        public_key,
+        private_key,
+    );
+
+    let config = peripheral::Config::default();
+
+    // Nordic UART Service 128-bit UUID for advertisement
+    // 6e400001-b5a3-f393-e0a9-e50e24dcca9e (reversed for little-endian wire format)
+    let nus_uuid_128: [u8; 16] = [
+        0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0, 0x93, 0xf3, 0xa3, 0xb5, 0x01, 0x00, 0x40, 0x6e,
+    ];
+
+    let mut adv_data = [0u8; 31];
+    let mut scan_data = [0u8; 31];
+
+    // Flags: LE General Discoverable Mode, BR/EDR Not Supported
+    adv_data[0] = 2; // length
+    adv_data[1] = 0x01; // Flags
+    adv_data[2] = 0x06;
+
+    // Complete 128-bit Service UUID list
+    adv_data[3] = 17; // 1 (type) + 16 (uuid)
+    adv_data[4] = 0x07; // Complete list of 128-bit Service UUIDs
+    adv_data[5..21].copy_from_slice(&nus_uuid_128);
+
+    // Scan response data: Complete Local Name (MeshCore-ThinkNode)
+    let name = b"MeshCore-M1";
+    scan_data[0] = (name.len() + 1) as u8;
+    scan_data[1] = 0x09; // Complete Local Name
+    scan_data[2..2 + name.len()].copy_from_slice(name);
+
+    let adv = peripheral::ConnectableAdvertisement::ScannableUndirected {
+        adv_data: &adv_data[..21],
+        scan_data: &scan_data[..2 + name.len()],
+    };
+
+    let mut frame_reader = UsbFrameReader::new();
+
+    loop {
+        info!("BLE: Waiting for connection from MeshCore companion app...");
+        let conn = match peripheral::advertise_connectable(sd, adv, &config).await {
+            Ok(c) => {
+                info!("BLE: Phone connected!");
+                c
+            }
+            Err(e) => {
+                error!("BLE: Advertising error: {:?}", e);
+                embassy_time::Timer::after_secs(1).await;
+                continue;
+            }
+        };
+
+        let e = gatt_server::run(&conn, &server, |event| match event {
+            MeshCoreGattServerEvent::Nus(NordicUartServiceEvent::RxWrite(data)) => {
+                debug!("BLE NUS received {} bytes", data.len());
+                for &b in data.iter() {
+                    if let Some(payload) = frame_reader.push_byte(b) {
+                        if let Some(resp) = node.handle_command(payload) {
+                            let mut out_frame = [0u8; 300];
+                            if let Ok(flen) = encode_usb_frame(&resp, &mut out_frame) {
+                                let mut vec = Vec::<u8, 256>::new();
+                                let copy_len = flen.min(256);
+                                let _ = vec.extend_from_slice(&out_frame[..copy_len]);
+                                let _ = server.nus.tx_notify(&conn, &vec);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        })
+        .await;
+
+        info!("BLE: Phone disconnected ({:?}), resuming advertising...", e);
+    }
+}
+
+use core::sync::atomic::{AtomicU32, Ordering};
+
+pub static BLE_STATUS: AtomicU32 = AtomicU32::new(0);
+
+unsafe extern "C" fn sd_fault_handler(id: u32, pc: u32, info: u32) {
+    defmt::error!("Softdevice fault: id={=u32:#x} pc={=u32:#x} info={=u32:#x}", id, pc, info);
+}
+
+#[embassy_executor::task]
+pub async fn ble_companion_supervisor_task(
+    spawner: embassy_executor::Spawner,
+    public_key: [u8; 32],
+    private_key: [u8; 32],
+) {
+    // Wait 500ms so USB CDC-ACM and SX1262 LoRa tasks are completely booted
+    embassy_time::Timer::after_millis(500).await;
+    BLE_STATUS.store(1, Ordering::Relaxed);
+    info!("BLE: Initializing SoftDevice S140 subsystem...");
+
+    let sd_config = nrf_softdevice::Config {
+        clock: Some(nrf_softdevice::raw::nrf_clock_lf_cfg_t {
+            source: nrf_softdevice::raw::NRF_CLOCK_LF_SRC_RC as u8,
+            rc_ctiv: 16,
+            rc_temp_ctiv: 2,
+            accuracy: nrf_softdevice::raw::NRF_CLOCK_LF_ACCURACY_500_PPM as u8,
+        }),
+        common_vs_uuid: Some(nrf_softdevice::raw::ble_common_cfg_vs_uuid_t {
+            vs_uuid_count: 2,
+        }),
+        conn_gap: Some(nrf_softdevice::raw::ble_gap_conn_cfg_t {
+            conn_count: 1,
+            event_length: 24,
+        }),
+        conn_gatts: Some(nrf_softdevice::raw::ble_gatts_conn_cfg_t {
+            hvn_tx_queue_size: 4,
+        }),
+        gatts_attr_tab_size: Some(nrf_softdevice::raw::ble_gatts_cfg_attr_tab_size_t {
+            attr_tab_size: 1408,
+        }),
+        gap_role_count: Some(nrf_softdevice::raw::ble_gap_cfg_role_count_t {
+            adv_set_count: 1,
+            periph_role_count: 1,
+            central_role_count: 0,
+            central_sec_count: 0,
+            _bitfield_1: nrf_softdevice::raw::ble_gap_cfg_role_count_t::new_bitfield_1(0),
+        }),
+        ..Default::default()
+    };
+
+    // Safely probe SoftDevice enablement without touching SCB->VTOR
+    let p_clock = sd_config.clock.as_ref().map(|x| x as _).unwrap_or(core::ptr::null());
+    let ret = unsafe { nrf_softdevice::raw::sd_softdevice_enable(p_clock, Some(sd_fault_handler as _)) };
+    if ret != 0 {
+        error!("BLE: sd_softdevice_enable returned status code {=u32:#x}", ret);
+        BLE_STATUS.store(0x1000 | ret, Ordering::Relaxed);
+        return;
+    }
+
+    info!("BLE: SoftDevice S140 successfully enabled!");
+    BLE_STATUS.store(2, Ordering::Relaxed);
+
+    // Disable raw SD so that embassy's Softdevice::enable can manage state cleanly
+    unsafe { nrf_softdevice::raw::sd_softdevice_disable() };
+
+    let sd = Softdevice::enable(&sd_config);
+    if let Ok(server) = MeshCoreGattServer::new(sd) {
+        if spawner.spawn(softdevice_task(sd)).is_ok()
+            && spawner.spawn(ble_companion_task(sd, server, public_key, private_key)).is_ok()
+        {
+            info!("MeshCore BLE companion service successfully started!");
+            BLE_STATUS.store(3, Ordering::Relaxed);
+        } else {
+            BLE_STATUS.store(4, Ordering::Relaxed);
+        }
+    } else {
+        BLE_STATUS.store(5, Ordering::Relaxed);
+    }
+}
+
+pub fn init_ble_companion(
+    spawner: embassy_executor::Spawner,
+    public_key: [u8; 32],
+    private_key: [u8; 32],
+) -> bool {
+    spawner.spawn(ble_companion_supervisor_task(spawner, public_key, private_key)).is_ok()
+}

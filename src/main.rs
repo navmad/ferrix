@@ -17,7 +17,7 @@ use embassy_executor::Spawner;
 use embassy_nrf::bind_interrupts;
 use embassy_nrf::peripherals;
 use embassy_nrf::spim::{self, Spim};
-use embassy_nrf::usb::{self, vbus_detect::HardwareVbusDetect};
+use embassy_nrf::usb;
 use embassy_time::Timer;
 #[cfg(feature = "thinknode-m1")]
 use static_cell::StaticCell;
@@ -33,10 +33,11 @@ use crate::radio::{lora_phy_task, LoraConfig, LoraPhyChannelRadio, LoraRadio};
 
 bind_interrupts!(struct Irqs {
     USBD => usb::InterruptHandler<peripherals::USBD>;
-    CLOCK_POWER => usb::vbus_detect::InterruptHandler;
     TWISPI0 => spim::InterruptHandler<peripherals::TWISPI0>;
     TWISPI1 => spim::InterruptHandler<peripherals::TWISPI1>;
 });
+
+static VBUS_DETECT: StaticCell<embassy_nrf::usb::vbus_detect::SoftwareVbusDetect> = StaticCell::new();
 
 // Static allocations for display framebuffer
 #[cfg(feature = "thinknode-m1")]
@@ -67,7 +68,19 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    let p = embassy_nrf::init(Default::default());
+    use embassy_nrf::interrupt::{InterruptExt, Priority};
+
+    // SoftDevice S140 reserves interrupt priorities P0, P1, and P4.
+    // Configure all Embassy system and peripheral interrupts to P2 or P3.
+    let mut nrf_config = embassy_nrf::config::Config::default();
+    nrf_config.gpiote_interrupt_priority = Priority::P2;
+    nrf_config.time_interrupt_priority = Priority::P2;
+    let p = embassy_nrf::init(nrf_config);
+
+    embassy_nrf::interrupt::USBD.set_priority(Priority::P3);
+    embassy_nrf::interrupt::TWISPI0.set_priority(Priority::P3);
+    embassy_nrf::interrupt::TWISPI1.set_priority(Priority::P3);
+
     let mut board = CurrentBoard::init(p);
 
     // Initialize native MeshCore Routing Engine & Local Cryptographic Identity from hardware FICR
@@ -75,6 +88,15 @@ async fn main(spawner: Spawner) {
     let pub_key = local_id.pub_key_bytes();
     let priv_key = local_id.signing_key_bytes();
     let mut mesh = MeshEngine::new(local_id, true);
+
+    // 0. Initialize USB CDC-ACM Serial & 1200-baud DFU Auto-Reset FIRST
+    // This guarantees serial CLI, packet logging, and DFU auto-reset are always available.
+    let vbus: &'static embassy_nrf::usb::vbus_detect::SoftwareVbusDetect =
+        &*VBUS_DETECT.init(embassy_nrf::usb::vbus_detect::SoftwareVbusDetect::new(true, true));
+    let usb_driver = usb::Driver::new(board.usbd, Irqs, vbus);
+    let (usb_dev, cdc_class) = crate::companion::usb::init_usb(usb_driver);
+    spawner.spawn(crate::companion::usb::usb_task(usb_dev)).unwrap();
+    spawner.spawn(crate::companion::usb::cdc_acm_task(cdc_class, pub_key, priv_key)).unwrap();
 
     // Initial node companion state
     let mut node = CompanionNode::new(
@@ -85,11 +107,8 @@ async fn main(spawner: Spawner) {
         priv_key,
     );
 
-    // 0. Initialize USB CDC-ACM Serial & 1200-baud DFU Auto-Reset
-    let usb_driver = usb::Driver::new(board.usbd, Irqs, HardwareVbusDetect::new(Irqs));
-    let (usb_dev, cdc_class) = crate::companion::usb::init_usb(usb_driver);
-    spawner.spawn(crate::companion::usb::usb_task(usb_dev)).unwrap();
-    spawner.spawn(crate::companion::usb::cdc_acm_task(cdc_class, pub_key, priv_key)).unwrap();
+    // Initialize BLE Companion peripheral (Nordic UART Service)
+    crate::companion::ble::init_ble_companion(spawner, pub_key, priv_key);
 
     info!("====================================================");
     info!(" MeshCore Companion Firmware (ferrix) ");

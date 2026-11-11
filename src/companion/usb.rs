@@ -14,7 +14,6 @@ use core::cell::RefCell;
 use core::fmt::Write;
 use defmt::{debug, info};
 use embassy_nrf::peripherals::USBD;
-use embassy_nrf::usb::vbus_detect::HardwareVbusDetect;
 use embassy_nrf::usb::Driver;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
@@ -109,9 +108,11 @@ fn hex_to_nibble_opt(b: u8) -> Option<u8> {
     }
 }
 
+use embassy_nrf::usb::vbus_detect::SoftwareVbusDetect;
+
 pub static USB_COMMAND_CHANNEL: Channel<CriticalSectionRawMutex, UsbCommand, 4> = Channel::new();
 
-pub type UsbDriver = Driver<'static, USBD, HardwareVbusDetect>;
+pub type UsbDriver = Driver<'static, USBD, &'static SoftwareVbusDetect>;
 
 static CONFIG_DESC: StaticCell<[u8; 256]> = StaticCell::new();
 static BOS_DESC: StaticCell<[u8; 256]> = StaticCell::new();
@@ -545,6 +546,25 @@ async fn handle_text_cli(
                     "  -> Freq: 910.525M, SF7, BW62.5k\r\n  -> TX Beacons: {}, RX Packets: {}\r\n  -> Last RSSI: -- dBm, SNR: -- dB (listening)\r\n",
                     tx, rx
                 );
+            }
+            let _ = write_all(sender, s.as_bytes()).await;
+        }
+        "stats-ble" | "get ble" => {
+            let st = crate::companion::ble::BLE_STATUS.load(core::sync::atomic::Ordering::Relaxed);
+            let mut s: heapless::String<128> = heapless::String::new();
+            match st {
+                0 => { let _ = write!(s, "  -> BLE: Not started\r\n"); }
+                1 => { let _ = write!(s, "  -> BLE: Probing SoftDevice...\r\n"); }
+                2 => { let _ = write!(s, "  -> BLE: SoftDevice enabled, setting vector table...\r\n"); }
+                3 => { let _ = write!(s, "  -> BLE: Active & Advertising (MeshCore-M1 NUS)\r\n"); }
+                code if code >= 0x1000 => {
+                    let w0 = unsafe { *(0x1000 as *const u32) };
+                    let w1 = unsafe { *(0x1004 as *const u32) };
+                    let _ = write!(s, "  -> BLE: sd_softdevice_enable failed (code 0x{:04x}, flash@0x1000: 0x{:08x} 0x{:08x})\r\n", code & 0xFFF, w0, w1);
+                }
+                code => {
+                    let _ = write!(s, "  -> BLE: Error state {}\r\n", code);
+                }
             }
             let _ = write_all(sender, s.as_bytes()).await;
         }
