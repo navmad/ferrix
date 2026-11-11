@@ -16,6 +16,31 @@ use crate::meshcore::queue::{PacketQueue, SeenPacketFilter};
 
 pub const DEFAULT_MAX_HOPS: u8 = 7;
 
+/// Discovered MeshCore Contact in range
+#[derive(Clone, Debug)]
+pub struct DiscoveredContact {
+    pub pub_key: [u8; 32],
+    pub callsign: heapless::String<32>,
+    pub node_id: [u8; 4],
+    pub last_seen_epoch: u32,
+    pub rssi: i16,
+    pub snr: i8,
+    pub battery_percentage: u8,
+    pub latitude: f32,
+    pub longitude: f32,
+}
+
+/// Recently received message entry for message history / inbox
+#[derive(Clone, Debug)]
+pub struct ReceivedMessage {
+    pub sender: heapless::String<32>,
+    pub text: heapless::String<128>,
+    pub timestamp: u32,
+    pub rssi: i16,
+    pub snr: i8,
+    pub is_direct: bool,
+}
+
 /// Actions resulting from processing an inbound over-the-air packet
 pub enum InboundAction {
     /// Dropped because it has already been processed recently

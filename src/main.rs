@@ -203,14 +203,78 @@ async fn main(spawner: Spawner) {
                 match mesh.handle_inbound_packet(pkt) {
                     InboundAction::ReceivedAdvert(adv) => {
                         info!("MeshCore Advert from: {}", adv.callsign.as_str());
+                        let node_id = [adv.pub_key[0], adv.pub_key[1], adv.pub_key[2], adv.pub_key[3]];
+                        crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| {
+                            let mut list = c.borrow_mut();
+                            if let Some(existing) = list.iter_mut().find(|c| c.pub_key == adv.pub_key) {
+                                existing.callsign = adv.callsign.clone();
+                                existing.last_seen_epoch = node.epoch_time as u32;
+                                existing.rssi = rssi;
+                                existing.snr = snr;
+                                existing.battery_percentage = adv.battery_percentage;
+                                existing.latitude = adv.latitude;
+                                existing.longitude = adv.longitude;
+                            } else {
+                                let mut cs = heapless::String::new();
+                                let _ = cs.push_str(adv.callsign.as_str());
+                                let _ = list.push(crate::meshcore::mesh::DiscoveredContact {
+                                    pub_key: adv.pub_key,
+                                    callsign: cs,
+                                    node_id,
+                                    last_seen_epoch: node.epoch_time as u32,
+                                    rssi,
+                                    snr,
+                                    battery_percentage: adv.battery_percentage,
+                                    latitude: adv.latitude,
+                                    longitude: adv.longitude,
+                                });
+                            }
+                        });
                     }
                     InboundAction::ReceivedGroupText(grp) => {
                         info!("MeshCore Group Text [ch {}]: <{}> {}", grp.channel_hash, grp.sender.as_str(), grp.message.as_str());
                         node.unread_messages = node.unread_messages.saturating_add(1);
+                        crate::companion::usb::MESSAGE_LOG.lock(|m| {
+                            let mut list = m.borrow_mut();
+                            if list.is_full() {
+                                list.remove(0);
+                            }
+                            let mut s_sender = heapless::String::new();
+                            let _ = s_sender.push_str(grp.sender.as_str());
+                            let mut s_text = heapless::String::new();
+                            let _ = s_text.push_str(grp.message.as_str());
+                            let _ = list.push(crate::meshcore::mesh::ReceivedMessage {
+                                sender: s_sender,
+                                text: s_text,
+                                timestamp: grp.timestamp,
+                                rssi,
+                                snr,
+                                is_direct: false,
+                            });
+                        });
                     }
                     InboundAction::ReceivedDirectText(msg) => {
                         info!("MeshCore Direct Msg: {}", msg.text.as_str());
                         node.unread_messages = node.unread_messages.saturating_add(1);
+                        crate::companion::usb::MESSAGE_LOG.lock(|m| {
+                            let mut list = m.borrow_mut();
+                            if list.is_full() {
+                                list.remove(0);
+                            }
+                            let mut s_sender = heapless::String::new();
+                            use core::fmt::Write;
+                            let _ = write!(s_sender, "{:02x}{:02x}{:02x}{:02x}", msg.src_hash[0], msg.src_hash[1], msg.src_hash[2], msg.src_hash[3]);
+                            let mut s_text = heapless::String::new();
+                            let _ = s_text.push_str(msg.text.as_str());
+                            let _ = list.push(crate::meshcore::mesh::ReceivedMessage {
+                                sender: s_sender,
+                                text: s_text,
+                                timestamp: msg.timestamp,
+                                rssi,
+                                snr,
+                                is_direct: true,
+                            });
+                        });
                     }
                     InboundAction::ReceivedAck(_ack) => {
                         info!("MeshCore ACK received");
@@ -262,6 +326,35 @@ async fn main(spawner: Spawner) {
                         node.longitude,
                         node.battery_percentage,
                     );
+                }
+                UsbCommand::SendGroupText(msg) => {
+                    info!("Queuing MeshCore Group Text: {}", msg.as_str());
+                    node.tx_beacons = node.tx_beacons.saturating_add(1);
+                    let _ = mesh.queue_group_text(0, msg.as_str(), node.epoch_time as u32);
+                }
+                UsbCommand::SendDirectText { dest_hash, text } => {
+                    info!("Queuing MeshCore Direct Text to {:?}: {}", dest_hash, text.as_str());
+                    node.tx_beacons = node.tx_beacons.saturating_add(1);
+                    let _ = mesh.queue_direct_text(dest_hash, text.as_str(), node.epoch_time as u32);
+                }
+                UsbCommand::SetRepeat(rep) => {
+                    info!("Setting repeater mode: {}", rep);
+                    mesh.is_repeater = rep;
+                }
+                UsbCommand::SetFrequency(f) => {
+                    info!("Frequency updated to: {} Hz", f);
+                }
+                UsbCommand::SetTxPower(tx) => {
+                    info!("TX power updated to: {} dBm", tx);
+                }
+                UsbCommand::SetSpreadingFactor(sf) => {
+                    info!("SF updated to: {}", sf);
+                }
+                UsbCommand::SetBandwidth(bw) => {
+                    info!("BW updated to: {} kHz", bw);
+                }
+                UsbCommand::SetCodingRate(cr) => {
+                    info!("CR updated to: 4/{}", cr);
                 }
             }
         }

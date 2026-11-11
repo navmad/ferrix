@@ -26,6 +26,32 @@ use static_cell::StaticCell;
 use crate::boards::{Board, CurrentBoard};
 use crate::companion::framing::{encode_usb_frame, UsbFrameReader, USB_INBOUND_DELIMITER};
 use crate::companion::protocol::CompanionNode;
+use crate::meshcore::mesh::{DiscoveredContact, ReceivedMessage};
+
+#[derive(Clone, Copy, Debug)]
+pub struct RadioSettings {
+    pub frequency_hz: u32,
+    pub tx_power_dbm: i8,
+    pub sf: u8,
+    pub bw_khz: u32,
+    pub cr: u8,
+    pub is_repeater: bool,
+}
+
+pub static RADIO_SETTINGS: Mutex<CriticalSectionRawMutex, RefCell<RadioSettings>> = Mutex::new(RefCell::new(RadioSettings {
+    frequency_hz: 910_525_000,
+    tx_power_dbm: 22,
+    sf: 7,
+    bw_khz: 62,
+    cr: 5,
+    is_repeater: true,
+}));
+
+pub static DISCOVERED_CONTACTS: Mutex<CriticalSectionRawMutex, RefCell<heapless::Vec<DiscoveredContact, 32>>> =
+    Mutex::new(RefCell::new(heapless::Vec::new()));
+
+pub static MESSAGE_LOG: Mutex<CriticalSectionRawMutex, RefCell<heapless::Vec<ReceivedMessage, 16>>> =
+    Mutex::new(RefCell::new(heapless::Vec::new()));
 
 #[derive(Clone, Copy, Debug)]
 pub struct RadioTelemetry {
@@ -50,6 +76,17 @@ pub enum UsbCommand {
     SetPrivateKey([u8; 32]),
     SetTime(u64),
     TriggerAdvert,
+    SendGroupText(heapless::String<128>),
+    SendDirectText {
+        dest_hash: [u8; 4],
+        text: heapless::String<128>,
+    },
+    SetFrequency(u32),
+    SetTxPower(i8),
+    SetRepeat(bool),
+    SetSpreadingFactor(u8),
+    SetBandwidth(u32),
+    SetCodingRate(u8),
 }
 
 #[inline]
@@ -59,6 +96,16 @@ fn hex_to_nibble(b: u8) -> u8 {
         b'a'..=b'f' => b - b'a' + 10,
         b'A'..=b'F' => b - b'A' + 10,
         _ => 0,
+    }
+}
+
+#[inline]
+fn hex_to_nibble_opt(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -196,13 +243,289 @@ async fn handle_text_cli(
             let _ = write_all(sender, s.as_bytes()).await;
         }
         "get radio" | "get freq" => {
-            let _ = write_all(sender, b"  -> 910.525 MHz, SF7, BW 62.5 kHz, CR 4/5, +22 dBm\r\n").await;
+            let (f, sf, bw, cr, tx) = RADIO_SETTINGS.lock(|r| {
+                let cfg = r.borrow();
+                (cfg.frequency_hz, cfg.sf, cfg.bw_khz, cfg.cr, cfg.tx_power_dbm)
+            });
+            let mut s: heapless::String<128> = heapless::String::new();
+            let _ = write!(s, "  -> {:.3} MHz, SF{}, BW {} kHz, CR 4/{}, {} dBm\r\n", f as f32 / 1_000_000.0, sf, bw, cr, tx);
+            let _ = write_all(sender, s.as_bytes()).await;
+        }
+        s if s.starts_with("set freq ") => {
+            let val = s[9..].trim();
+            // Accepts e.g. "910525000" or "910.525"
+            let freq_hz: Option<u32> = if val.contains('.') {
+                // parse as MHz float
+                let parts: heapless::Vec<&str, 2> = val.split('.').collect();
+                if parts.len() == 2 {
+                    let mhz: u32 = parts[0].parse().unwrap_or(0);
+                    let mut khz_str = heapless::String::<6>::new();
+                    let _ = khz_str.push_str(parts[1]);
+                    while khz_str.len() < 6 {
+                        let _ = khz_str.push('0');
+                    }
+                    let frac: u32 = khz_str.parse().unwrap_or(0);
+                    Some(mhz * 1_000_000 + frac)
+                } else {
+                    None
+                }
+            } else {
+                val.parse().ok()
+            };
+
+            if let Some(f) = freq_hz {
+                if f >= 150_000_000 && f <= 960_000_000 {
+                    RADIO_SETTINGS.lock(|r| {
+                        r.borrow_mut().frequency_hz = f;
+                    });
+                    let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetFrequency(f));
+                    let mut s: heapless::String<64> = heapless::String::new();
+                    let _ = write!(s, "  -> OK (Freq set to {:.3} MHz)\r\n", f as f32 / 1_000_000.0);
+                    let _ = write_all(sender, s.as_bytes()).await;
+                } else {
+                    let _ = write_all(sender, b"  -> Error: frequency out of range (150-960 MHz)\r\n").await;
+                }
+            } else {
+                let _ = write_all(sender, b"  -> Error: invalid frequency format\r\n").await;
+            }
         }
         "get tx" => {
-            let _ = write_all(sender, b"  -> 22 dBm\r\n").await;
+            let tx = RADIO_SETTINGS.lock(|r| r.borrow().tx_power_dbm);
+            let mut s: heapless::String<32> = heapless::String::new();
+            let _ = write!(s, "  -> {} dBm\r\n", tx);
+            let _ = write_all(sender, s.as_bytes()).await;
+        }
+        s if s.starts_with("set tx ") => {
+            if let Ok(tx) = s[7..].trim().parse::<i8>() {
+                if tx >= -9 && tx <= 22 {
+                    RADIO_SETTINGS.lock(|r| {
+                        r.borrow_mut().tx_power_dbm = tx;
+                    });
+                    let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetTxPower(tx));
+                    let mut s: heapless::String<32> = heapless::String::new();
+                    let _ = write!(s, "  -> OK (TX set to {} dBm)\r\n", tx);
+                    let _ = write_all(sender, s.as_bytes()).await;
+                } else {
+                    let _ = write_all(sender, b"  -> Error: TX power must be between -9 and 22 dBm\r\n").await;
+                }
+            } else {
+                let _ = write_all(sender, b"  -> Error: invalid TX power number\r\n").await;
+            }
+        }
+        "get sf" => {
+            let sf = RADIO_SETTINGS.lock(|r| r.borrow().sf);
+            let mut s: heapless::String<32> = heapless::String::new();
+            let _ = write!(s, "  -> SF{}\r\n", sf);
+            let _ = write_all(sender, s.as_bytes()).await;
+        }
+        s if s.starts_with("set sf ") => {
+            let val = s[7..].trim().trim_start_matches("sf").trim_start_matches("SF");
+            if let Ok(sf) = val.parse::<u8>() {
+                if sf >= 5 && sf <= 12 {
+                    RADIO_SETTINGS.lock(|r| {
+                        r.borrow_mut().sf = sf;
+                    });
+                    let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetSpreadingFactor(sf));
+                    let mut s: heapless::String<32> = heapless::String::new();
+                    let _ = write!(s, "  -> OK (SF set to {})\r\n", sf);
+                    let _ = write_all(sender, s.as_bytes()).await;
+                } else {
+                    let _ = write_all(sender, b"  -> Error: SF must be between 5 and 12\r\n").await;
+                }
+            } else {
+                let _ = write_all(sender, b"  -> Error: invalid SF\r\n").await;
+            }
+        }
+        "get bw" => {
+            let bw = RADIO_SETTINGS.lock(|r| r.borrow().bw_khz);
+            let mut s: heapless::String<32> = heapless::String::new();
+            let _ = write!(s, "  -> {} kHz\r\n", bw);
+            let _ = write_all(sender, s.as_bytes()).await;
+        }
+        s if s.starts_with("set bw ") => {
+            let val = s[7..].trim().trim_end_matches("k").trim_end_matches("kHz");
+            let bw_khz: Option<u32> = if val == "62.5" || val == "62" {
+                Some(62)
+            } else if val == "125" {
+                Some(125)
+            } else if val == "250" {
+                Some(250)
+            } else if val == "500" {
+                Some(500)
+            } else {
+                None
+            };
+            if let Some(bw) = bw_khz {
+                RADIO_SETTINGS.lock(|r| {
+                    r.borrow_mut().bw_khz = bw;
+                });
+                let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetBandwidth(bw));
+                let mut s: heapless::String<32> = heapless::String::new();
+                let _ = write!(s, "  -> OK (BW set to {} kHz)\r\n", bw);
+                let _ = write_all(sender, s.as_bytes()).await;
+            } else {
+                let _ = write_all(sender, b"  -> Error: supported BW values are 62.5, 125, 250, 500\r\n").await;
+            }
+        }
+        "get cr" => {
+            let cr = RADIO_SETTINGS.lock(|r| r.borrow().cr);
+            let mut s: heapless::String<32> = heapless::String::new();
+            let _ = write!(s, "  -> 4/{}\r\n", cr);
+            let _ = write_all(sender, s.as_bytes()).await;
+        }
+        s if s.starts_with("set cr ") => {
+            let val = s[7..].trim();
+            let cr_denom = if val == "5" || val == "4/5" {
+                Some(5)
+            } else if val == "6" || val == "4/6" {
+                Some(6)
+            } else if val == "7" || val == "4/7" {
+                Some(7)
+            } else if val == "8" || val == "4/8" {
+                Some(8)
+            } else {
+                None
+            };
+            if let Some(cr) = cr_denom {
+                RADIO_SETTINGS.lock(|r| {
+                    r.borrow_mut().cr = cr;
+                });
+                let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetCodingRate(cr));
+                let mut s: heapless::String<32> = heapless::String::new();
+                let _ = write!(s, "  -> OK (CR set to 4/{})\r\n", cr);
+                let _ = write_all(sender, s.as_bytes()).await;
+            } else {
+                let _ = write_all(sender, b"  -> Error: supported CR values are 4/5, 4/6, 4/7, 4/8\r\n").await;
+            }
         }
         "get repeat" | "get role" => {
-            let _ = write_all(sender, b"  -> on\r\n").await;
+            let is_rep = RADIO_SETTINGS.lock(|r| r.borrow().is_repeater);
+            if is_rep {
+                let _ = write_all(sender, b"  -> on (repeater)\r\n").await;
+            } else {
+                let _ = write_all(sender, b"  -> off (client)\r\n").await;
+            }
+        }
+        s if s.starts_with("set repeat ") || s.starts_with("set role ") => {
+            let val = if s.starts_with("set repeat ") { &s[11..] } else { &s[9..] }.trim();
+            let is_rep = val == "on" || val == "1" || val == "repeater" || val == "true";
+            RADIO_SETTINGS.lock(|r| {
+                r.borrow_mut().is_repeater = is_rep;
+            });
+            let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetRepeat(is_rep));
+            let mut s: heapless::String<32> = heapless::String::new();
+            let _ = write!(s, "  -> OK (Repeater: {})\r\n", if is_rep { "on" } else { "off" });
+            let _ = write_all(sender, s.as_bytes()).await;
+        }
+        s if s.starts_with("send ") => {
+            let msg = s[5..].trim();
+            if msg.is_empty() {
+                let _ = write_all(sender, b"  -> Error: message cannot be empty\r\n").await;
+            } else {
+                let mut s_msg = heapless::String::<128>::new();
+                let _ = s_msg.push_str(msg);
+                let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SendGroupText(s_msg));
+                RADIO_TELEMETRY.lock(|t| {
+                    let mut tel = t.borrow_mut();
+                    tel.tx_beacons = tel.tx_beacons.saturating_add(1);
+                });
+                let _ = write_all(sender, b"  -> OK (Group message broadcast queued)\r\n").await;
+            }
+        }
+        s if s.starts_with("msg ") => {
+            let rest = s[4..].trim();
+            if let Some(space_idx) = rest.find(' ') {
+                let hex_str = &rest[..space_idx];
+                let msg = rest[space_idx + 1..].trim();
+                if hex_str.len() == 8 {
+                    let mut dest = [0u8; 4];
+                    let mut valid = true;
+                    for i in 0..4 {
+                        if let (Some(hi), Some(lo)) = (
+                            hex_to_nibble_opt(hex_str.as_bytes()[i * 2]),
+                            hex_to_nibble_opt(hex_str.as_bytes()[i * 2 + 1]),
+                        ) {
+                            dest[i] = (hi << 4) | lo;
+                        } else {
+                            valid = false;
+                            break;
+                        }
+                    }
+                    if valid && !msg.is_empty() {
+                        let mut s_msg = heapless::String::<128>::new();
+                        let _ = s_msg.push_str(msg);
+                        let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SendDirectText {
+                            dest_hash: dest,
+                            text: s_msg,
+                        });
+                        RADIO_TELEMETRY.lock(|t| {
+                            let mut tel = t.borrow_mut();
+                            tel.tx_beacons = tel.tx_beacons.saturating_add(1);
+                        });
+                        let mut out_str = heapless::String::<64>::new();
+                        let _ = write!(out_str, "  -> OK (Direct message queued to {})\r\n", hex_str);
+                        let _ = write_all(sender, out_str.as_bytes()).await;
+                    } else {
+                        let _ = write_all(sender, b"  -> Error: invalid hex ID or empty text\r\n").await;
+                    }
+                } else {
+                    let _ = write_all(sender, b"  -> Error: target ID must be 8 hex characters (4 bytes)\r\n").await;
+                }
+            } else {
+                let _ = write_all(sender, b"  -> Usage: msg <8-hex-id> <message>\r\n").await;
+            }
+        }
+        "contacts" | "get contacts" => {
+            let contacts_snapshot: heapless::Vec<DiscoveredContact, 32> = DISCOVERED_CONTACTS.lock(|c| c.borrow().clone());
+            if contacts_snapshot.is_empty() {
+                let _ = write_all(sender, b"  -> No contacts discovered yet (listening for adverts...)\r\n").await;
+            } else {
+                let mut hdr = heapless::String::<64>::new();
+                let _ = write!(hdr, "  -> Discovered Contacts ({}):\r\n", contacts_snapshot.len());
+                let _ = write_all(sender, hdr.as_bytes()).await;
+                let _ = write_all(sender, b"  -> ID        CALLSIGN        RSSI     SNR   BAT   SEEN\r\n").await;
+                for c in contacts_snapshot.iter() {
+                    let mut s = heapless::String::<128>::new();
+                    let _ = write!(
+                        s,
+                        "  -> {:02x}{:02x}{:02x}{:02x}  {:<14}  {:>4}dBm  {:>3}dB  {:>3}%  {}s\r\n",
+                        c.node_id[0], c.node_id[1], c.node_id[2], c.node_id[3],
+                        c.callsign.as_str(),
+                        c.rssi, c.snr, c.battery_percentage, c.last_seen_epoch
+                    );
+                    let _ = write_all(sender, s.as_bytes()).await;
+                }
+            }
+        }
+        "clear contacts" => {
+            DISCOVERED_CONTACTS.lock(|c| {
+                c.borrow_mut().clear();
+            });
+            let _ = write_all(sender, b"  -> OK (Contacts cleared)\r\n").await;
+        }
+        "messages" | "inbox" | "get messages" => {
+            let msg_snapshot: heapless::Vec<ReceivedMessage, 16> = MESSAGE_LOG.lock(|m| m.borrow().clone());
+            if msg_snapshot.is_empty() {
+                let _ = write_all(sender, b"  -> No messages received yet\r\n").await;
+            } else {
+                let _ = write_all(sender, b"  -> === Recent Messages ===\r\n").await;
+                for msg in msg_snapshot.iter() {
+                    let mut s = heapless::String::<256>::new();
+                    let mode = if msg.is_direct { "[DM]" } else { "[GRP]" };
+                    let _ = write!(
+                        s,
+                        "  -> {} <{}> {}: {} (RSSI: {}dBm, SNR: {}dB)\r\n",
+                        mode, msg.sender.as_str(), msg.timestamp, msg.text.as_str(), msg.rssi, msg.snr
+                    );
+                    let _ = write_all(sender, s.as_bytes()).await;
+                }
+            }
+        }
+        "clear messages" => {
+            MESSAGE_LOG.lock(|m| {
+                m.borrow_mut().clear();
+            });
+            let _ = write_all(sender, b"  -> OK (Messages cleared)\r\n").await;
         }
         "stats-radio" => {
             let (tx, rx, rssi, snr, has_rx) = RADIO_TELEMETRY.lock(|t| {
@@ -254,13 +577,13 @@ async fn handle_text_cli(
             let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::TriggerAdvert);
             let _ = write_all(sender, b"  -> OK (MeshCore Advert broadcast queued)\r\n").await;
         }
-        "time" => {
+        "time" | "get time" => {
             let mut s: heapless::String<32> = heapless::String::new();
             let _ = write!(s, "  -> {}\r\n", node.epoch_time);
             let _ = write_all(sender, s.as_bytes()).await;
         }
-        s if s.starts_with("time ") => {
-            let time_str = s[5..].trim();
+        s if s.starts_with("set time ") || s.starts_with("time ") => {
+            let time_str = if s.starts_with("set time ") { &s[9..] } else { &s[5..] }.trim();
             let mut epoch = 0u64;
             for &b in time_str.as_bytes() {
                 if b >= b'0' && b <= b'9' {
@@ -280,7 +603,7 @@ async fn handle_text_cli(
             cortex_m::peripheral::SCB::sys_reset();
         }
         "help" => {
-            let _ = write_all(sender, b"  -> Available commands: ver, board, get name, set name <name>, get public.key, get prv.key, set prv.key <hex>, get radio, get freq, get tx, get repeat, stats-radio, stats-core, stats-packets, advert, time, reboot\r\n").await;
+            let _ = write_all(sender, b"  -> Commands:\r\n  ->   Identity: get/set name, get/set prv.key, get public.key\r\n  ->   Radio:    get/set freq, get/set tx, get/set sf, get/set bw, get/set cr, get/set repeat, stats-radio\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, advert, time\r\n  ->   System:   ver, board, stats-core, stats-packets, clear stats/contacts/messages, reboot\r\n").await;
         }
         _ => {
             let _ = write_all(sender, b"  -> Unknown command\r\n").await;

@@ -158,14 +158,62 @@ impl CompanionNode {
 
             CMD_GET_CONTACTS => {
                 // RESP_CODE_CONTACTS (4)
-                // Empty contacts list for initial discovery
+                // Payload: [RESP_CODE, count, [pubkey(32), name_len, name, epoch_le(4), rssi_le(2), snr, bat]...]
                 resp.push(RESP_CODE_CONTACTS).ok()?;
-                resp.push(0).ok()?; // 0 contacts
+                crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| {
+                    let list = c.borrow();
+                    let count = list.len().min(8) as u8; // limit chunk size to stay within 256B frame
+                    resp.push(count).ok()?;
+                    for contact in list.iter().take(count as usize) {
+                        resp.extend_from_slice(&contact.pub_key).ok()?;
+                        let cs = contact.callsign.as_bytes();
+                        let cs_len = cs.len().min(16) as u8;
+                        resp.push(cs_len).ok()?;
+                        resp.extend_from_slice(&cs[..cs_len as usize]).ok()?;
+                        resp.extend_from_slice(&contact.last_seen_epoch.to_le_bytes()).ok()?;
+                        resp.extend_from_slice(&contact.rssi.to_le_bytes()).ok()?;
+                        resp.push(contact.snr as u8).ok()?;
+                        resp.push(contact.battery_percentage).ok()?;
+                    }
+                    Some(())
+                });
+                Some(resp)
+            }
+
+            CMD_SEND_CHANNEL_MSG => {
+                // Inbound channel message: [CMD(3), channel_idx, timestamp(4 bytes le), text...]
+                if payload.len() > 6 {
+                    let text_bytes = &payload[6..];
+                    if let Ok(msg_str) = core::str::from_utf8(text_bytes) {
+                        let mut s = String::<128>::new();
+                        let _ = s.push_str(msg_str);
+                        let _ = crate::companion::usb::USB_COMMAND_CHANNEL.try_send(crate::companion::usb::UsbCommand::SendGroupText(s));
+                    }
+                }
+                resp.push(RESP_CODE_OK).ok()?;
+                Some(resp)
+            }
+
+            CMD_SEND_MSG => {
+                // Inbound direct message: [CMD(2), dest_pubkey(32), timestamp(4 bytes le), text...]
+                if payload.len() > 37 {
+                    let dest_hash = [payload[1], payload[2], payload[3], payload[4]];
+                    let text_bytes = &payload[37..];
+                    if let Ok(msg_str) = core::str::from_utf8(text_bytes) {
+                        let mut s = String::<128>::new();
+                        let _ = s.push_str(msg_str);
+                        let _ = crate::companion::usb::USB_COMMAND_CHANNEL.try_send(crate::companion::usb::UsbCommand::SendDirectText {
+                            dest_hash,
+                            text: s,
+                        });
+                    }
+                }
+                resp.push(RESP_CODE_OK).ok()?;
                 Some(resp)
             }
 
             CMD_SEND_SELF_ADVERT => {
-                // Acknowledge advertisement trigger
+                let _ = crate::companion::usb::USB_COMMAND_CHANNEL.try_send(crate::companion::usb::UsbCommand::TriggerAdvert);
                 resp.push(RESP_CODE_OK).ok()?;
                 Some(resp)
             }
