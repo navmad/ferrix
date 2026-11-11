@@ -243,7 +243,10 @@ impl CompanionNode {
                     if let Ok(msg_str) = core::str::from_utf8(text_bytes) {
                         let mut s = String::<128>::new();
                         let _ = s.push_str(msg_str);
-                        let _ = crate::companion::usb::USB_COMMAND_CHANNEL.try_send(crate::companion::usb::UsbCommand::SendGroupText(s));
+                        let _ = crate::companion::usb::USB_COMMAND_CHANNEL.try_send(crate::companion::usb::UsbCommand::SendGroupText {
+                            channel_idx: 0,
+                            text: s,
+                        });
                     }
                 }
                 let mut resp = Vec::<u8, 4>::new();

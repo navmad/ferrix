@@ -1028,6 +1028,7 @@ dependencies = [
  "embedded-hal-async",
  "embedded-hal-bus",
  "embedded-io-async",
+ "embedded-storage-async",
  "heapless 0.8.0",
  "lora-phy",
  "nmea",

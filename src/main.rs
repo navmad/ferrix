@@ -8,6 +8,7 @@ pub mod gps;
 pub mod input;
 pub mod meshcore;
 pub mod radio;
+pub mod storage;
 pub mod telemetry;
 
 use defmt::info;
@@ -83,8 +84,16 @@ async fn main(spawner: Spawner) {
 
     let mut board = CurrentBoard::init(p);
 
-    // Initialize native MeshCore Routing Engine & Local Cryptographic Identity from hardware FICR
-    let local_id = LocalIdentity::from_hardware(CurrentBoard::NAME);
+    // Initialize persistent configuration from flash
+    let (node_name, custom_key) = crate::storage::init_config();
+
+    // Initialize native MeshCore Routing Engine & Local Cryptographic Identity
+    let local_id = if let Some(key) = custom_key {
+        LocalIdentity::from_secret_key(node_name.as_str(), &key)
+    } else {
+        let seed = crate::meshcore::identity::hardware_seed();
+        LocalIdentity::from_secret_key(node_name.as_str(), &seed)
+    };
     let pub_key = local_id.pub_key_bytes();
     let priv_key = local_id.signing_key_bytes();
     let mut mesh = MeshEngine::new(local_id, true);
@@ -100,7 +109,7 @@ async fn main(spawner: Spawner) {
 
     // Initial node companion state
     let mut node = CompanionNode::new(
-        CurrentBoard::NAME,
+        node_name.as_str(),
         CurrentBoard::NAME,
         CurrentBoard::CAPABILITIES,
         pub_key,
@@ -346,10 +355,10 @@ async fn main(spawner: Spawner) {
                         node.battery_percentage,
                     );
                 }
-                UsbCommand::SendGroupText(msg) => {
-                    info!("Queuing MeshCore Group Text: {}", msg.as_str());
+                UsbCommand::SendGroupText { channel_idx: _, text } => {
+                    info!("Queuing MeshCore Group Text: {}", text.as_str());
                     node.tx_beacons = node.tx_beacons.saturating_add(1);
-                    let _ = mesh.queue_group_text(0, msg.as_str(), node.epoch_time as u32);
+                    let _ = mesh.queue_group_text(0, text.as_str(), node.epoch_time as u32);
                 }
                 UsbCommand::SendDirectText { dest_hash, text } => {
                     info!("Queuing MeshCore Direct Text to {:?}: {}", dest_hash, text.as_str());

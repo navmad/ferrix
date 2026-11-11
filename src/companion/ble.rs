@@ -236,6 +236,7 @@ pub async fn ble_companion_supervisor_task(
     let sd = Softdevice::enable(&sd_config);
     if let Ok(server) = MeshCoreGattServer::new(sd) {
         if spawner.spawn(softdevice_task(sd)).is_ok()
+            && spawner.spawn(crate::storage::storage_task(sd)).is_ok()
             && spawner.spawn(ble_companion_task(sd, server, public_key, private_key)).is_ok()
         {
             info!("MeshCore BLE companion service successfully started!");

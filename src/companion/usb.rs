@@ -53,6 +53,68 @@ pub static MESSAGE_LOG: Mutex<CriticalSectionRawMutex, RefCell<heapless::Vec<Rec
     Mutex::new(RefCell::new(heapless::Vec::new()));
 
 #[derive(Clone, Copy, Debug)]
+pub struct ChannelData {
+    pub name: [u8; 32],
+    pub secret: [u8; 16],
+}
+
+pub const DEFAULT_PUBLIC_SECRET: [u8; 16] = [
+    0x8b, 0x33, 0x87, 0xe9, 0xc5, 0xcd, 0xea, 0x6a,
+    0xc9, 0xe5, 0xed, 0xba, 0xa1, 0x15, 0xcd, 0x72,
+];
+
+const fn default_channels() -> [ChannelData; 8] {
+    let mut chs = [ChannelData {
+        name: [0u8; 32],
+        secret: [0u8; 16],
+    }; 8];
+    chs[0].name[0] = b'P';
+    chs[0].name[1] = b'u';
+    chs[0].name[2] = b'b';
+    chs[0].name[3] = b'l';
+    chs[0].name[4] = b'i';
+    chs[0].name[5] = b'c';
+    chs[0].secret = DEFAULT_PUBLIC_SECRET;
+    chs
+}
+
+pub static CHANNELS: Mutex<CriticalSectionRawMutex, RefCell<[ChannelData; 8]>> =
+    Mutex::new(RefCell::new(default_channels()));
+
+#[derive(Clone, Copy, Debug)]
+pub struct DeviceClock {
+    pub base_epoch: u32,
+    pub base_instant_secs: u64,
+}
+
+pub static DEVICE_CLOCK: Mutex<CriticalSectionRawMutex, RefCell<DeviceClock>> =
+    Mutex::new(RefCell::new(DeviceClock {
+        base_epoch: 0,
+        base_instant_secs: 0,
+    }));
+
+pub fn get_device_time() -> u32 {
+    DEVICE_CLOCK.lock(|c| {
+        let clock = c.borrow();
+        if clock.base_epoch == 0 {
+            0
+        } else {
+            let elapsed = embassy_time::Instant::now().as_secs().saturating_sub(clock.base_instant_secs);
+            clock.base_epoch.saturating_add(elapsed as u32)
+        }
+    })
+}
+
+pub fn set_device_time(epoch: u32) {
+    DEVICE_CLOCK.lock(|c| {
+        *c.borrow_mut() = DeviceClock {
+            base_epoch: epoch,
+            base_instant_secs: embassy_time::Instant::now().as_secs(),
+        };
+    });
+}
+
+#[derive(Clone, Copy, Debug)]
 pub struct RadioTelemetry {
     pub tx_beacons: u32,
     pub rx_packets: u32,
@@ -75,7 +137,10 @@ pub enum UsbCommand {
     SetPrivateKey([u8; 32]),
     SetTime(u64),
     TriggerAdvert,
-    SendGroupText(heapless::String<128>),
+    SendGroupText {
+        channel_idx: u8,
+        text: heapless::String<128>,
+    },
     SendDirectText {
         dest_hash: [u8; 4],
         text: heapless::String<128>,
@@ -164,9 +229,10 @@ async fn handle_text_cli(
     let _ = write_all(sender, b"\r\n").await;
 
     match trimmed {
-        "get name" => {
+        "get name" | "name" => {
             let mut s: heapless::String<64> = heapless::String::new();
-            let _ = write!(s, "  -> > {}\r\n", node.callsign.as_str());
+            let callsign = crate::storage::get_callsign();
+            let _ = write!(s, "  -> > {}\r\n", callsign.as_str());
             let _ = write_all(sender, s.as_bytes()).await;
         }
         "get public.key" | "get public_key" | "public.key" | "get pubkey" => {
@@ -199,6 +265,7 @@ async fn handle_text_cli(
                 node.private_key = key;
                 let signing_key = crate::meshcore::crypto::SigningKey::from_bytes(&key);
                 node.public_key = signing_key.verifying_key().to_bytes();
+                crate::storage::set_custom_priv_key(key);
                 info!("Node private & public key updated via CLI");
                 let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetPrivateKey(key));
                 let _ = write_all(sender, b"  -> OK\r\n").await;
@@ -206,7 +273,7 @@ async fn handle_text_cli(
                 let _ = write_all(sender, b"  -> Error, bad hex\r\n").await;
             }
         }
-        "set name" | "name" => {
+        "set name" => {
             let _ = write_all(sender, b"  -> Error, bad chars\r\n").await;
         }
         s if s.starts_with("set name ") || s.starts_with("name ") => {
@@ -233,6 +300,7 @@ async fn handle_text_cli(
                 });
 
             if is_valid {
+                crate::storage::set_callsign(new_name);
                 node.callsign.clear();
                 let _ = node.callsign.push_str(new_name);
                 info!("Node callsign updated to: {}", new_name);
@@ -286,6 +354,7 @@ async fn handle_text_cli(
                     RADIO_SETTINGS.lock(|r| {
                         r.borrow_mut().frequency_hz = f;
                     });
+                    crate::storage::request_save_config();
                     let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetFrequency(f));
                     let mut s: heapless::String<64> = heapless::String::new();
                     let _ = write!(s, "  -> OK (Freq set to {:.3} MHz)\r\n", f as f32 / 1_000_000.0);
@@ -309,6 +378,7 @@ async fn handle_text_cli(
                     RADIO_SETTINGS.lock(|r| {
                         r.borrow_mut().tx_power_dbm = tx;
                     });
+                    crate::storage::request_save_config();
                     let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetTxPower(tx));
                     let mut s: heapless::String<32> = heapless::String::new();
                     let _ = write!(s, "  -> OK (TX set to {} dBm)\r\n", tx);
@@ -333,6 +403,7 @@ async fn handle_text_cli(
                     RADIO_SETTINGS.lock(|r| {
                         r.borrow_mut().sf = sf;
                     });
+                    crate::storage::request_save_config();
                     let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetSpreadingFactor(sf));
                     let mut s: heapless::String<32> = heapless::String::new();
                     let _ = write!(s, "  -> OK (SF set to {})\r\n", sf);
@@ -367,6 +438,7 @@ async fn handle_text_cli(
                 RADIO_SETTINGS.lock(|r| {
                     r.borrow_mut().bw_khz = bw;
                 });
+                crate::storage::request_save_config();
                 let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetBandwidth(bw));
                 let mut s: heapless::String<32> = heapless::String::new();
                 let _ = write!(s, "  -> OK (BW set to {} kHz)\r\n", bw);
@@ -398,6 +470,7 @@ async fn handle_text_cli(
                 RADIO_SETTINGS.lock(|r| {
                     r.borrow_mut().cr = cr;
                 });
+                crate::storage::request_save_config();
                 let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetCodingRate(cr));
                 let mut s: heapless::String<32> = heapless::String::new();
                 let _ = write!(s, "  -> OK (CR set to 4/{})\r\n", cr);
@@ -420,6 +493,7 @@ async fn handle_text_cli(
             RADIO_SETTINGS.lock(|r| {
                 r.borrow_mut().is_repeater = is_rep;
             });
+            crate::storage::request_save_config();
             let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetRepeat(is_rep));
             let mut s: heapless::String<32> = heapless::String::new();
             let _ = write!(s, "  -> OK (Repeater: {})\r\n", if is_rep { "on" } else { "off" });
@@ -432,7 +506,10 @@ async fn handle_text_cli(
             } else {
                 let mut s_msg = heapless::String::<128>::new();
                 let _ = s_msg.push_str(msg);
-                let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SendGroupText(s_msg));
+                let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SendGroupText {
+                    channel_idx: 0,
+                    text: s_msg,
+                });
                 RADIO_TELEMETRY.lock(|t| {
                     let mut tel = t.borrow_mut();
                     tel.tx_beacons = tel.tx_beacons.saturating_add(1);
@@ -605,7 +682,8 @@ async fn handle_text_cli(
         }
         "time" | "get time" => {
             let mut s: heapless::String<32> = heapless::String::new();
-            let _ = write!(s, "  -> {}\r\n", node.epoch_time);
+            let epoch = get_device_time();
+            let _ = write!(s, "  -> {}\r\n", epoch);
             let _ = write_all(sender, s.as_bytes()).await;
         }
         s if s.starts_with("set time ") || s.starts_with("time ") => {
@@ -617,8 +695,24 @@ async fn handle_text_cli(
                 }
             }
             node.epoch_time = epoch;
+            set_device_time(epoch as u32);
             let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetTime(epoch));
             let _ = write_all(sender, b"  -> OK (Clock synchronized)\r\n").await;
+        }
+        "channels" | "channel" => {
+            let mut buf: heapless::String<256> = heapless::String::new();
+            let _ = write!(buf, "Channels:\r\n");
+            CHANNELS.lock(|c| {
+                let list = c.borrow();
+                for (i, ch) in list.iter().enumerate() {
+                    let name_len = ch.name.iter().position(|&b| b == 0).unwrap_or(32);
+                    if name_len > 0 {
+                        let name_str = core::str::from_utf8(&ch.name[..name_len]).unwrap_or("<invalid>");
+                        let _ = write!(buf, "  [{}] {}\r\n", i, name_str);
+                    }
+                }
+            });
+            let _ = write_all(sender, buf.as_bytes()).await;
         }
         "clock sync" | "sync_time" => {
             let _ = write_all(sender, b"  -> OK\r\n").await;
@@ -633,8 +727,12 @@ async fn handle_text_cli(
             embassy_time::Timer::after_millis(50).await;
             cortex_m::peripheral::SCB::sys_reset();
         }
+        "save" => {
+            crate::storage::request_save_config();
+            let _ = write_all(sender, b"  -> OK (Config save queued to flash)\r\n").await;
+        }
         "help" => {
-            let _ = write_all(sender, b"  -> Commands:\r\n  ->   Identity: get/set name, get/set prv.key, get public.key\r\n  ->   Radio:    get/set freq, get/set tx, get/set sf, get/set bw, get/set cr, get/set repeat, stats-radio\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, advert, time\r\n  ->   System:   ver, board, stats-core, stats-packets, clear stats/contacts/messages, reboot\r\n").await;
+            let _ = write_all(sender, b"  -> Commands:\r\n  ->   Identity: get/set name, get/set prv.key, get public.key\r\n  ->   Radio:    get/set freq, get/set tx, get/set sf, get/set bw, get/set cr, get/set repeat, stats-radio\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, advert, time, channels\r\n  ->   System:   save, ver, board, stats-core, stats-packets, clear stats/contacts/messages, reboot\r\n").await;
         }
         _ => {
             let _ = write_all(sender, b"  -> Unknown command\r\n").await;
@@ -654,8 +752,9 @@ pub async fn cdc_acm_task(
     private_key: [u8; 32],
 ) -> ! {
     let (mut sender, mut receiver, control) = class.split_with_control();
+    let callsign = crate::storage::get_callsign();
     let mut node = CompanionNode::new(
-        CurrentBoard::NAME,
+        callsign.as_str(),
         CurrentBoard::NAME,
         CurrentBoard::CAPABILITIES,
         public_key,

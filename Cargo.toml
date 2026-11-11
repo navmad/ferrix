@@ -24,6 +24,7 @@ embedded-hal = "1.0"
 embedded-hal-async = "1.0"
 embedded-hal-bus = { version = "0.2", features = ["async"] }
 embedded-io-async = { version = "0.6", features = ["defmt-03"] }
+embedded-storage-async = "0.4"
 embedded-graphics = "0.8"
 lora-phy = "3.0.1"
 nrf-softdevice = { git = "https://github.com/embassy-rs/nrf-softdevice.git", rev = "5949a5b", features = ["nrf52840", "s140", "ble-peripheral", "ble-gatt-server", "ble-sec", "defmt"] }
