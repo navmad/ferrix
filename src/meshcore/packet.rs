@@ -98,6 +98,40 @@ impl Packet {
         rt == ROUTE_TYPE_TRANSPORT_FLOOD || rt == ROUTE_TYPE_TRANSPORT_DIRECT
     }
 
+    /// Returns the hash size in bytes for each hop in the path (1 to 4 bytes).
+    /// Encoded in bits 7-6: `(path_len >> 6) + 1`
+    #[inline]
+    pub fn path_hash_size(&self) -> usize {
+        ((self.path_len >> 6) as usize) + 1
+    }
+
+    /// Returns the number of hops recorded in the path (0 to 63).
+    /// Encoded in bits 5-0: `path_len & 63`
+    #[inline]
+    pub fn path_hash_count(&self) -> usize {
+        (self.path_len & 63) as usize
+    }
+
+    /// Total byte length occupied by path hashes on the wire (`count * size`)
+    #[inline]
+    pub fn path_byte_len(&self) -> usize {
+        self.path_hash_count() * self.path_hash_size()
+    }
+
+    /// Check if a wire `path_len` byte encodes a valid hop count and size
+    #[inline]
+    pub fn is_valid_path_len(path_len: u8) -> bool {
+        let count = (path_len & 63) as usize;
+        let size = ((path_len >> 6) as usize) + 1;
+        count * size <= MAX_PATH_SIZE
+    }
+
+    /// Set path hash size and hop count
+    pub fn set_path_hash_size_and_count(&mut self, size: u8, count: u8) {
+        let sz = if size == 0 { 0 } else { (size - 1) & 0x03 };
+        self.path_len = (sz << 6) | (count & 63);
+    }
+
     /// Set payload bytes
     pub fn set_payload(&mut self, data: &[u8]) -> Result<(), ()> {
         if data.len() > MAX_PACKET_PAYLOAD {
@@ -110,9 +144,16 @@ impl Packet {
 
     /// Appends a node hash to the path if within capacity
     pub fn append_hop(&mut self, node_hash: u8) -> bool {
-        if (self.path_len as usize) < MAX_PATH_SIZE {
-            self.path[self.path_len as usize] = node_hash;
-            self.path_len += 1;
+        let count = self.path_hash_count();
+        let size = self.path_hash_size();
+        let next_bytes = (count + 1) * size;
+        if next_bytes <= MAX_PATH_SIZE {
+            let offset = count * size;
+            self.path[offset] = node_hash;
+            for i in 1..size {
+                self.path[offset + i] = 0;
+            }
+            self.set_path_hash_size_and_count(size as u8, (count + 1) as u8);
             true
         } else {
             false
@@ -141,15 +182,15 @@ impl Packet {
             offset += 4;
         }
 
-        // 3. Path length
+        // 3. Path length byte (encodes both hash_size and hash_count)
         if dest.len() <= offset {
             return Err(());
         }
         dest[offset] = self.path_len;
         offset += 1;
 
-        // 4. Path bytes
-        let path_bytes = self.path_len as usize;
+        // 4. Path bytes (hash_count * hash_size)
+        let path_bytes = self.path_byte_len();
         if dest.len() < offset + path_bytes {
             return Err(());
         }
@@ -197,8 +238,14 @@ impl Packet {
         let path_len = src[offset];
         offset += 1;
 
-        let path_bytes = path_len as usize;
-        if path_bytes > MAX_PATH_SIZE || src.len() < offset + path_bytes {
+        if !Packet::is_valid_path_len(path_len) {
+            return Err(());
+        }
+        let hash_count = (path_len & 63) as usize;
+        let hash_size = ((path_len >> 6) as usize) + 1;
+        let path_bytes = hash_count * hash_size;
+
+        if src.len() < offset + path_bytes {
             return Err(());
         }
 

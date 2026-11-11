@@ -107,7 +107,7 @@ impl MeshEngine {
     /// Process a packet received over the LoRa radio interface
     pub fn handle_inbound_packet(&mut self, pkt: Packet) -> InboundAction {
         // 1. Check hop limits
-        if pkt.path_len >= self.max_hops {
+        if pkt.path_hash_count() >= self.max_hops as usize {
             return InboundAction::DropHopLimitExceeded;
         }
 
@@ -151,10 +151,10 @@ impl MeshEngine {
 
                     if let Some((ch_idx, grp)) = matched {
                         if grp.sender.as_str() == self.identity.callsign() {
-                            if pkt.path_len >= 1 {
+                            if pkt.path_hash_count() >= 1 {
                                 InboundAction::ReceivedRepeaterEcho {
                                     pkt_hash: pkt.calculate_packet_hash(),
-                                    hops: pkt.path_len,
+                                    hops: pkt.path_hash_count() as u8,
                                 }
                             } else {
                                 InboundAction::DropDuplicate

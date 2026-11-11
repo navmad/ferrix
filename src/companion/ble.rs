@@ -41,7 +41,7 @@ pub struct MeshCoreGattServer {
     pub nus: NordicUartService,
 }
 
-pub static COMPANION_PUSH_CHANNEL: Channel<CriticalSectionRawMutex, Vec<u8, 256>, 4> = Channel::new();
+pub static COMPANION_PUSH_CHANNEL: Channel<CriticalSectionRawMutex, Vec<u8, 256>, 16> = Channel::new();
 
 pub struct MeshCoreSecurityHandler;
 
@@ -155,13 +155,16 @@ pub async fn ble_companion_task(
 
         let gatt_fut = gatt_server::run(&conn, &server, |event| match event {
             MeshCoreGattServerEvent::Nus(NordicUartServiceEvent::RxWrite(data)) => {
-                debug!("BLE NUS received {} bytes", data.len());
+                info!("BLE command received ({} bytes): opcode=0x{:02x}", data.len(), data.first().copied().unwrap_or(0));
                 node.handle_command(data.as_slice(), |resp| {
                     let mut vec = Vec::<u8, 256>::new();
                     let copy_len = resp.len().min(247);
                     let _ = vec.extend_from_slice(&resp[..copy_len]);
                     let _ = server.nus.tx_notify(&conn, &vec);
                 });
+            }
+            MeshCoreGattServerEvent::Nus(NordicUartServiceEvent::TxCccdWrite { notifications }) => {
+                info!("BLE NUS notifications configured: enabled={}", notifications);
             }
             _ => {}
         });
@@ -174,6 +177,8 @@ pub async fn ble_companion_task(
                 let _ = vec.extend_from_slice(&msg[..copy_len]);
                 if let Err(e) = server.nus.tx_notify(&conn, &vec) {
                     debug!("BLE NUS tx_notify push failed: {:?}", e);
+                } else {
+                    info!("BLE NUS push sent to phone: code=0x{:02x}, len={}", vec.first().copied().unwrap_or(0), vec.len());
                 }
             }
         };

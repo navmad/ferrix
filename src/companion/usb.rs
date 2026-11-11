@@ -139,6 +139,7 @@ pub enum UsbCommand {
     TriggerAdvert,
     SendGroupText {
         channel_idx: u8,
+        timestamp: u32,
         text: heapless::String<128>,
     },
     SendDirectText {
@@ -508,6 +509,7 @@ async fn handle_text_cli(
                 let _ = s_msg.push_str(msg);
                 let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SendGroupText {
                     channel_idx: 0,
+                    timestamp: get_device_time(),
                     text: s_msg,
                 });
                 RADIO_TELEMETRY.lock(|t| {

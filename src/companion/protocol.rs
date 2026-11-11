@@ -18,6 +18,7 @@ pub const CMD_GET_BAT: u8 = 19;
 pub const CMD_DEVICE_QUERY: u8 = 22;
 pub const CMD_GET_CHANNEL: u8 = 31;
 pub const CMD_SET_CHANNEL: u8 = 32;
+pub const CMD_SEND_CHANNEL_DATA: u8 = 0x3E;
 
 pub const RESP_CODE_OK: u8 = 0;
 pub const RESP_CODE_ERR: u8 = 1;
@@ -348,14 +349,46 @@ impl CompanionNode {
                 // [CMD(3), txt_type(1), channel_idx(1), timestamp(4 bytes le), text...]
                 if payload.len() > 7 {
                     let channel_idx = payload[2];
+                    let timestamp = u32::from_le_bytes([payload[3], payload[4], payload[5], payload[6]]);
                     let text_bytes = &payload[7..];
                     if let Ok(msg_str) = core::str::from_utf8(text_bytes) {
                         let mut s = String::<128>::new();
                         let _ = s.push_str(msg_str);
                         let _ = crate::companion::usb::USB_COMMAND_CHANNEL.try_send(crate::companion::usb::UsbCommand::SendGroupText {
                             channel_idx,
+                            timestamp,
                             text: s,
                         });
+                    }
+                }
+                let mut resp = Vec::<u8, 4>::new();
+                let _ = resp.push(RESP_CODE_OK);
+                emit(&resp);
+            }
+
+            CMD_SEND_CHANNEL_DATA => {
+                // Inbound channel datagram layout:
+                // [CMD(0x3E), channel_idx(1), path_len(1), path..., data_type(2), payload...]
+                if payload.len() >= 5 {
+                    let channel_idx = payload[1];
+                    let path_len = payload[2];
+                    let hash_count = (path_len & 63) as usize;
+                    let hash_size = ((path_len >> 6) as usize) + 1;
+                    let path_bytes = if path_len == 0xFF { 0 } else { hash_count * hash_size };
+                    let data_offset = 3 + path_bytes;
+                    if payload.len() >= data_offset + 2 {
+                        let _data_type = u16::from_le_bytes([payload[data_offset], payload[data_offset + 1]]);
+                        let text_bytes = &payload[data_offset + 2..];
+                        if let Ok(msg_str) = core::str::from_utf8(text_bytes) {
+                            let mut s = String::<128>::new();
+                            let _ = s.push_str(msg_str);
+                            let now = crate::companion::usb::get_device_time();
+                            let _ = crate::companion::usb::USB_COMMAND_CHANNEL.try_send(crate::companion::usb::UsbCommand::SendGroupText {
+                                channel_idx,
+                                timestamp: now,
+                                text: s,
+                            });
+                        }
                     }
                 }
                 let mut resp = Vec::<u8, 4>::new();

@@ -433,8 +433,8 @@ async fn main(spawner: Spawner) {
                         node.battery_percentage,
                     );
                 }
-                UsbCommand::SendGroupText { channel_idx, text } => {
-                    info!("Queuing MeshCore Group Text on ch {}: {}", channel_idx, text.as_str());
+                UsbCommand::SendGroupText { channel_idx, timestamp, text } => {
+                    info!("Queuing MeshCore Group Text on ch {}: {} (ts: {})", channel_idx, text.as_str(), timestamp);
                     let (ch_hash, secret) = crate::companion::usb::CHANNELS.lock(|chs| {
                         let list = chs.borrow();
                         if (channel_idx as usize) < list.len() {
@@ -444,9 +444,8 @@ async fn main(spawner: Spawner) {
                             (0, [0u8; 16])
                         }
                     });
-                    let time = crate::companion::usb::get_device_time();
                     node.tx_beacons = node.tx_beacons.saturating_add(1);
-                    if let Ok(pkt) = mesh.queue_group_text(ch_hash, &secret, text.as_str(), time) {
+                    if let Ok(pkt) = mesh.queue_group_text(ch_hash, &secret, text.as_str(), timestamp) {
                         track_outbound_packet(&pkt);
                     }
                 }
