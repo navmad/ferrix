@@ -68,6 +68,9 @@ pub struct CompanionNode {
     pub last_snr: i8,
     pub current_page: u8,
     pub path_hash_mode: u8,
+    /// Tracks how many channels have been synced since the last connection.
+    /// Used to defer connection parameter updates until after the sync burst.
+    pub channels_synced: u8,
 }
 
 impl CompanionNode {
@@ -100,6 +103,7 @@ impl CompanionNode {
             last_snr: 0,
             current_page: 0,
             path_hash_mode: crate::storage::get_path_hash_mode(),
+            channels_synced: 0,
         }
     }
 
@@ -115,6 +119,8 @@ impl CompanionNode {
 
         match cmd {
             CMD_DEVICE_QUERY => {
+                // Reset channel sync counter on each new device query (app reconnection).
+                self.channels_synced = 0;
                 // RESP_CODE_DEVICE_INFO (13)
                 // Protocol v3+ official layout:
                 // [code(13), firmware_ver(14), max_contacts_div_2(50), max_channels(8), ble_pin(u32_le), build_date(12), model(40), semver(20), offgrid(0), path_hash_mode(u8)]
@@ -216,6 +222,7 @@ impl CompanionNode {
             CMD_GET_CHANNEL => {
                 // Inbound: [CMD(31 / 0x1F), channel_idx]
                 let channel_idx = if payload.len() > 1 { payload[1] } else { 0 };
+                self.channels_synced = self.channels_synced.saturating_add(1);
                 let mut resp = Vec::<u8, 64>::new();
                 let _ = resp.push(RESP_CODE_CHANNEL_INFO); // 18 (0x12)
                 let _ = resp.push(channel_idx);

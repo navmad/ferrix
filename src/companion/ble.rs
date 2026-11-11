@@ -3,6 +3,8 @@
 //! Exposes Nordic UART Service (NUS) over BLE GATT, enabling official MeshCore
 //! mobile apps (iOS & Android) to discover, pair, and communicate with ThinkNode M1.
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use defmt::{debug, error, info};
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::channel::Channel;
@@ -144,12 +146,18 @@ pub async fn ble_companion_task(
 
     loop {
         info!("BLE: Waiting for pairable connection from MeshCore companion app (PIN 123456)...");
+        // Flag to signal when channel sync is complete, so we can defer connection
+        // parameter updates until after the sync burst (matching the reference firmware behavior).
+        let sync_done = AtomicBool::new(false);
+
         let conn = match peripheral::advertise_pairable(sd, adv, &config, &SECURITY_HANDLER).await {
             Ok(mut c) => {
                 info!("BLE: Phone connected & pairing!");
                 // Request maximum BLE data length (251 bytes) instead of the default 27 bytes.
                 // This increases throughput for channel sync and other large responses.
                 let _ = c.data_length_update(None);
+                // Disable slave latency during sync so the device wakes at every connection event.
+                let _ = c.ignore_slave_latency(true);
                 c
             }
             Err(e) => {
@@ -168,6 +176,12 @@ pub async fn ble_companion_task(
                     let _ = vec.extend_from_slice(&resp[..copy_len]);
                     let _ = server.nus.tx_notify(&conn, &vec);
                 });
+                // After handling a command, check if all 8 channels have been synced.
+                // If so, signal the background task to update connection parameters.
+                if node.channels_synced >= 8 && !sync_done.load(Ordering::Relaxed) {
+                    sync_done.store(true, Ordering::Relaxed);
+                    info!("BLE: Channel sync complete, will update connection params");
+                }
             }
             MeshCoreGattServerEvent::Nus(NordicUartServiceEvent::TxCccdWrite { notifications }) => {
                 info!("BLE NUS notifications configured: enabled={}", notifications);
@@ -189,16 +203,38 @@ pub async fn ble_companion_task(
             }
         };
 
-        match embassy_futures::select::select(gatt_fut, push_fut).await {
-            embassy_futures::select::Either::First(e) => {
+        // Background task that waits for channel sync to complete, then requests fast
+        // connection parameters (15ms interval) for faster post-sync interaction.
+        // This matches the reference firmware's deferred connection parameter update pattern.
+        let conn_params_fut = async {
+            while !sync_done.load(Ordering::Relaxed) {
+                embassy_time::Timer::after_millis(100).await;
+            }
+            // Small delay to ensure the last response has been sent before changing params.
+            embassy_time::Timer::after_millis(200).await;
+            info!("BLE: Requesting fast connection interval (15ms) after sync");
+            let _ = conn.set_conn_params(nrf_softdevice::raw::ble_gap_conn_params_t {
+                min_conn_interval: 12,  // 15 ms (12 * 1.25ms) — minimum iOS accepts
+                max_conn_interval: 12,  // 15 ms
+                slave_latency: 0,       // connect every interval
+                conn_sup_timeout: 40,   // 4000 ms (40 * 100ms)
+            });
+        };
+
+        match embassy_futures::select::select3(gatt_fut, push_fut, conn_params_fut).await {
+            embassy_futures::select::Either3::First(e) => {
                 info!("BLE: Phone disconnected ({:?}), resuming advertising...", e);
             }
-            embassy_futures::select::Either::Second(_) => {}
+            embassy_futures::select::Either3::Second(_) => {}
+            embassy_futures::select::Either3::Third(_) => {
+                // Connection params task completed; this shouldn't happen since it's a one-shot
+                // that completes after set_conn_params, but the select3 requires handling all arms.
+            }
         }
     }
 }
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::AtomicU32;
 
 pub static BLE_STATUS: AtomicU32 = AtomicU32::new(0);
 
