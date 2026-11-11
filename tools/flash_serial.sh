@@ -19,7 +19,7 @@ TARGET="thumbv7em-none-eabihf"
 # Locate adafruit-nrfutil
 NRFUTIL=""
 if command -v adafruit-nrfutil &>/dev/null; then
-    NRFUTIL="adafruit-nrfutil"
+    NRFUTIL="$(command -v adafruit-nrfutil)"
 elif [ -x "${HOME}/.local/bin/adafruit-nrfutil" ]; then
     NRFUTIL="${HOME}/.local/bin/adafruit-nrfutil"
 else
@@ -108,19 +108,63 @@ echo "==> Generating Nordic DFU package (.zip)..."
     --application "${HEX}" \
     "${ZIP}"
 
+# Determine Python interpreter powering adafruit-nrfutil (contains pySerial)
+NRFUTIL_PYTHON=""
+if [ -f "${NRFUTIL}" ]; then
+    NRFUTIL_PYTHON="$(head -n 1 "${NRFUTIL}" | sed 's/^#!//')"
+fi
+
 echo "==> Checking device state..."
-# If MeshCore/the reference firmware companion firmware is running, trigger 1200-baud touch via stty to enter bootloader
+# If MeshCore/the reference firmware companion firmware is running, trigger 1200-baud touch to enter bootloader
 if ioreg -p IOUSB -l -w 0 2>/dev/null | grep -E -q "MeshCore|the reference firmware"; then
     echo "==> MeshCore application active. Sending 1200-baud touch to enter bootloader..."
-    stty -f "${PORT}" 1200 2>/dev/null || true
-    sleep 0.5
-    for i in $(seq 1 30); do
+    PYTHON_CMD=""
+    if [ -x "${NRFUTIL_PYTHON}" ]; then
+        PYTHON_CMD="${NRFUTIL_PYTHON}"
+    elif [ -x "${HOME}/.local/share/uv/tools/adafruit-nrfutil/bin/python" ]; then
+        PYTHON_CMD="${HOME}/.local/share/uv/tools/adafruit-nrfutil/bin/python"
+    fi
+
+    if [ -n "${PYTHON_CMD}" ]; then
+        "${PYTHON_CMD}" -c "
+import serial
+try:
+    s = serial.Serial('${PORT}', 115200, timeout=0.2)
+    s.write(b'dfu\r\n')
+    s.flush()
+    s.close()
+except Exception:
+    pass
+try:
+    s = serial.Serial('${PORT}', 1200, timeout=0.5)
+    s.close()
+except Exception:
+    pass
+" 2>/dev/null || true
+    fi
+    sleep 1.0
+    IN_BOOTLOADER=false
+    for i in $(seq 1 40); do
         if ioreg -p IOUSB -l -w 0 2>/dev/null | grep -q "ThinkNodeM1"; then
+            IN_BOOTLOADER=true
             break
         fi
         sleep 0.2
     done
+
+    if [ "${IN_BOOTLOADER}" != "true" ]; then
+        echo "ERROR: Device failed to enter bootloader via 1200-baud touch." >&2
+        echo "Please double-click the reset button on your device to enter bootloader manually, then re-run this script." >&2
+        exit 1
+    fi
+    # Allow macOS kernel to complete USB CDC re-enumeration
     sleep 2.0
+    for p in /dev/cu.usbmodem*; do
+        if [ -e "${p}" ] && [[ "${p}" != *HA0F* ]]; then
+            PORT="${p}"
+            break
+        fi
+    done
     echo "==> Bootloader active on ${PORT}"
 fi
 

@@ -123,10 +123,17 @@ static CDC_STATE: StaticCell<State> = StaticCell::new();
 /// Reboot the nRF52840 directly into the DFU Bootloader
 pub fn reboot_to_bootloader() -> ! {
     info!("Rebooting into Adafruit DFU Bootloader (GPREGRET=0x57)...");
-    unsafe {
-        // NRF_POWER->GPREGRET (0x4000051C) = 0x57 (DFU Magic value)
-        let gpregret = (0x4000_0000 + 0x51C) as *mut u32;
-        gpregret.write_volatile(0x57);
+    let sd_active = crate::companion::ble::BLE_STATUS.load(core::sync::atomic::Ordering::Relaxed) >= 3;
+    if sd_active {
+        unsafe {
+            let _ = nrf_softdevice::raw::sd_power_gpregret_clr(0, 0xFF);
+            let _ = nrf_softdevice::raw::sd_power_gpregret_set(0, 0x57);
+        }
+    } else {
+        unsafe {
+            let gpregret = (0x4000_0000 + 0x51C) as *mut u32;
+            gpregret.write_volatile(0x57);
+        }
     }
     cortex_m::peripheral::SCB::sys_reset();
 }
@@ -664,6 +671,11 @@ pub async fn cdc_acm_task(
         receiver.wait_connection().await;
         info!("USB CDC-ACM Connected");
 
+        if receiver.line_coding().data_rate() == 1200 {
+            embassy_time::Timer::after_millis(150).await;
+            reboot_to_bootloader();
+        }
+
         loop {
             let changed_fut = control.control_changed();
             let mut rx_buf = [0u8; 64];
@@ -673,7 +685,7 @@ pub async fn cdc_acm_task(
                 embassy_futures::select::Either::First(_) => {
                     let rate = receiver.line_coding().data_rate();
                     if rate == 1200 {
-                        embassy_time::Timer::after_millis(30).await;
+                        embassy_time::Timer::after_millis(150).await;
                         reboot_to_bootloader();
                     }
                 }
@@ -682,7 +694,7 @@ pub async fn cdc_acm_task(
                         Ok(n) => {
                             let rate = receiver.line_coding().data_rate();
                             if rate == 1200 {
-                                embassy_time::Timer::after_millis(30).await;
+                                embassy_time::Timer::after_millis(150).await;
                                 reboot_to_bootloader();
                             }
                             debug!("USB CDC received {} bytes", n);
