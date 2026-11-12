@@ -1,0 +1,32 @@
+name: conformance
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    name: Rust vector tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run meshcore-wire tests on the host
+        run: cargo test -p meshcore-wire --target x86_64-unknown-linux-gnu
+
+  oracle:
+    name: Oracle self-check and reproducibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install oracle dependencies
+        run: pip install -r tools/oracle/requirements.txt
+      - name: Self-check primitives and print the vector summary
+        run: python tools/oracle/gen.py
+      - name: Checked-in oracle vectors are up to date
+        run: |
+          python tools/oracle/gen.py --emit --output /tmp/oracle_vectors.toml
+          diff -u crates/meshcore-wire/testdata/oracle_vectors.toml /tmp/oracle_vectors.toml

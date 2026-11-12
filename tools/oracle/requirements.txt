@@ -1,0 +1,3 @@
+# Oracle-only dependencies. Never used by the firmware build.
+cryptography==50.0.2
+pynacl==1.6.2

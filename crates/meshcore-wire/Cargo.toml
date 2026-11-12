@@ -10,3 +10,8 @@ heapless = "0.8"
 sha2 = { version = "0.10", default-features = false }
 aes = "0.8"
 ed25519-dalek = { version = "2.1", default-features = false }
+
+[dev-dependencies]
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"

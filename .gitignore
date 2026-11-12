@@ -3,4 +3,7 @@
 *.uf2
 .DS_Store
 firmware-backup/
+tools/oracle/.venv/
+__pycache__/
+*.pyc
 

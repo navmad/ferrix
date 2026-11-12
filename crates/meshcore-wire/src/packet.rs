@@ -240,6 +240,9 @@ impl Packet {
 
         let mut offset = 0;
         let header = src[offset];
+        if header >> PH_VER_SHIFT != 0 {
+            return Err(());
+        }
         offset += 1;
 
         let is_transport = {
