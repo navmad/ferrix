@@ -138,15 +138,19 @@ async fn main(spawner: Spawner) {
     // Initialize persistent configuration from flash
     let (node_name, custom_key) = crate::storage::init_config();
 
-    // Initialize native MeshCore Routing Engine & Local Cryptographic Identity
+    // Initialize native MeshCore Routing Engine & Local Cryptographic Identity.
+    // The stored key is MeshCore's 64-byte expanded form; old configs are
+    // migrated from their 32-byte seed by storage::init_config().
     let local_id = if let Some(key) = custom_key {
-        LocalIdentity::from_secret_key(node_name.as_str(), &key)
+        LocalIdentity::from_private(node_name.as_str(), &key).unwrap_or_else(|| {
+            info!("Stored private key is reserved or invalid; using hardware seed");
+            LocalIdentity::from_seed(node_name.as_str(), &crate::boards::hardware_seed())
+        })
     } else {
-        let seed = crate::boards::hardware_seed();
-        LocalIdentity::from_secret_key(node_name.as_str(), &seed)
+        LocalIdentity::from_seed(node_name.as_str(), &crate::boards::hardware_seed())
     };
     let pub_key = local_id.pub_key_bytes();
-    let priv_key = local_id.signing_key_bytes();
+    let priv_key = local_id.private_key_bytes();
     let mut mesh = MeshEngine::new(local_id, false);
 
     // 0. Initialize USB CDC-ACM Serial & 1200-baud DFU Auto-Reset FIRST
@@ -482,9 +486,12 @@ async fn main(spawner: Spawner) {
                 }
                 UsbCommand::SetPrivateKey(priv_key) => {
                     info!("Updating node private & public keys");
-                    mesh.set_secret_key(&priv_key);
-                    node.private_key = priv_key;
-                    node.public_key = *mesh.identity.pub_key();
+                    if mesh.set_private_key(&priv_key) {
+                        node.private_key = priv_key;
+                        node.public_key = *mesh.identity.pub_key();
+                    } else {
+                        info!("Rejected reserved private key");
+                    }
                 }
                 UsbCommand::SetTime(epoch) => {
                     info!("Node epoch time updated to: {}", epoch);

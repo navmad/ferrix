@@ -144,7 +144,7 @@ pub static RADIO_TELEMETRY: Mutex<SharedRawMutex, RefCell<RadioTelemetry>> = Mut
 #[derive(Clone, Debug)]
 pub enum UsbCommand {
     SetName(heapless::String<32>),
-    SetPrivateKey([u8; 32]),
+    SetPrivateKey([u8; 64]),
     SetTime(u64),
     TriggerAdvert,
     SendGroupText {
@@ -257,7 +257,7 @@ async fn handle_text_cli(
             let _ = write_all(sender, s.as_bytes()).await;
         }
         "get prv.key" | "get private_key" | "prv.key" => {
-            let mut s: heapless::String<128> = heapless::String::new();
+            let mut s: heapless::String<256> = heapless::String::new();
             let _ = write!(s, "  -> ");
             for b in &node.private_key {
                 let _ = write!(s, "{:02x}", b);
@@ -267,22 +267,52 @@ async fn handle_text_cli(
         }
         s if s.starts_with("set prv.key ") => {
             let hex_str = s[12..].trim();
-            if hex_str.len() == 64 && hex_str.bytes().all(|b| b.is_ascii_hexdigit()) {
-                let mut key = [0u8; 32];
-                for i in 0..32 {
+            let valid_hex = hex_str.bytes().all(|b| b.is_ascii_hexdigit());
+            if valid_hex && hex_str.len() == 128 {
+                // MeshCore's 64-byte expanded key (`scalar ‖ nonce_prefix`).
+                let mut key = [0u8; 64];
+                for i in 0..64 {
                     let hi = hex_to_nibble(hex_str.as_bytes()[i * 2]);
                     let lo = hex_to_nibble(hex_str.as_bytes()[i * 2 + 1]);
                     key[i] = (hi << 4) | lo;
                 }
+                match crate::meshcore::identity::LocalIdentity::from_private(
+                    node.callsign.as_str(),
+                    &key,
+                ) {
+                    Some(id) => {
+                        node.private_key = key;
+                        node.public_key = *id.pub_key();
+                        crate::storage::set_custom_priv_key(key);
+                        info!("Node expanded private & public key updated via CLI");
+                        let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetPrivateKey(key));
+                        let _ = write_all(sender, b"  -> OK\r\n").await;
+                    }
+                    None => {
+                        let _ = write_all(sender, b"  -> Error, reserved public key\r\n").await;
+                    }
+                }
+            } else if valid_hex && hex_str.len() == 64 {
+                // Convenience: accept a 32-byte seed and expand it for storage.
+                let mut seed = [0u8; 32];
+                for i in 0..32 {
+                    let hi = hex_to_nibble(hex_str.as_bytes()[i * 2]);
+                    let lo = hex_to_nibble(hex_str.as_bytes()[i * 2 + 1]);
+                    seed[i] = (hi << 4) | lo;
+                }
+                let id = crate::meshcore::identity::LocalIdentity::from_seed(
+                    node.callsign.as_str(),
+                    &seed,
+                );
+                let key = id.private_key_bytes();
                 node.private_key = key;
-                let signing_key = crate::meshcore::crypto::SigningKey::from_bytes(&key);
-                node.public_key = signing_key.verifying_key().to_bytes();
+                node.public_key = *id.pub_key();
                 crate::storage::set_custom_priv_key(key);
-                info!("Node private & public key updated via CLI");
+                info!("Node seed imported and expanded; public key updated via CLI");
                 let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetPrivateKey(key));
                 let _ = write_all(sender, b"  -> OK\r\n").await;
             } else {
-                let _ = write_all(sender, b"  -> Error, bad hex\r\n").await;
+                let _ = write_all(sender, b"  -> Error, expected 64 or 128 hex chars\r\n").await;
             }
         }
         "set name" => {
@@ -807,7 +837,7 @@ pub async fn usb_task(mut usb: UsbDevice<'static, UsbDriver>) -> ! {
 pub async fn cdc_acm_task(
     class: CdcAcmClass<'static, UsbDriver>,
     public_key: [u8; 32],
-    private_key: [u8; 32],
+    private_key: [u8; 64],
 ) -> ! {
     let (mut sender, mut receiver, control) = class.split_with_control();
     let callsign = crate::storage::get_callsign();

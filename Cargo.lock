@@ -1048,6 +1048,7 @@ name = "meshcore-wire"
 version = "0.1.0"
 dependencies = [
  "aes",
+ "curve25519-dalek",
  "ed25519-dalek",
  "heapless 0.8.0",
  "hex",

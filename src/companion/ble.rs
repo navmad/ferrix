@@ -109,7 +109,7 @@ pub async fn ble_companion_task(
     sd: &'static Softdevice,
     server: MeshCoreGattServer,
     public_key: [u8; 32],
-    private_key: [u8; 32],
+    private_key: [u8; 64],
 ) {
     info!("Starting MeshCore BLE companion advertising...");
 
@@ -279,7 +279,7 @@ unsafe extern "C" fn sd_fault_handler(id: u32, pc: u32, info: u32) {
 pub async fn ble_companion_supervisor_task(
     spawner: embassy_executor::Spawner,
     public_key: [u8; 32],
-    private_key: [u8; 32],
+    private_key: [u8; 64],
 ) {
     // Wait 500ms so USB CDC-ACM and SX1262 LoRa tasks are completely booted
     embassy_time::Timer::after_millis(500).await;
@@ -353,7 +353,7 @@ pub async fn ble_companion_supervisor_task(
 pub fn init_ble_companion(
     spawner: embassy_executor::Spawner,
     public_key: [u8; 32],
-    private_key: [u8; 32],
+    private_key: [u8; 64],
 ) -> bool {
     spawner.spawn(ble_companion_supervisor_task(spawner, public_key, private_key)).is_ok()
 }

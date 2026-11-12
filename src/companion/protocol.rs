@@ -74,7 +74,8 @@ pub struct CompanionNode {
     pub hw_model: &'static str,
     pub capabilities: u32,
     pub public_key: [u8; 32],
-    pub private_key: [u8; 32],
+    /// MeshCore's 64-byte expanded private key (`scalar ‖ nonce_prefix`).
+    pub private_key: [u8; 64],
     pub battery_millivolts: u16,
     pub battery_percentage: u8,
     pub epoch_time: u64,
@@ -103,7 +104,7 @@ impl CompanionNode {
         hw_model: &'static str,
         capabilities: u32,
         public_key: [u8; 32],
-        private_key: [u8; 32],
+        private_key: [u8; 64],
     ) -> Self {
         let mut cs = String::new();
         let _ = cs.push_str(callsign);

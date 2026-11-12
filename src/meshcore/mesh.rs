@@ -108,10 +108,17 @@ impl MeshEngine {
         }
     }
 
-    /// Update the local private key and derived public key
+    /// Update the local private key and derived public key.
+    /// Returns false if the key derives a reserved public key.
     #[inline]
-    pub fn set_secret_key(&mut self, secret: &[u8; 32]) {
-        self.identity.set_secret_key(secret);
+    pub fn set_private_key(&mut self, prv: &[u8; 64]) -> bool {
+        self.identity.set_private_key(prv)
+    }
+
+    /// Update from a 32-byte seed (kept for convenience).
+    #[inline]
+    pub fn set_secret_key(&mut self, seed: &[u8; 32]) {
+        self.identity.set_secret_key(seed);
     }
 
     /// Process a packet received over the LoRa radio interface

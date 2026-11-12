@@ -172,7 +172,12 @@ fn identity_vectors() {
 
         let id = meshcore_wire::LocalIdentity::from_secret_key(&v.name, &seed);
         assert_eq!(&id.pub_key()[..], &expected_pub[..], "{}: public key", v.name);
-        assert_eq!(id.signing_key_bytes(), seed, "{}: stored seed", v.name);
+        assert_eq!(
+            &id.private_key()[..],
+            &expected_prv[..],
+            "{}: expanded private key",
+            v.name
+        );
 
         let digest = Sha512::digest(seed);
         let mut expanded = [0u8; 64];
@@ -181,6 +186,17 @@ fn identity_vectors() {
         expanded[31] &= 63;
         expanded[31] |= 64;
         assert_eq!(&expanded[..], &expected_prv[..], "{}: expanded key", v.name);
+
+        // Importing the expanded key must reproduce the same identity.
+        let prv: [u8; 64] = expected_prv.try_into().unwrap();
+        let imported = meshcore_wire::LocalIdentity::from_private(&v.name, &prv).unwrap();
+        assert_eq!(imported.pub_key(), id.pub_key(), "{}: imported pub", v.name);
+        assert_eq!(
+            &imported.private_key()[..],
+            &prv[..],
+            "{}: imported key",
+            v.name
+        );
     }
 }
 
@@ -303,6 +319,23 @@ fn advert_vectors() {
         );
         assert!(adv.verify_signature(), "{}: signature", a.packet);
 
+        // The expanded key must produce exactly the stamped signature.
+        let ident = vectors
+            .identity
+            .iter()
+            .find(|i| i.name == a.identity)
+            .unwrap_or_else(|| panic!("{}: missing identity", a.packet));
+        let prv: [u8; 64] = hexv(&ident.prv).try_into().unwrap();
+        let id = meshcore_wire::LocalIdentity::from_private(&ident.name, &prv).unwrap();
+        let mut signed = [0u8; 160];
+        let n = adv.build_message_for_signing(&mut signed);
+        assert_eq!(
+            id.sign(&signed[..n]),
+            adv.signature,
+            "{}: expanded-key signature",
+            a.packet
+        );
+
         // The vector's `kind` is the low nibble of app_data[0].
         assert_eq!(app_data[0] & 0x0F, a.kind, "{}: kind", a.packet);
     }
@@ -340,9 +373,30 @@ fn group_txt_vectors() {
 // Known gaps. Run with `cargo test -- --ignored` to see the current failures.
 
 #[test]
-#[ignore = "pending Phase 1: ECDH shared secret not implemented"]
 fn ecdh_vectors() {
-    assert_eq!(vectors().ecdh.len(), 1);
+    let vectors = vectors();
+    for e in &vectors.ecdh {
+        let a = vectors
+            .identity
+            .iter()
+            .find(|i| i.name == e.a)
+            .unwrap_or_else(|| panic!("{}: missing identity", e.a));
+        let b = vectors
+            .identity
+            .iter()
+            .find(|i| i.name == e.b)
+            .unwrap_or_else(|| panic!("{}: missing identity", e.b));
+        let prv_a: [u8; 64] = hexv(&a.prv).try_into().unwrap();
+        let prv_b: [u8; 64] = hexv(&b.prv).try_into().unwrap();
+        let pub_a: [u8; 32] = hexv(&a.pub_).try_into().unwrap();
+        let pub_b: [u8; 32] = hexv(&b.pub_).try_into().unwrap();
+        let id_a = meshcore_wire::LocalIdentity::from_private(&a.name, &prv_a).unwrap();
+        let id_b = meshcore_wire::LocalIdentity::from_private(&b.name, &prv_b).unwrap();
+
+        let secret = id_a.shared_secret(&pub_b).unwrap();
+        assert_eq!(&secret[..], &hexv(&e.secret)[..], "{} -> {}", e.a, e.b);
+        assert_eq!(id_b.shared_secret(&pub_a).unwrap(), secret, "symmetric");
+    }
 }
 
 #[test]

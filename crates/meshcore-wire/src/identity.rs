@@ -1,11 +1,19 @@
 //! MeshCore Cryptographic Node Identity & Key Management
 //!
-//! Powered by `ed25519-dalek` for constant-time cryptographic signatures & verification.
+//! MeshCore stores an orlp-style **64-byte expanded private key**:
+//! `scalar[32] ‖ nonce_prefix[32]`, derived from a 32-byte seed with SHA-512
+//! and clamping. The seed is not retained. Signing and ECDH both use the
+//! expanded form.
 
+use curve25519_dalek::scalar::Scalar;
+use ed25519_dalek::hazmat::{raw_sign, ExpandedSecretKey};
 use heapless::String;
-use crate::crypto::{sha256, Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use sha2::{Digest, Sha512};
+
+pub use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
 pub const PUB_KEY_SIZE: usize = 32;
+pub const PRV_KEY_SIZE: usize = 64;
 pub const SIGNATURE_SIZE: usize = 64;
 
 /// Remote Node Identity (Public Key + Callsign)
@@ -28,7 +36,7 @@ impl Identity {
         self.pub_key[0]
     }
 
-    /// 4-byte hash prefix used in request/response addressing
+    /// 4-byte hash prefix used by the legacy request/response addressing
     #[inline]
     pub fn hash_u32(&self) -> u32 {
         u32::from_le_bytes([
@@ -59,45 +67,111 @@ impl Identity {
     }
 }
 
-/// Local Node Identity containing Ed25519 signing key
+/// Expand a 32-byte seed into MeshCore's 64-byte expanded private key:
+/// `clamp(SHA512(seed)[0..32]) ‖ SHA512(seed)[32..64]`.
+pub fn expand_seed(seed: &[u8; 32]) -> [u8; PRV_KEY_SIZE] {
+    let digest = Sha512::digest(seed);
+    let mut prv = [0u8; PRV_KEY_SIZE];
+    prv.copy_from_slice(&digest);
+    prv[0] &= 248;
+    prv[31] &= 63;
+    prv[31] |= 64;
+    prv
+}
+
+fn expanded(prv: &[u8; PRV_KEY_SIZE]) -> ExpandedSecretKey {
+    let mut scalar = [0u8; 32];
+    scalar.copy_from_slice(&prv[..32]);
+    let mut hash_prefix = [0u8; 32];
+    hash_prefix.copy_from_slice(&prv[32..]);
+    ExpandedSecretKey {
+        scalar: Scalar::from_bytes_mod_order(scalar),
+        hash_prefix,
+    }
+}
+
+/// Local Node Identity containing the 64-byte expanded signing key.
 pub struct LocalIdentity {
     pub base: Identity,
-    signing_key: SigningKey,
+    prv: [u8; PRV_KEY_SIZE],
 }
 
 impl LocalIdentity {
-    /// Initialize local node identity from a 32-byte secret key / seed
-    pub fn from_secret_key(callsign: &str, secret: &[u8; 32]) -> Self {
-        let signing_key = SigningKey::from_bytes(secret);
-        let pub_key = signing_key.verifying_key().to_bytes();
-
-        Self {
+    /// Initialize from a 64-byte expanded key. Returns `None` if the derived
+    /// public key is reserved (`pub[0] == 0x00` or `0xFF`), as MeshCore
+    /// rejects such identities.
+    pub fn from_private(callsign: &str, prv: &[u8; PRV_KEY_SIZE]) -> Option<Self> {
+        let esk = expanded(prv);
+        let pub_key = VerifyingKey::from(&esk).to_bytes();
+        if pub_key[0] == 0x00 || pub_key[0] == 0xFF {
+            return None;
+        }
+        Some(Self {
             base: Identity::new(pub_key, callsign),
-            signing_key,
+            prv: *prv,
+        })
+    }
+
+    /// Initialize from a 32-byte seed. In the rare reserved-key case, the
+    /// seed is re-hashed deterministically, matching MeshCore's "regenerate"
+    /// behaviour.
+    pub fn from_seed(callsign: &str, seed: &[u8; 32]) -> Self {
+        let mut current = *seed;
+        loop {
+            let prv = expand_seed(&current);
+            if let Some(id) = Self::from_private(callsign, &prv) {
+                return id;
+            }
+            current = crate::crypto::sha256(&current);
         }
     }
 
-    /// Initialize local node identity with deterministic Ed25519 key generation from seed/hardware ID
+    /// Backward-compatible alias for [`Self::from_seed`].
+    pub fn from_secret_key(callsign: &str, seed: &[u8; 32]) -> Self {
+        Self::from_seed(callsign, seed)
+    }
+
+    /// Initialize with deterministic Ed25519 key generation from a text seed.
     pub fn new(callsign: &str, seed_str: &str) -> Self {
-        let seed = sha256(seed_str.as_bytes());
-        Self::from_secret_key(callsign, &seed)
+        let seed = crate::crypto::sha256(seed_str.as_bytes());
+        Self::from_seed(callsign, &seed)
     }
 
-    /// Set a new 32-byte secret key, updating both private key and derived public key
-    pub fn set_secret_key(&mut self, secret: &[u8; 32]) {
-        self.signing_key = SigningKey::from_bytes(secret);
-        self.base.pub_key = self.signing_key.verifying_key().to_bytes();
+    /// Replace the key with a 64-byte expanded key. Returns false if the
+    /// derived public key is reserved.
+    pub fn set_private_key(&mut self, prv: &[u8; PRV_KEY_SIZE]) -> bool {
+        match Self::from_private(self.base.callsign.as_str(), prv) {
+            Some(id) => {
+                self.prv = id.prv;
+                self.base.pub_key = id.base.pub_key;
+                true
+            }
+            None => false,
+        }
     }
 
-    /// Get the 32-byte private signing key bytes
+    /// Replace the key from a 32-byte seed.
+    pub fn set_secret_key(&mut self, seed: &[u8; 32]) {
+        let id = Self::from_seed(self.base.callsign.as_str(), seed);
+        self.prv = id.prv;
+        self.base.pub_key = id.base.pub_key;
+    }
+
+    /// 64-byte expanded private key (`scalar ‖ nonce_prefix`).
     #[inline]
-    pub fn signing_key_bytes(&self) -> [u8; 32] {
-        self.signing_key.to_bytes()
+    pub fn private_key(&self) -> &[u8; PRV_KEY_SIZE] {
+        &self.prv
     }
 
-    /// Get the 32-byte public key bytes
+    /// 64-byte expanded private key, by value.
     #[inline]
-    pub fn pub_key_bytes(&self) -> [u8; 32] {
+    pub fn private_key_bytes(&self) -> [u8; PRV_KEY_SIZE] {
+        self.prv
+    }
+
+    /// 32-byte public key.
+    #[inline]
+    pub fn pub_key_bytes(&self) -> [u8; PUB_KEY_SIZE] {
         self.base.pub_key
     }
 
@@ -127,8 +201,27 @@ impl LocalIdentity {
         self.base.hash_u32()
     }
 
-    /// Sign a message using the local Ed25519 private key
+    /// The public key starts with 0x00 or 0xFF, which MeshCore rejects.
+    #[inline]
+    pub fn is_reserved(&self) -> bool {
+        self.base.pub_key[0] == 0x00 || self.base.pub_key[0] == 0xFF
+    }
+
+    /// Sign a message with the expanded key.
     pub fn sign(&self, message: &[u8]) -> [u8; SIGNATURE_SIZE] {
-        self.signing_key.sign(message).to_bytes()
+        let esk = expanded(&self.prv);
+        let vk = VerifyingKey::from(&esk);
+        raw_sign::<Sha512>(&esk, message, &vk).to_bytes()
+    }
+
+    /// MeshCore ECDH: X25519 with the clamped scalar and the peer's Ed25519
+    /// public key mapped to Montgomery form. Returns `None` if the peer key
+    /// does not decompress.
+    pub fn shared_secret(&self, peer: &[u8; PUB_KEY_SIZE]) -> Option<[u8; 32]> {
+        let vk = VerifyingKey::from_bytes(peer).ok()?;
+        let point = vk.to_montgomery();
+        let mut scalar = [0u8; 32];
+        scalar.copy_from_slice(&self.prv[..32]);
+        Some(point.mul_clamped(scalar).to_bytes())
     }
 }

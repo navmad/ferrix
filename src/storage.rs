@@ -23,7 +23,7 @@ use crate::companion::usb::ChannelData;
 /// (Top page of application flash, immediately preceding bootloader at 0x000ED000)
 pub const CONFIG_FLASH_ADDR: u32 = 0x000EC000;
 pub const CONFIG_MAGIC: u32 = 0x4D434647; // 'MCFG' (MeshCore Config)
-pub const CONFIG_VERSION: u32 = 1;
+pub const CONFIG_VERSION: u32 = 2;
 
 #[repr(C, align(4))]
 #[derive(Clone, Copy)]
@@ -31,7 +31,8 @@ pub struct PersistentConfig {
     pub magic: u32,
     pub version: u32,
     pub callsign: [u8; 32],
-    pub custom_priv_key: [u8; 32],
+    /// MeshCore's 64-byte expanded private key (`scalar ‖ nonce_prefix`).
+    pub custom_priv_key: [u8; 64],
     pub has_custom_key: u8,
     pub is_repeater: u8,
     pub radio_tx_power: i8,
@@ -46,20 +47,43 @@ pub struct PersistentConfig {
     pub checksum: u32,
 }
 
+/// v1 layout: the private key was a 32-byte seed. Read only for migration.
+#[repr(C, align(4))]
+#[derive(Clone, Copy)]
+struct PersistentConfigV1 {
+    magic: u32,
+    version: u32,
+    callsign: [u8; 32],
+    custom_priv_key: [u8; 32],
+    has_custom_key: u8,
+    is_repeater: u8,
+    radio_tx_power: i8,
+    radio_sf: u8,
+    radio_cr: u8,
+    path_hash_mode: u8,
+    autoadd_config: u8,
+    autoadd_max_hops: u8,
+    radio_freq_hz: u32,
+    radio_bw_khz: u32,
+    channels: [ChannelData; 8],
+    checksum: u32,
+}
+
 pub static NODE_CALLSIGN: Mutex<SharedRawMutex, RefCell<String<32>>> =
     Mutex::new(RefCell::new(String::new()));
 
-pub static CUSTOM_PRIV_KEY: Mutex<SharedRawMutex, RefCell<Option<[u8; 32]>>> =
+pub static CUSTOM_PRIV_KEY: Mutex<SharedRawMutex, RefCell<Option<[u8; 64]>>> =
     Mutex::new(RefCell::new(None));
 
 pub static SAVE_REQUEST_CHANNEL: Channel<SharedRawMutex, (), 2> = Channel::new();
 
-/// Compute a 32-bit checksum covering the configuration structure up to the checksum field
-pub fn compute_checksum(cfg: &PersistentConfig) -> u32 {
+/// Compute a 32-bit checksum covering a configuration structure up to its
+/// checksum field.
+fn compute_checksum<T>(cfg: &T) -> u32 {
     let words = unsafe {
         core::slice::from_raw_parts(
-            cfg as *const _ as *const u32,
-            (core::mem::size_of::<PersistentConfig>() - 4) / 4,
+            cfg as *const T as *const u32,
+            (core::mem::size_of::<T>() - 4) / 4,
         )
     };
     let mut sum = 0u32;
@@ -69,14 +93,51 @@ pub fn compute_checksum(cfg: &PersistentConfig) -> u32 {
     sum
 }
 
-/// Synchronously read and validate persistent configuration from internal flash memory
-pub fn read_config() -> Option<PersistentConfig> {
-    let ptr = CONFIG_FLASH_ADDR as *const PersistentConfig;
-    let cfg = unsafe { ptr.read_volatile() };
-    if cfg.magic == CONFIG_MAGIC && cfg.version == CONFIG_VERSION {
-        let expected = compute_checksum(&cfg);
-        if expected == cfg.checksum {
-            return Some(cfg);
+fn migrate_v1(v1: PersistentConfigV1) -> PersistentConfig {
+    let custom_priv_key = if v1.has_custom_key != 0 {
+        // Use the seed path so a reserved public key is regenerated exactly as
+        // a fresh identity would be.
+        crate::meshcore::identity::LocalIdentity::from_seed("", &v1.custom_priv_key)
+            .private_key_bytes()
+    } else {
+        [0u8; 64]
+    };
+    let mut cfg = PersistentConfig {
+        magic: CONFIG_MAGIC,
+        version: CONFIG_VERSION,
+        callsign: v1.callsign,
+        custom_priv_key,
+        has_custom_key: v1.has_custom_key,
+        is_repeater: v1.is_repeater,
+        radio_tx_power: v1.radio_tx_power,
+        radio_sf: v1.radio_sf,
+        radio_cr: v1.radio_cr,
+        path_hash_mode: v1.path_hash_mode,
+        autoadd_config: v1.autoadd_config,
+        autoadd_max_hops: v1.autoadd_max_hops,
+        radio_freq_hz: v1.radio_freq_hz,
+        radio_bw_khz: v1.radio_bw_khz,
+        channels: v1.channels,
+        checksum: 0,
+    };
+    cfg.checksum = compute_checksum(&cfg);
+    cfg
+}
+
+/// Synchronously read and validate persistent configuration from internal
+/// flash. Returns `(config, migrated_from_v1)`.
+pub fn read_config() -> Option<(PersistentConfig, bool)> {
+    let cfg = unsafe { (CONFIG_FLASH_ADDR as *const PersistentConfig).read_volatile() };
+    if cfg.magic != CONFIG_MAGIC {
+        return None;
+    }
+    if cfg.version == CONFIG_VERSION && compute_checksum(&cfg) == cfg.checksum {
+        return Some((cfg, false));
+    }
+    if cfg.version == 1 {
+        let v1 = unsafe { (CONFIG_FLASH_ADDR as *const PersistentConfigV1).read_volatile() };
+        if compute_checksum(&v1) == v1.checksum {
+            return Some((migrate_v1(v1), true));
         }
     }
     None
@@ -118,8 +179,8 @@ pub fn set_callsign(new_name: &str) {
     }
 }
 
-/// Set custom private key and queue a persistent flash save
-pub fn set_custom_priv_key(key: [u8; 32]) {
+/// Set the 64-byte expanded private key and queue a persistent flash save
+pub fn set_custom_priv_key(key: [u8; 64]) {
     CUSTOM_PRIV_KEY.lock(|k| {
         *k.borrow_mut() = Some(key);
     });
@@ -132,8 +193,8 @@ pub fn request_save_config() {
 }
 
 /// Initialize configuration from flash (or defaults if flash is uninitialized)
-pub fn init_config() -> (String<32>, Option<[u8; 32]>) {
-    if let Some(cfg) = read_config() {
+pub fn init_config() -> (String<32>, Option<[u8; 64]>) {
+    if let Some((cfg, migrated)) = read_config() {
         info!("Storage: Found valid persistent config in flash at 0x{:08x}!", CONFIG_FLASH_ADDR);
 
         // Load callsign
@@ -173,6 +234,11 @@ pub fn init_config() -> (String<32>, Option<[u8; 32]>) {
             None
         };
 
+        if migrated {
+            info!("Storage: Migrated config v1 -> v2 (seed -> 64-byte expanded key)");
+            request_save_config();
+        }
+
         info!("Storage: Loaded callsign '{}', channels, and radio parameters", name.as_str());
         (name, priv_key)
     } else {
@@ -204,7 +270,7 @@ pub fn assemble_current_config() -> PersistentConfig {
         if let Some(key) = *k.borrow() {
             (1u8, key)
         } else {
-            (0u8, [0u8; 32])
+            (0u8, [0u8; 64])
         }
     });
 
