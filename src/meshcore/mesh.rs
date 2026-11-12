@@ -59,7 +59,7 @@ pub enum InboundAction {
     },
     /// Received repeater echo of our own transmitted group message
     ReceivedRepeaterEcho {
-        pkt_hash: [u8; 4],
+        pkt_hash: [u8; 8],
         hops: u8,
     },
     /// Successfully decoded direct message addressed to this node

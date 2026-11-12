@@ -52,7 +52,10 @@ static PENDING_MESSAGE_ACKS: embassy_sync::blocking_mutex::Mutex<
 > = embassy_sync::blocking_mutex::Mutex::new(core::cell::RefCell::new(heapless::Vec::new()));
 
 fn track_outbound_packet(pkt: &Packet) {
-    let pkt_hash = pkt.calculate_packet_hash();
+    // Temporary until Phase 3: the pending-ACK list is keyed by the 4-byte ACK
+    // CRC, not the 8-byte dedup hash. Keep the hash prefix for now.
+    let hash = pkt.calculate_packet_hash();
+    let pkt_hash = [hash[0], hash[1], hash[2], hash[3]];
     let now = embassy_time::Instant::now().as_millis();
     PENDING_MESSAGE_ACKS.lock(|a| {
         let mut list = a.borrow_mut();
@@ -440,7 +443,10 @@ async fn main(spawner: Spawner) {
                     }
                     InboundAction::ReceivedRepeaterEcho { pkt_hash, hops } => {
                         info!("MeshCore Message echoed by repeater! ({} hops, pkt_hash: {:?})", hops, pkt_hash);
-                        handle_direct_message_confirmed(pkt_hash);
+                        // Temporary until Phase 3: pending ACKs are keyed by a 4-byte CRC.
+                        handle_direct_message_confirmed([
+                            pkt_hash[0], pkt_hash[1], pkt_hash[2], pkt_hash[3],
+                        ]);
                     }
                     InboundAction::ReceivedAck(ack) => {
                         info!("MeshCore ACK received for packet {:?}", ack.ack_packet_hash);

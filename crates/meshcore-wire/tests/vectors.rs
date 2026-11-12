@@ -8,9 +8,7 @@
 
 #![allow(dead_code)]
 
-use meshcore_wire::packet::{
-    Packet, PAYLOAD_TYPE_GRP_DATA, PAYLOAD_TYPE_GRP_TXT, PAYLOAD_TYPE_TRACE,
-};
+use meshcore_wire::packet::{Packet, PAYLOAD_TYPE_GRP_DATA, PAYLOAD_TYPE_GRP_TXT};
 use meshcore_wire::packets::{AdvertPacket, GrpTextPacket};
 use serde::Deserialize;
 use sha2::{Digest, Sha512};
@@ -255,19 +253,11 @@ fn packet_rejects() {
 }
 
 #[test]
-fn packet_hash_prefix_matches_non_trace() {
+fn packet_hashes_match() {
     for v in &vectors().packet {
-        if v.ptype == PAYLOAD_TYPE_TRACE {
-            continue;
-        }
         let p = Packet::read_from(&hexv(&v.raw)).unwrap();
         let expected = hexv(&v.hash);
-        assert_eq!(
-            &p.calculate_packet_hash()[..],
-            &expected[..4],
-            "{}: hash prefix",
-            v.name
-        );
+        assert_eq!(&p.calculate_packet_hash()[..], &expected[..], "{}: hash", v.name);
     }
 }
 
@@ -353,15 +343,6 @@ fn group_txt_vectors() {
 #[ignore = "pending Phase 1: ECDH shared secret not implemented"]
 fn ecdh_vectors() {
     assert_eq!(vectors().ecdh.len(), 1);
-}
-
-#[test]
-#[ignore = "pending Phase 2: 8-byte dedup hash and TRACE path_len preimage"]
-fn packet_hash_full() {
-    for v in &vectors().packet {
-        let p = Packet::read_from(&hexv(&v.raw)).unwrap();
-        assert_eq!(p.calculate_packet_hash().len(), 8, "{}", v.name);
-    }
 }
 
 #[test]

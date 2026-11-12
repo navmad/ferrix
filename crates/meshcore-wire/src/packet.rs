@@ -300,15 +300,25 @@ impl Packet {
         })
     }
 
-    /// Calculate a fast 4-byte packet hash for deduplication and acknowledgment tracking
-    /// Calculates the 4-byte MeshCore packet hash (SHA-256 over payload type + payload)
-    pub fn calculate_packet_hash(&self) -> [u8; 4] {
+    /// MeshCore duplicate-detection hash: `SHA256(type ‖ [path_len u16 if TRACE] ‖
+    /// payload)[0..8]`.
+    ///
+    /// The header, path and transport codes are not part of the hash. TRACE is
+    /// special-cased because a trace can revisit the same node on the return
+    /// path; the C++ hashes `path_len` as a little-endian `uint16_t`.
+    pub fn calculate_packet_hash(&self) -> [u8; 8] {
         use sha2::{Digest, Sha256};
         let t = self.payload_type();
         let mut hasher = Sha256::new();
-        hasher.update(&[t]);
+        hasher.update([t]);
+        if t == PAYLOAD_TYPE_TRACE {
+            hasher.update((self.path_len as u16).to_le_bytes());
+        }
         hasher.update(&self.payload[..self.payload_len]);
         let full: [u8; 32] = hasher.finalize().into();
-        [full[0], full[1], full[2], full[3]]
+
+        let mut hash = [0u8; 8];
+        hash.copy_from_slice(&full[..8]);
+        hash
     }
 }

@@ -8,12 +8,13 @@
 use crate::packet::Packet;
 use heapless::Deque;
 
-pub const SEEN_CACHE_SIZE: usize = 64;
+/// Matches the C++ `SimpleMeshTables` ring: 160 eight-byte hashes.
+pub const SEEN_CACHE_SIZE: usize = 160;
 pub const OUTBOUND_QUEUE_SIZE: usize = 8;
 
 /// Fast duplicate packet detector preventing infinite mesh re-broadcasts
 pub struct SeenPacketFilter {
-    cache: [[u8; 4]; SEEN_CACHE_SIZE],
+    cache: [[u8; 8]; SEEN_CACHE_SIZE],
     index: usize,
     count: usize,
 }
@@ -21,14 +22,14 @@ pub struct SeenPacketFilter {
 impl SeenPacketFilter {
     pub const fn new() -> Self {
         Self {
-            cache: [[0u8; 4]; SEEN_CACHE_SIZE],
+            cache: [[0u8; 8]; SEEN_CACHE_SIZE],
             index: 0,
             count: 0,
         }
     }
 
     /// Checks if this packet hash has already been received recently
-    pub fn has_seen(&self, hash: &[u8; 4]) -> bool {
+    pub fn has_seen(&self, hash: &[u8; 8]) -> bool {
         let check_len = self.count.min(SEEN_CACHE_SIZE);
         for i in 0..check_len {
             if &self.cache[i] == hash {
@@ -39,7 +40,7 @@ impl SeenPacketFilter {
     }
 
     /// Marks a packet hash as seen
-    pub fn mark_seen(&mut self, hash: [u8; 4]) {
+    pub fn mark_seen(&mut self, hash: [u8; 8]) {
         self.cache[self.index] = hash;
         self.index = (self.index + 1) % SEEN_CACHE_SIZE;
         if self.count < SEEN_CACHE_SIZE {
