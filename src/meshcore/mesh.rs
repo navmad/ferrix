@@ -8,10 +8,13 @@
 
 use crate::meshcore::identity::LocalIdentity;
 use crate::meshcore::packet::{
-    Packet, PAYLOAD_TYPE_ACK, PAYLOAD_TYPE_ADVERT, PAYLOAD_TYPE_GRP_TXT,
-    PAYLOAD_TYPE_PATH, PAYLOAD_TYPE_TXT_MSG, ROUTE_TYPE_FLOOD,
+    Packet, PAYLOAD_TYPE_ACK, PAYLOAD_TYPE_ADVERT, PAYLOAD_TYPE_ANON_REQ, PAYLOAD_TYPE_GRP_DATA,
+    PAYLOAD_TYPE_GRP_TXT, PAYLOAD_TYPE_PATH, PAYLOAD_TYPE_TXT_MSG, ROUTE_TYPE_FLOOD,
 };
-use crate::meshcore::packets::{AckPacket, AdvertPacket, GrpTextPacket, PathPacket, TxtMsgPacket};
+use crate::meshcore::packets::advert::{ADV_TYPE_CHAT, ADV_TYPE_REPEATER};
+use crate::meshcore::packets::{
+    AckPacket, AdvertPacket, AnonReqPacket, GrpDataPacket, GrpTextPacket, PathPacket, TxtMsgPacket,
+};
 use crate::meshcore::queue::{PacketQueue, SeenPacketFilter};
 
 pub const DEFAULT_MAX_HOPS: u8 = 7;
@@ -73,6 +76,13 @@ pub enum InboundAction {
     ReceivedAck(AckPacket),
     /// Received path discovery reply
     ReceivedPath(PathPacket),
+    /// Received channel datagram
+    ReceivedGroupData {
+        channel_idx: u8,
+        packet: GrpDataPacket,
+    },
+    /// Received anonymous request
+    ReceivedAnonReq(AnonReqPacket),
     /// Unhandled or unknown packet payload
     Unhandled,
 }
@@ -124,6 +134,19 @@ impl MeshEngine {
     #[inline]
     pub fn set_secret_key(&mut self, seed: &[u8; 32]) {
         self.identity.set_secret_key(seed);
+    }
+
+    /// Contact public keys whose first byte matches `hash`.
+    fn peers_by_hash(&self, hash: u8) -> heapless::Vec<[u8; 32], 32> {
+        let mut peers = heapless::Vec::new();
+        crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| {
+            for ct in c.borrow().iter() {
+                if ct.pub_key[0] == hash {
+                    let _ = peers.push(ct.pub_key);
+                }
+            }
+        });
+        peers
     }
 
     /// Process a packet received over the LoRa radio interface
@@ -249,15 +272,7 @@ impl MeshEngine {
 
                 // Collect candidate peer keys outside the lock, then try each
                 // shared secret until one authenticates the MAC.
-                let mut peers: heapless::Vec<[u8; 32], 32> = heapless::Vec::new();
-                crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| {
-                    for ct in c.borrow().iter() {
-                        if ct.pub_key[0] == src {
-                            let _ = peers.push(ct.pub_key);
-                        }
-                    }
-                });
-
+                let peers = self.peers_by_hash(src);
                 for peer in peers.iter() {
                     let secret = match self.identity.shared_secret(peer) {
                         Some(secret) => secret,
@@ -288,11 +303,55 @@ impl MeshEngine {
                 }
             }
             PAYLOAD_TYPE_PATH => {
-                if let Ok(path) = PathPacket::decode(&pkt.payload[..pkt.payload_len]) {
-                    InboundAction::ReceivedPath(path)
-                } else {
-                    InboundAction::Unhandled
+                let payload = &pkt.payload[..pkt.payload_len];
+                if payload.len() <= 4 || payload[0] != self.identity.pub_key()[0] {
+                    return InboundAction::Unhandled;
                 }
+                if is_dupe {
+                    return InboundAction::DropDuplicate;
+                }
+                for peer in self.peers_by_hash(payload[1]).iter() {
+                    if let Some(secret) = self.identity.shared_secret(peer) {
+                        if let Ok(path) = PathPacket::decode(payload, &secret) {
+                            return InboundAction::ReceivedPath(path);
+                        }
+                    }
+                }
+                InboundAction::Unhandled
+            }
+            PAYLOAD_TYPE_GRP_DATA => {
+                if pkt.payload_len < 4 {
+                    return InboundAction::Unhandled;
+                }
+                let ch_hash = pkt.payload[0];
+                let channels = crate::companion::usb::CHANNELS.lock(|chs| *chs.borrow());
+                for (idx, ch) in channels.iter().enumerate() {
+                    if crate::meshcore::crypto::channel_hash(&ch.secret) == ch_hash {
+                        if let Ok(grp) =
+                            GrpDataPacket::decode_encrypted(&pkt.payload[..pkt.payload_len], &ch.secret)
+                        {
+                            return InboundAction::ReceivedGroupData {
+                                channel_idx: idx as u8,
+                                packet: grp,
+                            };
+                        }
+                    }
+                }
+                InboundAction::Unhandled
+            }
+            PAYLOAD_TYPE_ANON_REQ => {
+                let payload = &pkt.payload[..pkt.payload_len];
+                if payload.len() <= 35 || payload[0] != self.identity.pub_key()[0] {
+                    return InboundAction::Unhandled;
+                }
+                let mut sender_pub = [0u8; 32];
+                sender_pub.copy_from_slice(&payload[1..33]);
+                if let Some(secret) = self.identity.shared_secret(&sender_pub) {
+                    if let Ok(req) = AnonReqPacket::decode(payload, &secret) {
+                        return InboundAction::ReceivedAnonReq(req);
+                    }
+                }
+                InboundAction::Unhandled
             }
             _ => InboundAction::Unhandled,
         }
@@ -305,20 +364,16 @@ impl MeshEngine {
         let lat_int = (lat_f32 * 1_000_000.0) as i32;
         let lon_int = (lon_f32 * 1_000_000.0) as i32;
 
-        // Build flags: this node is a chat node + has location + has name
-        let mut flags = AdvertPacket::ADV_FLAG_IS_CHAT;
-        if self.is_repeater {
-            flags |= AdvertPacket::ADV_FLAG_IS_REPEATER;
-        }
-        if lat_f32 != 0.0 || lon_f32 != 0.0 {
-            flags |= AdvertPacket::ADV_FLAG_HAS_LOCATION;
-        }
-        flags |= AdvertPacket::ADV_FLAG_HAS_NAME;
+        let kind = if self.is_repeater {
+            ADV_TYPE_REPEATER
+        } else {
+            ADV_TYPE_CHAT
+        };
 
         let mut adv = AdvertPacket::new(
             *self.identity.pub_key(),
             timestamp,
-            flags,
+            kind,
             lat_int,
             lon_int,
             self.identity.callsign(),

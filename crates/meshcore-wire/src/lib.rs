@@ -20,7 +20,10 @@ pub use packet::{
     PAYLOAD_TYPE_ADVERT, PAYLOAD_TYPE_GRP_TXT, PAYLOAD_TYPE_PATH, PAYLOAD_TYPE_TXT_MSG,
     ROUTE_TYPE_DIRECT, ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_DIRECT, ROUTE_TYPE_TRANSPORT_FLOOD,
 };
-pub use packets::{AckPacket, AdvertPacket, GrpTextPacket, PathPacket, TxtMsgPacket};
+pub use packets::{
+    AckPacket, AddressedPacket, AdvertPacket, AnonReqPacket, ControlPacket, GrpDataPacket,
+    GrpTextPacket, MultipartPacket, PathPacket, RawPacket, TracePacket, TxtMsgPacket,
+};
 pub use queue::{PacketQueue, SeenPacketFilter};
 
 #[cfg(test)]

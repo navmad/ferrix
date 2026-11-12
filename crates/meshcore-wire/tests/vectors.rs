@@ -9,7 +9,10 @@
 #![allow(dead_code)]
 
 use meshcore_wire::packet::{Packet, PAYLOAD_TYPE_GRP_DATA, PAYLOAD_TYPE_GRP_TXT};
-use meshcore_wire::packets::{AckPacket, AdvertPacket, GrpTextPacket, TxtMsgPacket};
+use meshcore_wire::packets::{
+    AckPacket, AddressedPacket, AdvertPacket, AnonReqPacket, ControlPacket, GrpDataPacket,
+    GrpTextPacket, MultipartPacket, PathPacket, RawPacket, TracePacket, TxtMsgPacket,
+};
 use serde::Deserialize;
 use sha2::{Digest, Sha512};
 
@@ -39,6 +42,18 @@ struct Vectors {
     anon: Vec<AnonVec>,
     #[serde(default)]
     transport: Vec<TransportVec>,
+    #[serde(default)]
+    req: Vec<AddressedVec>,
+    #[serde(default)]
+    response: Vec<AddressedVec>,
+    #[serde(default)]
+    trace: Vec<TraceVec>,
+    #[serde(default)]
+    multipart: Vec<MultipartVec>,
+    #[serde(default)]
+    control: Vec<ControlVec>,
+    #[serde(default)]
+    raw: Vec<RawVec>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -114,6 +129,10 @@ struct GroupVec {
     region: Option<String>,
     #[serde(default)]
     region_key: Option<String>,
+    #[serde(default)]
+    data_type: Option<u16>,
+    #[serde(default)]
+    data: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -159,6 +178,44 @@ struct TransportVec {
     ptype: u8,
     payload: String,
     code: u16,
+}
+
+#[derive(Debug, Deserialize)]
+struct AddressedVec {
+    packet: String,
+    from: String,
+    to: String,
+    plain: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TraceVec {
+    packet: String,
+    tag: u32,
+    auth: u32,
+    flags: u8,
+    hashes: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MultipartVec {
+    packet: String,
+    remaining: u8,
+    inner_type: u8,
+    body: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ControlVec {
+    packet: String,
+    flags: u8,
+    data: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawVec {
+    packet: String,
+    payload: String,
 }
 
 fn vectors() -> Vectors {
@@ -294,10 +351,6 @@ fn packet_hashes_match() {
 fn advert_vectors() {
     let vectors = vectors();
     for a in &vectors.advert {
-        // Pending Phase 3: AdvertPacket does not parse feat1/feat2 yet.
-        if a.feat1.is_some() || a.feat2.is_some() {
-            continue;
-        }
         let pv = vectors
             .packet
             .iter()
@@ -309,6 +362,9 @@ fn advert_vectors() {
         let name = hexv(&a.adv_name);
 
         assert_eq!(adv.flags, app_data[0], "{}: flags", a.packet);
+        assert_eq!(adv.kind, a.kind, "{}: kind", a.packet);
+        assert_eq!(adv.feat1, a.feat1, "{}: feat1", a.packet);
+        assert_eq!(adv.feat2, a.feat2, "{}: feat2", a.packet);
         assert_eq!(adv.name.as_bytes(), &name[..], "{}: name", a.packet);
         if let Some(lat) = a.lat {
             assert_eq!(adv.latitude, lat, "{}: latitude", a.packet);
@@ -376,6 +432,34 @@ fn group_txt_vectors() {
         let (sender, message) = text.split_once(": ").unwrap();
         assert_eq!(grp.sender.as_str(), sender, "{}: sender", g.packet);
         assert_eq!(grp.message.as_str(), message, "{}: message", g.packet);
+
+        let rebuilt = GrpTextPacket::new(
+            grp.channel_hash,
+            grp.sender.as_str(),
+            grp.message.as_str(),
+            grp.timestamp,
+            0,
+            0,
+        );
+        let mut out = [0u8; 184];
+        let n = rebuilt.encode_encrypted(&secret, &mut out).unwrap();
+        assert_eq!(&out[..n], &payload[..], "{}: re-encode", g.packet);
+
+        if let Some(region) = &g.region {
+            let key = meshcore_wire::crypto::region_key(region);
+            if let Some(expected_key) = &g.region_key {
+                assert_eq!(&key[..], &hexv(expected_key)[..], "{}: region key", g.packet);
+            }
+            if let Some([tc0, tc1]) = pv.transport {
+                assert_eq!(tc1, 0, "{}: tc1", g.packet);
+                assert_eq!(
+                    meshcore_wire::crypto::transport_code(&key, pv.ptype, &payload),
+                    tc0,
+                    "{}: transport code",
+                    g.packet
+                );
+            }
+        }
     }
 }
 
@@ -516,38 +600,306 @@ fn ack_vectors() {
 }
 
 #[test]
-#[ignore = "pending Phase 3: GRP_DATA is not implemented"]
 fn grp_data_vectors() {
     let vectors = vectors();
-    let n = vectors
-        .group
-        .iter()
-        .filter(|g| {
-            vectors
-                .packet
-                .iter()
-                .find(|p| p.name == g.packet)
-                .map(|p| p.ptype)
-                == Some(PAYLOAD_TYPE_GRP_DATA)
-        })
-        .count();
-    assert_eq!(n, 1);
+    for g in &vectors.group {
+        let pv = vectors
+            .packet
+            .iter()
+            .find(|p| p.name == g.packet)
+            .unwrap_or_else(|| panic!("{}: missing packet", g.packet));
+        if pv.ptype != PAYLOAD_TYPE_GRP_DATA {
+            continue;
+        }
+        let secret = hexv(&g.secret);
+        let payload = hexv(&pv.payload);
+        let grp = GrpDataPacket::decode_encrypted(&payload, &secret)
+            .unwrap_or_else(|_| panic!("{}: decode", g.packet));
+
+        assert_eq!(grp.channel_hash, g.channel_hash, "{}: channel hash", g.packet);
+        let data_type = g.data_type.unwrap();
+        let data = hexv(g.data.as_ref().unwrap());
+        assert_eq!(grp.data_type, data_type, "{}: type", g.packet);
+        assert_eq!(grp.data.as_slice(), &data[..], "{}: data", g.packet);
+
+        let rebuilt = GrpDataPacket::new(g.channel_hash, data_type, &data).unwrap();
+        let mut out = [0u8; 184];
+        let n = rebuilt.encode_encrypted(&secret, &mut out).unwrap();
+        assert_eq!(&out[..n], &payload[..], "{}: re-encode", g.packet);
+    }
 }
 
 #[test]
-#[ignore = "pending Phase 3: PATH is not spec-compatible yet"]
 fn path_vectors() {
-    assert_eq!(vectors().path.len(), 2);
+    let vectors = vectors();
+    for p in &vectors.path {
+        let pv = vectors
+            .packet
+            .iter()
+            .find(|x| x.name == p.packet)
+            .unwrap_or_else(|| panic!("{}: missing packet", p.packet));
+        let payload = hexv(&pv.payload);
+        let dest = payload[0];
+        let src = payload[1];
+        let src_id = vectors
+            .identity
+            .iter()
+            .find(|i| hexv(&i.pub_)[0] == src)
+            .unwrap();
+        let dest_id = vectors
+            .identity
+            .iter()
+            .find(|i| hexv(&i.pub_)[0] == dest)
+            .unwrap();
+        let src_prv: [u8; 64] = hexv(&src_id.prv).try_into().unwrap();
+        let dest_pub: [u8; 32] = hexv(&dest_id.pub_).try_into().unwrap();
+        let id = meshcore_wire::LocalIdentity::from_private(&src_id.name, &src_prv).unwrap();
+        let secret = id.shared_secret(&dest_pub).unwrap();
+
+        let path = hexv(&p.in_path);
+        let extra = hexv(&p.extra);
+        let random4: [u8; 4] = if p.extra_type == 0xFF {
+            extra[..4].try_into().unwrap()
+        } else {
+            [0u8; 4]
+        };
+        let pkt = PathPacket::new(
+            dest,
+            src,
+            p.in_path_len as u8,
+            &path,
+            p.extra_type,
+            &extra,
+        )
+        .unwrap();
+        let mut encoded = [0u8; 184];
+        let n = pkt.encode(&secret, &random4, &mut encoded).unwrap();
+        assert_eq!(&encoded[..n], &payload[..], "{}: payload", p.packet);
+
+        let decoded = PathPacket::decode(&payload, &secret).unwrap();
+        assert_eq!(decoded.path_len, p.in_path_len as u8);
+        assert_eq!(decoded.path_bytes(), &path[..]);
+        assert_eq!(decoded.extra_type, p.extra_type);
+        assert_eq!(&decoded.extra[..extra.len()], &extra[..]);
+
+        let full = pkt.to_packet(pv.route, &secret, &random4).unwrap();
+        let mut raw = [0u8; 255];
+        let rn = full.write_to(&mut raw).unwrap();
+        assert_eq!(&raw[..rn], &hexv(&pv.raw)[..], "{}: raw", p.packet);
+    }
 }
 
 #[test]
-#[ignore = "pending Phase 3: ANON_REQ is not implemented"]
 fn anon_vectors() {
-    assert_eq!(vectors().anon.len(), 1);
+    let vectors = vectors();
+    for a in &vectors.anon {
+        let pv = vectors
+            .packet
+            .iter()
+            .find(|x| x.name == a.packet)
+            .unwrap_or_else(|| panic!("{}: missing packet", a.packet));
+        let payload = hexv(&pv.payload);
+        let sender = vectors
+            .identity
+            .iter()
+            .find(|i| i.name == a.from)
+            .unwrap();
+        let recipient = vectors
+            .identity
+            .iter()
+            .find(|i| i.name == a.to)
+            .unwrap();
+        let sender_pub: [u8; 32] = hexv(&sender.pub_).try_into().unwrap();
+        let sender_prv: [u8; 64] = hexv(&sender.prv).try_into().unwrap();
+        let recipient_pub: [u8; 32] = hexv(&recipient.pub_).try_into().unwrap();
+        let id = meshcore_wire::LocalIdentity::from_private(&sender.name, &sender_prv).unwrap();
+        let secret = id.shared_secret(&recipient_pub).unwrap();
+        assert_eq!(&secret[..], &hexv(&a.secret)[..], "{}: ECDH", a.packet);
+
+        let plain = hexv(&a.plain);
+        let pkt = AnonReqPacket::new(recipient_pub[0], sender_pub, &plain).unwrap();
+        let mut encoded = [0u8; 184];
+        let n = pkt.encode(&secret, &mut encoded).unwrap();
+        assert_eq!(&encoded[..n], &payload[..], "{}: payload", a.packet);
+
+        let decoded = AnonReqPacket::decode(&payload, &secret).unwrap();
+        assert_eq!(decoded.sender_pub, sender_pub);
+        // The decrypted buffer keeps the zero padding.
+        assert_eq!(&decoded.plain[..plain.len()], &plain[..]);
+        assert!(decoded.plain[plain.len()..].iter().all(|&b| b == 0));
+
+        let full = pkt.to_packet(&secret, pv.route).unwrap();
+        let mut raw = [0u8; 255];
+        let rn = full.write_to(&mut raw).unwrap();
+        assert_eq!(&raw[..rn], &hexv(&pv.raw)[..], "{}: raw", a.packet);
+    }
 }
 
 #[test]
-#[ignore = "pending Phase 2: transport codes are not implemented"]
 fn transport_vectors() {
-    assert_eq!(vectors().transport.len(), 6);
+    for t in &vectors().transport {
+        let key = meshcore_wire::crypto::region_key(&t.region);
+        let code = meshcore_wire::crypto::transport_code(&key, t.ptype, &hexv(&t.payload));
+        assert_eq!(code, t.code, "{} / type {}", t.region, t.ptype);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Remaining wire types
+
+fn check_addressed(vectors: &Vectors, entries: &[AddressedVec]) {
+    for e in entries {
+        let pv = vectors
+            .packet
+            .iter()
+            .find(|p| p.name == e.packet)
+            .unwrap_or_else(|| panic!("{}: missing packet", e.packet));
+        let sender = vectors
+            .identity
+            .iter()
+            .find(|i| i.name == e.from)
+            .unwrap_or_else(|| panic!("{}: missing sender", e.packet));
+        let recipient = vectors
+            .identity
+            .iter()
+            .find(|i| i.name == e.to)
+            .unwrap_or_else(|| panic!("{}: missing recipient", e.packet));
+        let sender_pub: [u8; 32] = hexv(&sender.pub_).try_into().unwrap();
+        let sender_prv: [u8; 64] = hexv(&sender.prv).try_into().unwrap();
+        let recipient_pub: [u8; 32] = hexv(&recipient.pub_).try_into().unwrap();
+        let id = meshcore_wire::LocalIdentity::from_private(&sender.name, &sender_prv).unwrap();
+        let secret = id.shared_secret(&recipient_pub).unwrap();
+
+        let plain = hexv(&e.plain);
+        let pkt = AddressedPacket::new(recipient_pub[0], sender_pub[0], &plain).unwrap();
+        let payload = hexv(&pv.payload);
+        let mut out = [0u8; 184];
+        let n = pkt.encode(&secret, &mut out).unwrap();
+        assert_eq!(&out[..n], &payload[..], "{}: payload", e.packet);
+
+        let decoded = AddressedPacket::decode(&payload, &secret).unwrap();
+        assert_eq!(&decoded.plain[..plain.len()], &plain[..], "{}: plain", e.packet);
+
+        let full = pkt.to_packet(pv.ptype, pv.route, &secret).unwrap();
+        let mut raw = [0u8; 255];
+        let rn = full.write_to(&mut raw).unwrap();
+        assert_eq!(&raw[..rn], &hexv(&pv.raw)[..], "{}: raw", e.packet);
+    }
+}
+
+#[test]
+fn req_vectors() {
+    let vectors = vectors();
+    check_addressed(&vectors, &vectors.req);
+}
+
+#[test]
+fn response_vectors() {
+    let vectors = vectors();
+    check_addressed(&vectors, &vectors.response);
+}
+
+#[test]
+fn trace_vectors() {
+    let vectors = vectors();
+    for t in &vectors.trace {
+        let pv = vectors
+            .packet
+            .iter()
+            .find(|p| p.name == t.packet)
+            .unwrap_or_else(|| panic!("{}: missing packet", t.packet));
+        let hashes = hexv(&t.hashes);
+        let pkt = TracePacket::new(t.tag, t.auth, t.flags, &hashes).unwrap();
+        let payload = hexv(&pv.payload);
+        let mut out = [0u8; 184];
+        let n = pkt.encode(&mut out).unwrap();
+        assert_eq!(&out[..n], &payload[..], "{}: payload", t.packet);
+
+        let decoded = TracePacket::decode(&payload).unwrap();
+        assert_eq!(decoded.tag, t.tag);
+        assert_eq!(decoded.auth, t.auth);
+        assert_eq!(decoded.flags, t.flags);
+        assert_eq!(decoded.hashes.as_slice(), &hashes[..]);
+    }
+}
+
+#[test]
+fn multipart_vectors() {
+    let vectors = vectors();
+    for m in &vectors.multipart {
+        let pv = vectors
+            .packet
+            .iter()
+            .find(|p| p.name == m.packet)
+            .unwrap_or_else(|| panic!("{}: missing packet", m.packet));
+        let body = hexv(&m.body);
+        let pkt = MultipartPacket::new(m.remaining, m.inner_type, &body).unwrap();
+        let payload = hexv(&pv.payload);
+        let mut out = [0u8; 184];
+        let n = pkt.encode(&mut out).unwrap();
+        assert_eq!(&out[..n], &payload[..], "{}: payload", m.packet);
+
+        let decoded = MultipartPacket::decode(&payload).unwrap();
+        assert_eq!(decoded.remaining, m.remaining);
+        assert_eq!(decoded.inner_type, m.inner_type);
+        assert_eq!(decoded.body.as_slice(), &body[..]);
+
+        let full = pkt.to_packet(pv.route).unwrap();
+        let mut raw = [0u8; 255];
+        let rn = full.write_to(&mut raw).unwrap();
+        assert_eq!(&raw[..rn], &hexv(&pv.raw)[..], "{}: raw", m.packet);
+    }
+}
+
+#[test]
+fn control_vectors() {
+    let vectors = vectors();
+    for c in &vectors.control {
+        let pv = vectors
+            .packet
+            .iter()
+            .find(|p| p.name == c.packet)
+            .unwrap_or_else(|| panic!("{}: missing packet", c.packet));
+        let data = hexv(&c.data);
+        let pkt = ControlPacket::new(c.flags, &data).unwrap();
+        let payload = hexv(&pv.payload);
+        let mut out = [0u8; 184];
+        let n = pkt.encode(&mut out).unwrap();
+        assert_eq!(&out[..n], &payload[..], "{}: payload", c.packet);
+
+        let decoded = ControlPacket::decode(&payload).unwrap();
+        assert_eq!(decoded.flags, c.flags);
+        assert_eq!(decoded.data.as_slice(), &data[..]);
+
+        let full = pkt.to_packet(pv.route).unwrap();
+        let mut raw = [0u8; 255];
+        let rn = full.write_to(&mut raw).unwrap();
+        assert_eq!(&raw[..rn], &hexv(&pv.raw)[..], "{}: raw", c.packet);
+    }
+}
+
+#[test]
+fn raw_vectors() {
+    let vectors = vectors();
+    for r in &vectors.raw {
+        let pv = vectors
+            .packet
+            .iter()
+            .find(|p| p.name == r.packet)
+            .unwrap_or_else(|| panic!("{}: missing packet", r.packet));
+        let data = hexv(&r.payload);
+        let pkt = RawPacket::new(&data).unwrap();
+        let payload = hexv(&pv.payload);
+        let mut out = [0u8; 184];
+        let n = pkt.encode(&mut out).unwrap();
+        assert_eq!(&out[..n], &payload[..], "{}: payload", r.packet);
+
+        let decoded = RawPacket::decode(&payload).unwrap();
+        assert_eq!(decoded.data.as_slice(), &data[..]);
+
+        let full = pkt.to_packet(pv.route).unwrap();
+        let mut raw = [0u8; 255];
+        let rn = full.write_to(&mut raw).unwrap();
+        assert_eq!(&raw[..rn], &hexv(&pv.raw)[..], "{}: raw", r.packet);
+    }
 }

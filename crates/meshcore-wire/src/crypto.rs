@@ -182,3 +182,32 @@ pub fn ack_crc(ts: u32, flags: u8, text: &[u8], sender_pub: &[u8; 32]) -> u32 {
     let full: [u8; 32] = hasher.finalize().into();
     u32::from_le_bytes([full[0], full[1], full[2], full[3]])
 }
+
+/// Region key: `SHA256("#" ‖ name)[0..16]`. "fr" and "#fr" are equivalent.
+pub fn region_key(name: &str) -> [u8; 16] {
+    let name = name.strip_prefix('#').unwrap_or(name);
+    let mut hasher = Sha256::new();
+    hasher.update(b"#");
+    hasher.update(name.as_bytes());
+    let full: [u8; 32] = hasher.finalize().into();
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&full[..16]);
+    key
+}
+
+/// Transport (scope) code: `HMAC-SHA256(key16, type ‖ payload)[0..2]` as a
+/// little-endian u16. 0 becomes 1 and 0xFFFF becomes 0xFFFE.
+pub fn transport_code(key: &[u8; 16], ptype: u8, payload: &[u8]) -> u16 {
+    let mut input = [0u8; 1 + 184];
+    if payload.len() > 184 {
+        return 0;
+    }
+    input[0] = ptype & 0x0F;
+    input[1..1 + payload.len()].copy_from_slice(payload);
+    let full = hmac_sha256(key, &input[..1 + payload.len()]);
+    match u16::from_le_bytes([full[0], full[1]]) {
+        0 => 1,
+        0xFFFF => 0xFFFE,
+        code => code,
+    }
+}

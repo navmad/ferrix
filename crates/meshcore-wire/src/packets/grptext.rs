@@ -53,7 +53,9 @@ impl GrpTextPacket {
 
         let mut pt = [0u8; 192];
         pt[0..4].copy_from_slice(&self.timestamp.to_le_bytes());
-        pt[4] = (self.txt_type << 2) | self.attempt;
+        // GRP_TXT is plain text only in v1.18; the C++ writes 0x00 here and
+        // rejects any received byte with `(pt[4] >> 2) != 0`.
+        pt[4] = 0;
 
         let mut offset = 5;
         let s_bytes = self.sender.as_bytes();
@@ -72,8 +74,8 @@ impl GrpTextPacket {
         let take = m_bytes.len().min(avail);
         pt[offset..offset + take].copy_from_slice(&m_bytes[..take]);
         offset += take;
-        pt[offset] = 0; // null terminator
-        offset += 1;
+        // No explicit NUL: the AES zero-padding terminates the string, as in
+        // the C++ (the terminator is not part of the encrypted length).
 
         let enc_and_mac_len = crate::crypto::meshcore_encrypt_then_mac(
             secret,

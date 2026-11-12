@@ -134,21 +134,14 @@ impl CompanionNode {
         }
     }
 
-    /// Determine the contact type from advert flags
-    /// The lower bits of the flags field encode the node type:
-    /// 0x01 = chat, 0x02 = repeater, 0x03 = room server, 0x04 = sensor
+    /// Determine the contact type from advert flags.
+    /// The low nibble is a single kind value: 1 chat, 2 repeater, 3 room, 4 sensor.
     pub fn get_contact_type_from_flags(flags: u8) -> u8 {
-        // Extract the type from the lower bits of the flags field
-        // ADV_FLAG_IS_ROOM (0x03) and ADV_FLAG_IS_SENSOR (0x04) are higher values,
-        // so check them first before IS_REPEATER (0x02) and IS_CHAT (0x01)
-        if flags & crate::meshcore::packets::advert::AdvertPacket::ADV_FLAG_IS_SENSOR != 0 {
-            ADV_TYPE_SENSOR
-        } else if flags & crate::meshcore::packets::advert::AdvertPacket::ADV_FLAG_IS_ROOM != 0 {
-            ADV_TYPE_ROOM
-        } else if flags & crate::meshcore::packets::advert::AdvertPacket::ADV_FLAG_IS_REPEATER != 0 {
-            ADV_TYPE_REPEATER
-        } else {
-            ADV_TYPE_CHAT
+        match flags & 0x0F {
+            2 => ADV_TYPE_REPEATER,
+            3 => ADV_TYPE_ROOM,
+            4 => ADV_TYPE_SENSOR,
+            _ => ADV_TYPE_CHAT,
         }
     }
 
