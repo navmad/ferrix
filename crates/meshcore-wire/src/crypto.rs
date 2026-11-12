@@ -168,3 +168,17 @@ pub fn meshcore_mac_then_decrypt(
     }
     meshcore_decrypt(&key_16, dest, ct)
 }
+
+/// MeshCore ACK CRC: `SHA256(ts u32 LE ‖ flags ‖ text ‖ sender_pub)[0..4]`
+/// read as a little-endian u32.
+///
+/// `flags` is the full plaintext byte (`txt_type << 2 | attempt & 3`).
+pub fn ack_crc(ts: u32, flags: u8, text: &[u8], sender_pub: &[u8; 32]) -> u32 {
+    let mut hasher = Sha256::new();
+    hasher.update(ts.to_le_bytes());
+    hasher.update([flags]);
+    hasher.update(text);
+    hasher.update(sender_pub);
+    let full: [u8; 32] = hasher.finalize().into();
+    u32::from_le_bytes([full[0], full[1], full[2], full[3]])
+}

@@ -42,7 +42,7 @@ static VBUS_DETECT: StaticCell<embassy_nrf::usb::vbus_detect::SoftwareVbusDetect
 
 #[derive(Clone, Copy, Debug)]
 pub struct PendingMessageAck {
-    pub pkt_hash: [u8; 4],
+    pub crc: u32,
     pub send_instant_ms: u64,
 }
 
@@ -51,11 +51,7 @@ static PENDING_MESSAGE_ACKS: embassy_sync::blocking_mutex::Mutex<
     core::cell::RefCell<heapless::Vec<PendingMessageAck, 8>>,
 > = embassy_sync::blocking_mutex::Mutex::new(core::cell::RefCell::new(heapless::Vec::new()));
 
-fn track_outbound_packet(pkt: &Packet) {
-    // Temporary until Phase 3: the pending-ACK list is keyed by the 4-byte ACK
-    // CRC, not the 8-byte dedup hash. Keep the hash prefix for now.
-    let hash = pkt.calculate_packet_hash();
-    let pkt_hash = [hash[0], hash[1], hash[2], hash[3]];
+fn track_pending_ack(crc: u32) {
     let now = embassy_time::Instant::now().as_millis();
     PENDING_MESSAGE_ACKS.lock(|a| {
         let mut list = a.borrow_mut();
@@ -63,17 +59,17 @@ fn track_outbound_packet(pkt: &Packet) {
             list.remove(0);
         }
         let _ = list.push(PendingMessageAck {
-            pkt_hash,
+            crc,
             send_instant_ms: now,
         });
     });
 }
 
-fn handle_direct_message_confirmed(ack_hash: [u8; 4]) {
+fn handle_direct_message_confirmed(crc: u32) {
     let now = embassy_time::Instant::now().as_millis();
     let rtt_ms = PENDING_MESSAGE_ACKS.lock(|a| {
         let mut list = a.borrow_mut();
-        if let Some(pos) = list.iter().position(|p| p.pkt_hash == ack_hash) {
+        if let Some(pos) = list.iter().position(|p| p.crc == crc) {
             let item = list.remove(pos);
             now.saturating_sub(item.send_instant_ms) as u32
         } else {
@@ -81,12 +77,12 @@ fn handle_direct_message_confirmed(ack_hash: [u8; 4]) {
         }
     });
 
-    info!("MeshCore Direct Message Delivery ACK Confirmed! (RTT: {} ms)", rtt_ms);
+    info!("MeshCore Direct Message Delivery ACK Confirmed! (crc {:08x}, RTT: {} ms)", crc, rtt_ms);
 
     // Push PUSH_CODE_SEND_CONFIRMED (0x82) to BLE companion app
     let mut push_frame = heapless::Vec::<u8, 256>::new();
     let _ = push_frame.push(crate::companion::protocol::PUSH_CODE_SEND_CONFIRMED);
-    let _ = push_frame.extend_from_slice(&ack_hash);
+    let _ = push_frame.extend_from_slice(&crc.to_le_bytes());
     let _ = push_frame.extend_from_slice(&rtt_ms.to_le_bytes());
     let _ = crate::companion::ble::COMPANION_PUSH_CHANNEL.try_send(push_frame);
 }
@@ -402,6 +398,7 @@ async fn main(spawner: Spawner) {
                                 channel_idx,
                                 path_len,
                                 sender: s_sender,
+                                sender_pub: [0u8; 32],
                                 text: s_text,
                                 timestamp: grp.timestamp,
                                 rssi,
@@ -415,8 +412,13 @@ async fn main(spawner: Spawner) {
                         let _ = msg_wait.push(crate::companion::protocol::PUSH_CODE_MSG_WAITING);
                         let _ = crate::companion::ble::COMPANION_PUSH_CHANNEL.try_send(msg_wait);
                     }
-                    InboundAction::ReceivedDirectText(msg) => {
-                        info!("MeshCore Direct Msg: {}", msg.text.as_str());
+                    InboundAction::ReceivedDirectText { msg, sender_pub } => {
+                        info!(
+                            "MeshCore Direct Msg from {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}: {}",
+                            sender_pub[0], sender_pub[1], sender_pub[2],
+                            sender_pub[3], sender_pub[4], sender_pub[5],
+                            msg.text.as_str()
+                        );
                         node.unread_messages = node.unread_messages.saturating_add(1);
                         crate::companion::usb::MESSAGE_LOG.lock(|m| {
                             let mut list = m.borrow_mut();
@@ -425,13 +427,23 @@ async fn main(spawner: Spawner) {
                             }
                             let mut s_sender = heapless::String::new();
                             use core::fmt::Write;
-                            let _ = write!(s_sender, "{:02x}{:02x}{:02x}{:02x}", msg.src_hash[0], msg.src_hash[1], msg.src_hash[2], msg.src_hash[3]);
+                            let _ = write!(
+                                s_sender,
+                                "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                                sender_pub[0],
+                                sender_pub[1],
+                                sender_pub[2],
+                                sender_pub[3],
+                                sender_pub[4],
+                                sender_pub[5]
+                            );
                             let mut s_text = heapless::String::new();
                             let _ = s_text.push_str(msg.text.as_str());
                             let _ = list.push(crate::meshcore::mesh::ReceivedMessage {
                                 channel_idx: 0,
                                 path_len: 0,
                                 sender: s_sender,
+                                sender_pub,
                                 text: s_text,
                                 timestamp: msg.timestamp,
                                 rssi,
@@ -447,14 +459,10 @@ async fn main(spawner: Spawner) {
                     }
                     InboundAction::ReceivedRepeaterEcho { pkt_hash, hops } => {
                         info!("MeshCore Message echoed by repeater! ({} hops, pkt_hash: {:?})", hops, pkt_hash);
-                        // Temporary until Phase 3: pending ACKs are keyed by a 4-byte CRC.
-                        handle_direct_message_confirmed([
-                            pkt_hash[0], pkt_hash[1], pkt_hash[2], pkt_hash[3],
-                        ]);
                     }
                     InboundAction::ReceivedAck(ack) => {
-                        info!("MeshCore ACK received for packet {:?}", ack.ack_packet_hash);
-                        handle_direct_message_confirmed(ack.ack_packet_hash);
+                        info!("MeshCore ACK received (crc {:08x})", ack.crc);
+                        handle_direct_message_confirmed(ack.crc);
                     }
                     InboundAction::DropDuplicate => {
                         info!("MeshCore: dropped duplicate packet");
@@ -522,16 +530,42 @@ async fn main(spawner: Spawner) {
                     });
                     let ch_hash = crate::meshcore::crypto::channel_hash(&secret);
                     node.tx_beacons = node.tx_beacons.saturating_add(1);
-                    if let Ok(pkt) = mesh.queue_group_text(ch_hash, &secret, text.as_str(), timestamp) {
-                        track_outbound_packet(&pkt);
-                    }
+                    let _ = mesh.queue_group_text(ch_hash, &secret, text.as_str(), timestamp);
                 }
-                UsbCommand::SendDirectText { dest_hash, text } => {
-                    info!("Queuing MeshCore Direct Text to {:?}: {}", dest_hash, text.as_str());
-                    let time = crate::companion::usb::get_device_time();
+                UsbCommand::SendDirectText {
+                    dest_prefix,
+                    timestamp,
+                    txt_type,
+                    attempt,
+                    text,
+                } => {
+                    info!(
+                        "Queuing MeshCore Direct Text to {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}: {}",
+                        dest_prefix[0], dest_prefix[1], dest_prefix[2],
+                        dest_prefix[3], dest_prefix[4], dest_prefix[5],
+                        text.as_str()
+                    );
                     node.tx_beacons = node.tx_beacons.saturating_add(1);
-                    if let Ok(pkt) = mesh.queue_direct_text(dest_hash, text.as_str(), time) {
-                        track_outbound_packet(&pkt);
+                    let dest_pub = crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| {
+                        c.borrow()
+                            .iter()
+                            .find(|ct| &ct.pub_key[..6] == &dest_prefix[..])
+                            .map(|ct| ct.pub_key)
+                    });
+                    match dest_pub {
+                        Some(dest_pub) => {
+                            match mesh.queue_direct_text(
+                                &dest_pub,
+                                text.as_str(),
+                                timestamp,
+                                txt_type,
+                                attempt,
+                            ) {
+                                Ok(crc) => track_pending_ack(crc),
+                                Err(_) => info!("Direct message send failed (text or encryption)"),
+                            }
+                        }
+                        None => info!("Direct message send failed: contact not found"),
                     }
                 }
                 UsbCommand::SetRepeat(rep) => {

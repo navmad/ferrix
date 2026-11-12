@@ -1,70 +1,66 @@
-//! Lightweight Acknowledgment Packet (`PAYLOAD_TYPE_ACK = 0x03`)
+//! Acknowledgment (`PAYLOAD_TYPE_ACK = 0x03`).
 //!
-//! Confirms receipt and end-to-end delivery of direct messages or requests.
+//! The payload is the 4-byte ACK CRC followed by an optional tail. Companions
+//! send 6 bytes: `crc(4) ‖ extended_attempt ‖ random`. Servers send 4, and room
+//! keep-alives send 5. Reception only requires the first 4 bytes.
 
 use crate::packet::{Packet, PAYLOAD_TYPE_ACK};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AckPacket {
-    pub dest_hash: [u8; 4],
-    pub src_hash: [u8; 4],
-    pub ack_packet_hash: [u8; 4],
-    pub timestamp: u32,
+    pub crc: u32,
+    /// Up to two trailing bytes (extended attempt, random).
+    pub tail: [u8; 2],
+    pub tail_len: u8,
 }
 
 impl AckPacket {
-    pub fn new(dest_hash: [u8; 4], src_hash: [u8; 4], ack_packet_hash: [u8; 4], timestamp: u32) -> Self {
+    /// Bare ACK: the CRC only (4 bytes).
+    pub const fn new(crc: u32) -> Self {
         Self {
-            dest_hash,
-            src_hash,
-            ack_packet_hash,
-            timestamp,
+            crc,
+            tail: [0, 0],
+            tail_len: 0,
         }
     }
 
-    /// Encode into wire format: `[dest_hash: 4] [src_hash: 4] [ack_hash: 4] [timestamp: 4]`
-    pub fn encode(&self, dest: &mut [u8]) -> Result<usize, ()> {
-        if dest.len() < 16 {
+    /// Companion ACK: `crc ‖ extended_attempt ‖ random` (6 bytes).
+    pub const fn with_extended(crc: u32, extended_attempt: u8, random: u8) -> Self {
+        Self {
+            crc,
+            tail: [extended_attempt, random],
+            tail_len: 2,
+        }
+    }
+
+    pub fn encode(&self, out: &mut [u8]) -> Result<usize, ()> {
+        let len = 4 + self.tail_len as usize;
+        if self.tail_len > 2 || out.len() < len {
             return Err(());
         }
-
-        dest[0..4].copy_from_slice(&self.dest_hash);
-        dest[4..8].copy_from_slice(&self.src_hash);
-        dest[8..12].copy_from_slice(&self.ack_packet_hash);
-        dest[12..16].copy_from_slice(&self.timestamp.to_le_bytes());
-
-        Ok(16)
+        out[0..4].copy_from_slice(&self.crc.to_le_bytes());
+        out[4..len].copy_from_slice(&self.tail[..self.tail_len as usize]);
+        Ok(len)
     }
 
-    /// Decode acknowledgment payload from bytes
     pub fn decode(src: &[u8]) -> Result<Self, ()> {
-        if src.len() < 16 {
+        if src.len() < 4 {
             return Err(());
         }
-
-        let mut dest_hash = [0u8; 4];
-        dest_hash.copy_from_slice(&src[0..4]);
-
-        let mut src_hash = [0u8; 4];
-        src_hash.copy_from_slice(&src[4..8]);
-
-        let mut ack_packet_hash = [0u8; 4];
-        ack_packet_hash.copy_from_slice(&src[8..12]);
-
-        let timestamp = u32::from_le_bytes([src[12], src[13], src[14], src[15]]);
-
+        let crc = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
+        let tail_len = (src.len() - 4).min(2) as u8;
+        let mut tail = [0u8; 2];
+        tail[..tail_len as usize].copy_from_slice(&src[4..4 + tail_len as usize]);
         Ok(Self {
-            dest_hash,
-            src_hash,
-            ack_packet_hash,
-            timestamp,
+            crc,
+            tail,
+            tail_len,
         })
     }
 
-    /// Pack into a complete MeshCore Packet
     pub fn to_packet(&self, route_type: u8) -> Result<Packet, ()> {
         let mut pkt = Packet::new(route_type, PAYLOAD_TYPE_ACK);
-        let mut buf = [0u8; 16];
+        let mut buf = [0u8; 6];
         let len = self.encode(&mut buf)?;
         pkt.set_payload(&buf[..len])?;
         Ok(pkt)

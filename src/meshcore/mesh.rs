@@ -36,6 +36,8 @@ pub struct ReceivedMessage {
     pub channel_idx: u8,
     pub path_len: u8,
     pub sender: heapless::String<32>,
+    /// Full sender public key for direct messages; zero for channel messages.
+    pub sender_pub: [u8; 32],
     pub text: heapless::String<128>,
     pub timestamp: u32,
     pub rssi: i16,
@@ -63,7 +65,10 @@ pub enum InboundAction {
         hops: u8,
     },
     /// Successfully decoded direct message addressed to this node
-    ReceivedDirectText(TxtMsgPacket),
+    ReceivedDirectText {
+        msg: TxtMsgPacket,
+        sender_pub: [u8; 32],
+    },
     /// Received message delivery acknowledgment
     ReceivedAck(AckPacket),
     /// Received path discovery reply
@@ -216,7 +221,21 @@ impl MeshEngine {
                 }
             }
             PAYLOAD_TYPE_TXT_MSG => {
-                if self.is_repeater && pkt.is_flood() && !is_dupe && !already_in_path {
+                let payload = &pkt.payload[..pkt.payload_len];
+                // Addressed payload: dest(1) ‖ src(1) ‖ sealed.
+                if payload.len() <= 4 {
+                    return InboundAction::Unhandled;
+                }
+                let dest = payload[0];
+                let src = payload[1];
+
+                // Only forward flood packets that are not addressed to us.
+                if dest != self.identity.pub_key()[0]
+                    && self.is_repeater
+                    && pkt.is_flood()
+                    && !is_dupe
+                    && !already_in_path
+                {
                     let mut repeat_pkt = pkt.clone();
                     repeat_pkt.append_hop_bytes(self.identity.pub_key());
                     let _ = self.tx_queue.push(repeat_pkt);
@@ -224,15 +243,42 @@ impl MeshEngine {
                 if is_dupe {
                     return InboundAction::DropDuplicate;
                 }
-                if let Ok(msg) = TxtMsgPacket::decode(&pkt.payload[..pkt.payload_len]) {
-                    if self.identity.base.matches_hash(&msg.dest_hash) {
-                        InboundAction::ReceivedDirectText(msg)
-                    } else {
-                        InboundAction::Unhandled
-                    }
-                } else {
-                    InboundAction::Unhandled
+                if dest != self.identity.pub_key()[0] {
+                    return InboundAction::Unhandled;
                 }
+
+                // Collect candidate peer keys outside the lock, then try each
+                // shared secret until one authenticates the MAC.
+                let mut peers: heapless::Vec<[u8; 32], 32> = heapless::Vec::new();
+                crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| {
+                    for ct in c.borrow().iter() {
+                        if ct.pub_key[0] == src {
+                            let _ = peers.push(ct.pub_key);
+                        }
+                    }
+                });
+
+                for peer in peers.iter() {
+                    let secret = match self.identity.shared_secret(peer) {
+                        Some(secret) => secret,
+                        None => continue,
+                    };
+                    if let Ok(msg) = TxtMsgPacket::decode(payload, &secret, peer) {
+                        if msg.txt_type == crate::meshcore::packets::txtmsg::TXT_TYPE_PLAIN {
+                            let ack = AckPacket::with_extended(
+                                msg.ack_crc,
+                                msg.extended_attempt,
+                                0,
+                            );
+                            let _ = self.queue_ack_packet(ack);
+                        }
+                        return InboundAction::ReceivedDirectText {
+                            msg,
+                            sender_pub: *peer,
+                        };
+                    }
+                }
+                InboundAction::Unhandled
             }
             PAYLOAD_TYPE_ACK => {
                 if let Ok(ack) = AckPacket::decode(&pkt.payload[..pkt.payload_len]) {
@@ -298,21 +344,44 @@ impl MeshEngine {
         Ok(pkt)
     }
 
-    /// Construct and queue a direct text message
-    pub fn queue_direct_text(&mut self, dest_hash: [u8; 4], text: &str, timestamp: u32) -> Result<Packet, ()> {
-        let src_hash = self.identity.hash_u32().to_le_bytes();
-        let msg = TxtMsgPacket::new(dest_hash, src_hash, text, timestamp);
-        let mut pkt = msg.to_packet(ROUTE_TYPE_FLOOD)?;
+    /// Construct and queue a direct text message. Returns the ACK CRC the
+    /// sender should expect.
+    pub fn queue_direct_text(
+        &mut self,
+        dest_pub: &[u8; 32],
+        text: &str,
+        timestamp: u32,
+        txt_type: u8,
+        attempt: u8,
+    ) -> Result<u32, ()> {
+        let secret = self.identity.shared_secret(dest_pub).ok_or(())?;
+        let msg = TxtMsgPacket::new(
+            dest_pub[0],
+            self.identity.pub_key()[0],
+            timestamp,
+            txt_type,
+            attempt,
+            text,
+            self.identity.pub_key(),
+        )?;
+        let mut pkt = msg.to_packet(ROUTE_TYPE_FLOOD, &secret)?;
         pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
         self.seen_filter.mark_seen(pkt.calculate_packet_hash());
         let _ = self.tx_queue.push(pkt.clone());
-        Ok(pkt)
+        Ok(msg.ack_crc)
     }
 
-    /// Construct and queue an acknowledgment packet
-    pub fn queue_ack(&mut self, dest_hash: [u8; 4], ack_packet_hash: [u8; 4], timestamp: u32) -> Result<Packet, ()> {
-        let src_hash = self.identity.hash_u32().to_le_bytes();
-        let ack = AckPacket::new(dest_hash, src_hash, ack_packet_hash, timestamp);
+    /// Construct and queue an acknowledgment packet. Returns the packet.
+    pub fn queue_ack(
+        &mut self,
+        crc: u32,
+        extended_attempt: u8,
+        random: u8,
+    ) -> Result<Packet, ()> {
+        self.queue_ack_packet(AckPacket::with_extended(crc, extended_attempt, random))
+    }
+
+    fn queue_ack_packet(&mut self, ack: AckPacket) -> Result<Packet, ()> {
         let mut pkt = ack.to_packet(ROUTE_TYPE_FLOOD)?;
         pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
         self.seen_filter.mark_seen(pkt.calculate_packet_hash());

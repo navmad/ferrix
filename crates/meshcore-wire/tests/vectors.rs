@@ -9,7 +9,7 @@
 #![allow(dead_code)]
 
 use meshcore_wire::packet::{Packet, PAYLOAD_TYPE_GRP_DATA, PAYLOAD_TYPE_GRP_TXT};
-use meshcore_wire::packets::{AdvertPacket, GrpTextPacket};
+use meshcore_wire::packets::{AckPacket, AdvertPacket, GrpTextPacket, TxtMsgPacket};
 use serde::Deserialize;
 use sha2::{Digest, Sha512};
 
@@ -27,6 +27,8 @@ struct Vectors {
     reject: Vec<RejectVec>,
     #[serde(default)]
     txt: Vec<TxtVec>,
+    #[serde(default)]
+    ack: Vec<AckVec>,
     #[serde(default)]
     group: Vec<GroupVec>,
     #[serde(default)]
@@ -92,6 +94,14 @@ struct TxtVec {
     text: String,
     plain: String,
     ack: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct AckVec {
+    packet: String,
+    crc: u32,
+    extended_attempt: u8,
+    random: u8,
 }
 
 #[derive(Debug, Deserialize)]
@@ -400,9 +410,109 @@ fn ecdh_vectors() {
 }
 
 #[test]
-#[ignore = "pending Phase 3: TXT_MSG is not spec-compatible yet"]
 fn txt_vectors() {
-    assert!(vectors().txt.len() >= 4);
+    let vectors = vectors();
+    for t in &vectors.txt {
+        let sender = vectors
+            .identity
+            .iter()
+            .find(|i| i.name == t.from)
+            .unwrap_or_else(|| panic!("{}: missing sender", t.packet));
+        let recipient = vectors
+            .identity
+            .iter()
+            .find(|i| i.name == t.to)
+            .unwrap_or_else(|| panic!("{}: missing recipient", t.packet));
+        let sender_pub: [u8; 32] = hexv(&sender.pub_).try_into().unwrap();
+        let recipient_pub: [u8; 32] = hexv(&recipient.pub_).try_into().unwrap();
+        let sender_prv: [u8; 64] = hexv(&sender.prv).try_into().unwrap();
+        let recipient_prv: [u8; 64] = hexv(&recipient.prv).try_into().unwrap();
+        let id_sender =
+            meshcore_wire::LocalIdentity::from_private(&sender.name, &sender_prv).unwrap();
+        let id_recipient =
+            meshcore_wire::LocalIdentity::from_private(&recipient.name, &recipient_prv).unwrap();
+        let secret = id_sender.shared_secret(&recipient_pub).unwrap();
+
+        let text = String::from_utf8(hexv(&t.text)).unwrap();
+        let msg = TxtMsgPacket::new(
+            recipient_pub[0],
+            sender_pub[0],
+            t.ts,
+            0,
+            t.attempt,
+            &text,
+            &sender_pub,
+        )
+        .unwrap_or_else(|_| panic!("{}: build", t.packet));
+
+        assert_eq!(msg.ack_crc, t.ack, "{}: ack crc", t.packet);
+
+        let pv = vectors
+            .packet
+            .iter()
+            .find(|p| p.name == t.packet)
+            .unwrap_or_else(|| panic!("{}: missing packet", t.packet));
+        let payload = hexv(&pv.payload);
+        let mut encoded = [0u8; 184];
+        let n = msg.encode(&secret, &mut encoded).unwrap();
+        assert_eq!(&encoded[..n], &payload[..], "{}: payload", t.packet);
+
+        // The recipient can decrypt with the same shared secret.
+        let decoded = TxtMsgPacket::decode(&payload, &secret, &sender_pub)
+            .unwrap_or_else(|_| panic!("{}: decode", t.packet));
+        assert_eq!(decoded.timestamp, t.ts, "{}: ts", t.packet);
+        assert_eq!(decoded.text.as_str(), text, "{}: text", t.packet);
+        assert_eq!(decoded.attempt, t.attempt, "{}: attempt", t.packet);
+        assert_eq!(decoded.ack_crc, t.ack, "{}: decoded ack", t.packet);
+        assert_eq!(
+            id_recipient.shared_secret(&sender_pub).unwrap(),
+            secret,
+            "{}: ECDH",
+            t.packet
+        );
+
+        // With no path, the full packet must match the oracle raw bytes.
+        if pv.path_len == 0 {
+            let pkt = msg.to_packet(pv.route, &secret).unwrap();
+            assert_eq!(
+                &pkt.payload[..pkt.payload_len],
+                &payload[..],
+                "{}: packet payload",
+                t.packet
+            );
+            let mut raw = [0u8; 255];
+            let raw_len = pkt.write_to(&mut raw).unwrap();
+            assert_eq!(
+                &raw[..raw_len],
+                &hexv(&pv.raw)[..],
+                "{}: raw",
+                t.packet
+            );
+        }
+    }
+}
+
+#[test]
+fn ack_vectors() {
+    let vectors = vectors();
+    for a in &vectors.ack {
+        let pv = vectors
+            .packet
+            .iter()
+            .find(|p| p.name == a.packet)
+            .unwrap_or_else(|| panic!("{}: missing packet", a.packet));
+        let payload = hexv(&pv.payload);
+        let ack = AckPacket::decode(&payload).unwrap_or_else(|_| panic!("{}: decode", a.packet));
+
+        assert_eq!(ack.crc, a.crc, "{}: crc", a.packet);
+        assert_eq!(ack.tail_len, 2, "{}: length", a.packet);
+        assert_eq!(ack.tail, [a.extended_attempt, a.random], "{}: tail", a.packet);
+
+        let expected = AckPacket::with_extended(a.crc, a.extended_attempt, a.random);
+        let mut encoded = [0u8; 8];
+        let n = expected.encode(&mut encoded).unwrap();
+        assert_eq!(&encoded[..n], &payload[..], "{}: payload", a.packet);
+    }
 }
 
 #[test]

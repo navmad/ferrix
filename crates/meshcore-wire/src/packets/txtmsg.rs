@@ -1,98 +1,164 @@
-//! Direct Text Message Packet (`PAYLOAD_TYPE_TXT_MSG = 0x02`)
+//! Direct Text Message (`PAYLOAD_TYPE_TXT_MSG = 0x02`).
 //!
-//! Point-to-point text message sent between specific node identities.
+//! Wire payload: `dest(1) ‖ src(1) ‖ seal(plain)`.
+//! Plaintext: `ts u32 LE ‖ (txt_type << 2 | attempt & 3) ‖ text`,
+//! with `0x00 ‖ attempt` appended when `attempt > 3`.
 
 use heapless::String;
+
+use crate::crypto::{ack_crc, meshcore_encrypt_then_mac, meshcore_mac_then_decrypt};
 use crate::packet::{Packet, PAYLOAD_TYPE_TXT_MSG};
+
+pub const MAX_TEXT_LEN: usize = 160;
+
+pub const TXT_TYPE_PLAIN: u8 = 0;
+pub const TXT_TYPE_CLI_DATA: u8 = 1;
+pub const TXT_TYPE_SIGNED_PLAIN: u8 = 2;
+pub const TXT_TYPE_CLI_COMMAND: u8 = 3;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TxtMsgPacket {
-    pub dest_hash: [u8; 4],
-    pub src_hash: [u8; 4],
+    /// Destination node hash (`pub[0]`).
+    pub dest: u8,
+    /// Sender node hash (`pub[0]`).
+    pub src: u8,
     pub timestamp: u32,
-    pub mac: [u8; 2],
-    pub text: String<128>,
+    pub txt_type: u8,
+    pub attempt: u8,
+    pub text: String<MAX_TEXT_LEN>,
+    /// CRC the sender expects in the ACK.
+    pub ack_crc: u32,
+    /// Byte after the terminating NUL: the extended attempt, or padding.
+    pub extended_attempt: u8,
 }
 
 impl TxtMsgPacket {
-    pub fn new(dest_hash: [u8; 4], src_hash: [u8; 4], text: &str, timestamp: u32) -> Self {
+    pub fn new(
+        dest: u8,
+        src: u8,
+        timestamp: u32,
+        txt_type: u8,
+        attempt: u8,
+        text: &str,
+        sender_pub: &[u8; 32],
+    ) -> Result<Self, ()> {
+        if text.bytes().any(|b| b == 0) {
+            return Err(());
+        }
+        if text.len() > MAX_TEXT_LEN || (attempt > 3 && text.len() > MAX_TEXT_LEN - 2) {
+            return Err(());
+        }
+
         let mut t = String::new();
-        let _ = t.push_str(text);
+        t.push_str(text)?;
 
-        let mut chk = 0xA55Au16;
-        for &b in text.as_bytes() {
-            chk = chk.wrapping_add(b as u16).rotate_left(2);
-        }
-
-        Self {
-            dest_hash,
-            src_hash,
-            timestamp,
-            mac: chk.to_le_bytes(),
-            text: t,
-        }
-    }
-
-    /// Encode into wire format:
-    /// `[dest_hash: 4] [src_hash: 4] [timestamp: 4] [mac: 2] [text_len: 1] [text...]`
-    pub fn encode(&self, dest: &mut [u8]) -> Result<usize, ()> {
-        let text_bytes = self.text.as_bytes();
-        let needed = 4 + 4 + 4 + 2 + 1 + text_bytes.len();
-        if dest.len() < needed {
-            return Err(());
-        }
-
-        dest[0..4].copy_from_slice(&self.dest_hash);
-        dest[4..8].copy_from_slice(&self.src_hash);
-        dest[8..12].copy_from_slice(&self.timestamp.to_le_bytes());
-        dest[12..14].copy_from_slice(&self.mac);
-        dest[14] = text_bytes.len() as u8;
-        dest[15..15 + text_bytes.len()].copy_from_slice(text_bytes);
-
-        Ok(15 + text_bytes.len())
-    }
-
-    /// Decode direct text message from bytes
-    pub fn decode(src: &[u8]) -> Result<Self, ()> {
-        if src.len() < 15 {
-            return Err(());
-        }
-
-        let mut dest_hash = [0u8; 4];
-        dest_hash.copy_from_slice(&src[0..4]);
-
-        let mut src_hash = [0u8; 4];
-        src_hash.copy_from_slice(&src[4..8]);
-
-        let timestamp = u32::from_le_bytes([src[8], src[9], src[10], src[11]]);
-
-        let mut mac = [0u8; 2];
-        mac.copy_from_slice(&src[12..14]);
-
-        let text_len = src[14] as usize;
-        if src.len() < 15 + text_len {
-            return Err(());
-        }
-
-        let text_str = core::str::from_utf8(&src[15..15 + text_len]).map_err(|_| ())?;
-        let mut text = String::new();
-        let _ = text.push_str(text_str);
-
+        let flags = flags_of(txt_type, attempt);
         Ok(Self {
-            dest_hash,
-            src_hash,
+            dest,
+            src,
             timestamp,
-            mac,
-            text,
+            txt_type: txt_type & 0x3F,
+            attempt,
+            text: t,
+            ack_crc: ack_crc(timestamp, flags, text.as_bytes(), sender_pub),
+            extended_attempt: if attempt > 3 { attempt } else { 0 },
         })
     }
 
-    /// Pack into a complete MeshCore Packet
-    pub fn to_packet(&self, route_type: u8) -> Result<Packet, ()> {
+    /// Encode into `dest(1) ‖ src(1) ‖ seal(plain)`. Returns the wire length.
+    pub fn encode(&self, secret: &[u8; 32], out: &mut [u8]) -> Result<usize, ()> {
+        if out.len() < 2 {
+            return Err(());
+        }
+        let mut plain = [0u8; 4 + 1 + MAX_TEXT_LEN + 2];
+        let plain_len = self.write_plaintext(&mut plain)?;
+
+        out[0] = self.dest;
+        out[1] = self.src;
+        let sealed = meshcore_encrypt_then_mac(secret, &mut out[2..], &plain[..plain_len])?;
+        Ok(2 + sealed)
+    }
+
+    /// Decode and decrypt an addressed TXT_MSG payload.
+    ///
+    /// `sender_pub` is the candidate peer's public key; the caller tries each
+    /// contact whose `pub[0]` equals the payload's `src` byte.
+    pub fn decode(src: &[u8], secret: &[u8; 32], sender_pub: &[u8; 32]) -> Result<Self, ()> {
+        // The C++ requires more than 4 bytes before it even attempts decrypt.
+        if src.len() <= 4 {
+            return Err(());
+        }
+        let dest = src[0];
+        let src_hash = src[1];
+
+        let mut plain = [0u8; 4 + 1 + MAX_TEXT_LEN + 2];
+        let plain_len = meshcore_mac_then_decrypt(secret, &mut plain, &src[2..])?;
+        // The C++ requires `len > 5`.
+        if plain_len <= 5 {
+            return Err(());
+        }
+
+        let timestamp = u32::from_le_bytes([plain[0], plain[1], plain[2], plain[3]]);
+        let flags = plain[4];
+        let txt_type = flags >> 2;
+
+        let rest = &plain[5..plain_len];
+        let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
+        let text_str = core::str::from_utf8(&rest[..end]).map_err(|_| ())?;
+        let mut text = String::new();
+        text.push_str(text_str)?;
+
+        let extended_attempt = rest.get(end + 1).copied().unwrap_or(0);
+        let attempt = if extended_attempt > 3 {
+            extended_attempt
+        } else {
+            flags & 0x03
+        };
+
+        Ok(Self {
+            dest,
+            src: src_hash,
+            timestamp,
+            txt_type,
+            attempt,
+            ack_crc: ack_crc(timestamp, flags, text.as_bytes(), sender_pub),
+            text,
+            extended_attempt,
+        })
+    }
+
+    /// Pack into a complete MeshCore Packet.
+    pub fn to_packet(&self, route_type: u8, secret: &[u8; 32]) -> Result<Packet, ()> {
         let mut pkt = Packet::new(route_type, PAYLOAD_TYPE_TXT_MSG);
-        let mut buf = [0u8; 192];
-        let len = self.encode(&mut buf)?;
+        let mut buf = [0u8; 184];
+        let len = self.encode(secret, &mut buf)?;
         pkt.set_payload(&buf[..len])?;
         Ok(pkt)
     }
+
+    fn write_plaintext(&self, out: &mut [u8]) -> Result<usize, ()> {
+        let text = self.text.as_bytes();
+        let flags = flags_of(self.txt_type, self.attempt);
+        let mut n = 0;
+
+        if out.len() < 5 + text.len() + if self.attempt > 3 { 2 } else { 0 } {
+            return Err(());
+        }
+        out[0..4].copy_from_slice(&self.timestamp.to_le_bytes());
+        out[4] = flags;
+        n += 5;
+        out[n..n + text.len()].copy_from_slice(text);
+        n += text.len();
+        if self.attempt > 3 {
+            out[n] = 0;
+            out[n + 1] = self.attempt;
+            n += 2;
+        }
+        Ok(n)
+    }
+}
+
+#[inline]
+fn flags_of(txt_type: u8, attempt: u8) -> u8 {
+    ((txt_type & 0x3F) << 2) | (attempt & 0x03)
 }

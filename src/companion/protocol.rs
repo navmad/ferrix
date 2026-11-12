@@ -348,8 +348,7 @@ impl CompanionNode {
                         let _ = resp.push((msg.snr * 4) as u8);
                         let _ = resp.push(0);
                         let _ = resp.push(0);
-                        let pk_prefix = [0u8; 6];
-                        let _ = resp.extend_from_slice(&pk_prefix);
+                        let _ = resp.extend_from_slice(&msg.sender_pub[..6]);
                         let _ = resp.push(msg.path_len);
                         let _ = resp.push(0); // TXT_TYPE_PLAIN
                         let _ = resp.extend_from_slice(&msg.timestamp.to_le_bytes());
@@ -477,21 +476,34 @@ impl CompanionNode {
             }
 
             CMD_SEND_MSG => {
-                // Inbound direct message: [CMD(2), dest_pubkey(32), timestamp(4 bytes le), text...]
-                if payload.len() > 37 {
-                    let dest_hash = [payload[1], payload[2], payload[3], payload[4]];
-                    let text_bytes = &payload[37..];
-                    if let Ok(msg_str) = core::str::from_utf8(text_bytes) {
-                        let mut s = String::<128>::new();
-                        let _ = s.push_str(msg_str);
-                        let _ = crate::companion::usb::USB_COMMAND_CHANNEL.try_send(crate::companion::usb::UsbCommand::SendDirectText {
-                            dest_hash,
-                            text: s,
-                        });
+                // [cmd][txt_type][attempt][timestamp u32 LE][pubkey_prefix 6][text...]
+                // Minimum: 1 + 1 + 1 + 4 + 6 + 1 = 14 bytes.
+                let mut resp = Vec::<u8, 4>::new();
+                let mut queued = false;
+                if payload.len() >= 14 {
+                    let txt_type = payload[1];
+                    let attempt = payload[2];
+                    let timestamp = u32::from_le_bytes([
+                        payload[3], payload[4], payload[5], payload[6],
+                    ]);
+                    let mut dest_prefix = [0u8; 6];
+                    dest_prefix.copy_from_slice(&payload[7..13]);
+                    if let Ok(text_str) = core::str::from_utf8(&payload[13..]) {
+                        let mut s = String::<160>::new();
+                        if s.push_str(text_str).is_ok() {
+                            queued = crate::companion::usb::USB_COMMAND_CHANNEL
+                                .try_send(crate::companion::usb::UsbCommand::SendDirectText {
+                                    dest_prefix,
+                                    timestamp,
+                                    txt_type,
+                                    attempt,
+                                    text: s,
+                                })
+                                .is_ok();
+                        }
                     }
                 }
-                let mut resp = Vec::<u8, 4>::new();
-                let _ = resp.push(RESP_CODE_OK);
+                let _ = resp.push(if queued { RESP_CODE_OK } else { RESP_CODE_ERR });
                 emit(&resp);
             }
 

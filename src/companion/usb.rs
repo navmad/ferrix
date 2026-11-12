@@ -153,8 +153,12 @@ pub enum UsbCommand {
         text: heapless::String<128>,
     },
     SendDirectText {
-        dest_hash: [u8; 4],
-        text: heapless::String<128>,
+        /// First six bytes of the destination public key.
+        dest_prefix: [u8; 6],
+        timestamp: u32,
+        txt_type: u8,
+        attempt: u8,
+        text: heapless::String<160>,
     },
     SetFrequency(u32),
     SetTxPower(i8),
@@ -625,19 +629,56 @@ async fn handle_text_cli(
                         }
                     }
                     if valid && !msg.is_empty() {
-                        let mut s_msg = heapless::String::<128>::new();
-                        let _ = s_msg.push_str(msg);
-                        let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SendDirectText {
-                            dest_hash: dest,
-                            text: s_msg,
+                        let prefix = DISCOVERED_CONTACTS.lock(|c| {
+                            c.borrow()
+                                .iter()
+                                .find(|ct| &ct.pub_key[..4] == &dest[..])
+                                .map(|ct| {
+                                    let mut p = [0u8; 6];
+                                    p.copy_from_slice(&ct.pub_key[..6]);
+                                    p
+                                })
                         });
-                        RADIO_TELEMETRY.lock(|t| {
-                            let mut tel = t.borrow_mut();
-                            tel.tx_beacons = tel.tx_beacons.saturating_add(1);
-                        });
-                        let mut out_str = heapless::String::<64>::new();
-                        let _ = write!(out_str, "  -> OK (Direct message queued to {})\r\n", hex_str);
-                        let _ = write_all(sender, out_str.as_bytes()).await;
+                        match prefix {
+                            Some(dest_prefix) => {
+                                let mut s_msg = heapless::String::<160>::new();
+                                if s_msg.push_str(msg).is_ok() {
+                                    let _ = USB_COMMAND_CHANNEL.try_send(
+                                        UsbCommand::SendDirectText {
+                                            dest_prefix,
+                                            timestamp: get_device_time(),
+                                            txt_type: 0,
+                                            attempt: 0,
+                                            text: s_msg,
+                                        },
+                                    );
+                                    RADIO_TELEMETRY.lock(|t| {
+                                        let mut tel = t.borrow_mut();
+                                        tel.tx_beacons = tel.tx_beacons.saturating_add(1);
+                                    });
+                                    let mut out_str = heapless::String::<72>::new();
+                                    let _ = write!(
+                                        out_str,
+                                        "  -> OK (Direct message queued to {})\r\n",
+                                        hex_str
+                                    );
+                                    let _ = write_all(sender, out_str.as_bytes()).await;
+                                } else {
+                                    let _ = write_all(
+                                        sender,
+                                        b"  -> Error: message exceeds 160 bytes\r\n",
+                                    )
+                                    .await;
+                                }
+                            }
+                            None => {
+                                let _ = write_all(
+                                    sender,
+                                    b"  -> Error: no contact with that 4-byte hash\r\n",
+                                )
+                                .await;
+                            }
+                        }
                     } else {
                         let _ = write_all(sender, b"  -> Error: invalid hex ID or empty text\r\n").await;
                     }
