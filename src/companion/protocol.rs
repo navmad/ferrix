@@ -3,7 +3,21 @@
 //! Handles command parsing from companion apps (Mobile/Desktop/Web)
 //! and generates protocol response frames.
 
+use core::cell::RefCell;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
+use embassy_sync::blocking_mutex::Mutex;
 use heapless::{String, Vec};
+
+use crate::meshcore::packet::{Packet, PAYLOAD_TYPE_ADVERT};
+use crate::meshcore::packets::AdvertPacket;
+
+/// Signing scratch buffer. Advertised to the app by `SIGN_START`.
+pub const MAX_SIGN_DATA: usize = 4096;
+static SIGN_ACTIVE: AtomicBool = AtomicBool::new(false);
+static SIGN_BUFFER: Mutex<ThreadModeRawMutex, RefCell<Vec<u8, MAX_SIGN_DATA>>> =
+    Mutex::new(RefCell::new(Vec::new()));
 
 pub const CMD_APP_START: u8 = 1;
 pub const CMD_SEND_MSG: u8 = 2;
@@ -28,6 +42,9 @@ pub const CMD_SET_TUNING_PARAMS: u8 = 0x15;
 pub const CMD_EXPORT_PRIVATE_KEY: u8 = 0x17;
 pub const CMD_IMPORT_PRIVATE_KEY: u8 = 0x18;
 pub const CMD_GET_CONTACT_BY_KEY: u8 = 0x1E;
+pub const CMD_SIGN_START: u8 = 0x21;
+pub const CMD_SIGN_DATA: u8 = 0x22;
+pub const CMD_SIGN_FINISH: u8 = 0x23;
 pub const CMD_DEVICE_QUERY: u8 = 22;
 pub const CMD_GET_ADVERT_PATH: u8 = 0x2A;
 pub const CMD_GET_TUNING_PARAMS: u8 = 0x2B;
@@ -54,6 +71,8 @@ pub const RESP_CODE_PRIVATE_KEY: u8 = 0x0E;
 pub const RESP_CODE_CONTACT_MSG_V3: u8 = 0x10;
 pub const RESP_CODE_CHANNEL_MSG_V3: u8 = 0x11;
 pub const RESP_CODE_CHANNEL_INFO: u8 = 18;
+pub const RESP_CODE_SIGN_START: u8 = 0x13;
+pub const RESP_CODE_SIGNATURE: u8 = 0x14;
 pub const RESP_CODE_ADVERT_PATH: u8 = 0x16;
 pub const RESP_CODE_TUNING: u8 = 0x17;
 pub const RESP_CODE_STATS: u8 = 0x18;
@@ -678,30 +697,10 @@ impl CompanionNode {
                 // Layout: [code(3), pubkey(32), type(1), flags(1), out_path_len(1), out_path(64), adv_name(32), last_advert(u32_le), adv_lat(i32_le), adv_lon(i32_le), lastmod(u32_le)]
                 let mut max_lastmod = 0u32;
                 for c in contacts.iter() {
-                    let mut c_resp = Vec::<u8, 160>::new();
-                    let _ = c_resp.push(RESP_CODE_CONTACT);
-                    let _ = c_resp.extend_from_slice(&c.pub_key);
-                    let contact_type = CompanionNode::get_contact_type_from_flags(c.flags);
-                    let _ = c_resp.push(contact_type);
-                    let _ = c_resp.push(c.flags);
-                    let _ = c_resp.push(c.out_path_len);
-                    let _ = c_resp.extend_from_slice(&c.out_path);
-
-                    let mut adv_name = [0u8; 32];
-                    let cs = c.callsign.as_bytes();
-                    let cs_len = cs.len().min(31);
-                    adv_name[..cs_len].copy_from_slice(&cs[..cs_len]);
-                    let _ = c_resp.extend_from_slice(&adv_name);
-
-                    let last_advert = c.last_advert_ts;
                     if c.last_seen_epoch > max_lastmod {
                         max_lastmod = c.last_seen_epoch;
                     }
-                    let _ = c_resp.extend_from_slice(&last_advert.to_le_bytes());
-                    let _ = c_resp.extend_from_slice(&c.latitude.to_le_bytes()); // adv_lat
-                    let _ = c_resp.extend_from_slice(&c.longitude.to_le_bytes()); // adv_lon
-                    let _ = c_resp.extend_from_slice(&c.last_seen_epoch.to_le_bytes()); // lastmod
-                    emit(&c_resp);
+                    emit(&serialize_contact(c));
                 }
 
                 // 3. RESP_CODE_END_OF_CONTACTS (4) [code(4), most_recent_lastmod(u32_le)]
@@ -918,6 +917,168 @@ impl CompanionNode {
                 emit(&resp);
             }
 
+            CMD_GET_CONTACT_BY_KEY => {
+                let found = if payload.len() >= 33 {
+                    let mut key = [0u8; 32];
+                    key.copy_from_slice(&payload[1..33]);
+                    crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| {
+                        c.borrow().iter().find(|ct| ct.pub_key == key).cloned()
+                    })
+                } else {
+                    None
+                };
+                match found {
+                    Some(ct) => emit(&serialize_contact(&ct)),
+                    None => {
+                        let mut resp = Vec::<u8, 4>::new();
+                        let _ = resp.push(RESP_CODE_ERR);
+                        emit(&resp);
+                    }
+                }
+            }
+
+            CMD_SIGN_START => {
+                SIGN_ACTIVE.store(true, Ordering::Relaxed);
+                SIGN_BUFFER.lock(|b| b.borrow_mut().clear());
+                let mut resp = Vec::<u8, 6>::new();
+                let _ = resp.push(RESP_CODE_SIGN_START);
+                let _ = resp.push(0);
+                let _ = resp.extend_from_slice(&(MAX_SIGN_DATA as u32).to_le_bytes());
+                emit(&resp);
+            }
+
+            CMD_SIGN_DATA => {
+                let mut ok = false;
+                if payload.len() > 1 && SIGN_ACTIVE.load(Ordering::Relaxed) {
+                    ok = SIGN_BUFFER.lock(|b| {
+                        b.borrow_mut().extend_from_slice(&payload[1..]).is_ok()
+                    });
+                }
+                let mut resp = Vec::<u8, 4>::new();
+                let _ = resp.push(if ok { RESP_CODE_OK } else { RESP_CODE_ERR });
+                emit(&resp);
+            }
+
+            CMD_SIGN_FINISH => {
+                let mut signature = None;
+                if SIGN_ACTIVE.swap(false, Ordering::Relaxed) {
+                    SIGN_BUFFER.lock(|b| {
+                        let data = b.borrow();
+                        if !data.is_empty() {
+                            if let Some(id) = crate::meshcore::identity::LocalIdentity::from_private(
+                                self.callsign.as_str(),
+                                &self.private_key,
+                            ) {
+                                signature = Some(id.sign(&data));
+                            }
+                        }
+                    });
+                    SIGN_BUFFER.lock(|b| b.borrow_mut().clear());
+                }
+                match signature {
+                    Some(sig) => {
+                        let mut resp = Vec::<u8, 65>::new();
+                        let _ = resp.push(RESP_CODE_SIGNATURE);
+                        let _ = resp.extend_from_slice(&sig);
+                        emit(&resp);
+                    }
+                    None => {
+                        let mut resp = Vec::<u8, 4>::new();
+                        let _ = resp.push(RESP_CODE_ERR);
+                        emit(&resp);
+                    }
+                }
+            }
+
+            CMD_EXPORT_CONTACT => {
+                // Export self as a signed advert packet. Exporting a stored
+                // contact would require retaining its original advert blob.
+                if payload.len() < 33 {
+                    let id = crate::meshcore::identity::LocalIdentity::from_private(
+                        self.callsign.as_str(),
+                        &self.private_key,
+                    );
+                    match id {
+                        Some(id) => {
+                            let ts = crate::companion::usb::get_device_time();
+                            let lat = (self.latitude * 1_000_000.0) as i32;
+                            let lon = (self.longitude * 1_000_000.0) as i32;
+                            let mut adv = AdvertPacket::new(
+                                *id.pub_key(),
+                                ts,
+                                crate::meshcore::packets::advert::ADV_TYPE_CHAT,
+                                lat,
+                                lon,
+                                self.callsign.as_str(),
+                            );
+                            adv.sign(&id);
+                            if let Ok(pkt) =
+                                adv.to_packet(crate::meshcore::packet::ROUTE_TYPE_FLOOD)
+                            {
+                                let mut raw = [0u8; 184];
+                                if let Ok(n) = pkt.write_to(&mut raw) {
+                                    let mut resp = Vec::<u8, 185>::new();
+                                    let _ = resp.push(RESP_CODE_EXPORT_CONTACT);
+                                    let _ = resp.extend_from_slice(&raw[..n]);
+                                    emit(&resp);
+                                }
+                            }
+                        }
+                        None => {
+                            let mut resp = Vec::<u8, 4>::new();
+                            let _ = resp.push(RESP_CODE_ERR);
+                            emit(&resp);
+                        }
+                    }
+                } else {
+                    let mut resp = Vec::<u8, 4>::new();
+                    let _ = resp.push(RESP_CODE_ERR);
+                    emit(&resp);
+                }
+            }
+
+            CMD_IMPORT_CONTACT => {
+                let mut ok = false;
+                if payload.len() > 1 {
+                    if let Ok(pkt) = Packet::read_from(&payload[1..]) {
+                        if pkt.payload_type() == PAYLOAD_TYPE_ADVERT {
+                            if let Ok(adv) = AdvertPacket::decode(&pkt.payload[..pkt.payload_len]) {
+                                if adv.verify_signature() {
+                                    let mut callsign = String::<32>::new();
+                                    let _ = callsign.push_str(adv.name.as_str());
+                                    let mut out_path = [0u8; 64];
+                                    let plen = pkt.path_byte_len();
+                                    out_path[..plen].copy_from_slice(&pkt.path[..plen]);
+                                    let node_id = [
+                                        adv.pub_key[0],
+                                        adv.pub_key[1],
+                                        adv.pub_key[2],
+                                        adv.pub_key[3],
+                                    ];
+                                    ok = crate::companion::ble::CONTACT_OP_CHANNEL
+                                        .try_send(crate::companion::ble::ContactOperation::AddOrUpdate {
+                                            pub_key: adv.pub_key,
+                                            callsign,
+                                            node_id,
+                                            last_seen_epoch: crate::companion::usb::get_device_time(),
+                                            latitude: adv.latitude,
+                                            longitude: adv.longitude,
+                                            flags: adv.flags,
+                                            out_path,
+                                            out_path_len: pkt.path_len,
+                                            last_advert_ts: adv.timestamp,
+                                        })
+                                        .is_ok();
+                                }
+                            }
+                        }
+                    }
+                }
+                let mut resp = Vec::<u8, 4>::new();
+                let _ = resp.push(if ok { RESP_CODE_OK } else { RESP_CODE_ERR });
+                emit(&resp);
+            }
+
             _ => {
                 // Unsupported command: report an error rather than a misleading OK.
                 let mut resp = Vec::<u8, 4>::new();
@@ -928,3 +1089,26 @@ impl CompanionNode {
     }
 }
 
+
+/// Serialize one contact in the companion `PACKET_CONTACT` layout.
+fn serialize_contact(c: &crate::meshcore::mesh::DiscoveredContact) -> Vec<u8, 160> {
+    let mut resp = Vec::<u8, 160>::new();
+    let _ = resp.push(RESP_CODE_CONTACT);
+    let _ = resp.extend_from_slice(&c.pub_key);
+    let _ = resp.push(CompanionNode::get_contact_type_from_flags(c.flags));
+    let _ = resp.push(c.flags);
+    let _ = resp.push(c.out_path_len);
+    let _ = resp.extend_from_slice(&c.out_path);
+
+    let mut adv_name = [0u8; 32];
+    let cs = c.callsign.as_bytes();
+    let n = cs.len().min(31);
+    adv_name[..n].copy_from_slice(&cs[..n]);
+    let _ = resp.extend_from_slice(&adv_name);
+
+    let _ = resp.extend_from_slice(&c.last_advert_ts.to_le_bytes());
+    let _ = resp.extend_from_slice(&c.latitude.to_le_bytes());
+    let _ = resp.extend_from_slice(&c.longitude.to_le_bytes());
+    let _ = resp.extend_from_slice(&c.last_seen_epoch.to_le_bytes());
+    resp
+}
