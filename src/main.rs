@@ -290,9 +290,15 @@ async fn main(spawner: Spawner) {
                     InboundAction::ReceivedAdvert(adv) => {
                         info!("MeshCore Advert from: {}", adv.name.as_str());
                         let node_id = [adv.pub_key[0], adv.pub_key[1], adv.pub_key[2], adv.pub_key[3]];
+
+                        // Check if this contact already exists in our list
+                        let contact_type = CompanionNode::get_contact_type_from_flags(adv.flags);
+                        let should_add = node.should_auto_add_contact_type(contact_type);
+
                         crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| {
                             let mut list = c.borrow_mut();
-                            if let Some(existing) = list.iter_mut().find(|c| c.pub_key == adv.pub_key) {
+                            if let Some(existing) = list.iter_mut().find(|ct| ct.pub_key == adv.pub_key) {
+                                // Update existing contact
                                 existing.callsign = adv.name.clone();
                                 existing.last_seen_epoch = node.epoch_time as u32;
                                 existing.rssi = rssi;
@@ -301,19 +307,75 @@ async fn main(spawner: Spawner) {
                                 existing.longitude = adv.longitude;
                                 existing.flags = adv.flags;
                             } else {
-                                let mut cs = heapless::String::new();
-                                let _ = cs.push_str(adv.name.as_str());
-                                let _ = list.push(crate::meshcore::mesh::DiscoveredContact {
-                                    pub_key: adv.pub_key,
-                                    callsign: cs,
-                                    node_id,
-                                    last_seen_epoch: node.epoch_time as u32,
-                                    rssi,
-                                    snr,
-                                    latitude: adv.latitude,
-                                    longitude: adv.longitude,
-                                    flags: adv.flags,
-                                });
+                                // New contact - apply auto-add rules
+                                if !should_add {
+                                    // Contact type not enabled for auto-add, skip
+                                    return;
+                                }
+
+                                // Try to add the contact
+                                if list.len() < list.capacity() {
+                                    // Space available
+                                    let mut cs = heapless::String::new();
+                                    let _ = cs.push_str(adv.name.as_str());
+                                    let _ = list.push(crate::meshcore::mesh::DiscoveredContact {
+                                        pub_key: adv.pub_key,
+                                        callsign: cs,
+                                        node_id,
+                                        last_seen_epoch: node.epoch_time as u32,
+                                        rssi,
+                                        snr,
+                                        latitude: adv.latitude,
+                                        longitude: adv.longitude,
+                                        flags: adv.flags,
+                                    });
+                                } else if node.should_overwrite_when_full() {
+                                    // List is full, find oldest non-favorite contact to overwrite
+                                    let mut oldest_idx = None;
+                                    let mut oldest_lastmod = u32::MAX;
+                                    for (idx, ct) in list.iter().enumerate() {
+                                        let is_favorite = (ct.flags & crate::companion::protocol::CONTACT_FLAG_FAVORITE) != 0;
+                                        if !is_favorite && ct.last_seen_epoch < oldest_lastmod {
+                                            oldest_lastmod = ct.last_seen_epoch;
+                                            oldest_idx = Some(idx);
+                                        }
+                                    }
+                                    if let Some(idx) = oldest_idx {
+                                        // Send push notification that contact is being overwritten
+                                        let overwritten_key = list[idx].pub_key;
+                                        let mut push = heapless::Vec::<u8, 256>::new();
+                                        let _ = push.push(crate::companion::protocol::PUSH_CODE_CONTACT_DELETED);
+                                        let _ = push.extend_from_slice(&overwritten_key);
+                                        let _ = crate::companion::ble::COMPANION_PUSH_CHANNEL.try_send(push);
+
+                                        // Replace with new contact
+                                        let mut cs = heapless::String::new();
+                                        let _ = cs.push_str(adv.name.as_str());
+                                        list[idx] = crate::meshcore::mesh::DiscoveredContact {
+                                            pub_key: adv.pub_key,
+                                            callsign: cs,
+                                            node_id,
+                                            last_seen_epoch: node.epoch_time as u32,
+                                            rssi,
+                                            snr,
+                                            latitude: adv.latitude,
+                                            longitude: adv.longitude,
+                                            flags: adv.flags,
+                                        };
+                                    } else {
+                                        // All contacts are favorites, can't overwrite
+                                        // Send push notification that contacts list is full
+                                        let mut push = heapless::Vec::<u8, 256>::new();
+                                        let _ = push.push(crate::companion::protocol::PUSH_CODE_CONTACTS_FULL);
+                                        let _ = crate::companion::ble::COMPANION_PUSH_CHANNEL.try_send(push);
+                                    }
+                                } else {
+                                    // List is full and overwrite is disabled
+                                    // Send push notification that contacts list is full
+                                    let mut push = heapless::Vec::<u8, 256>::new();
+                                    let _ = push.push(crate::companion::protocol::PUSH_CODE_CONTACTS_FULL);
+                                    let _ = crate::companion::ble::COMPANION_PUSH_CHANNEL.try_send(push);
+                                }
                             }
                         });
                     }

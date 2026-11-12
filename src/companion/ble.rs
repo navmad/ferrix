@@ -11,7 +11,7 @@ use embassy_sync::channel::Channel;
 
 /// Shared raw mutex type — see usb.rs for documentation.
 type SharedRawMutex = ThreadModeRawMutex;
-use heapless::Vec;
+use heapless::{String, Vec};
 use nrf_softdevice::ble::gatt_server;
 use nrf_softdevice::ble::peripheral;
 use nrf_softdevice::ble::security::{IoCapabilities, SecurityHandler};
@@ -47,6 +47,28 @@ pub struct MeshCoreGattServer {
 }
 
 pub static COMPANION_PUSH_CHANNEL: Channel<SharedRawMutex, Vec<u8, 256>, 16> = Channel::new();
+
+/// Contact operation deferred from the GATT callback to avoid locking
+/// `DISCOVERED_CONTACTS` inside the SoftDevice critical section.
+pub enum ContactOperation {
+    AddOrUpdate {
+        pub_key: [u8; 32],
+        callsign: String<32>,
+        node_id: [u8; 4],
+        last_seen_epoch: u32,
+        latitude: i32,
+        longitude: i32,
+        flags: u8,
+    },
+    Remove {
+        pub_key: [u8; 32],
+    },
+}
+
+/// Channel for deferring contact mutations outside the GATT callback's
+/// SoftDevice critical section. Capacity 4 is sufficient since contact
+/// operations are infrequent and the channel is drained promptly.
+pub static CONTACT_OP_CHANNEL: Channel<SharedRawMutex, ContactOperation, 4> = Channel::new();
 
 pub struct MeshCoreSecurityHandler;
 

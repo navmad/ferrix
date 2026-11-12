@@ -38,7 +38,8 @@ pub struct PersistentConfig {
     pub radio_sf: u8,
     pub radio_cr: u8,
     pub path_hash_mode: u8,
-    pub _reserved: [u8; 2],
+    pub autoadd_config: u8,     // bitmask: overwrite_oldest, chat, repeater, room_server, sensor
+    pub autoadd_max_hops: u8,   // 0 = no limit, N = up to N-1 hops
     pub radio_freq_hz: u32,
     pub radio_bw_khz: u32,
     pub channels: [ChannelData; 8],
@@ -218,7 +219,8 @@ pub fn assemble_current_config() -> PersistentConfig {
         radio_sf: sf,
         radio_cr: cr,
         path_hash_mode: path_mode,
-        _reserved: [0; 2],
+        autoadd_config: 0x1E,   // default: auto-add all types with overwrite oldest (the reference firmware default)
+        autoadd_max_hops: 0,    // 0 = no hop limit
         radio_freq_hz: freq,
         radio_bw_khz: bw,
         channels,

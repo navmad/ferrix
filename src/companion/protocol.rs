@@ -12,6 +12,8 @@ pub const CMD_GET_CONTACTS: u8 = 4;
 pub const CMD_GET_DEVICE_TIME: u8 = 5;
 pub const CMD_SET_DEVICE_TIME: u8 = 6;
 pub const CMD_SEND_SELF_ADVERT: u8 = 7;
+pub const CMD_ADD_UPDATE_CONTACT: u8 = 9;
+pub const CMD_REMOVE_CONTACT: u8 = 15;
 pub const CMD_SYNC_NEXT_MESSAGE: u8 = 10;
 pub const CMD_GET_MSG: u8 = 11;
 pub const CMD_GET_BAT: u8 = 19;
@@ -40,6 +42,24 @@ pub const RESP_CODE_MSG: u8 = 21;
 pub const PUSH_CODE_SEND_CONFIRMED: u8 = 0x82;
 pub const PUSH_CODE_MSG_WAITING: u8 = 0x83;
 pub const PUSH_CODE_LOG_RX_DATA: u8 = 0x88;
+pub const PUSH_CODE_CONTACTS_FULL: u8 = 0x89;
+pub const PUSH_CODE_CONTACT_DELETED: u8 = 0x8A;
+
+/// Auto-add configuration bitmask (matches the reference firmware)
+pub const AUTO_ADD_OVERWRITE_OLDEST: u8 = 1 << 0;
+pub const AUTO_ADD_CHAT: u8 = 1 << 1;
+pub const AUTO_ADD_REPEATER: u8 = 1 << 2;
+pub const AUTO_ADD_ROOM_SERVER: u8 = 1 << 3;
+pub const AUTO_ADD_SENSOR: u8 = 1 << 4;
+
+/// Contact type constants (from advert flags)
+pub const ADV_TYPE_CHAT: u8 = 1;
+pub const ADV_TYPE_REPEATER: u8 = 2;
+pub const ADV_TYPE_ROOM: u8 = 3;
+pub const ADV_TYPE_SENSOR: u8 = 4;
+
+/// Contact flags bitmask
+pub const CONTACT_FLAG_FAVORITE: u8 = 1 << 0;
 
 /// Device capabilities bitmask
 pub const CAP_ROUTER: u32 = 1 << 0;
@@ -68,6 +88,10 @@ pub struct CompanionNode {
     pub last_snr: i8,
     pub current_page: u8,
     pub path_hash_mode: u8,
+    /// Auto-add configuration bitmask (matches the reference firmware)
+    pub autoadd_config: u8,
+    /// Max hops for auto-adding contacts (0 = no limit)
+    pub autoadd_max_hops: u8,
     /// Tracks how many channels have been synced since the last connection.
     /// Used to defer connection parameter updates until after the sync burst.
     pub channels_synced: u8,
@@ -103,8 +127,48 @@ impl CompanionNode {
             last_snr: 0,
             current_page: 0,
             path_hash_mode: crate::storage::get_path_hash_mode(),
+            autoadd_config: 0x1E,   // default: auto-add all types with overwrite oldest
+            autoadd_max_hops: 0,    // 0 = no hop limit
             channels_synced: 0,
         }
+    }
+
+    /// Determine the contact type from advert flags
+    /// The lower bits of the flags field encode the node type:
+    /// 0x01 = chat, 0x02 = repeater, 0x03 = room server, 0x04 = sensor
+    pub fn get_contact_type_from_flags(flags: u8) -> u8 {
+        // Extract the type from the lower bits of the flags field
+        // ADV_FLAG_IS_ROOM (0x03) and ADV_FLAG_IS_SENSOR (0x04) are higher values,
+        // so check them first before IS_REPEATER (0x02) and IS_CHAT (0x01)
+        if flags & crate::meshcore::packets::advert::AdvertPacket::ADV_FLAG_IS_SENSOR != 0 {
+            ADV_TYPE_SENSOR
+        } else if flags & crate::meshcore::packets::advert::AdvertPacket::ADV_FLAG_IS_ROOM != 0 {
+            ADV_TYPE_ROOM
+        } else if flags & crate::meshcore::packets::advert::AdvertPacket::ADV_FLAG_IS_REPEATER != 0 {
+            ADV_TYPE_REPEATER
+        } else {
+            ADV_TYPE_CHAT
+        }
+    }
+
+    /// Check if a contact type should be auto-added based on current config
+    /// Returns true if the contact type is enabled for auto-add
+    pub fn should_auto_add_contact_type(&self, contact_type: u8) -> bool {
+        // If manual_add_contacts is disabled (bit 0 == 0), auto-add all
+        // When manual_add_contacts is enabled, check the type-specific bits
+        let type_bit = match contact_type {
+            ADV_TYPE_CHAT => AUTO_ADD_CHAT,
+            ADV_TYPE_REPEATER => AUTO_ADD_REPEATER,
+            ADV_TYPE_ROOM => AUTO_ADD_ROOM_SERVER,
+            ADV_TYPE_SENSOR => AUTO_ADD_SENSOR,
+            _ => 0,
+        };
+        (self.autoadd_config & type_bit) != 0
+    }
+
+    /// Check if oldest non-favorite contacts should be overwritten when the list is full
+    pub fn should_overwrite_when_full(&self) -> bool {
+        (self.autoadd_config & AUTO_ADD_OVERWRITE_OLDEST) != 0
     }
 
     /// Process an inbound frame payload from the companion app
@@ -115,7 +179,8 @@ impl CompanionNode {
         }
 
         let cmd = payload[0];
-        defmt::info!("MeshCore Companion CMD: {} (len {})", cmd, payload.len());
+        // NOTE: No defmt::info! here — this runs inside the BLE GATT callback
+        // (SoftDevice critical section). RTT logging can block and freeze the device.
 
         match cmd {
             CMD_DEVICE_QUERY => {
@@ -173,7 +238,7 @@ impl CompanionNode {
                 let _ = resp.push(0); // reserved
                 let _ = resp.push(0); // advert_loc_policy
                 let _ = resp.push(0); // telemetry_modes
-                let _ = resp.push(0); // manual_add_contacts
+                let _ = resp.push(1); // manual_add_contacts: enabled
                 let _ = resp.extend_from_slice(&f.to_le_bytes()); // radio_freq in Hz
                 let bw_hz = bw * 1000;
                 let _ = resp.extend_from_slice(&bw_hz.to_le_bytes()); // radio_bw in Hz
@@ -321,14 +386,15 @@ impl CompanionNode {
                 emit(&start_resp);
 
                 // 2. Stream individual RESP_CODE_CONTACT (3)
-                // Layout: [code(3), pubkey(32), type(1), flags(0), out_path_len(0), out_path(64), adv_name(32), last_advert(u32_le), adv_lat(i32_le), adv_lon(i32_le), lastmod(u32_le)]
+                // Layout: [code(3), pubkey(32), type(1), flags(1), out_path_len(1), out_path(64), adv_name(32), last_advert(u32_le), adv_lat(i32_le), adv_lon(i32_le), lastmod(u32_le)]
                 let mut max_lastmod = 0u32;
                 for c in contacts.iter() {
                     let mut c_resp = Vec::<u8, 160>::new();
                     let _ = c_resp.push(RESP_CODE_CONTACT);
                     let _ = c_resp.extend_from_slice(&c.pub_key);
-                    let _ = c_resp.push(1); // type = client
-                    let _ = c_resp.push(0); // flags = 0
+                    let contact_type = CompanionNode::get_contact_type_from_flags(c.flags);
+                    let _ = c_resp.push(contact_type);
+                    let _ = c_resp.push(c.flags);
                     let _ = c_resp.push(0); // out_path_len = 0
                     let out_path = [0u8; 64];
                     let _ = c_resp.extend_from_slice(&out_path);
@@ -339,13 +405,13 @@ impl CompanionNode {
                     adv_name[..cs_len].copy_from_slice(&cs[..cs_len]);
                     let _ = c_resp.extend_from_slice(&adv_name);
 
-                    let last_advert = c.last_seen_epoch as u32;
+                    let last_advert = c.last_seen_epoch;
                     if last_advert > max_lastmod {
                         max_lastmod = last_advert;
                     }
                     let _ = c_resp.extend_from_slice(&last_advert.to_le_bytes());
-                    let _ = c_resp.extend_from_slice(&0i32.to_le_bytes()); // adv_lat
-                    let _ = c_resp.extend_from_slice(&0i32.to_le_bytes()); // adv_lon
+                    let _ = c_resp.extend_from_slice(&c.latitude.to_le_bytes()); // adv_lat
+                    let _ = c_resp.extend_from_slice(&c.longitude.to_le_bytes()); // adv_lon
                     let _ = c_resp.extend_from_slice(&last_advert.to_le_bytes()); // lastmod
                     emit(&c_resp);
                 }
@@ -456,6 +522,91 @@ impl CompanionNode {
 
             CMD_SEND_SELF_ADVERT => {
                 let _ = crate::companion::usb::USB_COMMAND_CHANNEL.try_send(crate::companion::usb::UsbCommand::TriggerAdvert);
+                let mut resp = Vec::<u8, 4>::new();
+                let _ = resp.push(RESP_CODE_OK);
+                emit(&resp);
+            }
+
+            CMD_ADD_UPDATE_CONTACT => {
+                // Inbound: [CMD(9), public_key(32), type(1), flags(1), out_path_len(1), out_path(64), adv_name(32), last_advert(4)]
+                // Optional: gps_lat(4), gps_lon(4), lastmod(4)
+                // Minimum required: 1 + 32 + 1 + 1 + 1 + 64 + 32 + 4 = 136 bytes (matches the reference firmware)
+                //
+                // CRITICAL: This handler runs inside the BLE GATT event callback, which executes
+                // within a SoftDevice critical section (Portal::call). We MUST NOT lock any mutexes
+                // here — even ThreadModeRawMutex will raise a nested critical section and freeze
+                // the device. Instead, we parse the payload and defer the actual contact storage
+                // to a background task via CONTACT_OP_CHANNEL.
+                if payload.len() >= 1 + 32 + 1 + 1 + 1 + 64 + 32 + 4 {
+                    let mut i = 1;
+                    let pub_key: [u8; 32] = payload[i..i+32].try_into().unwrap(); i += 32;
+                    let _node_type = payload[i]; i += 1;
+                    let flags = payload[i]; i += 1;
+                    let _out_path_len = payload[i]; i += 1;
+                    // out_path is 64 bytes
+                    i += 64;
+                    let adv_name_bytes = &payload[i..i+32]; i += 32;
+                    let adv_name = core::str::from_utf8(adv_name_bytes).unwrap_or("").trim_end_matches('\0');
+                    let _last_advert = u32::from_le_bytes([payload[i], payload[i+1], payload[i+2], payload[i+3]]); i += 4;
+
+                    // Optional fields after the required 136 bytes
+                    let (adv_lat, adv_lon, lastmod) = if payload.len() >= i + 8 {
+                        let lat = i32::from_le_bytes([payload[i], payload[i+1], payload[i+2], payload[i+3]]); i += 4;
+                        let lon = i32::from_le_bytes([payload[i], payload[i+1], payload[i+2], payload[i+3]]); i += 4;
+                        if payload.len() >= i + 4 {
+                            let lm = u32::from_le_bytes([payload[i], payload[i+1], payload[i+2], payload[i+3]]);
+                            (lat, lon, lm)
+                        } else {
+                            let lm = _last_advert;
+                            (lat, lon, lm)
+                        }
+                    } else {
+                        (0, 0, _last_advert)
+                    };
+
+                    let node_id = [pub_key[0], pub_key[1], pub_key[2], pub_key[3]];
+
+                    let mut callsign = heapless::String::new();
+                    let _ = callsign.push_str(adv_name);
+
+                    // Defer the actual contact storage to the background task to avoid
+                    // locking DISCOVERED_CONTACTS inside the SoftDevice critical section.
+                    // If the channel is full, we drop the operation — this is acceptable
+                    // since the app can retry.
+                    let _ = crate::companion::ble::CONTACT_OP_CHANNEL.try_send(
+                        crate::companion::ble::ContactOperation::AddOrUpdate {
+                            pub_key,
+                            callsign,
+                            node_id,
+                            last_seen_epoch: lastmod,
+                            latitude: adv_lat,
+                            longitude: adv_lon,
+                            flags,
+                        }
+                    );
+
+                    // Return OK immediately — the actual storage happens asynchronously.
+                    // the reference firmware also returns OK before the contact is fully persisted.
+                    let mut resp = Vec::<u8, 4>::new();
+                    let _ = resp.push(RESP_CODE_OK);
+                    emit(&resp);
+                    return;
+                }
+                let mut resp = Vec::<u8, 4>::new();
+                let _ = resp.push(RESP_CODE_ERR);
+                emit(&resp);
+            }
+
+            CMD_REMOVE_CONTACT => {
+                // Inbound: [CMD(15), public_key(32)]
+                // CRITICAL: Defer the actual removal to avoid locking DISCOVERED_CONTACTS
+                // inside the SoftDevice critical section.
+                if payload.len() >= 33 {
+                    let pub_key: [u8; 32] = payload[1..33].try_into().unwrap();
+                    let _ = crate::companion::ble::CONTACT_OP_CHANNEL.try_send(
+                        crate::companion::ble::ContactOperation::Remove { pub_key }
+                    );
+                }
                 let mut resp = Vec::<u8, 4>::new();
                 let _ = resp.push(RESP_CODE_OK);
                 emit(&resp);
