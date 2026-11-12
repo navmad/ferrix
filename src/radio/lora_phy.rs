@@ -118,7 +118,9 @@ impl LoraRadio for LoraPhyChannelRadio {
             data: [0u8; 256],
         };
         pkt.data[..payload.len()].copy_from_slice(payload);
-        LORA_TX_CHANNEL.send(pkt).await;
+        // Never block the main loop if the radio task is stalled or
+        // reconfiguring; dropping is preferable to a frozen UI.
+        let _ = LORA_TX_CHANNEL.try_send(pkt);
         Ok(())
     }
 
@@ -189,6 +191,7 @@ pub async fn lora_phy_task(
         });
     let mut tx_power_dbm = tx_power;
     let mut preamble = preamble_for(sf);
+    let mut current_cfg = (freq_hz, tx_power, sf, bw_khz, cr);
     let mut mdltn_params = match lora.create_modulation_params(
         sf_from_u8(sf),
         bw_from_khz(bw_khz),
@@ -242,8 +245,18 @@ pub async fn lora_phy_task(
                 }
                 Err(e) => {
                     debug!("lora-phy: RX error or timeout: {:?}", e);
-                    // Re-enter RX continuous if an error occurred
-                    let _ = lora.prepare_for_rx(RxMode::Continuous, &mdltn_params, &rx_pkt_params).await;
+                    // Re-enter RX continuous if an error occurred, but never
+                    // let a stuck BUSY line wedge the whole task forever.
+                    match embassy_time::with_timeout(
+                        embassy_time::Duration::from_secs(1),
+                        lora.prepare_for_rx(RxMode::Continuous, &mdltn_params, &rx_pkt_params),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => error!("lora-phy: re-enter RX failed: {:?}", e),
+                        Err(_) => error!("lora-phy: re-enter RX timed out"),
+                    }
                 }
             },
             Either3::Second(tx_packet) => {
@@ -268,9 +281,25 @@ pub async fn lora_phy_task(
                     }
                 }
                 // Return to continuous RX mode after transmission
-                let _ = lora.prepare_for_rx(RxMode::Continuous, &mdltn_params, &rx_pkt_params).await;
+                let _ = embassy_time::with_timeout(
+                    embassy_time::Duration::from_secs(1),
+                    lora.prepare_for_rx(RxMode::Continuous, &mdltn_params, &rx_pkt_params),
+                )
+                .await;
             }
             Either3::Third(cfg) => {
+                let requested = (
+                    cfg.frequency_hz,
+                    cfg.tx_power_dbm,
+                    cfg.spreading_factor,
+                    cfg.bandwidth_khz,
+                    cfg.coding_rate,
+                );
+                if requested == current_cfg {
+                    // The app re-sends its stored settings on every connect.
+                    // Do not stop and restart RX for a no-op.
+                    continue;
+                }
                 match lora.create_modulation_params(
                     sf_from_u8(cfg.spreading_factor),
                     bw_from_khz(cfg.bandwidth_khz),
@@ -292,13 +321,23 @@ pub async fn lora_phy_task(
                                 rx_pkt_params = new_rx;
                                 preamble = new_preamble;
                                 tx_power_dbm = cfg.tx_power_dbm;
-                                let _ = lora
-                                    .prepare_for_rx(
+                                current_cfg = requested;
+                                match embassy_time::with_timeout(
+                                    embassy_time::Duration::from_secs(1),
+                                    lora.prepare_for_rx(
                                         RxMode::Continuous,
                                         &mdltn_params,
                                         &rx_pkt_params,
-                                    )
-                                    .await;
+                                    ),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(e)) => {
+                                        error!("lora-phy: re-enter RX after cfg failed: {:?}", e)
+                                    }
+                                    Err(_) => error!("lora-phy: re-enter RX after cfg timed out"),
+                                }
                                 info!(
                                     "lora-phy: reconfigured to {} Hz (SF{}, BW{}k, CR 4/{}), {} dBm",
                                     cfg.frequency_hz,
