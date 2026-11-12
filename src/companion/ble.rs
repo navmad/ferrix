@@ -99,8 +99,15 @@ impl SecurityHandler for MeshCoreSecurityHandler {
     }
 
     fn enter_passkey(&self, reply: PasskeyReply) {
-        info!("BLE: Replying with MeshCore default PIN 123456");
-        let _ = reply.reply(Some(b"123456"));
+        let pin = BLE_PIN.load(Ordering::Relaxed);
+        let mut buf = [b'0'; 6];
+        let mut value = pin;
+        for i in (0..6).rev() {
+            buf[i] = b'0' + (value % 10) as u8;
+            value /= 10;
+        }
+        info!("BLE: Replying with stored PIN");
+        let _ = reply.reply(Some(&buf));
     }
 }
 
@@ -277,6 +284,8 @@ pub async fn ble_companion_task(
 use core::sync::atomic::AtomicU32;
 
 pub static BLE_STATUS: AtomicU32 = AtomicU32::new(0);
+/// Pairing PIN reported to the app and used by the security handler.
+pub static BLE_PIN: AtomicU32 = AtomicU32::new(123456);
 
 unsafe extern "C" fn sd_fault_handler(id: u32, pc: u32, info: u32) {
     defmt::error!("Softdevice fault: id={=u32:#x} pc={=u32:#x} info={=u32:#x}", id, pc, info);

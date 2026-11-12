@@ -19,6 +19,21 @@ static SIGN_ACTIVE: AtomicBool = AtomicBool::new(false);
 static SIGN_BUFFER: Mutex<ThreadModeRawMutex, RefCell<Vec<u8, MAX_SIGN_DATA>>> =
     Mutex::new(RefCell::new(Vec::new()));
 
+#[derive(Clone, Copy)]
+struct ScopeState {
+    send_key: Option<[u8; 16]>,
+    force_unscoped: bool,
+    default_name: [u8; 31],
+    default_key: [u8; 16],
+}
+static SCOPE: Mutex<ThreadModeRawMutex, RefCell<ScopeState>> =
+    Mutex::new(RefCell::new(ScopeState {
+        send_key: None,
+        force_unscoped: false,
+        default_name: [0; 31],
+        default_key: [0; 16],
+    }));
+
 pub const CMD_APP_START: u8 = 1;
 pub const CMD_SEND_MSG: u8 = 2;
 pub const CMD_SEND_CHANNEL_MSG: u8 = 3;
@@ -45,16 +60,28 @@ pub const CMD_GET_CONTACT_BY_KEY: u8 = 0x1E;
 pub const CMD_SIGN_START: u8 = 0x21;
 pub const CMD_SIGN_DATA: u8 = 0x22;
 pub const CMD_SIGN_FINISH: u8 = 0x23;
+pub const CMD_SEND_TRACE_PATH: u8 = 0x24;
+pub const CMD_SET_DEVICE_PIN: u8 = 0x25;
+pub const CMD_SET_OTHER_PARAMS: u8 = 0x26;
+pub const CMD_GET_CUSTOM_VARS: u8 = 0x28;
+pub const CMD_SET_CUSTOM_VAR: u8 = 0x29;
 pub const CMD_DEVICE_QUERY: u8 = 22;
 pub const CMD_GET_ADVERT_PATH: u8 = 0x2A;
 pub const CMD_GET_TUNING_PARAMS: u8 = 0x2B;
 pub const CMD_GET_CHANNEL: u8 = 31;
 pub const CMD_SET_CHANNEL: u8 = 32;
+pub const CMD_SET_FLOOD_SCOPE_KEY: u8 = 0x36;
+pub const CMD_SEND_CONTROL_DATA: u8 = 0x37;
 pub const CMD_GET_STATS: u8 = 0x38;
 pub const CMD_SET_AUTOADD_CONFIG: u8 = 0x3A;
 pub const CMD_GET_AUTOADD_CONFIG: u8 = 0x3B;
+pub const CMD_GET_ALLOWED_REPEAT_FREQ: u8 = 0x3C;
 pub const CMD_SET_PATH_HASH_MODE: u8 = 0x3D;
 pub const CMD_SEND_CHANNEL_DATA: u8 = 0x3E;
+pub const CMD_SET_DEFAULT_FLOOD_SCOPE: u8 = 0x3F;
+pub const CMD_GET_DEFAULT_FLOOD_SCOPE: u8 = 0x40;
+pub const CMD_SEND_RAW_PACKET: u8 = 0x41;
+pub const CMD_SEND_RAW_DATA: u8 = 0x19;
 
 pub const RESP_CODE_OK: u8 = 0;
 pub const RESP_CODE_ERR: u8 = 1;
@@ -73,10 +100,13 @@ pub const RESP_CODE_CHANNEL_MSG_V3: u8 = 0x11;
 pub const RESP_CODE_CHANNEL_INFO: u8 = 18;
 pub const RESP_CODE_SIGN_START: u8 = 0x13;
 pub const RESP_CODE_SIGNATURE: u8 = 0x14;
+pub const RESP_CODE_CUSTOM_VARS: u8 = 0x15;
 pub const RESP_CODE_ADVERT_PATH: u8 = 0x16;
 pub const RESP_CODE_TUNING: u8 = 0x17;
 pub const RESP_CODE_STATS: u8 = 0x18;
 pub const RESP_CODE_AUTOADD: u8 = 0x19;
+pub const RESP_CODE_ALLOWED_REPEAT_FREQ: u8 = 0x1A;
+pub const RESP_CODE_DEFAULT_FLOOD_SCOPE: u8 = 0x1C;
 pub const RESP_CODE_TIME: u8 = 20;
 pub const RESP_CODE_MSG: u8 = 21;
 
@@ -138,6 +168,12 @@ pub struct CompanionNode {
     pub rx_delay_ms: u32,
     /// Airtime factor × 1000 (tuning parameter).
     pub airtime_factor_milli: u32,
+    pub manual_add_contacts: u8,
+    pub telemetry_mode_base: u8,
+    pub telemetry_mode_loc: u8,
+    pub telemetry_mode_env: u8,
+    pub advert_loc_policy: u8,
+    pub multi_acks: u8,
     /// Tracks how many channels have been synced since the last connection.
     /// Used to defer connection parameter updates until after the sync burst.
     pub channels_synced: u8,
@@ -177,6 +213,12 @@ impl CompanionNode {
             autoadd_max_hops: 0,    // 0 = no hop limit
             rx_delay_ms: 0,
             airtime_factor_milli: 1000,
+            manual_add_contacts: 1,
+            telemetry_mode_base: 0,
+            telemetry_mode_loc: 0,
+            telemetry_mode_env: 0,
+            advert_loc_policy: 0,
+            multi_acks: 0,
             channels_synced: 0,
         }
     }
@@ -235,7 +277,11 @@ impl CompanionNode {
                 let _ = resp.push(14); // firmware_ver: 14 (v10+ required for path_hash_mode in apps)
                 let _ = resp.push(50); // max_contacts_div_2 (100 contacts)
                 let _ = resp.push(8); // max_channels
-                let _ = resp.extend_from_slice(&123456u32.to_le_bytes()); // ble_pin: 123456
+                let _ = resp.extend_from_slice(
+                    &crate::companion::ble::BLE_PIN
+                        .load(Ordering::Relaxed)
+                        .to_le_bytes(),
+                );
 
                 let mut bdate = [0u8; 12];
                 let d = b"Nov 10 2026";
@@ -277,9 +323,13 @@ impl CompanionNode {
                 let _ = resp.extend_from_slice(&0i32.to_le_bytes()); // adv_lat
                 let _ = resp.extend_from_slice(&0i32.to_le_bytes()); // adv_lon
                 let _ = resp.push(0); // reserved
-                let _ = resp.push(0); // advert_loc_policy
-                let _ = resp.push(0); // telemetry_modes
-                let _ = resp.push(1); // manual_add_contacts: enabled
+                let _ = resp.push(self.advert_loc_policy);
+                let _ = resp.push(
+                    (self.telemetry_mode_env << 4)
+                        | (self.telemetry_mode_loc << 2)
+                        | self.telemetry_mode_base,
+                );
+                let _ = resp.push(self.manual_add_contacts);
                 let _ = resp.extend_from_slice(&f.to_le_bytes()); // radio_freq in Hz
                 let bw_hz = bw * 1000;
                 let _ = resp.extend_from_slice(&bw_hz.to_le_bytes()); // radio_bw in Hz
@@ -344,6 +394,7 @@ impl CompanionNode {
                             s.cr = cr;
                         });
                         crate::storage::request_save_config();
+                        crate::radio::lora_phy::request_radio_config();
                         ok = true;
                     }
                 }
@@ -361,6 +412,7 @@ impl CompanionNode {
                             r.borrow_mut().tx_power_dbm = power;
                         });
                         crate::storage::request_save_config();
+                        crate::radio::lora_phy::request_radio_config();
                         ok = true;
                     }
                 }
@@ -1072,6 +1124,230 @@ impl CompanionNode {
                                 }
                             }
                         }
+                    }
+                }
+                let mut resp = Vec::<u8, 4>::new();
+                let _ = resp.push(if ok { RESP_CODE_OK } else { RESP_CODE_ERR });
+                emit(&resp);
+            }
+
+            CMD_SET_OTHER_PARAMS => {
+                let mut ok = false;
+                if payload.len() >= 2 {
+                    self.manual_add_contacts = payload[1];
+                    if payload.len() >= 3 {
+                        self.telemetry_mode_base = payload[2] & 0x03;
+                        self.telemetry_mode_loc = (payload[2] >> 2) & 0x03;
+                        self.telemetry_mode_env = (payload[2] >> 4) & 0x03;
+                        if payload.len() >= 4 {
+                            self.advert_loc_policy = payload[3];
+                        }
+                        if payload.len() >= 5 {
+                            self.multi_acks = payload[4];
+                        }
+                    }
+                    ok = true;
+                }
+                let mut resp = Vec::<u8, 4>::new();
+                let _ = resp.push(if ok { RESP_CODE_OK } else { RESP_CODE_ERR });
+                emit(&resp);
+            }
+
+            CMD_SET_DEVICE_PIN => {
+                let mut ok = false;
+                if payload.len() >= 5 {
+                    let pin = u32::from_le_bytes([
+                        payload[1], payload[2], payload[3], payload[4],
+                    ]);
+                    if pin == 0 || (100_000..=999_999).contains(&pin) {
+                        crate::companion::ble::BLE_PIN.store(pin, Ordering::Relaxed);
+                        ok = true;
+                    }
+                }
+                let mut resp = Vec::<u8, 4>::new();
+                let _ = resp.push(if ok { RESP_CODE_OK } else { RESP_CODE_ERR });
+                emit(&resp);
+            }
+
+            CMD_GET_CUSTOM_VARS => {
+                // No device-specific custom variables are exposed yet.
+                let mut resp = Vec::<u8, 4>::new();
+                let _ = resp.push(RESP_CODE_CUSTOM_VARS);
+                emit(&resp);
+            }
+
+            CMD_SET_CUSTOM_VAR => {
+                let ok = payload.len() >= 4;
+                let mut resp = Vec::<u8, 4>::new();
+                let _ = resp.push(if ok { RESP_CODE_OK } else { RESP_CODE_ERR });
+                emit(&resp);
+            }
+
+            CMD_GET_ALLOWED_REPEAT_FREQ => {
+                // The companion is a client; no repeat bands are advertised.
+                let mut resp = Vec::<u8, 4>::new();
+                let _ = resp.push(RESP_CODE_ALLOWED_REPEAT_FREQ);
+                emit(&resp);
+            }
+
+            CMD_SET_FLOOD_SCOPE_KEY => {
+                let mut ok = false;
+                if payload.len() >= 2 && payload[1] == 0 {
+                    SCOPE.lock(|s| {
+                        let mut scope = s.borrow_mut();
+                        if payload.len() >= 18 {
+                            let mut key = [0u8; 16];
+                            key.copy_from_slice(&payload[2..18]);
+                            scope.send_key = Some(key);
+                        } else {
+                            scope.send_key = None;
+                        }
+                        scope.force_unscoped = false;
+                    });
+                    ok = true;
+                } else if payload.len() == 2 && payload[1] == 1 {
+                    SCOPE.lock(|s| {
+                        let mut scope = s.borrow_mut();
+                        scope.send_key = None;
+                        scope.force_unscoped = true;
+                    });
+                    ok = true;
+                }
+                let mut resp = Vec::<u8, 4>::new();
+                let _ = resp.push(if ok { RESP_CODE_OK } else { RESP_CODE_ERR });
+                emit(&resp);
+            }
+
+            CMD_SET_DEFAULT_FLOOD_SCOPE => {
+                let mut ok = false;
+                if payload.len() >= 48 {
+                    let name = &payload[1..32];
+                    let n = name.iter().position(|&b| b == 0).unwrap_or(31);
+                    if n > 0 && n < 31 {
+                        SCOPE.lock(|s| {
+                            let mut scope = s.borrow_mut();
+                            scope.default_name = [0u8; 31];
+                            scope.default_name[..n].copy_from_slice(&name[..n]);
+                            scope.default_key.copy_from_slice(&payload[32..48]);
+                        });
+                        ok = true;
+                    }
+                } else if payload.len() == 1 {
+                    SCOPE.lock(|s| {
+                        let mut scope = s.borrow_mut();
+                        scope.default_name = [0u8; 31];
+                        scope.default_key = [0u8; 16];
+                    });
+                    ok = true;
+                }
+                let mut resp = Vec::<u8, 4>::new();
+                let _ = resp.push(if ok { RESP_CODE_OK } else { RESP_CODE_ERR });
+                emit(&resp);
+            }
+
+            CMD_GET_DEFAULT_FLOOD_SCOPE => {
+                let (name, key) = SCOPE.lock(|s| {
+                    let scope = s.borrow();
+                    (scope.default_name, scope.default_key)
+                });
+                if name[0] != 0 {
+                    let mut resp = Vec::<u8, 48>::new();
+                    let _ = resp.push(RESP_CODE_DEFAULT_FLOOD_SCOPE);
+                    let _ = resp.extend_from_slice(&name);
+                    let _ = resp.extend_from_slice(&key);
+                    emit(&resp);
+                } else {
+                    let mut resp = Vec::<u8, 4>::new();
+                    let _ = resp.push(RESP_CODE_DEFAULT_FLOOD_SCOPE);
+                    emit(&resp);
+                }
+            }
+
+            CMD_SEND_CONTROL_DATA => {
+                let mut ok = false;
+                if payload.len() >= 2 && (payload[1] & 0x80) != 0 {
+                    let mut data = Vec::<u8, 183>::new();
+                    if data.extend_from_slice(&payload[1..]).is_ok() {
+                        ok = crate::companion::usb::USB_COMMAND_CHANNEL
+                            .try_send(crate::companion::usb::UsbCommand::SendControlData { data })
+                            .is_ok();
+                    }
+                }
+                let mut resp = Vec::<u8, 4>::new();
+                let _ = resp.push(if ok { RESP_CODE_OK } else { RESP_CODE_ERR });
+                emit(&resp);
+            }
+
+            CMD_SEND_RAW_DATA => {
+                let mut ok = false;
+                if payload.len() >= 6 {
+                    let path_len = payload[1];
+                    if Packet::is_valid_path_len(path_len) {
+                        let n = (path_len & 63) as usize
+                            * (((path_len >> 6) as usize) + 1);
+                        if payload.len() >= 2 + n + 4 {
+                            let mut path = [0u8; 64];
+                            path[..n].copy_from_slice(&payload[2..2 + n]);
+                            let mut data = Vec::<u8, 184>::new();
+                            if data.extend_from_slice(&payload[2 + n..]).is_ok() {
+                                ok = crate::companion::usb::USB_COMMAND_CHANNEL
+                                    .try_send(
+                                        crate::companion::usb::UsbCommand::SendRawData {
+                                            path_len,
+                                            path,
+                                            payload: data,
+                                        },
+                                    )
+                                    .is_ok();
+                            }
+                        }
+                    }
+                }
+                let mut resp = Vec::<u8, 4>::new();
+                let _ = resp.push(if ok { RESP_CODE_OK } else { RESP_CODE_ERR });
+                emit(&resp);
+            }
+
+            CMD_SEND_RAW_PACKET => {
+                let mut ok = false;
+                if payload.len() >= 4 && Packet::read_from(&payload[2..]).is_ok() {
+                    let mut raw = Vec::<u8, 255>::new();
+                    if raw.extend_from_slice(&payload[2..]).is_ok() {
+                        ok = crate::companion::usb::USB_COMMAND_CHANNEL
+                            .try_send(crate::companion::usb::UsbCommand::SendRawPacket { raw })
+                            .is_ok();
+                    }
+                }
+                let mut resp = Vec::<u8, 4>::new();
+                let _ = resp.push(if ok { RESP_CODE_OK } else { RESP_CODE_ERR });
+                emit(&resp);
+            }
+
+            CMD_SEND_TRACE_PATH => {
+                let mut ok = false;
+                if payload.len() > 10 {
+                    let tag = u32::from_le_bytes([
+                        payload[1], payload[2], payload[3], payload[4],
+                    ]);
+                    let auth = u32::from_le_bytes([
+                        payload[5], payload[6], payload[7], payload[8],
+                    ]);
+                    let flags = payload[9];
+                    let path_len = payload.len() - 10;
+                    let hash_bytes = 1usize << (flags & 0x03);
+                    // Our Packet path encoding supports 1- and 2-byte hashes.
+                    if hash_bytes <= 2 && path_len <= 64 && path_len % hash_bytes == 0 {
+                        let mut path = [0u8; 64];
+                        path[..path_len].copy_from_slice(&payload[10..]);
+                        ok = crate::companion::usb::USB_COMMAND_CHANNEL
+                            .try_send(crate::companion::usb::UsbCommand::SendTracePath {
+                                tag,
+                                auth,
+                                flags,
+                                path_len: path_len as u8,
+                                path,
+                            })
+                            .is_ok();
                     }
                 }
                 let mut resp = Vec::<u8, 4>::new();

@@ -681,24 +681,95 @@ async fn main(spawner: Spawner) {
                         None => info!("Direct message send failed: contact not found"),
                     }
                 }
+                UsbCommand::SendControlData { data } => {
+                    if !data.is_empty() {
+                        if let Ok(cp) = crate::meshcore::packets::ControlPacket::new(
+                            data[0],
+                            &data[1..],
+                        ) {
+                            if let Ok(pkt) = cp.to_packet(
+                                crate::meshcore::packet::ROUTE_TYPE_DIRECT,
+                            ) {
+                                mesh.seen_filter.mark_seen(pkt.calculate_packet_hash());
+                                let _ = mesh.tx_queue.push(pkt);
+                            }
+                        }
+                    }
+                }
+                UsbCommand::SendRawData {
+                    path_len,
+                    path,
+                    payload,
+                } => {
+                    if Packet::is_valid_path_len(path_len) {
+                        let mut pkt = Packet::new(
+                            crate::meshcore::packet::ROUTE_TYPE_DIRECT,
+                            crate::meshcore::packet::PAYLOAD_TYPE_RAW_CUSTOM,
+                        );
+                        if pkt.set_payload(payload.as_slice()).is_ok() {
+                            pkt.path_len = path_len;
+                            let n = pkt.path_byte_len();
+                            pkt.path[..n].copy_from_slice(&path[..n]);
+                            mesh.seen_filter.mark_seen(pkt.calculate_packet_hash());
+                            let _ = mesh.tx_queue.push(pkt);
+                        }
+                    }
+                }
+                UsbCommand::SendRawPacket { raw } => {
+                    if let Ok(pkt) = Packet::read_from(raw.as_slice()) {
+                        mesh.seen_filter.mark_seen(pkt.calculate_packet_hash());
+                        let _ = mesh.tx_queue.push(pkt);
+                    }
+                }
+                UsbCommand::SendTracePath {
+                    tag,
+                    auth,
+                    flags,
+                    path_len,
+                    path,
+                } => {
+                    let hash_bytes = 1u8 << (flags & 0x03);
+                    if hash_bytes <= 2 && path_len as usize <= 64 {
+                        if let Ok(tp) =
+                            crate::meshcore::packets::TracePacket::new(tag, auth, flags, &[])
+                        {
+                            if let Ok(mut pkt) = tp.to_packet(
+                                crate::meshcore::packet::ROUTE_TYPE_DIRECT,
+                            ) {
+                                let hops = path_len / hash_bytes;
+                                pkt.path_len =
+                                    ((hash_bytes - 1) << 6) | (hops & 63);
+                                pkt.path[..path_len as usize]
+                                    .copy_from_slice(&path[..path_len as usize]);
+                                mesh.seen_filter.mark_seen(pkt.calculate_packet_hash());
+                                let _ = mesh.tx_queue.push(pkt);
+                            }
+                        }
+                    }
+                }
                 UsbCommand::SetRepeat(rep) => {
                     info!("Setting repeater mode: {}", rep);
                     mesh.is_repeater = rep;
                 }
                 UsbCommand::SetFrequency(f) => {
                     info!("Frequency updated to: {} Hz", f);
+                    let _ = crate::radio::lora_phy::request_radio_config();
                 }
                 UsbCommand::SetTxPower(tx) => {
                     info!("TX power updated to: {} dBm", tx);
+                    let _ = crate::radio::lora_phy::request_radio_config();
                 }
                 UsbCommand::SetSpreadingFactor(sf) => {
                     info!("SF updated to: {}", sf);
+                    let _ = crate::radio::lora_phy::request_radio_config();
                 }
                 UsbCommand::SetBandwidth(bw) => {
                     info!("BW updated to: {} kHz", bw);
+                    let _ = crate::radio::lora_phy::request_radio_config();
                 }
                 UsbCommand::SetCodingRate(cr) => {
                     info!("CR updated to: 4/{}", cr);
+                    let _ = crate::radio::lora_phy::request_radio_config();
                 }
                 UsbCommand::SetPathHashMode(mode) => {
                     info!("Setting path.hash.mode to: {} ({} bytes/hop)", mode, mode + 1);

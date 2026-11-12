@@ -162,6 +162,24 @@ pub enum UsbCommand {
         attempt: u8,
         text: heapless::String<160>,
     },
+    SendControlData {
+        data: heapless::Vec<u8, 183>,
+    },
+    SendRawData {
+        path_len: u8,
+        path: [u8; 64],
+        payload: heapless::Vec<u8, 184>,
+    },
+    SendRawPacket {
+        raw: heapless::Vec<u8, 255>,
+    },
+    SendTracePath {
+        tag: u32,
+        auth: u32,
+        flags: u8,
+        path_len: u8,
+        path: [u8; 64],
+    },
     SetFrequency(u32),
     SetTxPower(i8),
     SetRepeat(bool),

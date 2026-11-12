@@ -25,7 +25,7 @@ impl Default for LoraConfig {
             tx_power_dbm: 22,
             spreading_factor: 7,
             bandwidth_khz: 62,
-            coding_rate: 1, // CR 4/5
+            coding_rate: 5, // CR 4/5 (denominator, matching RADIO_SETTINGS)
             preamble_length: 16,
         }
     }
