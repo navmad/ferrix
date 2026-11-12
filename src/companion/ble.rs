@@ -59,6 +59,9 @@ pub enum ContactOperation {
         latitude: i32,
         longitude: i32,
         flags: u8,
+        out_path: [u8; 64],
+        out_path_len: u8,
+        last_advert_ts: u32,
     },
     Remove {
         pub_key: [u8; 32],

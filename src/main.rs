@@ -69,13 +69,17 @@ fn handle_direct_message_confirmed(crc: u32) {
     let now = embassy_time::Instant::now().as_millis();
     let rtt_ms = PENDING_MESSAGE_ACKS.lock(|a| {
         let mut list = a.borrow_mut();
-        if let Some(pos) = list.iter().position(|p| p.crc == crc) {
+        list.iter().position(|p| p.crc == crc).map(|pos| {
             let item = list.remove(pos);
             now.saturating_sub(item.send_instant_ms) as u32
-        } else {
-            120
-        }
+        })
     });
+
+    // ACK snooping can see ACKs for other nodes; only confirm a message we
+    // actually sent.
+    let Some(rtt_ms) = rtt_ms else {
+        return;
+    };
 
     info!("MeshCore Direct Message Delivery ACK Confirmed! (crc {:08x}, RTT: {} ms)", crc, rtt_ms);
 
@@ -260,6 +264,62 @@ async fn main(spawner: Spawner) {
     let mut page_turns = 0u32;
 
     loop {
+        // Drain deferred contact operations from the BLE GATT callback.
+        while let Ok(op) = crate::companion::ble::CONTACT_OP_CHANNEL.try_receive() {
+            match op {
+                crate::companion::ble::ContactOperation::AddOrUpdate {
+                    pub_key,
+                    callsign,
+                    node_id,
+                    last_seen_epoch,
+                    latitude,
+                    longitude,
+                    flags,
+                    out_path,
+                    out_path_len,
+                    last_advert_ts,
+                } => {
+                    crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| {
+                        let mut list = c.borrow_mut();
+                        if let Some(ct) = list.iter_mut().find(|ct| ct.pub_key == pub_key) {
+                            ct.callsign = callsign;
+                            ct.node_id = node_id;
+                            ct.last_seen_epoch = last_seen_epoch;
+                            ct.latitude = latitude;
+                            ct.longitude = longitude;
+                            ct.flags = flags;
+                            ct.out_path = out_path;
+                            ct.out_path_len = out_path_len;
+                            ct.last_advert_ts = last_advert_ts;
+                        } else if list.len() < list.capacity() {
+                            let _ = list.push(crate::meshcore::mesh::DiscoveredContact {
+                                pub_key,
+                                callsign,
+                                node_id,
+                                last_seen_epoch,
+                                rssi: 0,
+                                snr: 0,
+                                latitude,
+                                longitude,
+                                flags,
+                                out_path,
+                                out_path_len,
+                                last_advert_ts,
+                            });
+                        }
+                    });
+                }
+                crate::companion::ble::ContactOperation::Remove { pub_key } => {
+                    crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| {
+                        let mut list = c.borrow_mut();
+                        if let Some(pos) = list.iter().position(|ct| ct.pub_key == pub_key) {
+                            list.remove(pos);
+                        }
+                    });
+                }
+            }
+        }
+
         // Poll for incoming LoRa packets
         if let Some((len, rssi, snr)) = lora.poll_receive(&mut rx_buf).await {
             info!("Received LoRa packet: {} bytes, RSSI: {} dBm, SNR: {} dB", len, rssi, snr);
@@ -301,9 +361,13 @@ async fn main(spawner: Spawner) {
                         crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| {
                             let mut list = c.borrow_mut();
                             if let Some(existing) = list.iter_mut().find(|ct| ct.pub_key == adv.pub_key) {
-                                // Update existing contact
+                                // Anti-replay: ignore an advert no newer than the last accepted one.
+                                if existing.last_advert_ts != 0 && adv.timestamp <= existing.last_advert_ts {
+                                    return;
+                                }
                                 existing.callsign = adv.name.clone();
                                 existing.last_seen_epoch = node.epoch_time as u32;
+                                existing.last_advert_ts = adv.timestamp;
                                 existing.rssi = rssi;
                                 existing.snr = snr;
                                 existing.latitude = adv.latitude;
@@ -331,6 +395,9 @@ async fn main(spawner: Spawner) {
                                         latitude: adv.latitude,
                                         longitude: adv.longitude,
                                         flags: adv.flags,
+                                        out_path: [0u8; 64],
+                                        out_path_len: 0xFF,
+                                        last_advert_ts: adv.timestamp,
                                     });
                                 } else if node.should_overwrite_when_full() {
                                     // List is full, find oldest non-favorite contact to overwrite
@@ -364,6 +431,9 @@ async fn main(spawner: Spawner) {
                                             latitude: adv.latitude,
                                             longitude: adv.longitude,
                                             flags: adv.flags,
+                                            out_path: [0u8; 64],
+                                            out_path_len: 0xFF,
+                                            last_advert_ts: adv.timestamp,
                                         };
                                     } else {
                                         // All contacts are favorites, can't overwrite
@@ -464,6 +534,28 @@ async fn main(spawner: Spawner) {
                         info!("MeshCore ACK received (crc {:08x})", ack.crc);
                         handle_direct_message_confirmed(ack.crc);
                     }
+                    InboundAction::ReceivedPath { packet: path, sender_pub } => {
+                        info!(
+                            "MeshCore PATH from {:02x}{:02x}: {} hops, extra {}",
+                            sender_pub[0], sender_pub[1], path.hop_count(), path.extra_type
+                        );
+                        crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| {
+                            if let Some(ct) =
+                                c.borrow_mut().iter_mut().find(|ct| ct.pub_key == sender_pub)
+                            {
+                                ct.out_path = path.path;
+                                ct.out_path_len = path.path_len;
+                            }
+                        });
+                        // A PATH return can carry an ACK as its extra.
+                        if path.extra_type & 0x0F == 3 && path.extra.len() >= 4 {
+                            if let Ok(ack) =
+                                crate::meshcore::packets::AckPacket::decode(path.extra.as_slice())
+                            {
+                                handle_direct_message_confirmed(ack.crc);
+                            }
+                        }
+                    }
                     InboundAction::DropDuplicate => {
                         info!("MeshCore: dropped duplicate packet");
                     }
@@ -546,20 +638,22 @@ async fn main(spawner: Spawner) {
                         text.as_str()
                     );
                     node.tx_beacons = node.tx_beacons.saturating_add(1);
-                    let dest_pub = crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| {
+                    let peer = crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| {
                         c.borrow()
                             .iter()
                             .find(|ct| &ct.pub_key[..6] == &dest_prefix[..])
-                            .map(|ct| ct.pub_key)
+                            .map(|ct| (ct.pub_key, ct.out_path, ct.out_path_len))
                     });
-                    match dest_pub {
-                        Some(dest_pub) => {
+                    match peer {
+                        Some((dest_pub, out_path, out_path_len)) => {
                             match mesh.queue_direct_text(
                                 &dest_pub,
                                 text.as_str(),
                                 timestamp,
                                 txt_type,
                                 attempt,
+                                out_path_len,
+                                &out_path,
                             ) {
                                 Ok(crc) => track_pending_ack(crc),
                                 Err(_) => info!("Direct message send failed (text or encryption)"),

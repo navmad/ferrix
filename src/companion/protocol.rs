@@ -388,9 +388,8 @@ impl CompanionNode {
                     let contact_type = CompanionNode::get_contact_type_from_flags(c.flags);
                     let _ = c_resp.push(contact_type);
                     let _ = c_resp.push(c.flags);
-                    let _ = c_resp.push(0); // out_path_len = 0
-                    let out_path = [0u8; 64];
-                    let _ = c_resp.extend_from_slice(&out_path);
+                    let _ = c_resp.push(c.out_path_len);
+                    let _ = c_resp.extend_from_slice(&c.out_path);
 
                     let mut adv_name = [0u8; 32];
                     let cs = c.callsign.as_bytes();
@@ -398,14 +397,14 @@ impl CompanionNode {
                     adv_name[..cs_len].copy_from_slice(&cs[..cs_len]);
                     let _ = c_resp.extend_from_slice(&adv_name);
 
-                    let last_advert = c.last_seen_epoch;
-                    if last_advert > max_lastmod {
-                        max_lastmod = last_advert;
+                    let last_advert = c.last_advert_ts;
+                    if c.last_seen_epoch > max_lastmod {
+                        max_lastmod = c.last_seen_epoch;
                     }
                     let _ = c_resp.extend_from_slice(&last_advert.to_le_bytes());
                     let _ = c_resp.extend_from_slice(&c.latitude.to_le_bytes()); // adv_lat
                     let _ = c_resp.extend_from_slice(&c.longitude.to_le_bytes()); // adv_lon
-                    let _ = c_resp.extend_from_slice(&last_advert.to_le_bytes()); // lastmod
+                    let _ = c_resp.extend_from_slice(&c.last_seen_epoch.to_le_bytes()); // lastmod
                     emit(&c_resp);
                 }
 
@@ -548,12 +547,12 @@ impl CompanionNode {
                     let pub_key: [u8; 32] = payload[i..i+32].try_into().unwrap(); i += 32;
                     let _node_type = payload[i]; i += 1;
                     let flags = payload[i]; i += 1;
-                    let _out_path_len = payload[i]; i += 1;
-                    // out_path is 64 bytes
-                    i += 64;
+                    let out_path_len = payload[i]; i += 1;
+                    let mut out_path = [0u8; 64];
+                    out_path.copy_from_slice(&payload[i..i+64]); i += 64;
                     let adv_name_bytes = &payload[i..i+32]; i += 32;
                     let adv_name = core::str::from_utf8(adv_name_bytes).unwrap_or("").trim_end_matches('\0');
-                    let _last_advert = u32::from_le_bytes([payload[i], payload[i+1], payload[i+2], payload[i+3]]); i += 4;
+                    let last_advert = u32::from_le_bytes([payload[i], payload[i+1], payload[i+2], payload[i+3]]); i += 4;
 
                     // Optional fields after the required 136 bytes
                     let (adv_lat, adv_lon, lastmod) = if payload.len() >= i + 8 {
@@ -563,11 +562,11 @@ impl CompanionNode {
                             let lm = u32::from_le_bytes([payload[i], payload[i+1], payload[i+2], payload[i+3]]);
                             (lat, lon, lm)
                         } else {
-                            let lm = _last_advert;
+                            let lm = last_advert;
                             (lat, lon, lm)
                         }
                     } else {
-                        (0, 0, _last_advert)
+                        (0, 0, last_advert)
                     };
 
                     let node_id = [pub_key[0], pub_key[1], pub_key[2], pub_key[3]];
@@ -588,6 +587,9 @@ impl CompanionNode {
                             latitude: adv_lat,
                             longitude: adv_lon,
                             flags,
+                            out_path,
+                            out_path_len,
+                            last_advert_ts: last_advert,
                         }
                     );
 

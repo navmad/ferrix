@@ -151,6 +151,10 @@ impl Packet {
     pub fn append_hop_bytes(&mut self, hash_bytes: &[u8]) -> bool {
         let count = self.path_hash_count();
         let size = self.path_hash_size();
+        // 6 bits hold at most 63 hops; appending past that would wrap the count.
+        if count >= 63 {
+            return false;
+        }
         let next_bytes = (count + 1) * size;
         if next_bytes <= MAX_PATH_SIZE {
             let offset = count * size;
@@ -164,6 +168,23 @@ impl Packet {
         } else {
             false
         }
+    }
+
+    /// Remove the first hop from the path (direct forwarding). Returns false
+    /// when the path is empty.
+    pub fn pop_front_hop(&mut self) -> bool {
+        let size = self.path_hash_size();
+        let count = self.path_hash_count();
+        if count == 0 {
+            return false;
+        }
+        let len = count * size;
+        self.path.copy_within(size..len, 0);
+        for i in (len - size)..len {
+            self.path[i] = 0;
+        }
+        self.set_path_hash_size_and_count(size as u8, (count - 1) as u8);
+        true
     }
 
     /// Checks if a node hash is already present in the path to detect loops

@@ -9,7 +9,8 @@
 use crate::meshcore::identity::LocalIdentity;
 use crate::meshcore::packet::{
     Packet, PAYLOAD_TYPE_ACK, PAYLOAD_TYPE_ADVERT, PAYLOAD_TYPE_ANON_REQ, PAYLOAD_TYPE_GRP_DATA,
-    PAYLOAD_TYPE_GRP_TXT, PAYLOAD_TYPE_PATH, PAYLOAD_TYPE_TXT_MSG, ROUTE_TYPE_FLOOD,
+    PAYLOAD_TYPE_GRP_TXT, PAYLOAD_TYPE_PATH, PAYLOAD_TYPE_TXT_MSG, ROUTE_TYPE_DIRECT,
+    ROUTE_TYPE_FLOOD,
 };
 use crate::meshcore::packets::advert::{ADV_TYPE_CHAT, ADV_TYPE_REPEATER};
 use crate::meshcore::packets::{
@@ -17,7 +18,16 @@ use crate::meshcore::packets::{
 };
 use crate::meshcore::queue::{PacketQueue, SeenPacketFilter};
 
-pub const DEFAULT_MAX_HOPS: u8 = 7;
+pub const DEFAULT_MAX_HOPS: u8 = 64;
+
+/// Direct when the contact has a valid encoded path; flood otherwise.
+fn route_for(out_path_len: u8) -> (u8, u8) {
+    if out_path_len != 0xFF && Packet::is_valid_path_len(out_path_len) {
+        (ROUTE_TYPE_DIRECT, out_path_len)
+    } else {
+        (ROUTE_TYPE_FLOOD, 0)
+    }
+}
 
 /// Discovered MeshCore Contact in range
 #[derive(Clone, Debug)]
@@ -30,7 +40,13 @@ pub struct DiscoveredContact {
     pub snr: i8,
     pub latitude: i32,       // Changed from f32 to i32 (degrees * 1,000,000)
     pub longitude: i32,      // Changed from f32 to i32 (degrees * 1,000,000)
-    pub flags: u8,           // New: advert flags bitmask
+    pub flags: u8,           // raw advert app_data[0] (kind nibble + masks)
+    /// Learned return path (encoded path byte in `out_path_len`).
+    pub out_path: [u8; 64],
+    /// `0xFF` means unknown; otherwise a validated encoded path byte.
+    pub out_path_len: u8,
+    /// Timestamp from the last accepted advert (anti-replay).
+    pub last_advert_ts: u32,
 }
 
 /// Recently received message entry for message history / inbox
@@ -75,7 +91,10 @@ pub enum InboundAction {
     /// Received message delivery acknowledgment
     ReceivedAck(AckPacket),
     /// Received path discovery reply
-    ReceivedPath(PathPacket),
+    ReceivedPath {
+        packet: PathPacket,
+        sender_pub: [u8; 32],
+    },
     /// Received channel datagram
     ReceivedGroupData {
         channel_idx: u8,
@@ -83,6 +102,8 @@ pub enum InboundAction {
     },
     /// Received anonymous request
     ReceivedAnonReq(AnonReqPacket),
+    /// Retransmitted a direct packet addressed to the next hop
+    Forwarded,
     /// Unhandled or unknown packet payload
     Unhandled,
 }
@@ -159,7 +180,34 @@ impl MeshEngine {
         let is_dupe = self.seen_filter.check_and_mark(&pkt);
         let already_in_path = pkt.contains_hop(self.identity.pub_key());
 
-        // 2. Dispatch based on payload type
+        // 2. Direct forwarding: if the first hop is us, pop it and requeue.
+        if pkt.route_type() == crate::meshcore::packet::ROUTE_TYPE_DIRECT {
+            if pkt.path_hash_count() > 0 {
+                let size = pkt.path_hash_size();
+                if pkt.path[..size] == self.identity.pub_key()[..size] {
+                    if self.is_repeater {
+                        let mut fwd = pkt.clone();
+                        if fwd.pop_front_hop() {
+                            let ack = if fwd.payload_type() == PAYLOAD_TYPE_ACK {
+                                AckPacket::decode(&fwd.payload[..fwd.payload_len]).ok()
+                            } else {
+                                None
+                            };
+                            let _ = self.tx_queue.push(fwd);
+                            if let Some(ack) = ack {
+                                return InboundAction::ReceivedAck(ack);
+                            }
+                            return InboundAction::Forwarded;
+                        }
+                    }
+                }
+                // A direct packet with a non-empty path is not for us unless we
+                // are its next hop.
+                return InboundAction::Unhandled;
+            }
+        }
+
+        // 3. Dispatch based on payload type
         match pkt.payload_type() {
             PAYLOAD_TYPE_ADVERT => {
                 if is_dupe {
@@ -285,7 +333,23 @@ impl MeshEngine {
                                 msg.extended_attempt,
                                 0,
                             );
-                            let _ = self.queue_ack_packet(ack);
+                            if pkt.is_flood() {
+                                // Flooded DM: return the arrival path with the ACK
+                                // as extra, so the sender learns a direct route.
+                                let mut ack_bytes = [0u8; 8];
+                                if let Ok(alen) = ack.encode(&mut ack_bytes) {
+                                    let _ = self.queue_path_return(
+                                        peer[0],
+                                        self.identity.pub_key()[0],
+                                        &secret,
+                                        &pkt,
+                                        &ack_bytes[..alen],
+                                    );
+                                }
+                            } else {
+                                let (out_path_len, out_path) = self.peer_path(peer);
+                                let _ = self.queue_ack_packet(ack, out_path_len, &out_path);
+                            }
                         }
                         return InboundAction::ReceivedDirectText {
                             msg,
@@ -313,7 +377,10 @@ impl MeshEngine {
                 for peer in self.peers_by_hash(payload[1]).iter() {
                     if let Some(secret) = self.identity.shared_secret(peer) {
                         if let Ok(path) = PathPacket::decode(payload, &secret) {
-                            return InboundAction::ReceivedPath(path);
+                            return InboundAction::ReceivedPath {
+                                packet: path,
+                                sender_pub: *peer,
+                            };
                         }
                     }
                 }
@@ -408,6 +475,8 @@ impl MeshEngine {
         timestamp: u32,
         txt_type: u8,
         attempt: u8,
+        out_path_len: u8,
+        out_path: &[u8; 64],
     ) -> Result<u32, ()> {
         let secret = self.identity.shared_secret(dest_pub).ok_or(())?;
         let msg = TxtMsgPacket::new(
@@ -419,10 +488,9 @@ impl MeshEngine {
             text,
             self.identity.pub_key(),
         )?;
-        let mut pkt = msg.to_packet(ROUTE_TYPE_FLOOD, &secret)?;
-        pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
-        self.seen_filter.mark_seen(pkt.calculate_packet_hash());
-        let _ = self.tx_queue.push(pkt.clone());
+        let pkt = msg.to_packet(ROUTE_TYPE_FLOOD, &secret)?;
+        let (route, path_len) = route_for(out_path_len);
+        let _ = self.finish_outbound(pkt, route, path_len, out_path);
         Ok(msg.ack_crc)
     }
 
@@ -433,14 +501,67 @@ impl MeshEngine {
         extended_attempt: u8,
         random: u8,
     ) -> Result<Packet, ()> {
-        self.queue_ack_packet(AckPacket::with_extended(crc, extended_attempt, random))
+        self.queue_ack_packet(
+            AckPacket::with_extended(crc, extended_attempt, random),
+            0xFF,
+            &[0u8; 64],
+        )
     }
 
-    fn queue_ack_packet(&mut self, ack: AckPacket) -> Result<Packet, ()> {
-        let mut pkt = ack.to_packet(ROUTE_TYPE_FLOOD)?;
-        pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
+    fn queue_ack_packet(
+        &mut self,
+        ack: AckPacket,
+        out_path_len: u8,
+        out_path: &[u8; 64],
+    ) -> Result<Packet, ()> {
+        let pkt = ack.to_packet(ROUTE_TYPE_FLOOD)?;
+        let (route, path_len) = route_for(out_path_len);
+        Ok(self.finish_outbound(pkt, route, path_len, out_path))
+    }
+
+    fn queue_path_return(
+        &mut self,
+        dest: u8,
+        src: u8,
+        secret: &[u8; 32],
+        arrival: &Packet,
+        ack: &[u8],
+    ) -> Result<Packet, ()> {
+        let plen = arrival.path_byte_len();
+        let mut path = [0u8; 64];
+        path[..plen].copy_from_slice(&arrival.path[..plen]);
+        let pp = PathPacket::new(dest, src, arrival.path_len, &path[..plen], 3, ack)?;
+        let pkt = pp.to_packet(ROUTE_TYPE_FLOOD, secret, &[0u8; 4])?;
+        Ok(self.finish_outbound(pkt, ROUTE_TYPE_FLOOD, 0, &[0u8; 64]))
+    }
+
+    fn peer_path(&self, pub_key: &[u8; 32]) -> (u8, [u8; 64]) {
+        crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| {
+            if let Some(ct) = c.borrow().iter().find(|ct| ct.pub_key == *pub_key) {
+                (ct.out_path_len, ct.out_path)
+            } else {
+                (0xFF, [0u8; 64])
+            }
+        })
+    }
+
+    fn finish_outbound(
+        &mut self,
+        mut pkt: Packet,
+        route: u8,
+        path_len: u8,
+        path: &[u8; 64],
+    ) -> Packet {
+        pkt.header = (pkt.header & 0xFC) | (route & 0x03);
+        if route == ROUTE_TYPE_DIRECT && Packet::is_valid_path_len(path_len) {
+            pkt.path_len = path_len;
+            let n = pkt.path_byte_len();
+            pkt.path[..n].copy_from_slice(&path[..n]);
+        } else {
+            pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
+        }
         self.seen_filter.mark_seen(pkt.calculate_packet_hash());
         let _ = self.tx_queue.push(pkt.clone());
-        Ok(pkt)
+        pkt
     }
 }

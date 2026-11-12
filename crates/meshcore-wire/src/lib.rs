@@ -59,6 +59,30 @@ mod tests {
     }
 
     #[test]
+    fn pop_front_hop_shifts_path() {
+        let mut p = Packet::new(ROUTE_TYPE_DIRECT, PAYLOAD_TYPE_ADVERT);
+        p.set_path_hash_size_and_count(2, 2);
+        p.path[..4].copy_from_slice(&[1, 2, 3, 4]);
+
+        assert!(p.pop_front_hop());
+        assert_eq!(p.path_hash_size(), 2);
+        assert_eq!(p.path_hash_count(), 1);
+        assert_eq!(&p.path[..2], &[3, 4]);
+
+        assert!(p.pop_front_hop());
+        assert_eq!(p.path_hash_count(), 0);
+        assert!(!p.pop_front_hop());
+    }
+
+    #[test]
+    fn append_hop_stops_at_63() {
+        let mut p = Packet::new(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_ADVERT);
+        p.set_path_hash_size_and_count(1, 63);
+        assert!(!p.append_hop(7));
+        assert_eq!(p.path_hash_count(), 63);
+    }
+
+    #[test]
     fn channel_hash_is_stable() {
         let psk = [
             0x8b, 0x33, 0x87, 0xe9, 0xc5, 0xcd, 0xea, 0x6a, 0xc9, 0xe5, 0xed, 0xba, 0xa1, 0x15,
