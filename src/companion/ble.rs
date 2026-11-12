@@ -46,7 +46,9 @@ pub struct MeshCoreGattServer {
     pub nus: NordicUartService,
 }
 
-pub static COMPANION_PUSH_CHANNEL: Channel<SharedRawMutex, Vec<u8, 256>, 16> = Channel::new();
+/// Responses are queued here and drained by `push_fut`, never notified from
+/// inside the GATT callback. Sized for a full contact sync burst.
+pub static COMPANION_PUSH_CHANNEL: Channel<SharedRawMutex, Vec<u8, 256>, 40> = Channel::new();
 
 /// Contact operation deferred from the GATT callback to avoid locking
 /// `DISCOVERED_CONTACTS` inside the SoftDevice critical section.
@@ -279,12 +281,13 @@ pub async fn ble_companion_task(
 
         let gatt_fut = gatt_server::run(&conn, &server, |event| match event {
             MeshCoreGattServerEvent::Nus(NordicUartServiceEvent::RxWrite(data)) => {
-                info!("BLE command received ({} bytes): opcode=0x{:02x}", data.len(), data.first().copied().unwrap_or(0));
+                // No logging or SoftDevice calls here: this runs in the GATT
+                // event callback. Queue responses for `push_fut`.
                 node.handle_command(data.as_slice(), |resp| {
                     let mut vec = Vec::<u8, 256>::new();
                     let copy_len = resp.len().min(247);
                     let _ = vec.extend_from_slice(&resp[..copy_len]);
-                    let _ = server.nus.tx_notify(&conn, &vec);
+                    let _ = COMPANION_PUSH_CHANNEL.try_send(vec);
                 });
                 // After handling a command, check if all 8 channels have been synced.
                 // If so, signal the background task to update connection parameters.
@@ -307,8 +310,6 @@ pub async fn ble_companion_task(
                 let _ = vec.extend_from_slice(&msg[..copy_len]);
                 if let Err(e) = server.nus.tx_notify(&conn, &vec) {
                     debug!("BLE NUS tx_notify push failed: {:?}", e);
-                } else {
-                    info!("BLE NUS push sent to phone: code=0x{:02x}, len={}", vec.first().copied().unwrap_or(0), vec.len());
                 }
             }
         };
