@@ -98,23 +98,107 @@ static EPD_FRAMEBUFFER: StaticCell<EpdFrameBuffer> = StaticCell::new();
 /// Number of page turns between full screen refreshes (clears e-ink ghosting)
 const EPD_FULL_REFRESH_INTERVAL: u32 = 9;
 
-/// Custom panic handler: Blinks Red LED (P1.04) continuously to indicate fatal state without hard-faulting
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    defmt::error!("FATAL PANIC OCCURRED!");
-    // Directly toggle P1.04 (Red LED) in a loop
-    let p1_outset = (0x5000_0800 + 0x508) as *mut u32;
-    let p1_outclr = (0x5000_0800 + 0x50C) as *mut u32;
-    let p1_dirset = (0x5000_0800 + 0x518) as *mut u32;
+// ---------------------------------------------------------------------------
+// Fatal-error indicators
+//
+// The red LED (P1.04) on the ThinkNode M1 is driven by the charger IC, so it
+// cannot be used as a firmware status. Use the MCU-controlled blue LED (P0.13)
+// instead. Patterns (all on blue):
+//   - normal boot:  3 fast blinks, then the slow main-loop heartbeat
+//   - panic:        3 quick blinks, repeated forever
+//   - HardFault:    6 quick blinks, repeated forever
+//   - SoftDevice:  10 quick blinks, repeated forever
+// A dark blue LED therefore means the CPU is stuck in a loop that never
+// reaches any handler (a hang), while a blinking pattern identifies the fault.
+// ---------------------------------------------------------------------------
 
+const P0_BASE: u32 = 0x5000_0000;
+const P0_PIN_CNF13: *mut u32 = (P0_BASE + 0x504 + 4 * 13) as *mut u32;
+const P0_OUTSET: *mut u32 = (P0_BASE + 0x508) as *mut u32;
+const P0_OUTCLR: *mut u32 = (P0_BASE + 0x50C) as *mut u32;
+const P0_DIRSET: *mut u32 = (P0_BASE + 0x518) as *mut u32;
+const BLUE_LED: u32 = 1 << 13;
+
+/// ~35 ms at 64 MHz. Used instead of a timer so it still works when the
+/// scheduler, the SoftDevice or interrupts are wedged.
+#[inline(never)]
+fn fatal_delay() {
+    cortex_m::asm::delay(2_000_000);
+}
+
+fn blue_on() {
+    unsafe { P0_OUTSET.write_volatile(BLUE_LED) }
+}
+
+fn blue_off() {
+    unsafe { P0_OUTCLR.write_volatile(BLUE_LED) }
+}
+
+fn blue_init() {
     unsafe {
-        p1_dirset.write_volatile(1 << 4);
-        loop {
-            p1_outset.write_volatile(1 << 4);
-            cortex_m::asm::delay(2_000_000);
-            p1_outclr.write_volatile(1 << 4);
-            cortex_m::asm::delay(2_000_000);
+        // Dir=output, input buffer disconnected.
+        P0_PIN_CNF13.write_volatile(0x0000_0003);
+        P0_DIRSET.write_volatile(BLUE_LED);
+    }
+}
+
+/// Short, unmistakable burst used to classify the failure without a debugger.
+fn fatal_blink_burst(count: u32) {
+    blue_init();
+    for _ in 0..count {
+        blue_on();
+        fatal_delay();
+        blue_off();
+        fatal_delay();
+    }
+    // Gap between bursts.
+    for _ in 0..4 {
+        fatal_delay();
+    }
+}
+
+/// Repeat a burst forever. Used for fatal faults that cannot recover.
+pub(crate) fn fatal_blink_forever(count: u32) -> ! {
+    loop {
+        fatal_blink_burst(count);
+    }
+}
+
+/// Continuous blue heartbeat: a Rust panic is in progress.
+fn fatal_blink_slow() -> ! {
+    blue_init();
+    loop {
+        blue_on();
+        for _ in 0..12 {
+            fatal_delay();
         }
+        blue_off();
+        for _ in 0..12 {
+            fatal_delay();
+        }
+    }
+}
+
+/// Custom panic handler: 3 quick blue blinks, then a slow continuous blink.
+#[panic_handler]
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    // Blink first: defmt/RTT can block if a debugger configured blocking mode.
+    fatal_blink_burst(3);
+    defmt::error!("FATAL PANIC: {}", defmt::Display2Format(&info.message()));
+    fatal_blink_slow()
+}
+
+/// HardFault handler: 6 quick blue blinks, repeated forever. Different from
+/// the panic pattern so the two can be told apart without a debugger.
+#[cortex_m_rt::exception]
+unsafe fn HardFault(frame: &cortex_m_rt::ExceptionFrame) -> ! {
+    loop {
+        fatal_blink_burst(6);
+        defmt::error!(
+            "HARD FAULT pc={=u32:#010x} lr={=u32:#010x}",
+            frame.pc(),
+            frame.lr()
+        );
     }
 }
 

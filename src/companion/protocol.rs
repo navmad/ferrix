@@ -262,8 +262,8 @@ impl CompanionNode {
         }
 
         let cmd = payload[0];
-        // NOTE: No defmt::info! here — this runs inside the BLE GATT callback
-        // (SoftDevice critical section). RTT logging can block and freeze the device.
+        // NOTE: this runs in `command_fut` (normal task context), never inside
+        // the SoftDevice GATT callback. Logging is therefore safe here.
 
         match cmd {
             CMD_DEVICE_QUERY => {
@@ -892,11 +892,9 @@ impl CompanionNode {
                 // Optional: gps_lat(4), gps_lon(4), lastmod(4)
                 // Minimum required: 1 + 32 + 1 + 1 + 1 + 64 + 32 + 4 = 136 bytes (matches the reference firmware)
                 //
-                // CRITICAL: This handler runs inside the BLE GATT event callback, which executes
-                // within a SoftDevice critical section (Portal::call). We MUST NOT lock any mutexes
-                // here — explicit mutex work can raise a nested critical section; keep it deferred
-                // the device. Instead, we parse the payload and defer the actual contact storage
-                // to a background task via CONTACT_OP_CHANNEL.
+                // This handler runs in `command_fut` (normal task context), but contact
+                // storage is still deferred to `contact_task` via CONTACT_OP_CHANNEL so
+                // a slow or full contact list cannot back up the BLE task.
                 if payload.len() >= 1 + 32 + 1 + 1 + 1 + 64 + 32 + 4 {
                     let mut i = 1;
                     let pub_key: [u8; 32] = payload[i..i+32].try_into().unwrap(); i += 32;
@@ -962,8 +960,7 @@ impl CompanionNode {
 
             CMD_REMOVE_CONTACT => {
                 // Inbound: [CMD(15), public_key(32)]
-                // CRITICAL: Defer the actual removal to avoid locking DISCOVERED_CONTACTS
-                // inside the SoftDevice critical section.
+                // Defer the actual removal to `contact_task`, like AddOrUpdate.
                 if payload.len() >= 33 {
                     let pub_key: [u8; 32] = payload[1..33].try_into().unwrap();
                     let _ = crate::companion::ble::CONTACT_OP_CHANNEL.try_send(

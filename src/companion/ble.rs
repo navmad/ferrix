@@ -3,11 +3,15 @@
 //! Exposes Nordic UART Service (NUS) over BLE GATT, enabling official MeshCore
 //! mobile apps (iOS & Android) to discover, pair, and communicate with ThinkNode M1.
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::cell::UnsafeCell;
+use core::future::poll_fn;
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::task::Poll;
 
 use defmt::{debug, error, info};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
+use embassy_sync::waitqueue::AtomicWaker;
 
 /// Shared raw mutex type — see usb.rs for documentation.
 type SharedRawMutex = CriticalSectionRawMutex;
@@ -47,11 +51,118 @@ pub struct MeshCoreGattServer {
 }
 
 /// Responses are queued here and drained by `push_fut`, never notified from
-/// inside the GATT callback. Sized for a full contact sync burst.
+/// inside the GATT callback. Sized for a full contact sync burst
+/// (`GET_CONTACTS` emits at most: start + 32 contacts + end).
 pub static COMPANION_PUSH_CHANNEL: Channel<SharedRawMutex, Vec<u8, 256>, 40> = Channel::new();
 
-/// Contact operation deferred from the GATT callback to avoid locking
-/// `DISCOVERED_CONTACTS` inside the SoftDevice critical section.
+/// Largest companion command accepted over NUS.
+const CMD_MAX_LEN: usize = 247;
+/// Number of queued commands. Commands arrive one at a time from the app, so
+/// a small ring is plenty.
+const CMD_RING_SLOTS: usize = 8;
+
+#[derive(Clone, Copy)]
+struct CmdSlot {
+    len: u8,
+    data: [u8; CMD_MAX_LEN],
+}
+
+/// Single-producer/single-consumer ring between the GATT callback and
+/// `command_fut`.
+///
+/// The GATT callback must never run companion protocol code: `handle_command`
+/// takes locks, reads shared state and can emit many responses. Doing that
+/// inside a SoftDevice event callback can stall the SoftDevice and freeze the
+/// device. The callback now only copies the bytes here.
+struct CmdRing {
+    slots: UnsafeCell<[CmdSlot; CMD_RING_SLOTS]>,
+    head: AtomicUsize,
+    tail: AtomicUsize,
+}
+
+// SAFETY: the producer (GATT callback) and consumer (`command_fut`) are
+// distinct. The producer writes a slot only after observing it free and
+// publishes it with a Release store to `head`; the consumer only reads slots
+// below `head` (Acquire) and advances `tail` with Release before reuse.
+unsafe impl Sync for CmdRing {}
+
+impl CmdRing {
+    const fn new() -> Self {
+        Self {
+            slots: UnsafeCell::new(
+                [CmdSlot {
+                    len: 0,
+                    data: [0u8; CMD_MAX_LEN],
+                }; CMD_RING_SLOTS],
+            ),
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+        }
+    }
+
+    /// Enqueue one command. Never blocks, never takes a lock. Returns false if
+    /// the command is too long or the ring is full.
+    fn push(&self, data: &[u8]) -> bool {
+        if data.is_empty() || data.len() > CMD_MAX_LEN {
+            return false;
+        }
+
+        let head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Acquire);
+        if head.wrapping_sub(tail) >= CMD_RING_SLOTS {
+            return false;
+        }
+
+        let idx = head % CMD_RING_SLOTS;
+        // SAFETY: `idx` is free (head - tail < SLOTS) and only the producer
+        // writes slots.
+        unsafe {
+            let slot = &mut (*self.slots.get())[idx];
+            slot.len = data.len() as u8;
+            slot.data[..data.len()].copy_from_slice(data);
+        }
+        self.head.store(head.wrapping_add(1), Ordering::Release);
+        true
+    }
+
+    /// Dequeue one command into `out`, returning its length.
+    fn pop(&self, out: &mut [u8; CMD_MAX_LEN]) -> Option<usize> {
+        let tail = self.tail.load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Acquire);
+        if head == tail {
+            return None;
+        }
+
+        let idx = tail % CMD_RING_SLOTS;
+        // SAFETY: the slot was published by the producer (Acquire on head) and
+        // only the consumer reads it until it advances `tail`.
+        let len = unsafe {
+            let slot = &(*self.slots.get())[idx];
+            let len = slot.len as usize;
+            out[..len].copy_from_slice(&slot.data[..len]);
+            len
+        };
+        self.tail.store(tail.wrapping_add(1), Ordering::Release);
+        Some(len)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.head.load(Ordering::Acquire) == self.tail.load(Ordering::Relaxed)
+    }
+
+    /// Discard queued commands. Called by the consumer after a disconnect,
+    /// when the producer is no longer running.
+    fn clear(&self) {
+        let head = self.head.load(Ordering::Acquire);
+        self.tail.store(head, Ordering::Release);
+    }
+}
+
+static BLE_CMD_RING: CmdRing = CmdRing::new();
+static BLE_CMD_WAKER: AtomicWaker = AtomicWaker::new();
+
+/// Contact operation deferred out of the command handler so contact storage
+/// never runs inside the BLE/SoftDevice path.
 pub enum ContactOperation {
     AddOrUpdate {
         pub_key: [u8; 32],
@@ -162,10 +273,8 @@ impl SecurityHandler for MeshCoreSecurityHandler {
         true
     }
 
-    fn display_passkey(&self, passkey: &[u8; 6]) {
-        if let Ok(s) = core::str::from_utf8(passkey) {
-            info!("BLE: Passkey displayed: {}", s);
-        }
+    fn display_passkey(&self, _passkey: &[u8; 6]) {
+        // No logging: this runs from a SoftDevice callback.
     }
 
     fn enter_passkey(&self, reply: PasskeyReply) {
@@ -176,7 +285,6 @@ impl SecurityHandler for MeshCoreSecurityHandler {
             buf[i] = b'0' + (value % 10) as u8;
             value /= 10;
         }
-        info!("BLE: Replying with stored PIN");
         let _ = reply.reply(Some(&buf));
     }
 }
@@ -258,9 +366,6 @@ pub async fn ble_companion_task(
 
     loop {
         info!("BLE: Waiting for pairable connection from MeshCore companion app (PIN 123456)...");
-        // Flag to signal when channel sync is complete, so we can defer connection
-        // parameter updates until after the sync burst (matching the reference firmware behavior).
-        let sync_done = AtomicBool::new(false);
 
         let conn = match peripheral::advertise_pairable(sd, adv, &adv_config, &SECURITY_HANDLER).await {
             Ok(mut c) => {
@@ -279,28 +384,61 @@ pub async fn ble_companion_task(
             }
         };
 
+        // The GATT callback only copies the command into the lock-free ring and
+        // wakes `command_fut`. It must not parse commands, take locks, allocate
+        // or log: `handle_command` can emit dozens of responses (contact sync)
+        // and doing that inside a SoftDevice callback can stall the SoftDevice.
         let gatt_fut = gatt_server::run(&conn, &server, |event| match event {
             MeshCoreGattServerEvent::Nus(NordicUartServiceEvent::RxWrite(data)) => {
-                // No logging or SoftDevice calls here: this runs in the GATT
-                // event callback. Queue responses for `push_fut`.
-                node.handle_command(data.as_slice(), |resp| {
-                    let mut vec = Vec::<u8, 256>::new();
-                    let copy_len = resp.len().min(247);
-                    let _ = vec.extend_from_slice(&resp[..copy_len]);
-                    let _ = COMPANION_PUSH_CHANNEL.try_send(vec);
-                });
-                // After handling a command, check if all 8 channels have been synced.
-                // If so, signal the background task to update connection parameters.
-                if node.channels_synced >= 8 && !sync_done.load(Ordering::Relaxed) {
-                    sync_done.store(true, Ordering::Relaxed);
-                    info!("BLE: Channel sync complete, will update connection params");
+                if !BLE_CMD_RING.push(data.as_slice()) {
+                    // Ring full: drop rather than spin inside the callback.
+                    // Command drops are counted and logged by `command_fut`.
+                    BLE_CMD_DROPS.fetch_add(1, Ordering::Relaxed);
                 }
+                BLE_CMD_WAKER.wake();
             }
-            MeshCoreGattServerEvent::Nus(NordicUartServiceEvent::TxCccdWrite { notifications }) => {
-                info!("BLE NUS notifications configured: enabled={}", notifications);
+            MeshCoreGattServerEvent::Nus(NordicUartServiceEvent::TxCccdWrite {
+                notifications: _,
+            }) => {
+                // Never log from a SoftDevice callback.
             }
             _ => {}
         });
+
+        // Companion protocol processing, running in normal task context. One
+        // command at a time, then yield so `push_fut` can drain the responses
+        // before the next command is handled.
+        let mut cmd_buf = [0u8; CMD_MAX_LEN];
+        let command_fut = async {
+            loop {
+                if let Some(len) = BLE_CMD_RING.pop(&mut cmd_buf) {
+                    let drops = BLE_CMD_DROPS.swap(0, Ordering::Relaxed);
+                    if drops != 0 {
+                        debug!("BLE: dropped {} command(s) because the ring was full", drops);
+                    }
+                    node.handle_command(&cmd_buf[..len], |resp| {
+                        let mut vec = Vec::<u8, 256>::new();
+                        let copy_len = resp.len().min(247);
+                        let _ = vec.extend_from_slice(&resp[..copy_len]);
+                        if COMPANION_PUSH_CHANNEL.try_send(vec).is_err() {
+                            debug!("BLE: response queue full, dropping response");
+                        }
+                    });
+                    embassy_futures::yield_now().await;
+                } else {
+                    // Register before the emptiness check to avoid a lost wake.
+                    poll_fn(|cx| {
+                        BLE_CMD_WAKER.register(cx.waker());
+                        if BLE_CMD_RING.is_empty() {
+                            Poll::Pending
+                        } else {
+                            Poll::Ready(())
+                        }
+                    })
+                    .await;
+                }
+            }
+        };
 
         let push_fut = async {
             loop {
@@ -308,33 +446,28 @@ pub async fn ble_companion_task(
                 let mut vec = Vec::<u8, 256>::new();
                 let copy_len = msg.len().min(247);
                 let _ = vec.extend_from_slice(&msg[..copy_len]);
-                if let Err(e) = server.nus.tx_notify(&conn, &vec) {
-                    debug!("BLE NUS tx_notify push failed: {:?}", e);
+                // The SoftDevice HVX queue can be momentarily full during a
+                // contact sync burst. Retry briefly instead of dropping.
+                for attempt in 0..8 {
+                    match server.nus.tx_notify(&conn, &vec) {
+                        Ok(()) => break,
+                        Err(e) => {
+                            if attempt == 7 {
+                                debug!("BLE NUS tx_notify push failed: {:?}", e);
+                            } else {
+                                embassy_time::Timer::after_millis(5).await;
+                            }
+                        }
+                    }
                 }
             }
         };
 
-        // Background task that waits for channel sync to complete, then requests fast
-        // connection parameters (15ms interval) for faster post-sync interaction.
-        // This matches the reference firmware's deferred connection parameter update pattern.
-        let conn_params_fut = async {
-            while !sync_done.load(Ordering::Relaxed) {
-                embassy_time::Timer::after_millis(100).await;
-            }
-            // Small delay to ensure the last response has been sent before changing params.
-            embassy_time::Timer::after_millis(200).await;
-            info!("BLE: Requesting fast connection interval (15ms) after sync");
-            let _ = conn.set_conn_params(nrf_softdevice::raw::ble_gap_conn_params_t {
-                min_conn_interval: 12,  // 15 ms (12 * 1.25ms) — minimum iOS accepts
-                max_conn_interval: 12,  // 15 ms
-                slave_latency: 0,       // connect every interval
-                conn_sup_timeout: 40,   // 4000 ms (40 * 100ms)
-            });
-        };
-
-        match embassy_futures::select::select3(gatt_fut, push_fut, conn_params_fut).await {
+        match embassy_futures::select::select3(gatt_fut, command_fut, push_fut).await {
             embassy_futures::select::Either3::First(e) => {
                 info!("BLE: Phone disconnected ({:?}), resuming advertising...", e);
+                // Drop anything left over from the closed connection.
+                BLE_CMD_RING.clear();
                 // Switch to slow advertising (211ms) after the first connection to save power.
                 if adv_config.interval == 32 {
                     adv_config.interval = 338; // 211ms slow advertising
@@ -342,22 +475,22 @@ pub async fn ble_companion_task(
                 }
             }
             embassy_futures::select::Either3::Second(_) => {}
-            embassy_futures::select::Either3::Third(_) => {
-                // Connection params task completed; this shouldn't happen since it's a one-shot
-                // that completes after set_conn_params, but the select3 requires handling all arms.
-            }
+            embassy_futures::select::Either3::Third(_) => {}
         }
     }
 }
 
-use core::sync::atomic::AtomicU32;
-
 pub static BLE_STATUS: AtomicU32 = AtomicU32::new(0);
+/// Counts commands dropped because the GATT command ring was full.
+static BLE_CMD_DROPS: AtomicU32 = AtomicU32::new(0);
 /// Pairing PIN reported to the app and used by the security handler.
 pub static BLE_PIN: AtomicU32 = AtomicU32::new(123456);
 
 unsafe extern "C" fn sd_fault_handler(id: u32, pc: u32, info: u32) {
     defmt::error!("Softdevice fault: id={=u32:#x} pc={=u32:#x} info={=u32:#x}", id, pc, info);
+    // A SoftDevice assert is fatal. Signal it with 10 blue blinks so the
+    // failure can be identified without a debugger.
+    crate::fatal_blink_forever(10)
 }
 
 #[embassy_executor::task]
