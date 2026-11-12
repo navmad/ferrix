@@ -150,6 +150,16 @@ impl MeshEngine {
                 // Look up matching channel by channel_hash (pkt.payload[0])
                 if pkt.payload_len > 0 {
                     let ch_hash = pkt.payload[0];
+                    // Forward flood packets BEFORE trying to decrypt, matching the reference firmware behavior.
+                    // This ensures repeater nodes propagate group texts even when they can't
+                    // decrypt them (e.g., unknown channel hash). The packet continues through
+                    // the mesh regardless of whether this node can read its contents.
+                    if self.is_repeater && pkt.is_flood() && !is_dupe && !already_in_path {
+                        let mut repeat_pkt = pkt.clone();
+                        repeat_pkt.append_hop_bytes(self.identity.pub_key());
+                        let _ = self.tx_queue.push(repeat_pkt);
+                    }
+
                     // Copy the channel array out of the lock before doing any crypto.
                     // Running SHA-256 hashing and AES-128 decryption inside a lock callback
                     // can block the BLE SoftDevice (S140) and freeze the device.
@@ -179,13 +189,6 @@ impl MeshEngine {
                                 InboundAction::DropDuplicate
                             }
                         } else {
-                            // Message from other node: repeat if configured as repeater
-                            if self.is_repeater && pkt.is_flood() && !is_dupe && !already_in_path {
-                                let mut repeat_pkt = pkt.clone();
-                                repeat_pkt.append_hop_bytes(self.identity.pub_key());
-                                let _ = self.tx_queue.push(repeat_pkt);
-                            }
-
                             if is_dupe {
                                 InboundAction::DropDuplicate
                             } else {
