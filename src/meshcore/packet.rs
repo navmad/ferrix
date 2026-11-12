@@ -6,8 +6,8 @@
 //! - Route Type (R): bits 1-0 (2 bits)
 
 pub const MAX_PATH_SIZE: usize = 64;
-pub const MAX_PACKET_PAYLOAD: usize = 192;
-pub const MAX_PACKET_SIZE: usize = 256;
+pub const MAX_PACKET_PAYLOAD: usize = 184;
+pub const MAX_PACKET_SIZE: usize = 255;
 
 // Header Bit Masks & Shifts
 pub const PH_ROUTE_MASK: u8 = 0x03;
@@ -98,7 +98,7 @@ impl Packet {
         rt == ROUTE_TYPE_TRANSPORT_FLOOD || rt == ROUTE_TYPE_TRANSPORT_DIRECT
     }
 
-    /// Returns the hash size in bytes for each hop in the path (1 to 4 bytes).
+    /// Returns the hash size in bytes for each hop in the path (1 to 3 bytes).
     /// Encoded in bits 7-6: `(path_len >> 6) + 1`
     #[inline]
     pub fn path_hash_size(&self) -> usize {
@@ -123,12 +123,12 @@ impl Packet {
     pub fn is_valid_path_len(path_len: u8) -> bool {
         let count = (path_len & 63) as usize;
         let size = ((path_len >> 6) as usize) + 1;
-        count * size <= MAX_PATH_SIZE
+        size <= 3 && count * size <= MAX_PATH_SIZE
     }
 
     /// Set path hash size and hop count
     pub fn set_path_hash_size_and_count(&mut self, size: u8, count: u8) {
-        let sz = if size == 0 { 0 } else { (size - 1) & 0x03 };
+        let sz = if size == 0 { 0 } else if size > 3 { 3 } else { (size - 1) & 0x03 };
         self.path_len = (sz << 6) | (count & 63);
     }
 
