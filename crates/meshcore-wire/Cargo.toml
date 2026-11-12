@@ -1,0 +1,12 @@
+[package]
+name = "meshcore-wire"
+version = "0.1.0"
+edition = "2021"
+description = "MeshCore over-the-air wire protocol, crypto and payload codecs"
+publish = false
+
+[dependencies]
+heapless = "0.8"
+sha2 = { version = "0.10", default-features = false }
+aes = "0.8"
+ed25519-dalek = { version = "2.1", default-features = false }

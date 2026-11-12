@@ -1,3 +1,8 @@
+[workspace]
+resolver = "2"
+members = [".", "crates/meshcore-wire"]
+default-members = ["."]
+
 [package]
 name = "ferrix"
 version = "0.1.0"
@@ -33,10 +38,7 @@ heapless = { version = "0.8", features = ["defmt-03"] }
 static_cell = "2.1"
 nmea = { version = "0.6", default-features = false }
 
-sha2 = { version = "0.10", default-features = false }
-aes = "0.8"
-cbc = "0.1"
-ed25519-dalek = { version = "2.1", default-features = false }
+meshcore-wire = { path = "crates/meshcore-wire" }
 
 [profile.dev]
 codegen-units = 1

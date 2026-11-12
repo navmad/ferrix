@@ -139,7 +139,7 @@ async fn main(spawner: Spawner) {
     let local_id = if let Some(key) = custom_key {
         LocalIdentity::from_secret_key(node_name.as_str(), &key)
     } else {
-        let seed = crate::meshcore::identity::hardware_seed();
+        let seed = crate::boards::hardware_seed();
         LocalIdentity::from_secret_key(node_name.as_str(), &seed)
     };
     let pub_key = local_id.pub_key_bytes();

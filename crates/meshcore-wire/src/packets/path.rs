@@ -2,7 +2,7 @@
 //!
 //! Returns route paths discovered between mesh nodes.
 
-use crate::meshcore::packet::{Packet, PAYLOAD_TYPE_PATH};
+use crate::packet::{Packet, PAYLOAD_TYPE_PATH};
 
 pub const MAX_PATH_HOPS: usize = 32;
 

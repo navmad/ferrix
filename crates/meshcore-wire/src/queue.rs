@@ -5,7 +5,7 @@
 //!    broadcast loops and packet floods.
 //! 2. `PacketQueue`: Outbound packet FIFO buffer.
 
-use crate::meshcore::packet::Packet;
+use crate::packet::Packet;
 use heapless::Deque;
 
 pub const SEEN_CACHE_SIZE: usize = 64;

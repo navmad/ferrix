@@ -3,7 +3,7 @@
 //! Powered by `ed25519-dalek` for constant-time cryptographic signatures & verification.
 
 use heapless::String;
-use crate::meshcore::crypto::{sha256, Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use crate::crypto::{sha256, Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
 pub const PUB_KEY_SIZE: usize = 32;
 pub const SIGNATURE_SIZE: usize = 64;
@@ -59,22 +59,6 @@ impl Identity {
     }
 }
 
-/// Read nRF52840 factory-fused hardware unique ID (FICR) and derive a 32-byte cryptographic seed
-pub fn hardware_seed() -> [u8; 32] {
-    let id0 = unsafe { (0x1000_0060 as *const u32).read_volatile() };
-    let id1 = unsafe { (0x1000_0064 as *const u32).read_volatile() };
-    let addr0 = unsafe { (0x1000_00A4 as *const u32).read_volatile() };
-    let addr1 = unsafe { (0x1000_00A8 as *const u32).read_volatile() };
-
-    let mut buf = [0u8; 16];
-    buf[0..4].copy_from_slice(&id0.to_le_bytes());
-    buf[4..8].copy_from_slice(&id1.to_le_bytes());
-    buf[8..12].copy_from_slice(&addr0.to_le_bytes());
-    buf[12..16].copy_from_slice(&addr1.to_le_bytes());
-
-    sha256(&buf)
-}
-
 /// Local Node Identity containing Ed25519 signing key
 pub struct LocalIdentity {
     pub base: Identity,
@@ -82,12 +66,6 @@ pub struct LocalIdentity {
 }
 
 impl LocalIdentity {
-    /// Initialize local node identity from hardware unique ID
-    pub fn from_hardware(callsign: &str) -> Self {
-        let seed = hardware_seed();
-        Self::from_secret_key(callsign, &seed)
-    }
-
     /// Initialize local node identity from a 32-byte secret key / seed
     pub fn from_secret_key(callsign: &str, secret: &[u8; 32]) -> Self {
         let signing_key = SigningKey::from_bytes(secret);

@@ -12,7 +12,9 @@ compile_error!("No target board selected! Please build with a board feature flag
 
 // Active Board Selection
 #[cfg(feature = "thinknode-m1")]
-pub use thinknode_m1::{BoardPins as CurrentBoardPins, ThinkNodeM1 as CurrentBoard};
+pub use thinknode_m1::{
+    hardware_seed, BoardPins as CurrentBoardPins, ThinkNodeM1 as CurrentBoard,
+};
 
 /// Common Board Trait defining board metadata, capabilities, and peripheral initialization
 pub trait Board {

@@ -2,7 +2,7 @@
 //!
 //! Confirms receipt and end-to-end delivery of direct messages or requests.
 
-use crate::meshcore::packet::{Packet, PAYLOAD_TYPE_ACK};
+use crate::packet::{Packet, PAYLOAD_TYPE_ACK};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct AckPacket {

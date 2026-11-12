@@ -3,8 +3,8 @@
 //! Broadcasts node presence, public key identity, callsign, and GPS location.
 
 use heapless::String;
-use crate::meshcore::packet::{Packet, PAYLOAD_TYPE_ADVERT};
-use crate::meshcore::identity::{PUB_KEY_SIZE, SIGNATURE_SIZE};
+use crate::packet::{Packet, PAYLOAD_TYPE_ADVERT};
+use crate::identity::{PUB_KEY_SIZE, SIGNATURE_SIZE};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AdvertPacket {
@@ -204,7 +204,7 @@ impl AdvertPacket {
     }
 
     /// Sign this advert with the local identity's private key
-    pub fn sign(&mut self, local_identity: &crate::meshcore::identity::LocalIdentity) {
+    pub fn sign(&mut self, local_identity: &crate::identity::LocalIdentity) {
         let mut msg_buf = [0u8; 128];
         let msg_len = self.build_message_for_signing(&mut msg_buf);
         self.signature = local_identity.sign(&msg_buf[..msg_len]);
@@ -214,7 +214,7 @@ impl AdvertPacket {
     pub fn verify_signature(&self) -> bool {
         let mut msg_buf = [0u8; 128];
         let msg_len = self.build_message_for_signing(&mut msg_buf);
-        let identity = crate::meshcore::identity::Identity::new(self.pub_key, "");
+        let identity = crate::identity::Identity::new(self.pub_key, "");
         identity.verify(&msg_buf[..msg_len], &self.signature)
     }
 

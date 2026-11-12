@@ -3,7 +3,7 @@
 //! Point-to-point text message sent between specific node identities.
 
 use heapless::String;
-use crate::meshcore::packet::{Packet, PAYLOAD_TYPE_TXT_MSG};
+use crate::packet::{Packet, PAYLOAD_TYPE_TXT_MSG};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TxtMsgPacket {

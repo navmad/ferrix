@@ -3,7 +3,7 @@
 //! Broadcasts group channel messages (prefixed with channel hash and MAC, AES-128-ECB encrypted).
 
 use heapless::String;
-use crate::meshcore::packet::{Packet, PAYLOAD_TYPE_GRP_TXT};
+use crate::packet::{Packet, PAYLOAD_TYPE_GRP_TXT};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct GrpTextPacket {
@@ -75,7 +75,7 @@ impl GrpTextPacket {
         pt[offset] = 0; // null terminator
         offset += 1;
 
-        let enc_and_mac_len = crate::meshcore::crypto::meshcore_encrypt_then_mac(
+        let enc_and_mac_len = crate::crypto::meshcore_encrypt_then_mac(
             secret,
             &mut dest[1..],
             &pt[..offset],
@@ -95,7 +95,7 @@ impl GrpTextPacket {
         mac.copy_from_slice(&src[1..3]);
 
         let mut pt = [0u8; 192];
-        let pt_len = crate::meshcore::crypto::meshcore_mac_then_decrypt(secret, &mut pt, &src[1..])?;
+        let pt_len = crate::crypto::meshcore_mac_then_decrypt(secret, &mut pt, &src[1..])?;
         if pt_len < 5 {
             return Err(());
         }
