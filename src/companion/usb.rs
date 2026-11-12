@@ -794,6 +794,27 @@ async fn handle_text_cli(
             }
             let _ = write_all(sender, s.as_bytes()).await;
         }
+        "get panic" | "last-panic" | "panic" | "crash" => {
+            let mut s: heapless::String<256> = heapless::String::new();
+            match crate::fault::peek() {
+                Some(p) => {
+                    let _ = write!(
+                        s,
+                        "  -> PANIC at {}:{}:{} pc=0x{:08x}\r\n     {}\r\n",
+                        p.file.as_str(),
+                        p.line,
+                        p.column,
+                        p.pc,
+                        p.msg.as_str()
+                    );
+                }
+                None => {
+                    let _ = write!(s, "  -> No panic/hardfault record\r\n");
+                }
+            }
+            crate::fault::clear();
+            let _ = write_all(sender, s.as_bytes()).await;
+        }
         "stats-core" => {
             let uptime = embassy_time::Instant::now().as_secs();
             let mut s: heapless::String<128> = heapless::String::new();

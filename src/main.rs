@@ -4,6 +4,7 @@
 pub mod boards;
 pub mod companion;
 pub mod display;
+pub mod fault;
 pub mod gps;
 pub mod input;
 pub mod meshcore;
@@ -164,42 +165,34 @@ pub(crate) fn fatal_blink_forever(count: u32) -> ! {
     }
 }
 
-/// Continuous blue heartbeat: a Rust panic is in progress.
-fn fatal_blink_slow() -> ! {
-    blue_init();
-    loop {
-        blue_on();
-        for _ in 0..12 {
-            fatal_delay();
-        }
-        blue_off();
-        for _ in 0..12 {
-            fatal_delay();
-        }
+/// Blink a burst so the failure is visible, then reset the core. The panic
+/// record lives in `.uninit` RAM, which survives a soft reset, so the next
+/// boot can report it over USB (`get panic`).
+fn fatal_finish(burst: u32) -> ! {
+    fatal_blink_burst(burst);
+    if crate::fault::reset_budget_exhausted() {
+        // Panicking after several panic-triggered resets: stop rebooting so the
+        // failure can at least be observed.
+        fatal_blink_forever(burst)
+    } else {
+        crate::fault::reset_now()
     }
 }
 
-/// Custom panic handler: 3 quick blue blinks, then a slow continuous blink.
+/// Custom panic handler.
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    // Blink first: defmt/RTT can block if a debugger configured blocking mode.
-    fatal_blink_burst(3);
-    defmt::error!("FATAL PANIC: {}", defmt::Display2Format(&info.message()));
-    fatal_blink_slow()
+    // No logging here: defmt can block if a debugger configured blocking mode,
+    // which would prevent the diagnostic reset.
+    crate::fault::record_panic(info);
+    fatal_finish(3)
 }
 
-/// HardFault handler: 6 quick blue blinks, repeated forever. Different from
-/// the panic pattern so the two can be told apart without a debugger.
+/// HardFault handler.
 #[cortex_m_rt::exception]
 unsafe fn HardFault(frame: &cortex_m_rt::ExceptionFrame) -> ! {
-    loop {
-        fatal_blink_burst(6);
-        defmt::error!(
-            "HARD FAULT pc={=u32:#010x} lr={=u32:#010x}",
-            frame.pc(),
-            frame.lr()
-        );
-    }
+    crate::fault::record_hardfault(frame.pc(), frame.lr());
+    fatal_finish(6)
 }
 
 #[embassy_executor::main]
@@ -218,6 +211,19 @@ async fn main(spawner: Spawner) {
     embassy_nrf::interrupt::TWISPI1.set_priority(Priority::P3);
 
     let mut board = CurrentBoard::init(p);
+
+    // A panic/hardfault in the previous boot leaves a record in `.uninit` RAM
+    // and resets the core. Report it (and keep it for the `get panic` CLI).
+    if let Some(panic) = crate::fault::peek() {
+        defmt::error!(
+            "RECOVERED PANIC: {} at {}:{}:{} pc={=u32:#010x}",
+            panic.msg.as_str(),
+            panic.file.as_str(),
+            panic.line,
+            panic.column,
+            panic.pc
+        );
+    }
 
     // Initialize persistent configuration from flash
     let (node_name, custom_key) = crate::storage::init_config();
@@ -857,6 +863,12 @@ async fn main(spawner: Spawner) {
 
         Timer::after_millis(20).await;
         tick = tick.wrapping_add(1);
+
+        // After ~60 s of healthy uptime, give a future panic a fresh reset
+        // budget (protects against a panic-at-boot reboot loop).
+        if tick == 3000 {
+            crate::fault::clear_reset_budget();
+        }
 
         // Heartbeat LED flash every 2 seconds
         if tick % 100 == 0 {
