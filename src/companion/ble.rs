@@ -19,7 +19,7 @@ use heapless::{String, Vec};
 use nrf_softdevice::ble::gatt_server;
 use nrf_softdevice::ble::peripheral;
 use nrf_softdevice::ble::security::{IoCapabilities, SecurityHandler};
-use nrf_softdevice::ble::{Connection, PasskeyReply};
+use nrf_softdevice::ble::{Connection, EncryptionInfo, IdentityKey, MasterId, PasskeyReply};
 use nrf_softdevice::Softdevice;
 
 use crate::boards::{Board, CurrentBoard};
@@ -266,7 +266,25 @@ impl SecurityHandler for MeshCoreSecurityHandler {
     }
 
     fn can_bond(&self, _conn: &Connection) -> bool {
-        true
+        // Bond storage is not implemented: nrf-softdevice has no built-in bond
+        // store, so `on_bonded` would have to persist the keys itself.
+        //
+        // Enabling bonding without implementing `on_bonded` is fatal: when the
+        // SoftDevice reports a completed bond (BLE_GAP_EVT_AUTH_STATUS with
+        // bonded=1), the trait's default `on_bonded` panics, taking down USB,
+        // BLE and the whole executor. That was the contact-add freeze.
+        false
+    }
+
+    fn on_bonded(
+        &self,
+        _conn: &Connection,
+        _master_id: MasterId,
+        _key: EncryptionInfo,
+        _peer_id: IdentityKey,
+    ) {
+        // Defensive: never let a bonding event panic. If bonding is enabled in
+        // the future, persist the key here instead.
     }
 
     fn request_mitm_protection(&self, _conn: &Connection) -> bool {
