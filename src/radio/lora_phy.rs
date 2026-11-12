@@ -226,6 +226,10 @@ pub async fn lora_phy_task(
     );
 
     let mut rx_buf = [0u8; 256];
+    // If the radio starts returning immediate RX errors, never spin without
+    // yielding: the executor is cooperative, and a tight loop here starves the
+    // main loop, USB and BLE tasks.
+    let mut rx_backoff_ms = 50u64;
 
     loop {
         match select3(
@@ -237,6 +241,7 @@ pub async fn lora_phy_task(
         {
             Either3::First(rx_result) => match rx_result {
                 Ok((len, status)) => {
+                    rx_backoff_ms = 50;
                     info!("lora-phy: RX {} bytes, RSSI: {} dBm, SNR: {} dB", len, status.rssi, status.snr);
                     let mut packet_data = [0u8; 256];
                     let copy_len = (len as usize).min(256);
@@ -244,7 +249,15 @@ pub async fn lora_phy_task(
                     let _ = LORA_RX_CHANNEL.try_send((copy_len, status.rssi, status.snr as i8, packet_data));
                 }
                 Err(e) => {
-                    debug!("lora-phy: RX error or timeout: {:?}", e);
+                    if rx_backoff_ms <= 50 {
+                        debug!("lora-phy: RX error or timeout: {:?}", e);
+                    }
+                    // Yield first. Without this, an immediate RX error after a
+                    // failed reconfiguration turns this task into a busy loop
+                    // and the whole executor stops running.
+                    embassy_time::Timer::after_millis(rx_backoff_ms).await;
+                    rx_backoff_ms = (rx_backoff_ms * 2).min(1000);
+
                     // Re-enter RX continuous if an error occurred, but never
                     // let a stuck BUSY line wedge the whole task forever.
                     match embassy_time::with_timeout(
@@ -322,6 +335,7 @@ pub async fn lora_phy_task(
                                 preamble = new_preamble;
                                 tx_power_dbm = cfg.tx_power_dbm;
                                 current_cfg = requested;
+                                rx_backoff_ms = 50;
                                 match embassy_time::with_timeout(
                                     embassy_time::Duration::from_secs(1),
                                     lora.prepare_for_rx(
@@ -347,10 +361,34 @@ pub async fn lora_phy_task(
                                     cfg.tx_power_dbm
                                 );
                             }
-                            Err(e) => error!("lora-phy: RX params on reconfigure failed: {:?}", e),
+                            Err(e) => {
+                                error!("lora-phy: RX params on reconfigure failed: {:?}", e);
+                                // The previous RX future was cancelled; restore it
+                                // rather than leaving the radio idle and erroring.
+                                let _ = embassy_time::with_timeout(
+                                    embassy_time::Duration::from_secs(1),
+                                    lora.prepare_for_rx(
+                                        RxMode::Continuous,
+                                        &mdltn_params,
+                                        &rx_pkt_params,
+                                    ),
+                                )
+                                .await;
+                            }
                         }
                     }
-                    Err(e) => error!("lora-phy: reconfigure failed: {:?}", e),
+                    Err(e) => {
+                        error!("lora-phy: reconfigure failed: {:?}", e);
+                        let _ = embassy_time::with_timeout(
+                            embassy_time::Duration::from_secs(1),
+                            lora.prepare_for_rx(
+                                RxMode::Continuous,
+                                &mdltn_params,
+                                &rx_pkt_params,
+                            ),
+                        )
+                        .await;
+                    }
                 }
             }
         }
