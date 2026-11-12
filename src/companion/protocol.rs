@@ -6,7 +6,7 @@
 use core::cell::RefCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
 use heapless::{String, Vec};
 
@@ -16,7 +16,7 @@ use crate::meshcore::packets::AdvertPacket;
 /// Signing scratch buffer. Advertised to the app by `SIGN_START`.
 pub const MAX_SIGN_DATA: usize = 4096;
 static SIGN_ACTIVE: AtomicBool = AtomicBool::new(false);
-static SIGN_BUFFER: Mutex<ThreadModeRawMutex, RefCell<Vec<u8, MAX_SIGN_DATA>>> =
+static SIGN_BUFFER: Mutex<CriticalSectionRawMutex, RefCell<Vec<u8, MAX_SIGN_DATA>>> =
     Mutex::new(RefCell::new(Vec::new()));
 
 #[derive(Clone, Copy)]
@@ -26,7 +26,7 @@ struct ScopeState {
     default_name: [u8; 31],
     default_key: [u8; 16],
 }
-static SCOPE: Mutex<ThreadModeRawMutex, RefCell<ScopeState>> =
+static SCOPE: Mutex<CriticalSectionRawMutex, RefCell<ScopeState>> =
     Mutex::new(RefCell::new(ScopeState {
         send_key: None,
         force_unscoped: false,
@@ -736,8 +736,10 @@ impl CompanionNode {
             }
 
             CMD_GET_CONTACTS => {
-                let contacts = crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| c.borrow().clone());
-                let count = contacts.len() as u32;
+                // Do not clone the whole contact list: each entry is large and
+                // this runs in the BLE task. Read one contact at a time.
+                let count =
+                    crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| c.borrow().len()) as u32;
 
                 // 1. RESP_CODE_CONTACTS_START (2) [code(2), count(u32_le)]
                 let mut start_resp = Vec::<u8, 8>::new();
@@ -748,11 +750,15 @@ impl CompanionNode {
                 // 2. Stream individual RESP_CODE_CONTACT (3)
                 // Layout: [code(3), pubkey(32), type(1), flags(1), out_path_len(1), out_path(64), adv_name(32), last_advert(u32_le), adv_lat(i32_le), adv_lon(i32_le), lastmod(u32_le)]
                 let mut max_lastmod = 0u32;
-                for c in contacts.iter() {
-                    if c.last_seen_epoch > max_lastmod {
-                        max_lastmod = c.last_seen_epoch;
+                for idx in 0..count as usize {
+                    let item = crate::companion::usb::DISCOVERED_CONTACTS
+                        .lock(|c| c.borrow().get(idx).cloned());
+                    if let Some(c) = item {
+                        if c.last_seen_epoch > max_lastmod {
+                            max_lastmod = c.last_seen_epoch;
+                        }
+                        emit(&serialize_contact(&c));
                     }
-                    emit(&serialize_contact(c));
                 }
 
                 // 3. RESP_CODE_END_OF_CONTACTS (4) [code(4), most_recent_lastmod(u32_le)]
@@ -888,7 +894,7 @@ impl CompanionNode {
                 //
                 // CRITICAL: This handler runs inside the BLE GATT event callback, which executes
                 // within a SoftDevice critical section (Portal::call). We MUST NOT lock any mutexes
-                // here — even ThreadModeRawMutex will raise a nested critical section and freeze
+                // here — explicit mutex work can raise a nested critical section; keep it deferred
                 // the device. Instead, we parse the payload and defer the actual contact storage
                 // to a background task via CONTACT_OP_CHANNEL.
                 if payload.len() >= 1 + 32 + 1 + 1 + 1 + 64 + 32 + 4 {

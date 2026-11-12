@@ -15,17 +15,18 @@ use core::fmt::Write;
 use defmt::{debug, info};
 use embassy_nrf::peripherals::USBD;
 use embassy_nrf::usb::Driver;
-use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::channel::Channel;
 
 /// Shared raw mutex type for cross-module synchronization.
-/// Uses ThreadModeRawMutex — it does not disable interrupts, only asserting that the lock
-/// is called from thread mode (not interrupt context). All Embassy async tasks run in
-/// thread mode, so this is safe and avoids the BLE SoftDevice freeze caused by
-/// CriticalSectionRawMutex. For future multi-core targets (e.g., ESP32), this can be
-/// swapped to a real spinlock.
-type SharedRawMutex = ThreadModeRawMutex;
+///
+/// The BLE GATT callback can run in a SoftDevice event context, so shared
+/// state must be protected against preemption. `CriticalSectionRawMutex` uses
+/// the nrf-softdevice critical-section implementation, which is nested-safe and
+/// only disables non-reserved interrupts for the short critical section. Keep
+/// cryptographic work outside these locks.
+type SharedRawMutex = CriticalSectionRawMutex;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, Sender, State};
 use embassy_usb::{Builder, Config, UsbDevice};
 use static_cell::StaticCell;

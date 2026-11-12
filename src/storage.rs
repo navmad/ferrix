@@ -7,12 +7,11 @@
 
 use core::cell::RefCell;
 use defmt::{error, info};
-use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::channel::Channel;
 
 /// Shared raw mutex type — see usb.rs for documentation.
-type SharedRawMutex = ThreadModeRawMutex;
+type SharedRawMutex = embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embedded_storage_async::nor_flash::NorFlash;
 use heapless::String;
 

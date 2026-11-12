@@ -6,11 +6,11 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use defmt::{debug, error, info};
-use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 
 /// Shared raw mutex type — see usb.rs for documentation.
-type SharedRawMutex = ThreadModeRawMutex;
+type SharedRawMutex = CriticalSectionRawMutex;
 use heapless::{String, Vec};
 use nrf_softdevice::ble::gatt_server;
 use nrf_softdevice::ble::peripheral;
@@ -76,6 +76,74 @@ pub enum ContactOperation {
 /// SoftDevice critical section. Capacity 4 is sufficient since contact
 /// operations are infrequent and the channel is drained promptly.
 pub static CONTACT_OP_CHANNEL: Channel<SharedRawMutex, ContactOperation, 4> = Channel::new();
+
+/// Applies deferred contact mutations away from the GATT callback and the
+/// main routing loop, in its own task/future state.
+#[embassy_executor::task]
+pub async fn contact_task() -> ! {
+    loop {
+        match CONTACT_OP_CHANNEL.receive().await {
+            ContactOperation::AddOrUpdate {
+                pub_key,
+                callsign,
+                node_id,
+                last_seen_epoch,
+                latitude,
+                longitude,
+                flags,
+                out_path,
+                out_path_len,
+                last_advert_ts,
+            } => {
+                crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| {
+                    let mut list = c.borrow_mut();
+                    if let Some(ct) = list.iter_mut().find(|ct| ct.pub_key == pub_key) {
+                        ct.callsign = callsign;
+                        ct.node_id = node_id;
+                        ct.last_seen_epoch = last_seen_epoch;
+                        ct.latitude = latitude;
+                        ct.longitude = longitude;
+                        ct.flags = flags;
+                        ct.out_path = out_path;
+                        ct.out_path_len = out_path_len;
+                        ct.last_advert_ts = last_advert_ts;
+                    } else if list.len() < list.capacity() {
+                        let _ = list.push(crate::meshcore::mesh::DiscoveredContact {
+                            pub_key,
+                            callsign,
+                            node_id,
+                            last_seen_epoch,
+                            rssi: 0,
+                            snr: 0,
+                            latitude,
+                            longitude,
+                            flags,
+                            out_path,
+                            out_path_len,
+                            last_advert_ts,
+                        });
+                    }
+                });
+            }
+            ContactOperation::ResetPath { pub_key } => {
+                crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| {
+                    if let Some(ct) = c.borrow_mut().iter_mut().find(|ct| ct.pub_key == pub_key) {
+                        ct.out_path = [0u8; 64];
+                        ct.out_path_len = 0xFF;
+                    }
+                });
+            }
+            ContactOperation::Remove { pub_key } => {
+                crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| {
+                    let mut list = c.borrow_mut();
+                    if let Some(pos) = list.iter().position(|ct| ct.pub_key == pub_key) {
+                        list.remove(pos);
+                    }
+                });
+            }
+        }
+    }
+}
 
 pub struct MeshCoreSecurityHandler;
 

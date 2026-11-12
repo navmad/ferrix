@@ -8,11 +8,10 @@ use embassy_futures::select::{select3, Either3};
 use embassy_nrf::gpio::{Input, Output};
 use embassy_nrf::peripherals::TWISPI0;
 use embassy_nrf::spim::Spim;
-use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::channel::Channel;
 
 /// Shared raw mutex type — see usb.rs for documentation.
-type SharedRawMutex = ThreadModeRawMutex;
+type SharedRawMutex = embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_time::Delay;
 use embedded_hal_bus::spi::ExclusiveDevice;
 use lora_phy::iv::GenericSx126xInterfaceVariant;
