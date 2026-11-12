@@ -15,9 +15,17 @@ use core::fmt::Write;
 use defmt::{debug, info};
 use embassy_nrf::peripherals::USBD;
 use embassy_nrf::usb::Driver;
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::channel::Channel;
+
+/// Shared raw mutex type for cross-module synchronization.
+/// Uses ThreadModeRawMutex — it does not disable interrupts, only asserting that the lock
+/// is called from thread mode (not interrupt context). All Embassy async tasks run in
+/// thread mode, so this is safe and avoids the BLE SoftDevice freeze caused by
+/// CriticalSectionRawMutex. For future multi-core targets (e.g., ESP32), this can be
+/// swapped to a real spinlock.
+type SharedRawMutex = ThreadModeRawMutex;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, Sender, State};
 use embassy_usb::{Builder, Config, UsbDevice};
 use static_cell::StaticCell;
@@ -38,7 +46,7 @@ pub struct RadioSettings {
     pub path_hash_mode: u8,
 }
 
-pub static RADIO_SETTINGS: Mutex<CriticalSectionRawMutex, RefCell<RadioSettings>> = Mutex::new(RefCell::new(RadioSettings {
+pub static RADIO_SETTINGS: Mutex<SharedRawMutex, RefCell<RadioSettings>> = Mutex::new(RefCell::new(RadioSettings {
     frequency_hz: 910_525_000,
     tx_power_dbm: 22,
     sf: 7,
@@ -48,10 +56,10 @@ pub static RADIO_SETTINGS: Mutex<CriticalSectionRawMutex, RefCell<RadioSettings>
     path_hash_mode: 0,
 }));
 
-pub static DISCOVERED_CONTACTS: Mutex<CriticalSectionRawMutex, RefCell<heapless::Vec<DiscoveredContact, 32>>> =
+pub static DISCOVERED_CONTACTS: Mutex<SharedRawMutex, RefCell<heapless::Vec<DiscoveredContact, 32>>> =
     Mutex::new(RefCell::new(heapless::Vec::new()));
 
-pub static MESSAGE_LOG: Mutex<CriticalSectionRawMutex, RefCell<heapless::Vec<ReceivedMessage, 16>>> =
+pub static MESSAGE_LOG: Mutex<SharedRawMutex, RefCell<heapless::Vec<ReceivedMessage, 16>>> =
     Mutex::new(RefCell::new(heapless::Vec::new()));
 
 #[derive(Clone, Copy, Debug)]
@@ -80,7 +88,7 @@ const fn default_channels() -> [ChannelData; 8] {
     chs
 }
 
-pub static CHANNELS: Mutex<CriticalSectionRawMutex, RefCell<[ChannelData; 8]>> =
+pub static CHANNELS: Mutex<SharedRawMutex, RefCell<[ChannelData; 8]>> =
     Mutex::new(RefCell::new(default_channels()));
 
 #[derive(Clone, Copy, Debug)]
@@ -89,7 +97,7 @@ pub struct DeviceClock {
     pub base_instant_secs: u64,
 }
 
-pub static DEVICE_CLOCK: Mutex<CriticalSectionRawMutex, RefCell<DeviceClock>> =
+pub static DEVICE_CLOCK: Mutex<SharedRawMutex, RefCell<DeviceClock>> =
     Mutex::new(RefCell::new(DeviceClock {
         base_epoch: 0,
         base_instant_secs: 0,
@@ -125,7 +133,7 @@ pub struct RadioTelemetry {
     pub has_rx: bool,
 }
 
-pub static RADIO_TELEMETRY: Mutex<CriticalSectionRawMutex, RefCell<RadioTelemetry>> = Mutex::new(RefCell::new(RadioTelemetry {
+pub static RADIO_TELEMETRY: Mutex<SharedRawMutex, RefCell<RadioTelemetry>> = Mutex::new(RefCell::new(RadioTelemetry {
     tx_beacons: 0,
     rx_packets: 0,
     last_rssi: 0,
@@ -179,7 +187,7 @@ fn hex_to_nibble_opt(b: u8) -> Option<u8> {
 
 use embassy_nrf::usb::vbus_detect::SoftwareVbusDetect;
 
-pub static USB_COMMAND_CHANNEL: Channel<CriticalSectionRawMutex, UsbCommand, 4> = Channel::new();
+pub static USB_COMMAND_CHANNEL: Channel<SharedRawMutex, UsbCommand, 4> = Channel::new();
 
 pub type UsbDriver = Driver<'static, USBD, &'static SoftwareVbusDetect>;
 

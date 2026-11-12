@@ -8,8 +8,11 @@ use embassy_futures::select::{select, Either};
 use embassy_nrf::gpio::{Input, Output};
 use embassy_nrf::peripherals::TWISPI0;
 use embassy_nrf::spim::Spim;
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::channel::Channel;
+
+/// Shared raw mutex type — see usb.rs for documentation.
+type SharedRawMutex = ThreadModeRawMutex;
 use embassy_time::Delay;
 use embedded_hal_bus::spi::ExclusiveDevice;
 use lora_phy::iv::GenericSx126xInterfaceVariant;
@@ -25,8 +28,8 @@ pub struct TxPacket {
     pub data: [u8; 256],
 }
 
-pub static LORA_RX_CHANNEL: Channel<CriticalSectionRawMutex, (usize, i16, i8, [u8; 256]), 4> = Channel::new();
-pub static LORA_TX_CHANNEL: Channel<CriticalSectionRawMutex, TxPacket, 4> = Channel::new();
+pub static LORA_RX_CHANNEL: Channel<SharedRawMutex, (usize, i16, i8, [u8; 256]), 4> = Channel::new();
+pub static LORA_TX_CHANNEL: Channel<SharedRawMutex, TxPacket, 4> = Channel::new();
 
 /// ThinkNode M1 LoRa Radio Adapter implementing `LoraRadio` via channels
 pub struct LoraPhyChannelRadio;

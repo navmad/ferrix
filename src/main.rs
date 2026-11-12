@@ -47,7 +47,7 @@ pub struct PendingMessageAck {
 }
 
 static PENDING_MESSAGE_ACKS: embassy_sync::blocking_mutex::Mutex<
-    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+    embassy_sync::blocking_mutex::raw::ThreadModeRawMutex,
     core::cell::RefCell<heapless::Vec<PendingMessageAck, 8>>,
 > = embassy_sync::blocking_mutex::Mutex::new(core::cell::RefCell::new(heapless::Vec::new()));
 
@@ -435,15 +435,17 @@ async fn main(spawner: Spawner) {
                 }
                 UsbCommand::SendGroupText { channel_idx, timestamp, text } => {
                     info!("Queuing MeshCore Group Text on ch {}: {} (ts: {})", channel_idx, text.as_str(), timestamp);
-                    let (ch_hash, secret) = crate::companion::usb::CHANNELS.lock(|chs| {
+                    // Copy the channel secret out of the lock before computing channel_hash.
+                    // Running SHA-256 inside the lock callback can block the BLE SoftDevice.
+                    let secret = crate::companion::usb::CHANNELS.lock(|chs| {
                         let list = chs.borrow();
                         if (channel_idx as usize) < list.len() {
-                            let sec = list[channel_idx as usize].secret;
-                            (crate::meshcore::crypto::channel_hash(&sec), sec)
+                            list[channel_idx as usize].secret
                         } else {
-                            (0, [0u8; 16])
+                            [0u8; 16]
                         }
                     });
+                    let ch_hash = crate::meshcore::crypto::channel_hash(&secret);
                     node.tx_beacons = node.tx_beacons.saturating_add(1);
                     if let Ok(pkt) = mesh.queue_group_text(ch_hash, &secret, text.as_str(), timestamp) {
                         track_outbound_packet(&pkt);

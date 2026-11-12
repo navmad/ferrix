@@ -1104,6 +1104,7 @@ version = "0.1.0"
 source = "git+https://github.com/embassy-rs/nrf-softdevice.git?rev=5949a5b#5949a5b1445cc907745c6449a35577e4544cd255"
 dependencies = [
  "cortex-m",
+ "critical-section",
  "defmt 0.3.101",
  "embassy-futures",
  "embassy-sync 0.6.2",

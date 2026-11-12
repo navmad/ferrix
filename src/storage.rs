@@ -7,9 +7,12 @@
 
 use core::cell::RefCell;
 use defmt::{error, info};
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::channel::Channel;
+
+/// Shared raw mutex type — see usb.rs for documentation.
+type SharedRawMutex = ThreadModeRawMutex;
 use embedded_storage_async::nor_flash::NorFlash;
 use heapless::String;
 
@@ -42,13 +45,13 @@ pub struct PersistentConfig {
     pub checksum: u32,
 }
 
-pub static NODE_CALLSIGN: Mutex<CriticalSectionRawMutex, RefCell<String<32>>> =
+pub static NODE_CALLSIGN: Mutex<SharedRawMutex, RefCell<String<32>>> =
     Mutex::new(RefCell::new(String::new()));
 
-pub static CUSTOM_PRIV_KEY: Mutex<CriticalSectionRawMutex, RefCell<Option<[u8; 32]>>> =
+pub static CUSTOM_PRIV_KEY: Mutex<SharedRawMutex, RefCell<Option<[u8; 32]>>> =
     Mutex::new(RefCell::new(None));
 
-pub static SAVE_REQUEST_CHANNEL: Channel<CriticalSectionRawMutex, (), 2> = Channel::new();
+pub static SAVE_REQUEST_CHANNEL: Channel<SharedRawMutex, (), 2> = Channel::new();
 
 /// Compute a 32-bit checksum covering the configuration structure up to the checksum field
 pub fn compute_checksum(cfg: &PersistentConfig) -> u32 {

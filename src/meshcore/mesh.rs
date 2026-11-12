@@ -151,10 +151,8 @@ impl MeshEngine {
                 if pkt.payload_len > 0 {
                     let ch_hash = pkt.payload[0];
                     // Copy the channel array out of the lock before doing any crypto.
-                    // CHANNELS.lock() is a CriticalSectionRawMutex — it disables all interrupts
-                    // for the duration of the callback. Running SHA-256 hashing and AES-128
-                    // decryption with interrupts disabled will cause the Nordic BLE SoftDevice
-                    // (S140) to fault and freeze the device solid.
+                    // Running SHA-256 hashing and AES-128 decryption inside a lock callback
+                    // can block the BLE SoftDevice (S140) and freeze the device.
                     //
                     // The array ([ChannelData; 8] = 320 bytes) is copied by value here,
                     // which is cheap compared to the crypto operations below.
