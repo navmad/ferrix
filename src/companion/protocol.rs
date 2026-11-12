@@ -12,14 +12,30 @@ pub const CMD_GET_CONTACTS: u8 = 4;
 pub const CMD_GET_DEVICE_TIME: u8 = 5;
 pub const CMD_SET_DEVICE_TIME: u8 = 6;
 pub const CMD_SEND_SELF_ADVERT: u8 = 7;
+pub const CMD_SET_ADVERT_NAME: u8 = 8;
 pub const CMD_ADD_UPDATE_CONTACT: u8 = 9;
-pub const CMD_REMOVE_CONTACT: u8 = 15;
 pub const CMD_SYNC_NEXT_MESSAGE: u8 = 10;
-pub const CMD_GET_MSG: u8 = 11;
-pub const CMD_GET_BAT: u8 = 19;
+pub const CMD_SET_RADIO_PARAMS: u8 = 0x0B;
+pub const CMD_SET_RADIO_TX_POWER: u8 = 0x0C;
+pub const CMD_RESET_PATH: u8 = 0x0D;
+pub const CMD_SET_ADVERT_LATLON: u8 = 0x0E;
+pub const CMD_REMOVE_CONTACT: u8 = 15;
+pub const CMD_EXPORT_CONTACT: u8 = 0x11;
+pub const CMD_IMPORT_CONTACT: u8 = 0x12;
+pub const CMD_REBOOT: u8 = 0x13;
+pub const CMD_GET_BATT_AND_STORAGE: u8 = 0x14;
+pub const CMD_SET_TUNING_PARAMS: u8 = 0x15;
+pub const CMD_EXPORT_PRIVATE_KEY: u8 = 0x17;
+pub const CMD_IMPORT_PRIVATE_KEY: u8 = 0x18;
+pub const CMD_GET_CONTACT_BY_KEY: u8 = 0x1E;
 pub const CMD_DEVICE_QUERY: u8 = 22;
+pub const CMD_GET_ADVERT_PATH: u8 = 0x2A;
+pub const CMD_GET_TUNING_PARAMS: u8 = 0x2B;
 pub const CMD_GET_CHANNEL: u8 = 31;
 pub const CMD_SET_CHANNEL: u8 = 32;
+pub const CMD_GET_STATS: u8 = 0x38;
+pub const CMD_SET_AUTOADD_CONFIG: u8 = 0x3A;
+pub const CMD_GET_AUTOADD_CONFIG: u8 = 0x3B;
 pub const CMD_SET_PATH_HASH_MODE: u8 = 0x3D;
 pub const CMD_SEND_CHANNEL_DATA: u8 = 0x3E;
 
@@ -32,10 +48,16 @@ pub const RESP_CODE_SELF_INFO: u8 = 5;
 pub const RESP_CODE_CURR_TIME: u8 = 9;
 pub const RESP_CODE_NO_MORE_MESSAGES: u8 = 10;
 pub const RESP_CODE_DEVICE_INFO: u8 = 13;
+pub const RESP_CODE_EXPORT_CONTACT: u8 = 0x0B;
+pub const RESP_CODE_BATTERY: u8 = 0x0C;
+pub const RESP_CODE_PRIVATE_KEY: u8 = 0x0E;
 pub const RESP_CODE_CONTACT_MSG_V3: u8 = 0x10;
 pub const RESP_CODE_CHANNEL_MSG_V3: u8 = 0x11;
 pub const RESP_CODE_CHANNEL_INFO: u8 = 18;
-pub const RESP_CODE_BAT: u8 = 19;
+pub const RESP_CODE_ADVERT_PATH: u8 = 0x16;
+pub const RESP_CODE_TUNING: u8 = 0x17;
+pub const RESP_CODE_STATS: u8 = 0x18;
+pub const RESP_CODE_AUTOADD: u8 = 0x19;
 pub const RESP_CODE_TIME: u8 = 20;
 pub const RESP_CODE_MSG: u8 = 21;
 
@@ -93,6 +115,10 @@ pub struct CompanionNode {
     pub autoadd_config: u8,
     /// Max hops for auto-adding contacts (0 = no limit)
     pub autoadd_max_hops: u8,
+    /// Receive delay base in milliseconds (tuning parameter).
+    pub rx_delay_ms: u32,
+    /// Airtime factor × 1000 (tuning parameter).
+    pub airtime_factor_milli: u32,
     /// Tracks how many channels have been synced since the last connection.
     /// Used to defer connection parameter updates until after the sync burst.
     pub channels_synced: u8,
@@ -130,6 +156,8 @@ impl CompanionNode {
             path_hash_mode: crate::storage::get_path_hash_mode(),
             autoadd_config: 0x1E,   // default: auto-add all types with overwrite oldest
             autoadd_max_hops: 0,    // 0 = no hop limit
+            rx_delay_ms: 0,
+            airtime_factor_milli: 1000,
             channels_synced: 0,
         }
     }
@@ -244,14 +272,282 @@ impl CompanionNode {
                 emit(&resp);
             }
 
-            CMD_GET_BAT => {
-                // RESP_CODE_BAT (19)
-                // Payload: [RESP_CODE, mV_low, mV_high, percentage]
-                let mut resp = Vec::<u8, 8>::new();
-                let _ = resp.push(RESP_CODE_BAT);
+            CMD_GET_BATT_AND_STORAGE => {
+                // [PACKET_BATTERY][mV u16][storage used KiB u32][storage total KiB u32]
+                let mut resp = Vec::<u8, 16>::new();
+                let _ = resp.push(RESP_CODE_BATTERY);
                 let _ = resp.extend_from_slice(&self.battery_millivolts.to_le_bytes());
-                let _ = resp.push(self.battery_percentage);
+                let _ = resp.extend_from_slice(&0u32.to_le_bytes());
+                let _ = resp.extend_from_slice(&0u32.to_le_bytes());
                 emit(&resp);
+            }
+
+            CMD_SET_ADVERT_NAME => {
+                let mut ok = false;
+                if payload.len() >= 2 {
+                    let raw = &payload[1..];
+                    let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+                    if let Ok(text) = core::str::from_utf8(&raw[..end]) {
+                        let mut name = String::<32>::new();
+                        if !text.is_empty() && name.push_str(text).is_ok() {
+                            self.callsign = name.clone();
+                            crate::storage::set_callsign(text);
+                            let _ = crate::companion::usb::USB_COMMAND_CHANNEL
+                                .try_send(crate::companion::usb::UsbCommand::SetName(name));
+                            ok = true;
+                        }
+                    }
+                }
+                let mut resp = Vec::<u8, 4>::new();
+                let _ = resp.push(if ok { RESP_CODE_OK } else { RESP_CODE_ERR });
+                emit(&resp);
+            }
+
+            CMD_SET_RADIO_PARAMS => {
+                let mut ok = false;
+                if payload.len() >= 11 {
+                    let freq_khz =
+                        u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+                    let bw_hz =
+                        u32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]);
+                    let sf = payload[9];
+                    let cr = payload[10];
+                    if (100_000..=1_000_000).contains(&freq_khz)
+                        && (7_800..=500_000).contains(&bw_hz)
+                        && (5..=12).contains(&sf)
+                        && (5..=8).contains(&cr)
+                    {
+                        crate::companion::usb::RADIO_SETTINGS.lock(|r| {
+                            let mut s = r.borrow_mut();
+                            s.frequency_hz = freq_khz * 1000;
+                            s.bw_khz = bw_hz / 1000;
+                            s.sf = sf;
+                            s.cr = cr;
+                        });
+                        crate::storage::request_save_config();
+                        ok = true;
+                    }
+                }
+                let mut resp = Vec::<u8, 4>::new();
+                let _ = resp.push(if ok { RESP_CODE_OK } else { RESP_CODE_ERR });
+                emit(&resp);
+            }
+
+            CMD_SET_RADIO_TX_POWER => {
+                let mut ok = false;
+                if payload.len() >= 2 {
+                    let power = payload[1] as i8;
+                    if (-9..=22).contains(&power) {
+                        crate::companion::usb::RADIO_SETTINGS.lock(|r| {
+                            r.borrow_mut().tx_power_dbm = power;
+                        });
+                        crate::storage::request_save_config();
+                        ok = true;
+                    }
+                }
+                let mut resp = Vec::<u8, 4>::new();
+                let _ = resp.push(if ok { RESP_CODE_OK } else { RESP_CODE_ERR });
+                emit(&resp);
+            }
+
+            CMD_SET_ADVERT_LATLON => {
+                let mut ok = false;
+                if payload.len() >= 9 {
+                    let lat =
+                        i32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+                    let lon =
+                        i32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]);
+                    if (-90_000_000..=90_000_000).contains(&lat)
+                        && (-180_000_000..=180_000_000).contains(&lon)
+                    {
+                        self.latitude = lat as f32 / 1_000_000.0;
+                        self.longitude = lon as f32 / 1_000_000.0;
+                        let _ = crate::companion::usb::USB_COMMAND_CHANNEL.try_send(
+                            crate::companion::usb::UsbCommand::SetAdvertLatLon { lat, lon },
+                        );
+                        ok = true;
+                    }
+                }
+                let mut resp = Vec::<u8, 4>::new();
+                let _ = resp.push(if ok { RESP_CODE_OK } else { RESP_CODE_ERR });
+                emit(&resp);
+            }
+
+            CMD_RESET_PATH => {
+                let mut ok = false;
+                if payload.len() >= 33 {
+                    let mut pub_key = [0u8; 32];
+                    pub_key.copy_from_slice(&payload[1..33]);
+                    ok = crate::companion::ble::CONTACT_OP_CHANNEL
+                        .try_send(crate::companion::ble::ContactOperation::ResetPath { pub_key })
+                        .is_ok();
+                }
+                let mut resp = Vec::<u8, 4>::new();
+                let _ = resp.push(if ok { RESP_CODE_OK } else { RESP_CODE_ERR });
+                emit(&resp);
+            }
+
+            CMD_EXPORT_PRIVATE_KEY => {
+                // [PACKET_PRIVATE_KEY][64-byte expanded private key]
+                let mut resp = Vec::<u8, 66>::new();
+                let _ = resp.push(RESP_CODE_PRIVATE_KEY);
+                let _ = resp.extend_from_slice(&self.private_key);
+                emit(&resp);
+            }
+
+            CMD_IMPORT_PRIVATE_KEY => {
+                let mut ok = false;
+                if payload.len() >= 65 {
+                    let mut key = [0u8; 64];
+                    key.copy_from_slice(&payload[1..65]);
+                    if let Some(id) = crate::meshcore::identity::LocalIdentity::from_private(
+                        self.callsign.as_str(),
+                        &key,
+                    ) {
+                        self.private_key = key;
+                        self.public_key = *id.pub_key();
+                        let _ = crate::companion::usb::USB_COMMAND_CHANNEL
+                            .try_send(crate::companion::usb::UsbCommand::SetPrivateKey(key));
+                        ok = true;
+                    }
+                }
+                let mut resp = Vec::<u8, 4>::new();
+                let _ = resp.push(if ok { RESP_CODE_OK } else { RESP_CODE_ERR });
+                emit(&resp);
+            }
+
+            CMD_SET_TUNING_PARAMS => {
+                let mut ok = false;
+                if payload.len() >= 9 {
+                    self.rx_delay_ms =
+                        u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+                    self.airtime_factor_milli =
+                        u32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]);
+                    ok = true;
+                }
+                let mut resp = Vec::<u8, 4>::new();
+                let _ = resp.push(if ok { RESP_CODE_OK } else { RESP_CODE_ERR });
+                emit(&resp);
+            }
+
+            CMD_GET_TUNING_PARAMS => {
+                let mut resp = Vec::<u8, 9>::new();
+                let _ = resp.push(RESP_CODE_TUNING);
+                let _ = resp.extend_from_slice(&self.rx_delay_ms.to_le_bytes());
+                let _ = resp.extend_from_slice(&self.airtime_factor_milli.to_le_bytes());
+                emit(&resp);
+            }
+
+            CMD_SET_AUTOADD_CONFIG => {
+                let mut ok = false;
+                if payload.len() >= 2 {
+                    self.autoadd_config = payload[1];
+                    if payload.len() >= 3 {
+                        self.autoadd_max_hops = payload[2].min(64);
+                    }
+                    let _ = crate::companion::usb::USB_COMMAND_CHANNEL.try_send(
+                        crate::companion::usb::UsbCommand::SetAutoAddConfig {
+                            config: self.autoadd_config,
+                            max_hops: self.autoadd_max_hops,
+                        },
+                    );
+                    ok = true;
+                }
+                let mut resp = Vec::<u8, 4>::new();
+                let _ = resp.push(if ok { RESP_CODE_OK } else { RESP_CODE_ERR });
+                emit(&resp);
+            }
+
+            CMD_GET_AUTOADD_CONFIG => {
+                let mut resp = Vec::<u8, 3>::new();
+                let _ = resp.push(RESP_CODE_AUTOADD);
+                let _ = resp.push(self.autoadd_config);
+                let _ = resp.push(self.autoadd_max_hops);
+                emit(&resp);
+            }
+
+            CMD_GET_ADVERT_PATH => {
+                let mut found = None;
+                if payload.len() >= 9 {
+                    let prefix = &payload[2..9];
+                    found = crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| {
+                        c.borrow()
+                            .iter()
+                            .find(|ct| &ct.pub_key[..7] == prefix)
+                            .map(|ct| (ct.out_path_len, ct.out_path, ct.last_advert_ts))
+                    });
+                }
+                if let Some((path_len, path, ts)) = found {
+                    if path_len != 0xFF
+                        && crate::meshcore::packet::Packet::is_valid_path_len(path_len)
+                    {
+                        let n = (path_len & 63) as usize * (((path_len >> 6) as usize) + 1);
+                        let mut resp = Vec::<u8, 72>::new();
+                        let _ = resp.push(RESP_CODE_ADVERT_PATH);
+                        let _ = resp.extend_from_slice(&ts.to_le_bytes());
+                        let _ = resp.push(path_len);
+                        let _ = resp.extend_from_slice(&path[..n]);
+                        emit(&resp);
+                    } else {
+                        let mut resp = Vec::<u8, 4>::new();
+                        let _ = resp.push(RESP_CODE_ERR);
+                        emit(&resp);
+                    }
+                } else {
+                    let mut resp = Vec::<u8, 4>::new();
+                    let _ = resp.push(RESP_CODE_ERR);
+                    emit(&resp);
+                }
+            }
+
+            CMD_GET_STATS => {
+                let mut handled = false;
+                if payload.len() >= 2 {
+                    let kind = payload[1];
+                    if kind == 0 {
+                        let uptime = embassy_time::Instant::now().as_secs() as u32;
+                        let mut resp = Vec::<u8, 11>::new();
+                        let _ = resp.push(RESP_CODE_STATS);
+                        let _ = resp.push(0);
+                        let _ = resp.extend_from_slice(&self.battery_millivolts.to_le_bytes());
+                        let _ = resp.extend_from_slice(&uptime.to_le_bytes());
+                        let _ = resp.extend_from_slice(&0u16.to_le_bytes());
+                        let _ = resp.push(0);
+                        emit(&resp);
+                        handled = true;
+                    } else if kind == 1 {
+                        let (rssi, snr) = crate::companion::usb::RADIO_TELEMETRY
+                            .lock(|t| (t.borrow().last_rssi, t.borrow().last_snr));
+                        let mut resp = Vec::<u8, 14>::new();
+                        let _ = resp.push(RESP_CODE_STATS);
+                        let _ = resp.push(1);
+                        let _ = resp.extend_from_slice(&0i16.to_le_bytes());
+                        let _ = resp.push(rssi as i8 as u8);
+                        let _ = resp.push((snr * 4) as u8);
+                        let _ = resp.extend_from_slice(&0u32.to_le_bytes());
+                        let _ = resp.extend_from_slice(&0u32.to_le_bytes());
+                        emit(&resp);
+                        handled = true;
+                    }
+                }
+                if !handled {
+                    let mut resp = Vec::<u8, 4>::new();
+                    let _ = resp.push(RESP_CODE_ERR);
+                    emit(&resp);
+                }
+            }
+
+            CMD_REBOOT => {
+                if payload.len() >= 7 && &payload[1..7] == b"reboot" {
+                    let mut resp = Vec::<u8, 4>::new();
+                    let _ = resp.push(RESP_CODE_OK);
+                    emit(&resp);
+                    cortex_m::peripheral::SCB::sys_reset();
+                } else {
+                    let mut resp = Vec::<u8, 4>::new();
+                    let _ = resp.push(RESP_CODE_ERR);
+                    emit(&resp);
+                }
             }
 
             CMD_GET_DEVICE_TIME => {
@@ -526,7 +822,9 @@ impl CompanionNode {
             }
 
             CMD_SEND_SELF_ADVERT => {
-                let _ = crate::companion::usb::USB_COMMAND_CHANNEL.try_send(crate::companion::usb::UsbCommand::TriggerAdvert);
+                let flood = payload.len() >= 2 && payload[1] == 1;
+                let _ = crate::companion::usb::USB_COMMAND_CHANNEL
+                    .try_send(crate::companion::usb::UsbCommand::TriggerAdvert { flood });
                 let mut resp = Vec::<u8, 4>::new();
                 let _ = resp.push(RESP_CODE_OK);
                 emit(&resp);
@@ -621,9 +919,9 @@ impl CompanionNode {
             }
 
             _ => {
-                // Generic OK for unsupported unhandled commands to keep companion session alive
+                // Unsupported command: report an error rather than a misleading OK.
                 let mut resp = Vec::<u8, 4>::new();
-                let _ = resp.push(RESP_CODE_OK);
+                let _ = resp.push(RESP_CODE_ERR);
                 emit(&resp);
             }
         }

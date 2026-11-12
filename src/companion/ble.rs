@@ -63,6 +63,10 @@ pub enum ContactOperation {
         out_path_len: u8,
         last_advert_ts: u32,
     },
+    /// Clear a contact's learned path.
+    ResetPath {
+        pub_key: [u8; 32],
+    },
     Remove {
         pub_key: [u8; 32],
     },

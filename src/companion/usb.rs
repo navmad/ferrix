@@ -146,7 +146,9 @@ pub enum UsbCommand {
     SetName(heapless::String<32>),
     SetPrivateKey([u8; 64]),
     SetTime(u64),
-    TriggerAdvert,
+    TriggerAdvert { flood: bool },
+    SetAdvertLatLon { lat: i32, lon: i32 },
+    SetAutoAddConfig { config: u8, max_hops: u8 },
     SendGroupText {
         channel_idx: u8,
         timestamp: u32,
@@ -806,7 +808,7 @@ async fn handle_text_cli(
                 let mut tel = t.borrow_mut();
                 tel.tx_beacons = tel.tx_beacons.saturating_add(1);
             });
-            let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::TriggerAdvert);
+            let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::TriggerAdvert { flood: true });
             let _ = write_all(sender, b"  -> OK (MeshCore Advert broadcast queued)\r\n").await;
         }
         "time" | "get time" => {

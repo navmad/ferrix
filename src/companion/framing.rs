@@ -10,7 +10,7 @@
 pub const USB_INBOUND_DELIMITER: u8 = 0x3C;  // '<'
 pub const USB_OUTBOUND_DELIMITER: u8 = 0x3E; // '>'
 
-pub const MAX_FRAME_PAYLOAD_SIZE: usize = 512;
+pub const MAX_FRAME_PAYLOAD_SIZE: usize = 176;
 pub const MAX_USB_FRAME_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE + 3; // Delimiter + 2 bytes length
 
 /// Reader for assembling streaming USB frames into complete packets.

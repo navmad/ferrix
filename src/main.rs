@@ -309,6 +309,16 @@ async fn main(spawner: Spawner) {
                         }
                     });
                 }
+                crate::companion::ble::ContactOperation::ResetPath { pub_key } => {
+                    crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| {
+                        if let Some(ct) =
+                            c.borrow_mut().iter_mut().find(|ct| ct.pub_key == pub_key)
+                        {
+                            ct.out_path = [0u8; 64];
+                            ct.out_path_len = 0xFF;
+                        }
+                    });
+                }
                 crate::companion::ble::ContactOperation::Remove { pub_key } => {
                     crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| {
                         let mut list = c.borrow_mut();
@@ -598,15 +608,24 @@ async fn main(spawner: Spawner) {
                     node.epoch_time = epoch;
                     crate::companion::usb::set_device_time(epoch as u32);
                 }
-                UsbCommand::TriggerAdvert => {
-                    info!("Queuing MeshCore Advert from USB CLI command...");
+                UsbCommand::TriggerAdvert { flood } => {
+                    info!("Queuing MeshCore Advert (flood: {})", flood);
                     node.tx_beacons = node.tx_beacons.saturating_add(1);
                     let time = crate::companion::usb::get_device_time();
                     let _ = mesh.queue_advert(
                         time,
                         node.latitude,
                         node.longitude,
+                        flood,
                     );
+                }
+                UsbCommand::SetAdvertLatLon { lat, lon } => {
+                    node.latitude = lat as f32 / 1_000_000.0;
+                    node.longitude = lon as f32 / 1_000_000.0;
+                }
+                UsbCommand::SetAutoAddConfig { config, max_hops } => {
+                    node.autoadd_config = config;
+                    node.autoadd_max_hops = max_hops;
                 }
                 UsbCommand::SendGroupText { channel_idx, timestamp, text } => {
                     info!("Queuing MeshCore Group Text on ch {}: {} (ts: {})", channel_idx, text.as_str(), timestamp);
@@ -725,6 +744,7 @@ async fn main(spawner: Spawner) {
                         node.epoch_time as u32,
                         node.latitude,
                         node.longitude,
+                        true,
                     );
                 }
                 _ => {}

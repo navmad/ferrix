@@ -426,7 +426,13 @@ impl MeshEngine {
 
     /// Construct and queue an advertisement packet for transmission
     /// Construct, sign, and queue an advertisement packet for transmission
-    pub fn queue_advert(&mut self, timestamp: u32, lat_f32: f32, lon_f32: f32) -> Result<Packet, ()> {
+    pub fn queue_advert(
+        &mut self,
+        timestamp: u32,
+        lat_f32: f32,
+        lon_f32: f32,
+        flood: bool,
+    ) -> Result<Packet, ()> {
         // Convert f32 GPS to integer (degrees * 1,000,000)
         let lat_int = (lat_f32 * 1_000_000.0) as i32;
         let lon_int = (lon_f32 * 1_000_000.0) as i32;
@@ -449,8 +455,18 @@ impl MeshEngine {
         // Sign the advert with our private key
         adv.sign(&self.identity);
 
-        let mut pkt = adv.to_packet(ROUTE_TYPE_FLOOD)?;
-        pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
+        let route = if flood {
+            ROUTE_TYPE_FLOOD
+        } else {
+            ROUTE_TYPE_DIRECT
+        };
+        let mut pkt = adv.to_packet(route)?;
+        if flood {
+            pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
+        } else {
+            // Zero-hop direct: only neighbours hear it.
+            pkt.path_len = 0;
+        }
         self.seen_filter.mark_seen(pkt.calculate_packet_hash());
         let _ = self.tx_queue.push(pkt.clone());
         Ok(pkt)
