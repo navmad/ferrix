@@ -232,15 +232,18 @@ pub async fn lora_phy_task(
     let mut rx_backoff_ms = 50u64;
 
     loop {
-        match select3(
+        // Re-arm RX if no packet arrives for a minute. This is a safety net
+        // for the case where the SX1262 stops raising DIO1 (for example after
+        // a cancelled TX/RX operation) and `lora.rx` would otherwise wait
+        // forever: the task would still be alive but permanently deaf.
+        let rx_fut = embassy_time::with_timeout(
+            embassy_time::Duration::from_secs(60),
             lora.rx(&rx_pkt_params, &mut rx_buf),
-            LORA_TX_CHANNEL.receive(),
-            LORA_CFG_CHANNEL.receive(),
-        )
-        .await
-        {
+        );
+
+        match select3(rx_fut, LORA_TX_CHANNEL.receive(), LORA_CFG_CHANNEL.receive()).await {
             Either3::First(rx_result) => match rx_result {
-                Ok((len, status)) => {
+                Ok(Ok((len, status))) => {
                     rx_backoff_ms = 50;
                     info!("lora-phy: RX {} bytes, RSSI: {} dBm, SNR: {} dB", len, status.rssi, status.snr);
                     let mut packet_data = [0u8; 256];
@@ -248,7 +251,7 @@ pub async fn lora_phy_task(
                     packet_data[..copy_len].copy_from_slice(&rx_buf[..copy_len]);
                     let _ = LORA_RX_CHANNEL.try_send((copy_len, status.rssi, status.snr as i8, packet_data));
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     if rx_backoff_ms <= 50 {
                         debug!("lora-phy: RX error or timeout: {:?}", e);
                     }
@@ -271,27 +274,50 @@ pub async fn lora_phy_task(
                         Err(_) => error!("lora-phy: re-enter RX timed out"),
                     }
                 }
+                Err(_) => {
+                    // RX watchdog fired: no DIO1 for 60 s. Re-arm the receiver.
+                    debug!("lora-phy: RX watchdog re-arm");
+                    match embassy_time::with_timeout(
+                        embassy_time::Duration::from_secs(1),
+                        lora.prepare_for_rx(RxMode::Continuous, &mdltn_params, &rx_pkt_params),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => error!("lora-phy: watchdog re-arm failed: {:?}", e),
+                        Err(_) => error!("lora-phy: watchdog re-arm timed out"),
+                    }
+                }
             },
             Either3::Second(tx_packet) => {
                 info!("lora-phy: Transmitting {} bytes...", tx_packet.len);
-                if let Ok(mut tx_pkt_params) =
-                    lora.create_tx_packet_params(preamble, false, true, false, &mdltn_params)
-                {
-                    if let Ok(()) = lora
-                        .prepare_for_tx(
+                // A TX that never sees DIO1 would otherwise wedge this task
+                // forever, leaving the node alive but unable to receive.
+                let tx_result = embassy_time::with_timeout(
+                    embassy_time::Duration::from_secs(20),
+                    async {
+                        let mut tx_pkt_params = lora.create_tx_packet_params(
+                            preamble,
+                            false,
+                            true,
+                            false,
+                            &mdltn_params,
+                        )?;
+                        lora.prepare_for_tx(
                             &mdltn_params,
                             &mut tx_pkt_params,
                             tx_power_dbm as i32,
                             &tx_packet.data[..tx_packet.len],
                         )
-                        .await
-                    {
-                        if let Ok(()) = lora.tx().await {
-                            info!("lora-phy: Transmission complete!");
-                        } else {
-                            error!("lora-phy: Transmission failed!");
-                        }
-                    }
+                        .await?;
+                        lora.tx().await
+                    },
+                )
+                .await;
+                match tx_result {
+                    Ok(Ok(())) => info!("lora-phy: Transmission complete!"),
+                    Ok(Err(e)) => error!("lora-phy: Transmission failed: {:?}", e),
+                    Err(_) => error!("lora-phy: Transmission timed out; forcing RX recovery"),
                 }
                 // Return to continuous RX mode after transmission
                 let _ = embassy_time::with_timeout(

@@ -466,8 +466,10 @@ pub async fn ble_companion_task(
         match embassy_futures::select::select3(gatt_fut, command_fut, push_fut).await {
             embassy_futures::select::Either3::First(e) => {
                 info!("BLE: Phone disconnected ({:?}), resuming advertising...", e);
-                // Drop anything left over from the closed connection.
+                // Drop anything left over from the closed connection so the
+                // next app session never receives stale responses.
                 BLE_CMD_RING.clear();
+                while COMPANION_PUSH_CHANNEL.try_receive().is_ok() {}
                 // Switch to slow advertising (211ms) after the first connection to save power.
                 if adv_config.interval == 32 {
                     adv_config.interval = 338; // 211ms slow advertising

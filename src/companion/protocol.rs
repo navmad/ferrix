@@ -386,15 +386,26 @@ impl CompanionNode {
                         && (5..=12).contains(&sf)
                         && (5..=8).contains(&cr)
                     {
-                        crate::companion::usb::RADIO_SETTINGS.lock(|r| {
+                        // The app re-sends its stored settings on every connect.
+                        // Only touch flash and interrupt RX when something changed.
+                        let changed = crate::companion::usb::RADIO_SETTINGS.lock(|r| {
                             let mut s = r.borrow_mut();
-                            s.frequency_hz = freq_khz * 1000;
-                            s.bw_khz = bw_hz / 1000;
+                            let new_freq = freq_khz * 1000;
+                            let new_bw = bw_hz / 1000;
+                            let changed = s.frequency_hz != new_freq
+                                || s.bw_khz != new_bw
+                                || s.sf != sf
+                                || s.cr != cr;
+                            s.frequency_hz = new_freq;
+                            s.bw_khz = new_bw;
                             s.sf = sf;
                             s.cr = cr;
+                            changed
                         });
-                        crate::storage::request_save_config();
-                        crate::radio::lora_phy::request_radio_config();
+                        if changed {
+                            crate::storage::request_save_config();
+                            crate::radio::lora_phy::request_radio_config();
+                        }
                         ok = true;
                     }
                 }
@@ -408,11 +419,16 @@ impl CompanionNode {
                 if payload.len() >= 2 {
                     let power = payload[1] as i8;
                     if (-9..=22).contains(&power) {
-                        crate::companion::usb::RADIO_SETTINGS.lock(|r| {
-                            r.borrow_mut().tx_power_dbm = power;
+                        let changed = crate::companion::usb::RADIO_SETTINGS.lock(|r| {
+                            let mut s = r.borrow_mut();
+                            let changed = s.tx_power_dbm != power;
+                            s.tx_power_dbm = power;
+                            changed
                         });
-                        crate::storage::request_save_config();
-                        crate::radio::lora_phy::request_radio_config();
+                        if changed {
+                            crate::storage::request_save_config();
+                            crate::radio::lora_phy::request_radio_config();
+                        }
                         ok = true;
                     }
                 }
