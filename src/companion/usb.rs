@@ -1416,6 +1416,19 @@ async fn handle_text_cli(
             );
             let _ = write_all(sender, s.as_bytes()).await;
         }
+        "stats-adverts" => {
+            let (cursor, pending, erase_pending) = crate::storage::adverts::stats();
+            let mut s: heapless::String<64> = heapless::String::new();
+            let _ = write!(
+                s,
+                "  -> slot {}/{} pending {}{}\r\n",
+                cursor,
+                crate::storage::adverts::SLOTS,
+                pending,
+                if erase_pending { " erase-pending" } else { "" }
+            );
+            let _ = write_all(sender, s.as_bytes()).await;
+        }
         "stats-ble" | "get ble" => {
             let st = crate::companion::ble::BLE_STATUS.load(core::sync::atomic::Ordering::Relaxed);
             let mut s: heapless::String<128> = heapless::String::new();

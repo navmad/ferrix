@@ -7,13 +7,14 @@ MEMORY
      * FLASH layout:
      * 0x00000000 - 0x00001000 : MBR
      * 0x00001000 - 0x00026000 : SoftDevice / Bootloader reserved area
-     * 0x00026000 - 0x000B0000 : Application Flash (~565 KB)
+     * 0x00026000 - 0x000A0000 : Application Flash (~500 KB)
+     * 0x000A0000 - 0x000B0000 : Persistent advert blobs (append log)
      * 0x000B0000 - 0x000CC000 : Persistent contacts (two 56 KB banks)
      * 0x000CC000 - 0x000EC000 : Persistent messages (two 64 KB banks)
      * 0x000EC000 - 0x000ED000 : Persistent configuration page (4 KB)
      * 0x000ED000 - 0x00100000 : Bootloader code & settings (~76 KB)
      */
-    FLASH (rx)  : ORIGIN = 0x00026000, LENGTH = 0x000B0000 - 0x00026000
+    FLASH (rx)  : ORIGIN = 0x00026000, LENGTH = 0x000A0000 - 0x00026000
 
     /* 
      * RAM layout:

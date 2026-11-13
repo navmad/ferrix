@@ -251,12 +251,18 @@ pub async fn contact_task() -> ! {
                 });
             }
             ContactOperation::Remove { pub_key } => {
-                crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| {
+                let removed = crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| {
                     let mut list = c.borrow_mut();
                     if let Some(pos) = list.iter().position(|ct| ct.pub_key == pub_key) {
                         list.remove(pos);
+                        true
+                    } else {
+                        false
                     }
                 });
+                if removed {
+                    crate::storage::adverts::forget(&pub_key);
+                }
             }
         }
         // Persist a structural change. The storage task's hash check means

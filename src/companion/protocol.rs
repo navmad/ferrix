@@ -1275,8 +1275,9 @@ impl CompanionNode {
             }
 
             CMD_EXPORT_CONTACT => {
-                // Export self as a signed advert packet. Exporting a stored
-                // contact would require retaining its original advert blob.
+                // No key: export self as a fresh signed advert. With a key:
+                // return the signed advert blob retained when the contact was
+                // discovered, as MeshCore does.
                 if payload.len() < 33 {
                     let private_key = crate::companion::usb::current_private_key();
                     let id = crate::meshcore::identity::LocalIdentity::from_private(
@@ -1316,8 +1317,21 @@ impl CompanionNode {
                         }
                     }
                 } else {
-                    let mut resp = Vec::<u8, 4>::new();
-                    let _ = resp.push(RESP_CODE_ERR);
+                    let mut key = [0u8; 32];
+                    key.copy_from_slice(&payload[1..33]);
+                    let known = crate::companion::usb::DISCOVERED_CONTACTS
+                        .lock(|c| c.borrow().iter().any(|ct| ct.pub_key == key));
+                    let mut resp = Vec::<u8, 140>::new();
+                    if !known {
+                        let _ = resp.push(RESP_CODE_ERR);
+                        let _ = resp.push(ERR_NOT_FOUND);
+                    } else if let Some(packet) = crate::storage::adverts::export(&key) {
+                        let _ = resp.push(RESP_CODE_EXPORT_CONTACT);
+                        let _ = resp.extend_from_slice(&packet);
+                    } else {
+                        let _ = resp.push(RESP_CODE_ERR);
+                        let _ = resp.push(ERR_BAD_STATE);
+                    }
                     emit(&resp);
                 }
             }
@@ -1384,6 +1398,10 @@ impl CompanionNode {
                                         let _ =
                                             crate::companion::ble::COMPANION_PUSH_CHANNEL
                                                 .try_send(frame);
+                                        crate::storage::adverts::remember(
+                                            &adv.pub_key,
+                                            &pkt.payload[..pkt.payload_len],
+                                        );
                                     }
 
                                     ok = crate::companion::ble::CONTACT_OP_CHANNEL

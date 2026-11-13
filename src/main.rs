@@ -486,6 +486,15 @@ async fn main(spawner: Spawner) {
             // Deserialize and dispatch through MeshCore Network Engine
             if let Ok(pkt) = Packet::read_from(&rx_buf[..len]) {
                 let advert_hops = pkt.path_hash_count() as u8;
+                // Retain the signed payload so the contact can be exported.
+                let advert_payload =
+                    if pkt.payload_type() == crate::meshcore::packet::PAYLOAD_TYPE_ADVERT {
+                        let mut v = heapless::Vec::<u8, 184>::new();
+                        let _ = v.extend_from_slice(&pkt.payload[..pkt.payload_len]);
+                        Some(v)
+                    } else {
+                        None
+                    };
                 match mesh.handle_inbound_packet(pkt) {
                     InboundAction::ReceivedAdvert(adv) => {
                         info!("MeshCore Advert from: {}", adv.name.as_str());
@@ -496,12 +505,23 @@ async fn main(spawner: Spawner) {
                         let should_add = node.should_auto_add_contact_type(contact_type)
                             && node.autoadd_allows_hops(advert_hops);
 
+                        let mut store_blob = false;
                         crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| {
                             let mut list = c.borrow_mut();
                             if let Some(existing) = list.iter_mut().find(|ct| ct.pub_key == adv.pub_key) {
                                 // Anti-replay: ignore an advert no newer than the last accepted one.
                                 if existing.last_advert_ts != 0 && adv.timestamp <= existing.last_advert_ts {
                                     return;
+                                }
+                                // Only rewrite the shared advert blob when the
+                                // contact's advertised identity actually changed.
+                                if existing.callsign != adv.name
+                                    || existing.contact_type != contact_type
+                                    || existing.latitude != adv.latitude
+                                    || existing.longitude != adv.longitude
+                                    || !crate::storage::adverts::has_blob(&adv.pub_key)
+                                {
+                                    store_blob = true;
                                 }
                                 existing.callsign = adv.name.clone();
                                 existing.last_seen_epoch = node.epoch_time as u32;
@@ -558,19 +578,24 @@ async fn main(spawner: Spawner) {
                                         }
                                     }
                                     if let Some(idx) = oldest_idx {
+                                        let overwritten = list[idx].pub_key;
                                         let mut push = heapless::Vec::<u8, 256>::new();
                                         let _ = push.push(
                                             crate::companion::protocol::PUSH_CODE_CONTACT_DELETED,
                                         );
-                                        let _ = push.extend_from_slice(&list[idx].pub_key);
+                                        let _ = push.extend_from_slice(&overwritten);
                                         let _ =
                                             crate::companion::ble::COMPANION_PUSH_CHANNEL.try_send(push);
+                                        crate::storage::adverts::forget(&overwritten);
                                         list[idx] = discovered.clone();
                                         added = true;
                                     }
                                 }
                             }
 
+                            if added {
+                                store_blob = true;
+                            }
                             push_new_advert(&discovered);
 
                             if !added && list.len() >= list.capacity() {
@@ -582,6 +607,11 @@ async fn main(spawner: Spawner) {
                                     crate::companion::ble::COMPANION_PUSH_CHANNEL.try_send(push);
                             }
                         });
+                        if store_blob {
+                            if let Some(payload) = advert_payload.as_ref() {
+                                crate::storage::adverts::remember(&adv.pub_key, payload);
+                            }
+                        }
                         crate::storage::request_contacts();
                     }
                     InboundAction::ReceivedGroupText { channel_idx, path_len, packet: grp } => {
