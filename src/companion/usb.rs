@@ -1416,6 +1416,26 @@ async fn handle_text_cli(
             );
             let _ = write_all(sender, s.as_bytes()).await;
         }
+        "stats-disc" => {
+            let mut s: heapless::String<160> = heapless::String::new();
+            let _ = write!(
+                s,
+                "  -> tx {} tag {:08x} pending {}\r\n",
+                crate::companion::protocol::DISC_TX_COUNT.load(core::sync::atomic::Ordering::Relaxed),
+                crate::companion::protocol::DISC_TX_TAG.load(core::sync::atomic::Ordering::Relaxed),
+                crate::companion::protocol::DISC_PENDING.load(core::sync::atomic::Ordering::Relaxed)
+            );
+            let _ = write!(
+                s,
+                "  -> rx {} tag {:08x} out {:#04x} in {:#04x} rtt {}ms\r\n",
+                crate::companion::protocol::DISC_RX_COUNT.load(core::sync::atomic::Ordering::Relaxed),
+                crate::companion::protocol::DISC_RX_TAG.load(core::sync::atomic::Ordering::Relaxed),
+                crate::companion::protocol::DISC_RX_OUT.load(core::sync::atomic::Ordering::Relaxed),
+                crate::companion::protocol::DISC_RX_IN.load(core::sync::atomic::Ordering::Relaxed),
+                crate::companion::protocol::DISC_RX_RTT_MS.load(core::sync::atomic::Ordering::Relaxed)
+            );
+            let _ = write_all(sender, s.as_bytes()).await;
+        }
         "stats-binary" => {
             let mut s: heapless::String<160> = heapless::String::new();
             let _ = write!(

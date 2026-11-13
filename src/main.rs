@@ -780,7 +780,12 @@ async fn main(spawner: Spawner) {
                                 .try_send(push);
                         }
                     }
-                    InboundAction::ReceivedPath { packet: path, sender_pub } => {
+                    InboundAction::ReceivedPath {
+                        packet: path,
+                        sender_pub,
+                        arrival_path_len,
+                        arrival_path,
+                    } => {
                         info!(
                             "MeshCore PATH from {:02x}{:02x}: {} hops, extra {}",
                             sender_pub[0], sender_pub[1], path.hop_count(), path.extra_type
@@ -812,7 +817,20 @@ async fn main(spawner: Spawner) {
                                 }
                             }
                         } else if path.extra_type & 0x0F == 1 && !path.extra.is_empty() {
-                            if !crate::companion::protocol::handle_response(
+                            let tag = u32::from_le_bytes([
+                                path.extra[0],
+                                path.extra[1],
+                                path.extra[2],
+                                path.extra[3],
+                            ]);
+                            if !crate::companion::protocol::handle_path_discovery(
+                                tag,
+                                &sender_pub,
+                                path.path_len,
+                                &path.path,
+                                arrival_path_len,
+                                &arrival_path,
+                            ) && !crate::companion::protocol::handle_response(
                                 &path.extra,
                                 &sender_pub,
                             ) {

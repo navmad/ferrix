@@ -111,6 +111,20 @@ pub static REQ_RX_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static REQ_RX_TAG: AtomicU32 = AtomicU32::new(0);
 pub static REQ_RX_LEN: AtomicU32 = AtomicU32::new(0);
 
+pub static DISC_TX_COUNT: AtomicU32 = AtomicU32::new(0);
+pub static DISC_TX_TAG: AtomicU32 = AtomicU32::new(0);
+pub static DISC_RX_COUNT: AtomicU32 = AtomicU32::new(0);
+pub static DISC_RX_TAG: AtomicU32 = AtomicU32::new(0);
+pub static DISC_RX_OUT: AtomicU8 = AtomicU8::new(0);
+pub static DISC_RX_IN: AtomicU8 = AtomicU8::new(0);
+pub static DISC_PENDING: AtomicBool = AtomicBool::new(false);
+pub static DISC_TX_MS: AtomicU32 = AtomicU32::new(0);
+pub static DISC_RX_RTT_MS: AtomicU32 = AtomicU32::new(0);
+
+/// Outstanding path-discovery request: (tag, destination).
+static PENDING_DISCOVERY: Mutex<CriticalSectionRawMutex, RefCell<Option<(u32, [u8; 32])>>> =
+    Mutex::new(RefCell::new(None));
+
 /// Outstanding telemetry request: (tag, destination).
 static PENDING_TELEMETRY: Mutex<CriticalSectionRawMutex, RefCell<Option<(u32, [u8; 32])>>> =
     Mutex::new(RefCell::new(None));
@@ -135,6 +149,59 @@ fn note_pending_req(tag: u32, pub_key: [u8; 32]) {
 
 fn note_pending_telemetry(tag: u32, pub_key: [u8; 32]) {
     PENDING_TELEMETRY.lock(|p| *p.borrow_mut() = Some((tag, pub_key)));
+}
+
+fn note_pending_discovery(tag: u32, pub_key: [u8; 32]) {
+    PENDING_DISCOVERY.lock(|p| *p.borrow_mut() = Some((tag, pub_key)));
+    DISC_TX_COUNT.fetch_add(1, Ordering::Relaxed);
+    DISC_TX_TAG.store(tag, Ordering::Relaxed);
+    DISC_TX_MS.store(embassy_time::Instant::now().as_millis() as u32, Ordering::Relaxed);
+    DISC_PENDING.store(true, Ordering::Relaxed);
+}
+
+/// Emit PATH_DISCOVERY_RESP when a PATH reply carries the pending tag.
+pub fn handle_path_discovery(
+    tag: u32,
+    sender_pub: &[u8; 32],
+    out_path_len: u8,
+    out_path: &[u8],
+    in_path_len: u8,
+    in_path: &[u8],
+) -> bool {
+    let matched = PENDING_DISCOVERY.lock(|p| {
+        let mut pending = p.borrow_mut();
+        if pending.map_or(false, |(t, k)| t == tag && k == *sender_pub) {
+            *pending = None;
+            true
+        } else {
+            false
+        }
+    });
+    if !matched {
+        return false;
+    }
+    DISC_RX_COUNT.fetch_add(1, Ordering::Relaxed);
+    DISC_RX_TAG.store(tag, Ordering::Relaxed);
+    DISC_RX_OUT.store(out_path_len, Ordering::Relaxed);
+    DISC_RX_IN.store(in_path_len, Ordering::Relaxed);
+    DISC_RX_RTT_MS.store(
+        (embassy_time::Instant::now().as_millis() as u32)
+            .wrapping_sub(DISC_TX_MS.load(Ordering::Relaxed)),
+        Ordering::Relaxed,
+    );
+    DISC_PENDING.store(false, Ordering::Relaxed);
+    let mut push = Vec::<u8, 256>::new();
+    let _ = push.push(PUSH_CODE_PATH_DISCOVERY_RESP);
+    let _ = push.push(0);
+    let _ = push.extend_from_slice(&sender_pub[..6]);
+    let _ = push.push(out_path_len);
+    let on = (out_path_len & 63) as usize * (((out_path_len >> 6) & 3) as usize + 1);
+    let _ = push.extend_from_slice(&out_path[..on.min(out_path.len())]);
+    let _ = push.push(in_path_len);
+    let inn = (in_path_len & 63) as usize * (((in_path_len >> 6) & 3) as usize + 1);
+    let _ = push.extend_from_slice(&in_path[..inn.min(in_path.len())]);
+    let _ = DELAYED_PUSH.try_send(push);
+    true
 }
 
 fn start_connection(pub_key: [u8; 32], keep_alive_secs: u16) {
@@ -620,6 +687,7 @@ pub const CMD_GET_TUNING_PARAMS: u8 = 0x2B;
 pub const CMD_GET_CHANNEL: u8 = 31;
 pub const CMD_SET_CHANNEL: u8 = 32;
 pub const CMD_SEND_BINARY_REQ: u8 = 0x32;
+pub const CMD_SEND_PATH_DISCOVERY_REQ: u8 = 0x34;
 pub const CMD_SET_FLOOD_SCOPE_KEY: u8 = 0x36;
 pub const CMD_SEND_CONTROL_DATA: u8 = 0x37;
 pub const CMD_GET_STATS: u8 = 0x38;
@@ -2649,6 +2717,95 @@ impl CompanionNode {
                     let _ = resp.push(ERR_ILLEGAL_ARG);
                     emit(&resp);
                 }
+            }
+
+            CMD_SEND_PATH_DISCOVERY_REQ => {
+                // [cmd][0][public_key 32]
+                let mut resp = Vec::<u8, 10>::new();
+                let mut reply = None;
+                if payload.len() >= 34 && payload[1] == 0 {
+                    let mut dest_key = [0u8; 32];
+                    dest_key.copy_from_slice(&payload[2..34]);
+                    let known = crate::companion::usb::DISCOVERED_CONTACTS
+                        .lock(|c| c.borrow().iter().any(|ct| ct.pub_key == dest_key));
+                    if known {
+                        let identity =
+                            crate::meshcore::identity::LocalIdentity::from_private(
+                                self.callsign.as_str(),
+                                &self.private_key,
+                            );
+                        if let Some(id) = identity {
+                            if let Some(secret) = id.shared_secret(&dest_key) {
+                                let tag = next_tag();
+                                let mut req = [0u8; 9];
+                                req[0] = REQ_TYPE_GET_TELEMETRY_DATA;
+                                req[1] = !0x01; // inverse BASE permission mask
+                                req[5..9].copy_from_slice(
+                                    &tag.wrapping_mul(0x9E37_79B1).to_le_bytes(),
+                                );
+                                let mut plain = [0u8; 13];
+                                plain[..4].copy_from_slice(&tag.to_le_bytes());
+                                plain[4..].copy_from_slice(&req);
+                                if let Ok(addressed) = AddressedPacket::new(
+                                    dest_key[0],
+                                    self.public_key[0],
+                                    &plain,
+                                ) {
+                                    // Discovery always floods.
+                                    if let Ok(mut pkt) = addressed.to_packet(
+                                        PAYLOAD_TYPE_REQ,
+                                        ROUTE_TYPE_FLOOD,
+                                        &secret,
+                                    ) {
+                                        apply_flood_scope(&mut pkt);
+                                        let mut buf = [0u8; 255];
+                                        if let Ok(n) = pkt.write_to(&mut buf) {
+                                            let mut raw = heapless::Vec::<u8, 255>::new();
+                                            if raw.extend_from_slice(&buf[..n]).is_ok()
+                                                && crate::companion::usb::USB_COMMAND_CHANNEL
+                                                    .try_send(
+                                                        crate::companion::usb::UsbCommand::SendRawPacket {
+                                                            raw,
+                                                        },
+                                                    )
+                                                    .is_ok()
+                                            {
+                                                let (sf, bw_khz, cr) =
+                                                    crate::companion::usb::RADIO_SETTINGS.lock(|r| {
+                                                        let s = r.borrow();
+                                                        (s.sf, s.bw_khz, s.cr)
+                                                    });
+                                                let air_ms = crate::radio::estimate_airtime_ms(
+                                                    n,
+                                                    sf,
+                                                    bw_khz,
+                                                    cr,
+                                                    if sf <= 8 { 32 } else { 16 },
+                                                );
+                                                let est_timeout = 500 + 16 * air_ms;
+                                                note_pending_discovery(tag, dest_key);
+                                                reply = Some((tag, est_timeout.max(15000)));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                match reply {
+                    Some((tag, est_timeout)) => {
+                        let _ = resp.push(RESP_CODE_SENT);
+                        let _ = resp.push(1); // flood
+                        let _ = resp.extend_from_slice(&tag.to_le_bytes());
+                        let _ = resp.extend_from_slice(&est_timeout.to_le_bytes());
+                    }
+                    None => {
+                        let _ = resp.push(RESP_CODE_ERR);
+                        let _ = resp.push(ERR_NOT_FOUND);
+                    }
+                }
+                emit(&resp);
             }
 
             CMD_SEND_BINARY_REQ => {

@@ -100,6 +100,9 @@ pub enum InboundAction {
     ReceivedPath {
         packet: PathPacket,
         sender_pub: [u8; 32],
+        /// Path the reply travelled to reach us (packed length + bytes).
+        arrival_path_len: u8,
+        arrival_path: heapless::Vec<u8, 64>,
     },
     /// Received channel datagram
     ReceivedGroupData {
@@ -478,9 +481,14 @@ impl MeshEngine {
                 for peer in self.peers_by_hash(payload[1]).iter() {
                     if let Some(secret) = self.identity.shared_secret(peer) {
                         if let Ok(path) = PathPacket::decode(payload, &secret) {
+                            let mut arrival_path = heapless::Vec::<u8, 64>::new();
+                            let an = pkt.path_byte_len();
+                            let _ = arrival_path.extend_from_slice(&pkt.path[..an]);
                             return InboundAction::ReceivedPath {
                                 packet: path,
                                 sender_pub: *peer,
+                                arrival_path_len: pkt.path_len,
+                                arrival_path,
                             };
                         }
                     }
