@@ -22,7 +22,7 @@ use crate::companion::usb::ChannelData;
 /// (Top page of application flash, immediately preceding bootloader at 0x000ED000)
 pub const CONFIG_FLASH_ADDR: u32 = 0x000EC000;
 pub const CONFIG_MAGIC: u32 = 0x4D434647; // 'MCFG' (MeshCore Config)
-pub const CONFIG_VERSION: u32 = 9;
+pub const CONFIG_VERSION: u32 = 10;
 
 #[repr(C, align(4))]
 #[derive(Clone, Copy)]
@@ -48,10 +48,52 @@ pub struct PersistentConfig {
     pub leds_disabled: u8,      // 1 = all user LEDs off
     pub rx_duty_cycle: u8,      // 1 = duty-cycle/sniff RX
     pub airtime_factor_tenths: u8, // 0..90; 90 = 9.0 -> 10% duty
+    pub flood_scope_name: [u8; 31],
+    pub flood_scope_key: [u8; 16],
+    pub advert_loc_policy: u8,
+    pub telemetry_mode_base: u8,
+    pub telemetry_mode_loc: u8,
+    pub telemetry_mode_env: u8,
+    pub multi_acks: u8,
     pub radio_freq_hz: u32,
     pub radio_bw_khz: u32,
     pub channels: [ChannelData; crate::companion::usb::MAX_CHANNELS],
     pub checksum: u32,
+}
+
+/// v9 layout: no flood-scope or advert/telemetry preferences.
+#[repr(C, align(4))]
+#[derive(Clone, Copy)]
+struct PersistentConfigV9 {
+    magic: u32,
+    version: u32,
+    callsign: [u8; 32],
+    custom_priv_key: [u8; 64],
+    has_custom_key: u8,
+    is_repeater: u8,
+    client_repeat: u8,
+    offgrid_home_freq: u32,
+    radio_tx_power: i8,
+    radio_sf: u8,
+    radio_cr: u8,
+    path_hash_mode: u8,
+    autoadd_config: u8,
+    autoadd_max_hops: u8,
+    manual_add_contacts: u8,
+    leds_disabled: u8,
+    rx_duty_cycle: u8,
+    airtime_factor_tenths: u8,
+    flood_scope_name: [u8; 31],
+    flood_scope_key: [u8; 16],
+    advert_loc_policy: u8,
+    telemetry_mode_base: u8,
+    telemetry_mode_loc: u8,
+    telemetry_mode_env: u8,
+    multi_acks: u8,
+    radio_freq_hz: u32,
+    radio_bw_khz: u32,
+    channels: [ChannelData; crate::companion::usb::MAX_CHANNELS],
+    checksum: u32,
 }
 
 /// v6 layout: no `leds_disabled`. Read only for migration.
@@ -283,6 +325,13 @@ fn migrate_v1(v1: PersistentConfigV1) -> PersistentConfig {
         leds_disabled: 0,
         rx_duty_cycle: 0,
         airtime_factor_tenths: 90,
+        flood_scope_name: [0; 31],
+        flood_scope_key: [0; 16],
+        advert_loc_policy: 0,
+        telemetry_mode_base: 0,
+        telemetry_mode_loc: 0,
+        telemetry_mode_env: 0,
+        multi_acks: 0,
         radio_freq_hz: v1.radio_freq_hz,
         radio_bw_khz: v1.radio_bw_khz,
         channels: expand_channels(v1.channels),
@@ -312,6 +361,13 @@ fn migrate_v2(v2: PersistentConfigV2) -> PersistentConfig {
         leds_disabled: 0,
         rx_duty_cycle: 0,
         airtime_factor_tenths: 90,
+        flood_scope_name: [0; 31],
+        flood_scope_key: [0; 16],
+        advert_loc_policy: 0,
+        telemetry_mode_base: 0,
+        telemetry_mode_loc: 0,
+        telemetry_mode_env: 0,
+        multi_acks: 0,
         radio_freq_hz: v2.radio_freq_hz,
         radio_bw_khz: v2.radio_bw_khz,
         channels: expand_channels(v2.channels),
@@ -341,6 +397,13 @@ fn migrate_v3(v3: PersistentConfigV3) -> PersistentConfig {
         leds_disabled: 0,
         rx_duty_cycle: 0,
         airtime_factor_tenths: 90,
+        flood_scope_name: [0; 31],
+        flood_scope_key: [0; 16],
+        advert_loc_policy: 0,
+        telemetry_mode_base: 0,
+        telemetry_mode_loc: 0,
+        telemetry_mode_env: 0,
+        multi_acks: 0,
         radio_freq_hz: v3.radio_freq_hz,
         radio_bw_khz: v3.radio_bw_khz,
         channels: v3.channels,
@@ -370,6 +433,13 @@ fn migrate_v4(v4: PersistentConfigV4) -> PersistentConfig {
         leds_disabled: 0,
         rx_duty_cycle: 0,
         airtime_factor_tenths: 90,
+        flood_scope_name: [0; 31],
+        flood_scope_key: [0; 16],
+        advert_loc_policy: 0,
+        telemetry_mode_base: 0,
+        telemetry_mode_loc: 0,
+        telemetry_mode_env: 0,
+        multi_acks: 0,
         radio_freq_hz: v4.radio_freq_hz,
         radio_bw_khz: v4.radio_bw_khz,
         channels: v4.channels,
@@ -399,6 +469,13 @@ fn migrate_v6(v6: PersistentConfigV6) -> PersistentConfig {
         leds_disabled: 0,
         rx_duty_cycle: 0,
         airtime_factor_tenths: 90,
+        flood_scope_name: [0; 31],
+        flood_scope_key: [0; 16],
+        advert_loc_policy: 0,
+        telemetry_mode_base: 0,
+        telemetry_mode_loc: 0,
+        telemetry_mode_env: 0,
+        multi_acks: 0,
         radio_freq_hz: v6.radio_freq_hz,
         radio_bw_khz: v6.radio_bw_khz,
         channels: v6.channels,
@@ -428,9 +505,53 @@ fn migrate_v7(v7: PersistentConfigV7) -> PersistentConfig {
         leds_disabled: v7.leds_disabled,
         rx_duty_cycle: 0,
         airtime_factor_tenths: 90,
+        flood_scope_name: [0; 31],
+        flood_scope_key: [0; 16],
+        advert_loc_policy: 0,
+        telemetry_mode_base: 0,
+        telemetry_mode_loc: 0,
+        telemetry_mode_env: 0,
+        multi_acks: 0,
         radio_freq_hz: v7.radio_freq_hz,
         radio_bw_khz: v7.radio_bw_khz,
         channels: v7.channels,
+        checksum: 0,
+    };
+    cfg.checksum = compute_checksum(&cfg);
+    cfg
+}
+
+fn migrate_v9(v9: PersistentConfigV9) -> PersistentConfig {
+    let defaults = crate::companion::protocol::DEFAULT_PREFS;
+    let mut cfg = PersistentConfig {
+        magic: v9.magic,
+        version: CONFIG_VERSION,
+        callsign: v9.callsign,
+        custom_priv_key: v9.custom_priv_key,
+        has_custom_key: v9.has_custom_key,
+        is_repeater: v9.is_repeater,
+        client_repeat: v9.client_repeat,
+        offgrid_home_freq: v9.offgrid_home_freq,
+        radio_tx_power: v9.radio_tx_power,
+        radio_sf: v9.radio_sf,
+        radio_cr: v9.radio_cr,
+        path_hash_mode: v9.path_hash_mode,
+        autoadd_config: v9.autoadd_config,
+        autoadd_max_hops: v9.autoadd_max_hops,
+        manual_add_contacts: v9.manual_add_contacts,
+        leds_disabled: v9.leds_disabled,
+        rx_duty_cycle: v9.rx_duty_cycle,
+        airtime_factor_tenths: v9.airtime_factor_tenths,
+        flood_scope_name: defaults.scope_name,
+        flood_scope_key: defaults.scope_key,
+        advert_loc_policy: defaults.advert_loc_policy,
+        telemetry_mode_base: defaults.telemetry_mode_base,
+        telemetry_mode_loc: defaults.telemetry_mode_loc,
+        telemetry_mode_env: defaults.telemetry_mode_env,
+        multi_acks: defaults.multi_acks,
+        radio_freq_hz: v9.radio_freq_hz,
+        radio_bw_khz: v9.radio_bw_khz,
+        channels: v9.channels,
         checksum: 0,
     };
     cfg.checksum = compute_checksum(&cfg);
@@ -457,6 +578,13 @@ fn migrate_v8(v8: PersistentConfigV8) -> PersistentConfig {
         leds_disabled: v8.leds_disabled,
         rx_duty_cycle: v8.rx_duty_cycle,
         airtime_factor_tenths: 90,
+        flood_scope_name: [0; 31],
+        flood_scope_key: [0; 16],
+        advert_loc_policy: 0,
+        telemetry_mode_base: 0,
+        telemetry_mode_loc: 0,
+        telemetry_mode_env: 0,
+        multi_acks: 0,
         radio_freq_hz: v8.radio_freq_hz,
         radio_bw_khz: v8.radio_bw_khz,
         channels: v8.channels,
@@ -488,6 +616,12 @@ pub fn read_config() -> Option<(PersistentConfig, bool)> {
     }
     if cfg.version == CONFIG_VERSION && compute_checksum(&cfg) == cfg.checksum {
         return Some((cfg, false));
+    }
+    if cfg.version == 9 {
+        let v9 = unsafe { (CONFIG_FLASH_ADDR as *const PersistentConfigV9).read_volatile() };
+        if compute_checksum(&v9) == v9.checksum {
+            return Some((migrate_v9(v9), true));
+        }
     }
     if cfg.version == 8 {
         let v8 = unsafe { (CONFIG_FLASH_ADDR as *const PersistentConfigV8).read_volatile() };
@@ -639,6 +773,20 @@ pub fn init_config() -> (String<32>, Option<[u8; 64]>) {
 
         crate::companion::usb::init_leds_disabled(cfg.leds_disabled != 0);
 
+        crate::companion::protocol::update_prefs(|p| {
+            p.scope_name = cfg.flood_scope_name;
+            p.scope_key = cfg.flood_scope_key;
+            p.advert_loc_policy = if cfg.advert_loc_policy <= 2 {
+                cfg.advert_loc_policy
+            } else {
+                0
+            };
+            p.telemetry_mode_base = cfg.telemetry_mode_base.min(2);
+            p.telemetry_mode_loc = cfg.telemetry_mode_loc.min(2);
+            p.telemetry_mode_env = cfg.telemetry_mode_env.min(2);
+            p.multi_acks = cfg.multi_acks;
+        });
+
         let priv_key = if cfg.has_custom_key != 0 {
             CUSTOM_PRIV_KEY.lock(|k| *k.borrow_mut() = Some(cfg.custom_priv_key));
             Some(cfg.custom_priv_key)
@@ -647,7 +795,7 @@ pub fn init_config() -> (String<32>, Option<[u8; 64]>) {
         };
 
         if migrated {
-            info!("Storage: Migrated config to v9 (up to {} contacts / {} channels)", crate::companion::usb::MAX_CONTACTS, crate::companion::usb::MAX_CHANNELS);
+            info!("Storage: Migrated config to v10 (up to {} contacts / {} channels)", crate::companion::usb::MAX_CONTACTS, crate::companion::usb::MAX_CHANNELS);
             request_save_config();
         }
 
@@ -700,6 +848,7 @@ pub fn assemble_current_config() -> PersistentConfig {
     });
 
     let auto = crate::companion::usb::AUTOADD_SETTINGS.lock(|a| *a.borrow());
+    let prefs = crate::companion::protocol::prefs();
 
     let mut cfg = PersistentConfig {
         magic: CONFIG_MAGIC,
@@ -720,6 +869,13 @@ pub fn assemble_current_config() -> PersistentConfig {
         leds_disabled: if crate::companion::usb::leds_disabled() { 1 } else { 0 },
         rx_duty_cycle: if rx_duty { 1 } else { 0 },
         airtime_factor_tenths: af,
+        flood_scope_name: prefs.scope_name,
+        flood_scope_key: prefs.scope_key,
+        advert_loc_policy: prefs.advert_loc_policy,
+        telemetry_mode_base: prefs.telemetry_mode_base,
+        telemetry_mode_loc: prefs.telemetry_mode_loc,
+        telemetry_mode_env: prefs.telemetry_mode_env,
+        multi_acks: prefs.multi_acks,
         radio_freq_hz: freq,
         radio_bw_khz: bw,
         channels,

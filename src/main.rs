@@ -840,12 +840,11 @@ async fn main(spawner: Spawner) {
                     info!("Queuing MeshCore Advert (flood: {})", flood);
                     node.tx_beacons = node.tx_beacons.saturating_add(1);
                     let time = crate::companion::usb::get_device_time();
-                    let _ = mesh.queue_advert(
-                        time,
+                    let (lat, lon) = crate::companion::protocol::advert_location(
                         node.latitude,
                         node.longitude,
-                        flood,
                     );
+                    let _ = mesh.queue_advert(time, lat, lon, flood);
                 }
                 UsbCommand::SetAdvertLatLon { lat, lon } => {
                     node.latitude = lat as f32 / 1_000_000.0;
@@ -1068,10 +1067,14 @@ async fn main(spawner: Spawner) {
                             info!("Input: flood advert");
                             node.tx_beacons = node.tx_beacons.saturating_add(1);
                             advert_feedback(&mut board.telemetry.blue_led).await;
-                            let _ = mesh.queue_advert(
-                                node.epoch_time as u32,
+                            let (lat, lon) = crate::companion::protocol::advert_location(
                                 node.latitude,
                                 node.longitude,
+                            );
+                            let _ = mesh.queue_advert(
+                                node.epoch_time as u32,
+                                lat,
+                                lon,
                                 true,
                             );
                         }
@@ -1079,10 +1082,14 @@ async fn main(spawner: Spawner) {
                             info!("Input: zero-hop advert");
                             node.tx_beacons = node.tx_beacons.saturating_add(1);
                             advert_feedback(&mut board.telemetry.blue_led).await;
-                            let _ = mesh.queue_advert(
-                                node.epoch_time as u32,
+                            let (lat, lon) = crate::companion::protocol::advert_location(
                                 node.latitude,
                                 node.longitude,
+                            );
+                            let _ = mesh.queue_advert(
+                                node.epoch_time as u32,
+                                lat,
+                                lon,
                                 false,
                             );
                         }

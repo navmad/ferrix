@@ -587,6 +587,9 @@ impl MeshEngine {
         let mut pkt = adv.to_packet(route)?;
         if flood {
             pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
+            // Self adverts always use the persisted default scope, even when
+            // the session scope override is force-unscoped.
+            crate::companion::protocol::apply_flood_scope_default(&mut pkt);
         } else {
             // Zero-hop direct: only neighbours hear it.
             pkt.path_len = 0;
@@ -601,6 +604,7 @@ impl MeshEngine {
         let grp = GrpTextPacket::new(channel_hash, self.identity.callsign(), message, timestamp, GrpTextPacket::TXT_TYPE_PLAIN, 0);
         let mut pkt = grp.to_packet(channel_secret, ROUTE_TYPE_FLOOD)?;
         pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
+        crate::companion::protocol::apply_flood_scope(&mut pkt);
         self.seen_filter.mark_seen(pkt.calculate_packet_hash());
         let _ = self.tx_queue.push(pkt.clone());
         Ok(pkt)
@@ -693,6 +697,9 @@ impl MeshEngine {
         path: &[u8; 64],
     ) -> Packet {
         pkt.header = (pkt.header & 0xFC) | (route & 0x03);
+        if route == ROUTE_TYPE_FLOOD {
+            crate::companion::protocol::apply_flood_scope(&mut pkt);
+        }
         if route == ROUTE_TYPE_DIRECT && Packet::is_valid_path_len(path_len) {
             pkt.path_len = path_len;
             let n = pkt.path_byte_len();

@@ -1416,6 +1416,30 @@ async fn handle_text_cli(
             );
             let _ = write_all(sender, s.as_bytes()).await;
         }
+        "stats-scope" => {
+            let p = crate::companion::protocol::prefs();
+            let over = crate::companion::protocol::scope_override();
+            let mut s: heapless::String<160> = heapless::String::new();
+            let _ = write!(
+                s,
+                "  -> default '{}' key {:02x}{:02x}.. scoped {}\r\n",
+                core::str::from_utf8(
+                    &p.scope_name[..p.scope_name.iter().position(|&b| b == 0).unwrap_or(31)]
+                )
+                .unwrap_or(""),
+                p.scope_key[0],
+                p.scope_key[1],
+                crate::companion::protocol::SCOPED_FLOODS
+                    .load(core::sync::atomic::Ordering::Relaxed)
+            );
+            let _ = write!(
+                s,
+                "  -> override {} force_unscoped {}\r\n",
+                if over.0 { "set" } else { "none" },
+                over.1
+            );
+            let _ = write_all(sender, s.as_bytes()).await;
+        }
         "stats-trace" => {
             let mut s: heapless::String<160> = heapless::String::new();
             let _ = write!(

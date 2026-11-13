@@ -112,16 +112,122 @@ pub fn note_advert(pub_key: &[u8; 32], timestamp: u32, had_blob: bool) {
 struct ScopeState {
     send_key: Option<[u8; 16]>,
     force_unscoped: bool,
-    default_name: [u8; 31],
-    default_key: [u8; 16],
 }
 static SCOPE: Mutex<CriticalSectionRawMutex, RefCell<ScopeState>> =
     Mutex::new(RefCell::new(ScopeState {
         send_key: None,
         force_unscoped: false,
-        default_name: [0; 31],
-        default_key: [0; 16],
     }));
+
+/// Preferences managed by `SET_OTHER_PARAMS` / default flood scope and
+/// persisted in the config page.
+#[derive(Clone, Copy)]
+pub struct CompanionPrefs {
+    pub advert_loc_policy: u8,
+    pub telemetry_mode_base: u8,
+    pub telemetry_mode_loc: u8,
+    pub telemetry_mode_env: u8,
+    pub multi_acks: u8,
+    pub scope_name: [u8; 31],
+    pub scope_key: [u8; 16],
+}
+
+pub const DEFAULT_PREFS: CompanionPrefs = CompanionPrefs {
+    advert_loc_policy: 0,
+    telemetry_mode_base: 0,
+    telemetry_mode_loc: 0,
+    telemetry_mode_env: 0,
+    multi_acks: 0,
+    scope_name: [0; 31],
+    scope_key: [0; 16],
+};
+
+static PREFS: Mutex<CriticalSectionRawMutex, RefCell<CompanionPrefs>> =
+    Mutex::new(RefCell::new(DEFAULT_PREFS));
+
+pub fn prefs() -> CompanionPrefs {
+    PREFS.lock(|p| *p.borrow())
+}
+
+pub fn update_prefs(update: impl FnOnce(&mut CompanionPrefs)) {
+    PREFS.lock(|p| update(&mut p.borrow_mut()));
+}
+
+fn non_zero_key(key: &[u8; 16]) -> Option<[u8; 16]> {
+    if key.iter().any(|b| *b != 0) {
+        Some(*key)
+    } else {
+        None
+    }
+}
+
+/// Scope for ordinary outgoing floods: explicit override, else the default.
+/// `force_unscoped` disables both.
+pub fn flood_scope_send() -> Option<[u8; 16]> {
+    SCOPE.lock(|s| {
+        let scope = s.borrow();
+        if scope.force_unscoped {
+            None
+        } else if let Some(key) = scope.send_key {
+            non_zero_key(&key)
+        } else {
+            non_zero_key(&prefs().scope_key)
+        }
+    })
+}
+
+/// `(override set, force_unscoped)` for diagnostics.
+pub fn scope_override() -> (bool, bool) {
+    SCOPE.lock(|s| {
+        let scope = s.borrow();
+        (scope.send_key.is_some() || scope.force_unscoped, scope.force_unscoped)
+    })
+}
+
+/// Scope used for self adverts: always the persisted default.
+pub fn flood_scope_default() -> Option<[u8; 16]> {
+    non_zero_key(&prefs().scope_key)
+}
+
+pub static SCOPED_FLOODS: AtomicU32 = AtomicU32::new(0);
+
+fn scope_packet(pkt: &mut Packet, key: [u8; 16]) {
+    let code = crate::meshcore::crypto::transport_code(
+        &key,
+        pkt.payload_type(),
+        &pkt.payload[..pkt.payload_len],
+    );
+    pkt.header = (pkt.header & !0x03) | crate::meshcore::packet::ROUTE_TYPE_TRANSPORT_FLOOD;
+    pkt.transport_codes = [code, 0];
+    SCOPED_FLOODS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Attach the current send scope (override or default) to a flood packet.
+pub fn apply_flood_scope(pkt: &mut Packet) {
+    if pkt.route_type() == ROUTE_TYPE_FLOOD {
+        if let Some(key) = flood_scope_send() {
+            scope_packet(pkt, key);
+        }
+    }
+}
+
+/// Attach the persisted default scope (used for self adverts).
+pub fn apply_flood_scope_default(pkt: &mut Packet) {
+    if pkt.route_type() == ROUTE_TYPE_FLOOD {
+        if let Some(key) = flood_scope_default() {
+            scope_packet(pkt, key);
+        }
+    }
+}
+
+/// Advert position after applying the location policy.
+pub fn advert_location(lat: f32, lon: f32) -> (f32, f32) {
+    if prefs().advert_loc_policy == 0 {
+        (0.0, 0.0)
+    } else {
+        (lat, lon)
+    }
+}
 
 pub const CMD_APP_START: u8 = 1;
 pub const CMD_SEND_MSG: u8 = 2;
@@ -315,6 +421,7 @@ impl CompanionNode {
                 crate::companion::usb::current_private_key(),
             )
         };
+        let prefs = prefs();
         let battery_mv = crate::telemetry::battery_millivolts();
         let (battery_millivolts, battery_percentage) =
             if battery_mv >= crate::telemetry::MIN_PLAUSIBLE_BATTERY_MV {
@@ -347,11 +454,11 @@ impl CompanionNode {
             rx_delay_ms: 0,
             airtime_factor_milli: 9000,
             manual_add_contacts: auto.manual_add_contacts,
-            telemetry_mode_base: 0,
-            telemetry_mode_loc: 0,
-            telemetry_mode_env: 0,
-            advert_loc_policy: 0,
-            multi_acks: 0,
+            telemetry_mode_base: prefs.telemetry_mode_base,
+            telemetry_mode_loc: prefs.telemetry_mode_loc,
+            telemetry_mode_env: prefs.telemetry_mode_env,
+            advert_loc_policy: prefs.advert_loc_policy,
+            multi_acks: prefs.multi_acks,
             channels_synced: 0,
         }
     }
@@ -1424,8 +1531,10 @@ impl CompanionNode {
                     match id {
                         Some(id) => {
                             let ts = crate::companion::usb::get_device_time();
-                            let lat = (self.latitude * 1_000_000.0) as i32;
-                            let lon = (self.longitude * 1_000_000.0) as i32;
+                            let (adv_lat, adv_lon) =
+                                advert_location(self.latitude, self.longitude);
+                            let lat = (adv_lat * 1_000_000.0) as i32;
+                            let lon = (adv_lon * 1_000_000.0) as i32;
                             let mut adv = AdvertPacket::new(
                                 *id.pub_key(),
                                 ts,
@@ -1589,6 +1698,14 @@ impl CompanionNode {
                         if payload.len() >= 5 {
                             self.multi_acks = payload[4];
                         }
+                        update_prefs(|p| {
+                            p.telemetry_mode_base = self.telemetry_mode_base;
+                            p.telemetry_mode_loc = self.telemetry_mode_loc;
+                            p.telemetry_mode_env = self.telemetry_mode_env;
+                            p.advert_loc_policy = self.advert_loc_policy;
+                            p.multi_acks = self.multi_acks;
+                        });
+                        crate::storage::request_save_config();
                     }
                     ok = true;
                 }
@@ -1672,20 +1789,20 @@ impl CompanionNode {
                     let name = &payload[1..32];
                     let n = name.iter().position(|&b| b == 0).unwrap_or(31);
                     if n > 0 && n < 31 {
-                        SCOPE.lock(|s| {
-                            let mut scope = s.borrow_mut();
-                            scope.default_name = [0u8; 31];
-                            scope.default_name[..n].copy_from_slice(&name[..n]);
-                            scope.default_key.copy_from_slice(&payload[32..48]);
+                        update_prefs(|p| {
+                            p.scope_name = [0u8; 31];
+                            p.scope_name[..n].copy_from_slice(&name[..n]);
+                            p.scope_key.copy_from_slice(&payload[32..48]);
                         });
+                        crate::storage::request_save_config();
                         ok = true;
                     }
                 } else if payload.len() == 1 {
-                    SCOPE.lock(|s| {
-                        let mut scope = s.borrow_mut();
-                        scope.default_name = [0u8; 31];
-                        scope.default_key = [0u8; 16];
+                    update_prefs(|p| {
+                        p.scope_name = [0u8; 31];
+                        p.scope_key = [0u8; 16];
                     });
+                    crate::storage::request_save_config();
                     ok = true;
                 }
                 let mut resp = Vec::<u8, 4>::new();
@@ -1694,10 +1811,8 @@ impl CompanionNode {
             }
 
             CMD_GET_DEFAULT_FLOOD_SCOPE => {
-                let (name, key) = SCOPE.lock(|s| {
-                    let scope = s.borrow();
-                    (scope.default_name, scope.default_key)
-                });
+                let p = prefs();
+                let (name, key) = (p.scope_name, p.scope_key);
                 if name[0] != 0 {
                     let mut resp = Vec::<u8, 48>::new();
                     let _ = resp.push(RESP_CODE_DEFAULT_FLOOD_SCOPE);
@@ -1816,6 +1931,8 @@ impl CompanionNode {
                                             pkt.path_len = out_path_len;
                                             let n = pkt.path_byte_len();
                                             pkt.path[..n].copy_from_slice(&out_path[..n]);
+                                        } else {
+                                            apply_flood_scope(&mut pkt);
                                         }
                                         let mut buf = [0u8; 255];
                                         if let Ok(n) = pkt.write_to(&mut buf) {
