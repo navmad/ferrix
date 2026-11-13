@@ -441,9 +441,20 @@ async fn main(spawner: Spawner) {
             let _ = crate::companion::ble::COMPANION_PUSH_CHANNEL.try_send(log_rx_push);
 
             // Synchronize real radio telemetry to shared USB CLI status
+            let rx_air = crate::companion::usb::RADIO_SETTINGS.lock(|r| {
+                let s = r.borrow();
+                crate::radio::estimate_airtime_ms(
+                    len,
+                    s.sf,
+                    s.bw_khz,
+                    s.cr,
+                    if s.sf <= 8 { 32 } else { 16 },
+                )
+            });
             crate::companion::usb::RADIO_TELEMETRY.lock(|t| {
                 let mut tel = t.borrow_mut();
                 tel.rx_packets = tel.rx_packets.saturating_add(1);
+                tel.rx_air_ms = tel.rx_air_ms.saturating_add(rx_air);
                 tel.last_rssi = rssi;
                 tel.last_snr = snr;
                 tel.has_rx = true;
@@ -1141,6 +1152,7 @@ async fn main(spawner: Spawner) {
                 crate::companion::usb::RADIO_TELEMETRY.lock(|t| {
                     let mut tel = t.borrow_mut();
                     tel.tx_beacons = tel.tx_beacons.saturating_add(1);
+                    tel.tx_air_ms = tel.tx_air_ms.saturating_add(airtime);
                 });
             }
             if duty_pct < 100 && airtime > 0 {

@@ -717,16 +717,24 @@ impl CompanionNode {
                         emit(&resp);
                         handled = true;
                     } else if kind == 1 {
-                        let (rssi, snr) = crate::companion::usb::RADIO_TELEMETRY
-                            .lock(|t| (t.borrow().last_rssi, t.borrow().last_snr));
+                        let (rssi, snr, tx_air_s, rx_air_s) =
+                            crate::companion::usb::RADIO_TELEMETRY.lock(|t| {
+                                let tel = t.borrow();
+                                (
+                                    tel.last_rssi,
+                                    tel.last_snr,
+                                    tel.tx_air_ms / 1000,
+                                    tel.rx_air_ms / 1000,
+                                )
+                            });
                         let mut resp = Vec::<u8, 14>::new();
                         let _ = resp.push(RESP_CODE_STATS);
                         let _ = resp.push(1);
-                        let _ = resp.extend_from_slice(&0i16.to_le_bytes());
+                        let _ = resp.extend_from_slice(&(-118i16).to_le_bytes());
                         let _ = resp.push(rssi as i8 as u8);
                         let _ = resp.push((snr * 4) as u8);
-                        let _ = resp.extend_from_slice(&0u32.to_le_bytes());
-                        let _ = resp.extend_from_slice(&0u32.to_le_bytes());
+                        let _ = resp.extend_from_slice(&tx_air_s.to_le_bytes());
+                        let _ = resp.extend_from_slice(&rx_air_s.to_le_bytes());
                         emit(&resp);
                         handled = true;
                     }

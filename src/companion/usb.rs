@@ -430,6 +430,10 @@ pub struct RadioTelemetry {
     pub last_rssi: i16,
     pub last_snr: i8,
     pub has_rx: bool,
+    /// Estimated cumulative transmit airtime in milliseconds.
+    pub tx_air_ms: u32,
+    /// Estimated cumulative receive airtime in milliseconds.
+    pub rx_air_ms: u32,
 }
 
 pub static RADIO_TELEMETRY: Mutex<SharedRawMutex, RefCell<RadioTelemetry>> = Mutex::new(RefCell::new(RadioTelemetry {
@@ -438,6 +442,8 @@ pub static RADIO_TELEMETRY: Mutex<SharedRawMutex, RefCell<RadioTelemetry>> = Mut
     last_rssi: 0,
     last_snr: 0,
     has_rx: false,
+    tx_air_ms: 0,
+    rx_air_ms: 0,
 }));
 
 #[derive(Clone, Debug)]
@@ -1395,15 +1401,18 @@ async fn handle_text_cli(
             let _ = write_all(sender, b"  -> OK (Messages cleared)\r\n").await;
         }
         "stats-radio" => {
-            let (tx, rx, rssi, snr, _has_rx) = RADIO_TELEMETRY.lock(|t| {
+            let (tx_ms, rx_ms, rssi, snr) = RADIO_TELEMETRY.lock(|t| {
                 let tel = t.borrow();
-                (tel.tx_beacons, tel.rx_packets, tel.last_rssi, tel.last_snr, tel.has_rx)
+                (tel.tx_air_ms, tel.rx_air_ms, tel.last_rssi, tel.last_snr)
             });
             let mut s: heapless::String<128> = heapless::String::new();
             let _ = write!(
                 s,
                 "  -> {{\"noise_floor\":-118,\"last_rssi\":{},\"last_snr\":{:.2},\"tx_air_secs\":{},\"rx_air_secs\":{}}}\r\n",
-                rssi, snr as f32, tx, rx
+                rssi,
+                snr as f32,
+                tx_ms / 1000,
+                rx_ms / 1000
             );
             let _ = write_all(sender, s.as_bytes()).await;
         }
@@ -1459,6 +1468,8 @@ async fn handle_text_cli(
                 let mut tel = t.borrow_mut();
                 tel.tx_beacons = 0;
                 tel.rx_packets = 0;
+                tel.tx_air_ms = 0;
+                tel.rx_air_ms = 0;
                 tel.has_rx = false;
             });
             let _ = write_all(sender, b"  -> OK\r\n").await;
