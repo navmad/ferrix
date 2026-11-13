@@ -1219,7 +1219,11 @@ async fn handle_text_cli(
             let _ = write_all(sender, s.as_bytes()).await;
         }
         s if s.starts_with("set dutycycle ") || s.starts_with("set duty ") => {
-            let arg = s.split_once(' ').map(|(_, v)| v).unwrap_or("").trim();
+            let arg = s
+                .strip_prefix("set dutycycle ")
+                .or_else(|| s.strip_prefix("set duty "))
+                .unwrap_or("")
+                .trim();
             if let Some(dc_x10) = parse_decimal_tenths(arg) {
                 let dc_x10 = dc_x10.clamp(100, 1000);
                 let af = if dc_x10 <= 100 {
