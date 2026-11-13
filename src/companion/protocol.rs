@@ -238,7 +238,7 @@ impl CompanionNode {
             autoadd_config: auto.config,
             autoadd_max_hops: auto.max_hops,
             rx_delay_ms: 0,
-            airtime_factor_milli: 1000,
+            airtime_factor_milli: 9000,
             manual_add_contacts: auto.manual_add_contacts,
             telemetry_mode_base: 0,
             telemetry_mode_loc: 0,
