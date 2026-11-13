@@ -383,6 +383,7 @@ async fn main(spawner: Spawner) {
 
             // Deserialize and dispatch through MeshCore Network Engine
             if let Ok(pkt) = Packet::read_from(&rx_buf[..len]) {
+                let advert_hops = pkt.path_hash_count() as u8;
                 match mesh.handle_inbound_packet(pkt) {
                     InboundAction::ReceivedAdvert(adv) => {
                         info!("MeshCore Advert from: {}", adv.name.as_str());
@@ -390,7 +391,8 @@ async fn main(spawner: Spawner) {
 
                         // Check if this contact already exists in our list
                         let contact_type = CompanionNode::get_contact_type_from_flags(adv.flags);
-                        let should_add = node.should_auto_add_contact_type(contact_type);
+                        let should_add = node.should_auto_add_contact_type(contact_type)
+                            && node.autoadd_allows_hops(advert_hops);
 
                         crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| {
                             let mut list = c.borrow_mut();

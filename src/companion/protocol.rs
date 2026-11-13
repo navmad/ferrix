@@ -189,6 +189,7 @@ impl CompanionNode {
     ) -> Self {
         let mut cs = String::new();
         let _ = cs.push_str(callsign);
+        let auto = crate::companion::usb::AUTOADD_SETTINGS.lock(|a| *a.borrow());
 
         Self {
             callsign: cs,
@@ -209,11 +210,11 @@ impl CompanionNode {
             last_snr: 0,
             current_page: 0,
             path_hash_mode: crate::storage::get_path_hash_mode(),
-            autoadd_config: 0x1E,   // default: auto-add all types with overwrite oldest
-            autoadd_max_hops: 0,    // 0 = no hop limit
+            autoadd_config: auto.config,
+            autoadd_max_hops: auto.max_hops,
             rx_delay_ms: 0,
             airtime_factor_milli: 1000,
-            manual_add_contacts: 1,
+            manual_add_contacts: auto.manual_add_contacts,
             telemetry_mode_base: 0,
             telemetry_mode_loc: 0,
             telemetry_mode_env: 0,
@@ -237,21 +238,34 @@ impl CompanionNode {
     /// Check if a contact type should be auto-added based on current config
     /// Returns true if the contact type is enabled for auto-add
     pub fn should_auto_add_contact_type(&self, contact_type: u8) -> bool {
-        // If manual_add_contacts is disabled (bit 0 == 0), auto-add all
-        // When manual_add_contacts is enabled, check the type-specific bits
+        // The shared policy is authoritative: the app may have changed it on
+        // the BLE transport while this instance serves USB (or vice versa).
+        let auto = crate::companion::usb::AUTOADD_SETTINGS.lock(|a| *a.borrow());
+        // Bit 0 of manual_add_contacts: 0 = add every advert, 1 = only the
+        // contact types enabled in the autoadd_config bitmask.
+        if (auto.manual_add_contacts & 1) == 0 {
+            return true;
+        }
         let type_bit = match contact_type {
             ADV_TYPE_CHAT => AUTO_ADD_CHAT,
             ADV_TYPE_REPEATER => AUTO_ADD_REPEATER,
             ADV_TYPE_ROOM => AUTO_ADD_ROOM_SERVER,
             ADV_TYPE_SENSOR => AUTO_ADD_SENSOR,
-            _ => 0,
+            _ => return false,
         };
-        (self.autoadd_config & type_bit) != 0
+        (auto.config & type_bit) != 0
+    }
+
+    /// Check whether an advert's hop count is within the auto-add limit.
+    pub fn autoadd_allows_hops(&self, hops: u8) -> bool {
+        let max_hops = crate::companion::usb::AUTOADD_SETTINGS.lock(|a| a.borrow().max_hops);
+        max_hops == 0 || hops < max_hops
     }
 
     /// Check if oldest non-favorite contacts should be overwritten when the list is full
     pub fn should_overwrite_when_full(&self) -> bool {
-        (self.autoadd_config & AUTO_ADD_OVERWRITE_OLDEST) != 0
+        let config = crate::companion::usb::AUTOADD_SETTINGS.lock(|a| a.borrow().config);
+        (config & AUTO_ADD_OVERWRITE_OLDEST) != 0
     }
 
     /// Process an inbound frame payload from the companion app
@@ -558,9 +572,18 @@ impl CompanionNode {
             CMD_SET_AUTOADD_CONFIG => {
                 let mut ok = false;
                 if payload.len() >= 2 {
-                    self.autoadd_config = payload[1];
-                    if payload.len() >= 3 {
-                        self.autoadd_max_hops = payload[2].min(64);
+                    let config = payload[1];
+                    let max_hops = payload.get(2).map_or(self.autoadd_max_hops, |&b| b.min(64));
+                    let changed = config != self.autoadd_config || max_hops != self.autoadd_max_hops;
+                    self.autoadd_config = config;
+                    self.autoadd_max_hops = max_hops;
+                    crate::companion::usb::AUTOADD_SETTINGS.lock(|a| {
+                        let mut st = a.borrow_mut();
+                        st.config = config;
+                        st.max_hops = max_hops;
+                    });
+                    if changed {
+                        crate::storage::request_save_config();
                     }
                     let _ = crate::companion::usb::USB_COMMAND_CHANNEL.try_send(
                         crate::companion::usb::UsbCommand::SetAutoAddConfig {
@@ -1169,7 +1192,15 @@ impl CompanionNode {
             CMD_SET_OTHER_PARAMS => {
                 let mut ok = false;
                 if payload.len() >= 2 {
-                    self.manual_add_contacts = payload[1];
+                    let manual = payload[1];
+                    let auto_changed = manual != self.manual_add_contacts;
+                    self.manual_add_contacts = manual;
+                    crate::companion::usb::AUTOADD_SETTINGS.lock(|a| {
+                        a.borrow_mut().manual_add_contacts = manual;
+                    });
+                    if auto_changed {
+                        crate::storage::request_save_config();
+                    }
                     if payload.len() >= 3 {
                         self.telemetry_mode_base = payload[2] & 0x03;
                         self.telemetry_mode_loc = (payload[2] >> 2) & 0x03;

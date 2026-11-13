@@ -65,6 +65,23 @@ pub static RADIO_SETTINGS: Mutex<SharedRawMutex, RefCell<RadioSettings>> = Mutex
     path_hash_mode: 0,
 }));
 
+/// Contact auto-add policy, shared by every companion transport and the main
+/// loop. `manual_add_contacts` bit 0 selects the policy: 0 = add every advert,
+/// 1 = add only the types enabled in `config`.
+#[derive(Clone, Copy, Debug)]
+pub struct AutoAddSettings {
+    pub manual_add_contacts: u8,
+    pub config: u8,
+    pub max_hops: u8,
+}
+
+pub static AUTOADD_SETTINGS: Mutex<SharedRawMutex, RefCell<AutoAddSettings>> =
+    Mutex::new(RefCell::new(AutoAddSettings {
+        manual_add_contacts: 1,
+        config: 0x1E,
+        max_hops: 0,
+    }));
+
 /// Companion defaults on nRF52840: 350 contacts, 40 channels.
 pub const MAX_CONTACTS: usize = 350;
 /// Companion default group-channel count.
@@ -1066,6 +1083,83 @@ async fn handle_text_cli(
                 }
             }
         }
+        "get autoadd" | "get auto-add" => {
+            let a = AUTOADD_SETTINGS.lock(|x| *x.borrow());
+            let enabled = (a.manual_add_contacts & 1) == 0 || a.config != 0;
+            let mode = if (a.manual_add_contacts & 1) == 0 { "all" } else { "types" };
+            let mut s: heapless::String<96> = heapless::String::new();
+            let _ = write!(
+                s,
+                "  -> auto-add: {} (mode={}, config=0x{:02X}, max_hops={})\r\n",
+                if enabled { "on" } else { "off" },
+                mode,
+                a.config,
+                a.max_hops
+            );
+            let _ = write_all(sender, s.as_bytes()).await;
+        }
+        s if s == "set autoadd" || s.starts_with("set autoadd ") => {
+            let arg = s["set autoadd".len()..].trim();
+            let (manual, config, max_hops, label) = if arg.eq_ignore_ascii_case("on") {
+                (0u8, 0x1Eu8, AUTOADD_SETTINGS.lock(|a| a.borrow().max_hops), 1u8)
+            } else if arg.eq_ignore_ascii_case("off") {
+                (1u8, 0x00u8, AUTOADD_SETTINGS.lock(|a| a.borrow().max_hops), 2u8)
+            } else {
+                let mut parts = arg
+                    .split(|c: char| c == ',' || c.is_whitespace())
+                    .filter(|p| !p.is_empty());
+                match (parts.next(), parts.next(), parts.next()) {
+                    (Some(cfg), Some(hops), None) => {
+                        let cfg_val = cfg
+                            .trim_start_matches("0x")
+                            .trim_start_matches("0X");
+                        let config = u8::from_str_radix(cfg_val, 16)
+                            .ok()
+                            .filter(|v| *v <= 0x1F);
+                        let hops = hops.parse::<u8>().ok().filter(|v| *v <= 64);
+                        match (config, hops) {
+                            (Some(config), Some(max_hops)) => (1, config, max_hops, 3),
+                            _ => (0, 0, 0, 0),
+                        }
+                    }
+                    _ => (0, 0, 0, 0),
+                }
+            };
+
+            if label != 0 {
+                AUTOADD_SETTINGS.lock(|a| {
+                    *a.borrow_mut() = AutoAddSettings {
+                        manual_add_contacts: manual,
+                        config,
+                        max_hops,
+                    };
+                });
+                node.manual_add_contacts = manual;
+                node.autoadd_config = config;
+                node.autoadd_max_hops = max_hops;
+                crate::storage::request_save_config();
+
+                let mut s: heapless::String<96> = heapless::String::new();
+                if label == 1 {
+                    let _ = write!(s, "  -> OK (auto-add on)\r\n");
+                } else if label == 2 {
+                    let _ = write!(s, "  -> OK (auto-add off)\r\n");
+                } else {
+                    let _ = write!(
+                        s,
+                        "  -> OK (config=0x{:02X}, max_hops={})\r\n",
+                        config, max_hops
+                    );
+                }
+                let _ = write_all(sender, s.as_bytes()).await;
+            } else {
+                let _ = write_all(
+                    sender,
+                    b"Error: use set autoadd on|off or set autoadd <config>,<max_hops>\r\n",
+                )
+                .await;
+            }
+        }
         "clear contacts" => {
             DISCOVERED_CONTACTS.lock(|c| {
                 c.borrow_mut().clear();
@@ -1227,7 +1321,7 @@ async fn handle_text_cli(
             let _ = write_all(sender, b"  -> OK (Config save queued to flash)\r\n").await;
         }
         "help" => {
-            let _ = write_all(sender, b"  -> Commands:\r\n  ->   Identity: get/set name, get/set prv.key, get public.key\r\n  ->   Radio:    get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq/tx/sf/bw/cr, get/set repeat, get/set hash-mode, stats-radio\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, advert, time, channels\r\n  ->   System:   save, ver, board, stats-core, stats-packets, clear stats/contacts/messages, reboot\r\n").await;
+            let _ = write_all(sender, b"  -> Commands:\r\n  ->   Identity: get/set name, get/set prv.key, get public.key\r\n  ->   Radio:    get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq/tx/sf/bw/cr, get/set repeat, get/set hash-mode, stats-radio\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, get/set autoadd, advert, time, channels\r\n  ->   System:   save, ver, board, stats-core, stats-packets, clear stats/contacts/messages, reboot\r\n").await;
         }
         _ => {
             let _ = write_all(sender, b"  -> Unknown command\r\n").await;

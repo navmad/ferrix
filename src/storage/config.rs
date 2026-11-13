@@ -22,7 +22,7 @@ use crate::companion::usb::ChannelData;
 /// (Top page of application flash, immediately preceding bootloader at 0x000ED000)
 pub const CONFIG_FLASH_ADDR: u32 = 0x000EC000;
 pub const CONFIG_MAGIC: u32 = 0x4D434647; // 'MCFG' (MeshCore Config)
-pub const CONFIG_VERSION: u32 = 4;
+pub const CONFIG_VERSION: u32 = 5;
 
 #[repr(C, align(4))]
 #[derive(Clone, Copy)]
@@ -44,10 +44,35 @@ pub struct PersistentConfig {
     pub path_hash_mode: u8,
     pub autoadd_config: u8,     // bitmask: overwrite_oldest, chat, repeater, room_server, sensor
     pub autoadd_max_hops: u8,   // 0 = no limit, N = up to N-1 hops
+    pub manual_add_contacts: u8, // bit 0: 0 = auto-add all, 1 = use autoadd_config
     pub radio_freq_hz: u32,
     pub radio_bw_khz: u32,
     pub channels: [ChannelData; crate::companion::usb::MAX_CHANNELS],
     pub checksum: u32,
+}
+
+/// v4 layout: no `manual_add_contacts`. Read only for migration.
+#[repr(C, align(4))]
+#[derive(Clone, Copy)]
+struct PersistentConfigV4 {
+    magic: u32,
+    version: u32,
+    callsign: [u8; 32],
+    custom_priv_key: [u8; 64],
+    has_custom_key: u8,
+    is_repeater: u8,
+    client_repeat: u8,
+    offgrid_home_freq: u32,
+    radio_tx_power: i8,
+    radio_sf: u8,
+    radio_cr: u8,
+    path_hash_mode: u8,
+    autoadd_config: u8,
+    autoadd_max_hops: u8,
+    radio_freq_hz: u32,
+    radio_bw_khz: u32,
+    channels: [ChannelData; crate::companion::usb::MAX_CHANNELS],
+    checksum: u32,
 }
 
 /// v2 layout: 8 channels. Read only for migration.
@@ -173,6 +198,7 @@ fn migrate_v1(v1: PersistentConfigV1) -> PersistentConfig {
         path_hash_mode: v1.path_hash_mode,
         autoadd_config: v1.autoadd_config,
         autoadd_max_hops: v1.autoadd_max_hops,
+        manual_add_contacts: 1,
         radio_freq_hz: v1.radio_freq_hz,
         radio_bw_khz: v1.radio_bw_khz,
         channels: expand_channels(v1.channels),
@@ -198,6 +224,7 @@ fn migrate_v2(v2: PersistentConfigV2) -> PersistentConfig {
         path_hash_mode: v2.path_hash_mode,
         autoadd_config: v2.autoadd_config,
         autoadd_max_hops: v2.autoadd_max_hops,
+        manual_add_contacts: 1,
         radio_freq_hz: v2.radio_freq_hz,
         radio_bw_khz: v2.radio_bw_khz,
         channels: expand_channels(v2.channels),
@@ -223,9 +250,36 @@ fn migrate_v3(v3: PersistentConfigV3) -> PersistentConfig {
         path_hash_mode: v3.path_hash_mode,
         autoadd_config: v3.autoadd_config,
         autoadd_max_hops: v3.autoadd_max_hops,
+        manual_add_contacts: 1,
         radio_freq_hz: v3.radio_freq_hz,
         radio_bw_khz: v3.radio_bw_khz,
         channels: v3.channels,
+        checksum: 0,
+    };
+    cfg.checksum = compute_checksum(&cfg);
+    cfg
+}
+
+fn migrate_v4(v4: PersistentConfigV4) -> PersistentConfig {
+    let mut cfg = PersistentConfig {
+        magic: CONFIG_MAGIC,
+        version: CONFIG_VERSION,
+        callsign: v4.callsign,
+        custom_priv_key: v4.custom_priv_key,
+        has_custom_key: v4.has_custom_key,
+        is_repeater: v4.is_repeater,
+        client_repeat: v4.client_repeat,
+        offgrid_home_freq: v4.offgrid_home_freq,
+        radio_tx_power: v4.radio_tx_power,
+        radio_sf: v4.radio_sf,
+        radio_cr: v4.radio_cr,
+        path_hash_mode: v4.path_hash_mode,
+        autoadd_config: v4.autoadd_config,
+        autoadd_max_hops: v4.autoadd_max_hops,
+        manual_add_contacts: 1,
+        radio_freq_hz: v4.radio_freq_hz,
+        radio_bw_khz: v4.radio_bw_khz,
+        channels: v4.channels,
         checksum: 0,
     };
     cfg.checksum = compute_checksum(&cfg);
@@ -241,6 +295,12 @@ pub fn read_config() -> Option<(PersistentConfig, bool)> {
     }
     if cfg.version == CONFIG_VERSION && compute_checksum(&cfg) == cfg.checksum {
         return Some((cfg, false));
+    }
+    if cfg.version == 4 {
+        let v4 = unsafe { (CONFIG_FLASH_ADDR as *const PersistentConfigV4).read_volatile() };
+        if compute_checksum(&v4) == v4.checksum {
+            return Some((migrate_v4(v4), true));
+        }
     }
     if cfg.version == 3 {
         let v3 = unsafe { (CONFIG_FLASH_ADDR as *const PersistentConfigV3).read_volatile() };
@@ -349,6 +409,15 @@ pub fn init_config() -> (String<32>, Option<[u8; 64]>) {
             s.path_hash_mode = if cfg.path_hash_mode <= 2 { cfg.path_hash_mode } else { 0 };
         });
 
+        // Load the contact auto-add policy.
+        crate::companion::usb::AUTOADD_SETTINGS.lock(|a| {
+            *a.borrow_mut() = crate::companion::usb::AutoAddSettings {
+                manual_add_contacts: if cfg.manual_add_contacts != 0 { 1 } else { 0 },
+                config: cfg.autoadd_config,
+                max_hops: cfg.autoadd_max_hops.min(64),
+            };
+        });
+
         let priv_key = if cfg.has_custom_key != 0 {
             CUSTOM_PRIV_KEY.lock(|k| *k.borrow_mut() = Some(cfg.custom_priv_key));
             Some(cfg.custom_priv_key)
@@ -357,7 +426,7 @@ pub fn init_config() -> (String<32>, Option<[u8; 64]>) {
         };
 
         if migrated {
-            info!("Storage: Migrated config to v3 (up to {} contacts / {} channels)", crate::companion::usb::MAX_CONTACTS, crate::companion::usb::MAX_CHANNELS);
+            info!("Storage: Migrated config to v5 (up to {} contacts / {} channels)", crate::companion::usb::MAX_CONTACTS, crate::companion::usb::MAX_CHANNELS);
             request_save_config();
         }
 
@@ -407,6 +476,8 @@ pub fn assemble_current_config() -> PersistentConfig {
         }
     });
 
+    let auto = crate::companion::usb::AUTOADD_SETTINGS.lock(|a| *a.borrow());
+
     let mut cfg = PersistentConfig {
         magic: CONFIG_MAGIC,
         version: CONFIG_VERSION,
@@ -420,8 +491,9 @@ pub fn assemble_current_config() -> PersistentConfig {
         radio_sf: sf,
         radio_cr: cr,
         path_hash_mode: path_mode,
-        autoadd_config: 0x1E,   // default: auto-add all types with overwrite oldest (MeshCore default)
-        autoadd_max_hops: 0,    // 0 = no hop limit
+        autoadd_config: auto.config,
+        autoadd_max_hops: auto.max_hops,
+        manual_add_contacts: auto.manual_add_contacts,
         radio_freq_hz: freq,
         radio_bw_khz: bw,
         channels,
