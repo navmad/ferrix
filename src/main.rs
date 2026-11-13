@@ -247,7 +247,7 @@ async fn main(spawner: Spawner) {
     crate::companion::ble::init_ble_companion(spawner, pub_key, priv_key);
 
     info!("====================================================");
-    info!(" MeshCore Companion Firmware (ferrix) ");
+    info!(" Ferrix Companion Firmware (ferrix) ");
     info!(" Active Board: {} ", CurrentBoard::NAME);
     info!(" Runtime: Embassy async no_std (nRF52840 Cortex-M4) ");
     info!("====================================================");

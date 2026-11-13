@@ -294,12 +294,12 @@ impl CompanionNode {
                 let _ = resp.extend_from_slice(&bdate);
 
                 let mut mmodel = [0u8; 40];
-                let m = b"Elecrow ThinkNode M1";
+                let m = b"Ferrix Companion";
                 mmodel[..m.len()].copy_from_slice(m);
                 let _ = resp.extend_from_slice(&mmodel);
 
                 let mut sver = [0u8; 20];
-                let s = b"0.1.0-embassy";
+                let s = b"0.1.0-ferrix";
                 sver[..s.len()].copy_from_slice(s);
                 let _ = resp.extend_from_slice(&sver);
 

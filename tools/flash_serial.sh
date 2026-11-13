@@ -50,7 +50,7 @@ if [ -z "${PORT}" ]; then
     # Filter for ThinkNode / MeshCore port if multiple ports detected
     MESH_PORTS=()
     for p in "${VALID_PORTS[@]}"; do
-        if [[ "${p}" =~ MESH|1101 ]]; then
+        if [[ "${p}" =~ Ferrix|MESH|1101 ]]; then
             MESH_PORTS+=("${p}")
         fi
     done
@@ -115,9 +115,9 @@ if [ -f "${NRFUTIL}" ]; then
 fi
 
 echo "==> Checking device state..."
-# If MeshCore/the reference firmware companion firmware is running, trigger 1200-baud touch to enter bootloader
-if ioreg -p IOUSB -l -w 0 2>/dev/null | grep -E -q "MeshCore|the reference firmware"; then
-    echo "==> MeshCore application active. Sending 1200-baud touch to enter bootloader..."
+# If Ferrix/MeshCore/the reference firmware companion firmware is running, trigger 1200-baud touch to enter bootloader
+if ioreg -p IOUSB -l -w 0 2>/dev/null | grep -E -q "Ferrix|MeshCore|the reference firmware"; then
+    echo "==> Ferrix/MeshCore application active. Sending 1200-baud touch to enter bootloader..."
     PYTHON_CMD=""
     if [ -x "${NRFUTIL_PYTHON}" ]; then
         PYTHON_CMD="${NRFUTIL_PYTHON}"
