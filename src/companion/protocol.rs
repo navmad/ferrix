@@ -119,11 +119,26 @@ pub const RESP_CODE_DEFAULT_FLOOD_SCOPE: u8 = 0x1C;
 pub const RESP_CODE_TIME: u8 = 20;
 pub const RESP_CODE_MSG: u8 = 21;
 
+// Keep these in sync with MeshCore's CompanionMesh.h. Several push codes
+// currently have no producer; they are defined so future handlers use the
+// right values instead of colliding with another event.
+pub const PUSH_CODE_ADVERT: u8 = 0x80;
+pub const PUSH_CODE_PATH_UPDATED: u8 = 0x81;
 pub const PUSH_CODE_SEND_CONFIRMED: u8 = 0x82;
 pub const PUSH_CODE_MSG_WAITING: u8 = 0x83;
+pub const PUSH_CODE_RAW_DATA: u8 = 0x84;
+pub const PUSH_CODE_LOGIN_SUCCESS: u8 = 0x85;
+pub const PUSH_CODE_LOGIN_FAIL: u8 = 0x86;
+pub const PUSH_CODE_STATUS_RESPONSE: u8 = 0x87;
 pub const PUSH_CODE_LOG_RX_DATA: u8 = 0x88;
-pub const PUSH_CODE_CONTACTS_FULL: u8 = 0x89;
-pub const PUSH_CODE_CONTACT_DELETED: u8 = 0x8A;
+pub const PUSH_CODE_TRACE_DATA: u8 = 0x89;
+pub const PUSH_CODE_NEW_ADVERT: u8 = 0x8A;
+pub const PUSH_CODE_TELEMETRY_RESPONSE: u8 = 0x8B;
+pub const PUSH_CODE_BINARY_RESPONSE: u8 = 0x8C;
+pub const PUSH_CODE_PATH_DISCOVERY_RESP: u8 = 0x8D;
+pub const PUSH_CODE_CONTROL_DATA: u8 = 0x8E;
+pub const PUSH_CODE_CONTACT_DELETED: u8 = 0x8F;
+pub const PUSH_CODE_CONTACTS_FULL: u8 = 0x90;
 
 /// Auto-add configuration bitmask (matches MeshCore)
 pub const AUTO_ADD_OVERWRITE_OLDEST: u8 = 1 << 0;
