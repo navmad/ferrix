@@ -12,6 +12,7 @@
 
 use core::cell::RefCell;
 use core::fmt::Write;
+use core::sync::atomic::{AtomicBool, Ordering};
 use defmt::{debug, info};
 use embassy_nrf::peripherals::USBD;
 use embassy_nrf::usb::Driver;
@@ -103,6 +104,24 @@ pub fn current_public_key() -> [u8; 32] {
 
 pub fn current_private_key() -> [u8; 64] {
     NODE_PRIVATE_KEY.lock(|k| *k.borrow())
+}
+
+/// Blue status LED disabled by the user (persisted in the config page).
+pub static LEDS_DISABLED: AtomicBool = AtomicBool::new(false);
+
+pub fn leds_disabled() -> bool {
+    LEDS_DISABLED.load(Ordering::Relaxed)
+}
+
+/// Load the persisted value without requesting another flash save.
+pub fn init_leds_disabled(disabled: bool) {
+    LEDS_DISABLED.store(disabled, Ordering::Relaxed);
+}
+
+pub fn set_leds_disabled(disabled: bool) {
+    if LEDS_DISABLED.swap(disabled, Ordering::Relaxed) != disabled {
+        crate::storage::request_save_config();
+    }
 }
 
 /// Companion defaults on nRF52840: 350 contacts, 40 channels.
@@ -1108,6 +1127,24 @@ async fn handle_text_cli(
                 }
             }
         }
+        "get leds" => {
+            let mut s: heapless::String<32> = heapless::String::new();
+            let _ = write!(s, "  -> {}\r\n", if leds_disabled() { "off" } else { "on" });
+            let _ = write_all(sender, s.as_bytes()).await;
+        }
+        "set leds on" | "set leds off" => {
+            let disabled = trimmed == "set leds off";
+            set_leds_disabled(disabled);
+            let _ = write_all(
+                sender,
+                if disabled {
+                    b"  -> OK (LEDs off)\r\n" as &[u8]
+                } else {
+                    b"  -> OK (LEDs on)\r\n" as &[u8]
+                },
+            )
+            .await;
+        }
         "get autoadd" | "get auto-add" => {
             let a = AUTOADD_SETTINGS.lock(|x| *x.borrow());
             let enabled = (a.manual_add_contacts & 1) == 0 || a.config != 0;
@@ -1385,7 +1422,7 @@ async fn handle_text_cli(
             let _ = write_all(sender, b"  -> OK (Config save queued to flash)\r\n").await;
         }
         "help" => {
-            let _ = write_all(sender, b"  -> Commands:\r\n  ->   Identity: get/set name, get/set prv.key, get public.key\r\n  ->   Radio:    get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq/tx/sf/bw/cr, get/set repeat, get/set hash-mode, stats-radio\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, get/set autoadd, advert, time, channels\r\n  ->   System:   save, ver, board, stats-core, stats-packets, clear stats/contacts/messages, reboot\r\n").await;
+            let _ = write_all(sender, b"  -> Commands:\r\n  ->   Identity: get/set name, get/set prv.key, get public.key\r\n  ->   Radio:    get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq/tx/sf/bw/cr, get/set repeat, get/set hash-mode, stats-radio\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, get/set autoadd, advert, time, channels\r\n  ->   System:   save, ver, board, get/set leds, stats-core, stats-packets, clear stats/contacts/messages, reboot\r\n").await;
         }
         _ => {
             let _ = write_all(sender, b"  -> Unknown command\r\n").await;

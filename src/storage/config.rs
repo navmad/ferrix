@@ -22,7 +22,7 @@ use crate::companion::usb::ChannelData;
 /// (Top page of application flash, immediately preceding bootloader at 0x000ED000)
 pub const CONFIG_FLASH_ADDR: u32 = 0x000EC000;
 pub const CONFIG_MAGIC: u32 = 0x4D434647; // 'MCFG' (MeshCore Config)
-pub const CONFIG_VERSION: u32 = 6;
+pub const CONFIG_VERSION: u32 = 7;
 
 #[repr(C, align(4))]
 #[derive(Clone, Copy)]
@@ -45,10 +45,36 @@ pub struct PersistentConfig {
     pub autoadd_config: u8,     // bitmask: overwrite_oldest, chat, repeater, room_server, sensor
     pub autoadd_max_hops: u8,   // 0 = no limit, N = up to N-1 hops
     pub manual_add_contacts: u8, // bit 0: 0 = auto-add all, 1 = use autoadd_config
+    pub leds_disabled: u8,      // 1 = all user LEDs off
     pub radio_freq_hz: u32,
     pub radio_bw_khz: u32,
     pub channels: [ChannelData; crate::companion::usb::MAX_CHANNELS],
     pub checksum: u32,
+}
+
+/// v6 layout: no `leds_disabled`. Read only for migration.
+#[repr(C, align(4))]
+#[derive(Clone, Copy)]
+struct PersistentConfigV6 {
+    magic: u32,
+    version: u32,
+    callsign: [u8; 32],
+    custom_priv_key: [u8; 64],
+    has_custom_key: u8,
+    is_repeater: u8,
+    client_repeat: u8,
+    offgrid_home_freq: u32,
+    radio_tx_power: i8,
+    radio_sf: u8,
+    radio_cr: u8,
+    path_hash_mode: u8,
+    autoadd_config: u8,
+    autoadd_max_hops: u8,
+    manual_add_contacts: u8,
+    radio_freq_hz: u32,
+    radio_bw_khz: u32,
+    channels: [ChannelData; crate::companion::usb::MAX_CHANNELS],
+    checksum: u32,
 }
 
 /// v4 layout: no `manual_add_contacts`. Read only for migration.
@@ -199,6 +225,7 @@ fn migrate_v1(v1: PersistentConfigV1) -> PersistentConfig {
         autoadd_config: 0,
         autoadd_max_hops: v1.autoadd_max_hops,
         manual_add_contacts: 0,
+        leds_disabled: 0,
         radio_freq_hz: v1.radio_freq_hz,
         radio_bw_khz: v1.radio_bw_khz,
         channels: expand_channels(v1.channels),
@@ -225,6 +252,7 @@ fn migrate_v2(v2: PersistentConfigV2) -> PersistentConfig {
         autoadd_config: 0,
         autoadd_max_hops: v2.autoadd_max_hops,
         manual_add_contacts: 0,
+        leds_disabled: 0,
         radio_freq_hz: v2.radio_freq_hz,
         radio_bw_khz: v2.radio_bw_khz,
         channels: expand_channels(v2.channels),
@@ -251,6 +279,7 @@ fn migrate_v3(v3: PersistentConfigV3) -> PersistentConfig {
         autoadd_config: 0,
         autoadd_max_hops: v3.autoadd_max_hops,
         manual_add_contacts: 0,
+        leds_disabled: 0,
         radio_freq_hz: v3.radio_freq_hz,
         radio_bw_khz: v3.radio_bw_khz,
         channels: v3.channels,
@@ -277,9 +306,37 @@ fn migrate_v4(v4: PersistentConfigV4) -> PersistentConfig {
         autoadd_config: 0,
         autoadd_max_hops: v4.autoadd_max_hops,
         manual_add_contacts: 0,
+        leds_disabled: 0,
         radio_freq_hz: v4.radio_freq_hz,
         radio_bw_khz: v4.radio_bw_khz,
         channels: v4.channels,
+        checksum: 0,
+    };
+    cfg.checksum = compute_checksum(&cfg);
+    cfg
+}
+
+fn migrate_v6(v6: PersistentConfigV6) -> PersistentConfig {
+    let mut cfg = PersistentConfig {
+        magic: v6.magic,
+        version: CONFIG_VERSION,
+        callsign: v6.callsign,
+        custom_priv_key: v6.custom_priv_key,
+        has_custom_key: v6.has_custom_key,
+        is_repeater: v6.is_repeater,
+        client_repeat: v6.client_repeat,
+        offgrid_home_freq: v6.offgrid_home_freq,
+        radio_tx_power: v6.radio_tx_power,
+        radio_sf: v6.radio_sf,
+        radio_cr: v6.radio_cr,
+        path_hash_mode: v6.path_hash_mode,
+        autoadd_config: v6.autoadd_config,
+        autoadd_max_hops: v6.autoadd_max_hops,
+        manual_add_contacts: v6.manual_add_contacts,
+        leds_disabled: 0,
+        radio_freq_hz: v6.radio_freq_hz,
+        radio_bw_khz: v6.radio_bw_khz,
+        channels: v6.channels,
         checksum: 0,
     };
     cfg.checksum = compute_checksum(&cfg);
@@ -290,13 +347,13 @@ fn migrate_v4(v4: PersistentConfigV4) -> PersistentConfig {
 /// companion app's manual mode (`0x1E` meant "manual" still matched every
 /// type). Resetting to MeshCore's fresh-node defaults makes the app's
 /// manual/off switch behave as expected.
-fn migrate_v5(mut v5: PersistentConfig) -> PersistentConfig {
-    v5.version = CONFIG_VERSION;
-    v5.autoadd_config = 0;
-    v5.manual_add_contacts = 0;
-    v5.checksum = 0;
-    v5.checksum = compute_checksum(&v5);
-    v5
+fn migrate_v5(v5: PersistentConfigV6) -> PersistentConfig {
+    let mut cfg = migrate_v6(v5);
+    cfg.autoadd_config = 0;
+    cfg.manual_add_contacts = 0;
+    cfg.checksum = 0;
+    cfg.checksum = compute_checksum(&cfg);
+    cfg
 }
 
 /// Synchronously read and validate persistent configuration from internal
@@ -309,8 +366,14 @@ pub fn read_config() -> Option<(PersistentConfig, bool)> {
     if cfg.version == CONFIG_VERSION && compute_checksum(&cfg) == cfg.checksum {
         return Some((cfg, false));
     }
+    if cfg.version == 6 {
+        let v6 = unsafe { (CONFIG_FLASH_ADDR as *const PersistentConfigV6).read_volatile() };
+        if compute_checksum(&v6) == v6.checksum {
+            return Some((migrate_v6(v6), true));
+        }
+    }
     if cfg.version == 5 {
-        let v5 = unsafe { (CONFIG_FLASH_ADDR as *const PersistentConfig).read_volatile() };
+        let v5 = unsafe { (CONFIG_FLASH_ADDR as *const PersistentConfigV6).read_volatile() };
         if compute_checksum(&v5) == v5.checksum {
             return Some((migrate_v5(v5), true));
         }
@@ -437,6 +500,8 @@ pub fn init_config() -> (String<32>, Option<[u8; 64]>) {
             };
         });
 
+        crate::companion::usb::init_leds_disabled(cfg.leds_disabled != 0);
+
         let priv_key = if cfg.has_custom_key != 0 {
             CUSTOM_PRIV_KEY.lock(|k| *k.borrow_mut() = Some(cfg.custom_priv_key));
             Some(cfg.custom_priv_key)
@@ -445,7 +510,7 @@ pub fn init_config() -> (String<32>, Option<[u8; 64]>) {
         };
 
         if migrated {
-            info!("Storage: Migrated config to v6 (up to {} contacts / {} channels)", crate::companion::usb::MAX_CONTACTS, crate::companion::usb::MAX_CHANNELS);
+            info!("Storage: Migrated config to v7 (up to {} contacts / {} channels)", crate::companion::usb::MAX_CONTACTS, crate::companion::usb::MAX_CHANNELS);
             request_save_config();
         }
 
@@ -513,6 +578,7 @@ pub fn assemble_current_config() -> PersistentConfig {
         autoadd_config: auto.config,
         autoadd_max_hops: auto.max_hops,
         manual_add_contacts: auto.manual_add_contacts,
+        leds_disabled: if crate::companion::usb::leds_disabled() { 1 } else { 0 },
         radio_freq_hz: freq,
         radio_bw_khz: bw,
         channels,

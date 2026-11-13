@@ -28,7 +28,7 @@ use crate::companion::protocol::CompanionNode;
 use crate::display::epd::{EpdFrameBuffer, EPD_WIDTH};
 
 /// Number of dashboard pages. Keep in sync with `main`'s page-turn modulo.
-pub const PAGE_COUNT: u8 = 6;
+pub const PAGE_COUNT: u8 = 7;
 
 const DISP_W: i32 = EPD_WIDTH as i32;
 const SMALL_W: i32 = 6;
@@ -63,7 +63,8 @@ pub fn render_page(page: u8, node: &CompanionNode, fb: &mut EpdFrameBuffer) {
         2 => render_radio(fb, small),
         3 => render_traffic(fb, small),
         4 => render_gps(node, fb, small),
-        _ => render_offgrid(fb, small),
+        5 => render_offgrid(fb, small),
+        _ => render_leds(fb, small),
     }
 }
 
@@ -269,6 +270,13 @@ fn render_gps(node: &CompanionNode, fb: &mut EpdFrameBuffer, small: SmallStyle) 
         let _ = write!(buf, "Lon: {:.5}", node.longitude);
         draw_text(fb, buf.as_str(), 2, CONTENT_Y + 64, small);
     }
+}
+
+fn render_leds(fb: &mut EpdFrameBuffer, small: SmallStyle) {
+    let disabled = crate::companion::usb::leds_disabled();
+    draw_centered(fb, "Blue LED", CONTENT_Y + 10, small);
+    draw_centered(fb, if disabled { "OFF" } else { "ON" }, CONTENT_Y + 30, small);
+    draw_centered(fb, "FK: toggle", CONTENT_Y + 50, small);
 }
 
 fn render_offgrid(fb: &mut EpdFrameBuffer, small: SmallStyle) {

@@ -182,6 +182,15 @@ unsafe fn HardFault(_frame: &cortex_m_rt::ExceptionFrame) -> ! {
     fatal_blink_forever(6)
 }
 
+/// Drive the blue status LED unless the user disabled LEDs in the UI.
+fn set_blue_led(led: &mut embassy_nrf::gpio::Output<'static>, on: bool) {
+    if on && !crate::companion::usb::leds_disabled() {
+        led.set_high();
+    } else {
+        led.set_low();
+    }
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     use embassy_nrf::interrupt::{InterruptExt, Priority};
@@ -279,9 +288,9 @@ async fn main(spawner: Spawner) {
 
     // Visual Boot Confirmation: 3 fast blue blinks indicate successful MCU & runtime start
     for _ in 0..3 {
-        board.telemetry.blue_led.set_high(); // ON (active-high)
+        set_blue_led(&mut board.telemetry.blue_led, true); // ON (active-high)
         Timer::after_millis(70).await;
-        board.telemetry.blue_led.set_low(); // OFF
+        set_blue_led(&mut board.telemetry.blue_led, false); // OFF
         Timer::after_millis(70).await;
     }
 
@@ -354,7 +363,7 @@ async fn main(spawner: Spawner) {
     };
 
     // Ensure blue LED is OFF after boot (active-high: Low = OFF)
-    board.telemetry.blue_led.set_low();
+    set_blue_led(&mut board.telemetry.blue_led, false);
 
     let mut rx_buf = [0u8; 256];
     let mut page_turns = 0u32;
@@ -363,6 +372,8 @@ async fn main(spawner: Spawner) {
     // pressing buttons.
     #[cfg(feature = "thinknode-m1")]
     let mut backlight_on = true;
+    #[cfg(feature = "thinknode-m1")]
+    let mut epd_active = true;
     #[cfg(feature = "thinknode-m1")]
     let mut backlight_deadline = embassy_time::Instant::now()
         .checked_add(embassy_time::Duration::from_secs(BACKLIGHT_IDLE_SECS))
@@ -383,7 +394,7 @@ async fn main(spawner: Spawner) {
         match wake {
         Either4::First((len, rssi, snr)) => {
             info!("Received LoRa packet: {} bytes, RSSI: {} dBm, SNR: {} dB", len, rssi, snr);
-            board.telemetry.blue_led.set_high(); // ON
+            set_blue_led(&mut board.telemetry.blue_led, true); // ON
             node.rx_packets = node.rx_packets.saturating_add(1);
             node.last_rssi = rssi;
             node.last_snr = snr;
@@ -638,7 +649,7 @@ async fn main(spawner: Spawner) {
             }
 
             Timer::after_millis(50).await;
-            board.telemetry.blue_led.set_low(); // OFF
+            set_blue_led(&mut board.telemetry.blue_led, false); // OFF
         }
         Either4::Second(cmd) => {
             match cmd {
@@ -870,6 +881,7 @@ async fn main(spawner: Spawner) {
             #[cfg(feature = "thinknode-m1")]
             {
                 backlight_on = true;
+                epd_active = true;
                 backlight_deadline = embassy_time::Instant::now()
                     .checked_add(embassy_time::Duration::from_secs(BACKLIGHT_IDLE_SECS))
                     .unwrap();
@@ -896,24 +908,41 @@ async fn main(spawner: Spawner) {
                     }
                 }
                 InputEvent::ActionPrimary => {
-                    info!("Input: Primary Action (broadcasting MeshCore Advert)...");
-                    node.tx_beacons = node.tx_beacons.saturating_add(1);
+                    if node.current_page == crate::display::ui::PAGE_COUNT - 1 {
+                        // LEDs page: toggle the blue status LED.
+                        let disabled = !crate::companion::usb::leds_disabled();
+                        crate::companion::usb::set_leds_disabled(disabled);
+                        set_blue_led(&mut board.telemetry.blue_led, !disabled);
+                        info!("Input: blue LED {}", if disabled { "disabled" } else { "enabled" });
+                        #[cfg(feature = "thinknode-m1")]
+                        if let Some(d) = &mut display {
+                            d.render_dashboard(&node).await.ok();
+                        }
+                    } else {
+                        info!("Input: Primary Action (broadcasting MeshCore Advert)...");
+                        node.tx_beacons = node.tx_beacons.saturating_add(1);
 
-                    // Quick double-flash on blue LED to give immediate visual feedback
-                    for _ in 0..2 {
-                        board.telemetry.blue_led.set_high();
-                        Timer::after_millis(40).await;
-                        board.telemetry.blue_led.set_low();
-                        Timer::after_millis(40).await;
+                        // Quick double-flash on blue LED to give immediate visual feedback
+                        for _ in 0..2 {
+                            set_blue_led(&mut board.telemetry.blue_led, true);
+                            Timer::after_millis(40).await;
+                            set_blue_led(&mut board.telemetry.blue_led, false);
+                            Timer::after_millis(40).await;
+                        }
+
+                        // Queue standard MeshCore Advertisement packet over LoRa
+                        let _ = mesh.queue_advert(
+                            node.epoch_time as u32,
+                            node.latitude,
+                            node.longitude,
+                            true,
+                        );
+
+                        #[cfg(feature = "thinknode-m1")]
+                        if let Some(d) = &mut display {
+                            d.render_dashboard(&node).await.ok();
+                        }
                     }
-
-                    // Queue standard MeshCore Advertisement packet over LoRa
-                    let _ = mesh.queue_advert(
-                        node.epoch_time as u32,
-                        node.latitude,
-                        node.longitude,
-                        true,
-                    );
                 }
                 _ => {}
             }
@@ -928,13 +957,18 @@ async fn main(spawner: Spawner) {
                     d.set_backlight(false);
                 }
                 backlight_on = false;
+                epd_active = false;
             }
 
-            // Refresh the dashboard every 30 s (15 ticks).
-            if tick % 15 == 0 {
+            // Refresh the dashboard every 60 s (30 ticks) only while the UI
+            // is awake. After the backlight timeout the panel is left alone
+            // until a button press wakes it again.
+            if tick % 30 == 0 {
                 #[cfg(feature = "thinknode-m1")]
-                if let Some(d) = &mut display {
-                    d.render_dashboard(&node).await.ok();
+                if epd_active {
+                    if let Some(d) = &mut display {
+                        d.render_dashboard(&node).await.ok();
+                    }
                 }
             }
 
@@ -950,10 +984,12 @@ async fn main(spawner: Spawner) {
                 }
             }
 
-            // Heartbeat LED flash every 2 s (each tick).
-            board.telemetry.blue_led.set_high(); // ON
-            Timer::after_millis(20).await;
-            board.telemetry.blue_led.set_low(); // OFF
+            // Heartbeat LED flash every 2 s (each tick), unless disabled.
+            if !crate::companion::usb::leds_disabled() {
+                set_blue_led(&mut board.telemetry.blue_led, true); // ON
+                Timer::after_millis(20).await;
+            }
+            set_blue_led(&mut board.telemetry.blue_led, false); // OFF
         }
         }
 
