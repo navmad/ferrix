@@ -313,6 +313,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(crate::companion::usb::usb_task(usb_dev)).unwrap();
     spawner.spawn(crate::companion::usb::cdc_acm_task(cdc_class, pub_key, priv_key)).unwrap();
     spawner.spawn(crate::companion::ble::contact_task()).unwrap();
+    spawner.spawn(crate::companion::protocol::delayed_push_task()).unwrap();
     spawner
         .spawn(crate::boards::thinknode_m1::thinknode_input_task(board.inputs))
         .unwrap();
@@ -707,7 +708,9 @@ async fn main(spawner: Spawner) {
                     }
                     InboundAction::ReceivedAck(ack) => {
                         info!("MeshCore ACK received (crc {:08x})", ack.crc);
-                        handle_direct_message_confirmed(ack.crc);
+                        if !crate::companion::protocol::handle_keepalive_ack(ack.crc) {
+                            handle_direct_message_confirmed(ack.crc);
+                        }
                     }
                     InboundAction::ReceivedResponse { plain, sender_pub } => {
                         if !crate::companion::protocol::handle_response(&plain, &sender_pub) {
@@ -798,12 +801,25 @@ async fn main(spawner: Spawner) {
                             push_path_updated(&sender_pub);
                         }
                         crate::storage::request_contacts();
-                        // A PATH return can carry an ACK as its extra.
+                        // A PATH return can carry an ACK or a RESPONSE as its
+                        // extra. Flooded logins/requests use a RESPONSE extra.
                         if path.extra_type & 0x0F == 3 && path.extra.len() >= 4 {
                             if let Ok(ack) =
                                 crate::meshcore::packets::AckPacket::decode(path.extra.as_slice())
                             {
-                                handle_direct_message_confirmed(ack.crc);
+                                if !crate::companion::protocol::handle_keepalive_ack(ack.crc) {
+                                    handle_direct_message_confirmed(ack.crc);
+                                }
+                            }
+                        } else if path.extra_type & 0x0F == 1 && !path.extra.is_empty() {
+                            if !crate::companion::protocol::handle_response(
+                                &path.extra,
+                                &sender_pub,
+                            ) {
+                                info!(
+                                    "MeshCore PATH RESPONSE extra unhandled ({} bytes)",
+                                    path.extra.len()
+                                );
                             }
                         }
                     }
@@ -1194,6 +1210,7 @@ async fn main(spawner: Spawner) {
         }
         Either4::Fourth(_) => {
             tick = tick.wrapping_add(1);
+            crate::companion::protocol::keepalive_tick();
 
             // Turn the frontlight off after 15 s of no button presses.
             #[cfg(feature = "thinknode-m1")]

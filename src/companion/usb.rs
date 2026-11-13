@@ -1416,6 +1416,45 @@ async fn handle_text_cli(
             );
             let _ = write_all(sender, s.as_bytes()).await;
         }
+        "stats-binary" => {
+            let mut s: heapless::String<160> = heapless::String::new();
+            let _ = write!(
+                s,
+                "  -> tx {} tag {:08x} type {:#04x}\r\n",
+                crate::companion::protocol::REQ_TX_COUNT.load(core::sync::atomic::Ordering::Relaxed),
+                crate::companion::protocol::REQ_TX_TAG.load(core::sync::atomic::Ordering::Relaxed),
+                crate::companion::protocol::REQ_TX_TYPE.load(core::sync::atomic::Ordering::Relaxed)
+            );
+            let _ = write!(
+                s,
+                "  -> rx {} tag {:08x} len {}\r\n",
+                crate::companion::protocol::REQ_RX_COUNT.load(core::sync::atomic::Ordering::Relaxed),
+                crate::companion::protocol::REQ_RX_TAG.load(core::sync::atomic::Ordering::Relaxed),
+                crate::companion::protocol::REQ_RX_LEN.load(core::sync::atomic::Ordering::Relaxed)
+            );
+            let _ = write_all(sender, s.as_bytes()).await;
+        }
+        "stats-login" => {
+            let mut s: heapless::String<160> = heapless::String::new();
+            let _ = write!(
+                s,
+                "  -> tx {} key {:08x} tag {:08x} flood {} pending {}\r\n",
+                crate::companion::protocol::LOGIN_TX_COUNT.load(core::sync::atomic::Ordering::Relaxed),
+                crate::companion::protocol::LOGIN_TX_KEY.load(core::sync::atomic::Ordering::Relaxed),
+                crate::companion::protocol::LOGIN_TX_TAG.load(core::sync::atomic::Ordering::Relaxed),
+                crate::companion::protocol::LOGIN_TX_FLOOD.load(core::sync::atomic::Ordering::Relaxed),
+                crate::companion::protocol::LOGIN_PENDING.load(core::sync::atomic::Ordering::Relaxed)
+            );
+            let _ = write!(
+                s,
+                "  -> rx {} tag {:08x} len {} result {}\r\n",
+                crate::companion::protocol::LOGIN_RX_COUNT.load(core::sync::atomic::Ordering::Relaxed),
+                crate::companion::protocol::LOGIN_RX_TAG.load(core::sync::atomic::Ordering::Relaxed),
+                crate::companion::protocol::LOGIN_RX_LEN.load(core::sync::atomic::Ordering::Relaxed),
+                crate::companion::protocol::LOGIN_RESULT.load(core::sync::atomic::Ordering::Relaxed)
+            );
+            let _ = write_all(sender, s.as_bytes()).await;
+        }
         "stats-scope" => {
             let p = crate::companion::protocol::prefs();
             let over = crate::companion::protocol::scope_override();
