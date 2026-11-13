@@ -498,6 +498,13 @@ async fn main(spawner: Spawner) {
                 match mesh.handle_inbound_packet(pkt) {
                     InboundAction::ReceivedAdvert(adv) => {
                         info!("MeshCore Advert from: {}", adv.name.as_str());
+                        let had_blob =
+                            crate::storage::adverts::has_blob(&adv.pub_key);
+                        crate::companion::protocol::note_advert(
+                            &adv.pub_key,
+                            adv.timestamp,
+                            had_blob,
+                        );
                         let node_id = [adv.pub_key[0], adv.pub_key[1], adv.pub_key[2], adv.pub_key[3]];
 
                         // Check if this contact already exists in our list
@@ -509,6 +516,11 @@ async fn main(spawner: Spawner) {
                         crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| {
                             let mut list = c.borrow_mut();
                             if let Some(existing) = list.iter_mut().find(|ct| ct.pub_key == adv.pub_key) {
+                                // Backfill a missing blob even from a replayed
+                                // advert: the payload is still correctly signed.
+                                if !crate::storage::adverts::has_blob(&adv.pub_key) {
+                                    store_blob = true;
+                                }
                                 // Anti-replay: ignore an advert no newer than the last accepted one.
                                 if existing.last_advert_ts != 0 && adv.timestamp <= existing.last_advert_ts {
                                     return;
@@ -519,7 +531,6 @@ async fn main(spawner: Spawner) {
                                     || existing.contact_type != contact_type
                                     || existing.latitude != adv.latitude
                                     || existing.longitude != adv.longitude
-                                    || !crate::storage::adverts::has_blob(&adv.pub_key)
                                 {
                                     store_blob = true;
                                 }

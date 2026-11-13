@@ -141,41 +141,51 @@ pub fn has_blob(pub_key: &[u8; 32]) -> bool {
         || (0..CURSOR.load(Ordering::Relaxed)).any(|i| key_matches(&read_slot(i), pub_key))
 }
 
-/// Build a complete advert packet (`header ‖ path_len ‖ payload`) for export.
-/// Scans newest-last, so a repeated key returns the most recent valid blob.
-pub fn export(pub_key: &[u8; 32]) -> Option<Vec<u8, { MAX_ADVERT_PAYLOAD + 2 }>> {
+fn find_blob(pub_key: &[u8; 32]) -> Option<PersistBlob> {
     // A blob queued moments ago is already valid; do not make the app wait
     // for the debounced flash write.
-    let mut found = PENDING.lock(|p| {
+    if let Some(rec) = PENDING.lock(|p| {
         p.borrow()
             .iter()
             .rev()
             .find(|e| e.pub_key == *pub_key && e.len != 0)
             .copied()
-    });
-    if found.is_none() {
-        let cursor = CURSOR.load(Ordering::Relaxed);
-        for i in 0..cursor {
-            let rec = read_slot(i);
-            if key_matches(&rec, pub_key) {
-                found = Some(rec);
-            }
+    }) {
+        return Some(rec);
+    }
+    let cursor = CURSOR.load(Ordering::Relaxed);
+    let mut found = None;
+    for i in 0..cursor {
+        let rec = read_slot(i);
+        if key_matches(&rec, pub_key) {
+            found = Some(rec);
         }
     }
-    if let Some(rec) = found {
-        let len = rec.len as usize;
-        if let Ok(adv) = AdvertPacket::decode(&rec.payload[..len]) {
-            if adv.verify_signature() {
-                let mut out = Vec::<u8, { MAX_ADVERT_PAYLOAD + 2 }>::new();
-                // Flood-routed advert with no path, as MeshCore exports it.
-                out.push(0x11).ok()?;
-                out.push(0x00).ok()?;
-                out.extend_from_slice(&rec.payload[..len]).ok()?;
-                return Some(out);
-            }
-        }
+    found
+}
+
+/// Verified advert payload for a contact, or `None` if no valid blob exists.
+pub fn payload(pub_key: &[u8; 32]) -> Option<Vec<u8, MAX_ADVERT_PAYLOAD>> {
+    let rec = find_blob(pub_key)?;
+    let len = rec.len as usize;
+    let adv = AdvertPacket::decode(&rec.payload[..len]).ok()?;
+    if !adv.verify_signature() {
+        return None;
     }
-    None
+    let mut out = Vec::<u8, MAX_ADVERT_PAYLOAD>::new();
+    out.extend_from_slice(&rec.payload[..len]).ok()?;
+    Some(out)
+}
+
+/// Build a complete advert packet (`header ‖ path_len ‖ payload`) for export.
+pub fn export(pub_key: &[u8; 32]) -> Option<Vec<u8, { MAX_ADVERT_PAYLOAD + 2 }>> {
+    let payload = payload(pub_key)?;
+    let mut out = Vec::<u8, { MAX_ADVERT_PAYLOAD + 2 }>::new();
+    // Flood-routed advert with no path, as MeshCore exports it.
+    out.push(0x11).ok()?;
+    out.push(0x00).ok()?;
+    out.extend_from_slice(&payload).ok()?;
+    Some(out)
 }
 
 /// Append queued blobs to the log.

@@ -1418,7 +1418,7 @@ async fn handle_text_cli(
         }
         "stats-adverts" => {
             let (cursor, pending, erase_pending) = crate::storage::adverts::stats();
-            let mut s: heapless::String<64> = heapless::String::new();
+            let mut s: heapless::String<96> = heapless::String::new();
             let _ = write!(
                 s,
                 "  -> slot {}/{} pending {}{}\r\n",
@@ -1426,6 +1426,14 @@ async fn handle_text_cli(
                 crate::storage::adverts::SLOTS,
                 pending,
                 if erase_pending { " erase-pending" } else { "" }
+            );
+            let _ = write!(
+                s,
+                "  -> adverts {} last {:08x} ts {} blob {}\r\n",
+                crate::companion::protocol::ADVERT_COUNT.load(core::sync::atomic::Ordering::Relaxed),
+                crate::companion::protocol::ADVERT_LAST_KEY.load(core::sync::atomic::Ordering::Relaxed),
+                crate::companion::protocol::ADVERT_LAST_TS.load(core::sync::atomic::Ordering::Relaxed),
+                if crate::companion::protocol::ADVERT_LAST_HAD_BLOB.load(core::sync::atomic::Ordering::Relaxed) { "yes" } else { "no" }
             );
             let _ = write_all(sender, s.as_bytes()).await;
         }

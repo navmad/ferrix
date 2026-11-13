@@ -25,6 +25,21 @@ pub static DEVICE_QUERY_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static GET_AUTOADD_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static SET_AUTOADD_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static LAST_CMD: AtomicU8 = AtomicU8::new(0);
+/// Diagnostics for advert processing and blob backfill.
+pub static ADVERT_COUNT: AtomicU32 = AtomicU32::new(0);
+pub static ADVERT_LAST_KEY: AtomicU32 = AtomicU32::new(0);
+pub static ADVERT_LAST_TS: AtomicU32 = AtomicU32::new(0);
+pub static ADVERT_LAST_HAD_BLOB: AtomicBool = AtomicBool::new(false);
+
+pub fn note_advert(pub_key: &[u8; 32], timestamp: u32, had_blob: bool) {
+    ADVERT_COUNT.fetch_add(1, Ordering::Relaxed);
+    ADVERT_LAST_HAD_BLOB.store(had_blob, Ordering::Relaxed);
+    ADVERT_LAST_KEY.store(
+        u32::from_le_bytes([pub_key[0], pub_key[1], pub_key[2], pub_key[3]]),
+        Ordering::Relaxed,
+    );
+    ADVERT_LAST_TS.store(timestamp, Ordering::Relaxed);
+}
 
 #[derive(Clone, Copy)]
 struct ScopeState {
@@ -56,6 +71,7 @@ pub const CMD_SET_RADIO_TX_POWER: u8 = 0x0C;
 pub const CMD_RESET_PATH: u8 = 0x0D;
 pub const CMD_SET_ADVERT_LATLON: u8 = 0x0E;
 pub const CMD_REMOVE_CONTACT: u8 = 15;
+pub const CMD_SHARE_CONTACT: u8 = 0x10;
 pub const CMD_EXPORT_CONTACT: u8 = 0x11;
 pub const CMD_IMPORT_CONTACT: u8 = 0x12;
 pub const CMD_REBOOT: u8 = 0x13;
@@ -1189,6 +1205,59 @@ impl CompanionNode {
                         .is_ok()
                     {
                         let _ = resp.push(RESP_CODE_OK);
+                    } else {
+                        let _ = resp.push(RESP_CODE_ERR);
+                        let _ = resp.push(ERR_BAD_STATE);
+                    }
+                } else {
+                    let _ = resp.push(RESP_CODE_ERR);
+                    let _ = resp.push(ERR_ILLEGAL_ARG);
+                }
+                emit(&resp);
+            }
+
+            CMD_SHARE_CONTACT => {
+                // Inbound: [CMD(0x10), public_key(32)]
+                // Re-broadcast the stored advert as a zero-hop transport-direct
+                // advert so nearby nodes can add the contact.
+                let mut resp = Vec::<u8, 2>::new();
+                if payload.len() >= 33 {
+                    let mut key = [0u8; 32];
+                    key.copy_from_slice(&payload[1..33]);
+                    let known = crate::companion::usb::DISCOVERED_CONTACTS
+                        .lock(|c| c.borrow().iter().any(|ct| ct.pub_key == key));
+                    if !known {
+                        let _ = resp.push(RESP_CODE_ERR);
+                        let _ = resp.push(ERR_NOT_FOUND);
+                    } else if let Some(advert) = crate::storage::adverts::payload(&key) {
+                        let mut pkt = Packet::new(
+                            crate::meshcore::packet::ROUTE_TYPE_TRANSPORT_DIRECT,
+                            PAYLOAD_TYPE_ADVERT,
+                        );
+                        pkt.transport_codes = [0, 0];
+                        pkt.path_len = 0;
+                        let mut raw = heapless::Vec::<u8, 255>::new();
+                        let mut buf = [0u8; 255];
+                        let sent = if pkt.set_payload(&advert).is_ok() {
+                            if let Ok(n) = pkt.write_to(&mut buf) {
+                                raw.extend_from_slice(&buf[..n]).is_ok()
+                                    && crate::companion::usb::USB_COMMAND_CHANNEL
+                                        .try_send(crate::companion::usb::UsbCommand::SendRawPacket {
+                                            raw,
+                                        })
+                                        .is_ok()
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        };
+                        if sent {
+                            let _ = resp.push(RESP_CODE_OK);
+                        } else {
+                            let _ = resp.push(RESP_CODE_ERR);
+                            let _ = resp.push(ERR_BAD_STATE);
+                        }
                     } else {
                         let _ = resp.push(RESP_CODE_ERR);
                         let _ = resp.push(ERR_BAD_STATE);
