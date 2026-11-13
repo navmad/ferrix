@@ -122,7 +122,7 @@ pub static NODE_CALLSIGN: Mutex<SharedRawMutex, RefCell<String<32>>> =
 pub static CUSTOM_PRIV_KEY: Mutex<SharedRawMutex, RefCell<Option<[u8; 64]>>> =
     Mutex::new(RefCell::new(None));
 
-pub static SAVE_REQUEST_CHANNEL: Channel<SharedRawMutex, (), 2> = Channel::new();
+pub(crate) static SAVE_REQUEST_CHANNEL: Channel<SharedRawMutex, (), 2> = Channel::new();
 
 /// Compute a 32-bit checksum covering a configuration structure up to its
 /// checksum field.
@@ -431,55 +431,27 @@ pub fn assemble_current_config() -> PersistentConfig {
     cfg
 }
 
-/// Background storage task that listens for save requests and commits to flash via SoftDevice
-#[embassy_executor::task]
-pub async fn storage_task(sd: &'static nrf_softdevice::Softdevice) -> ! {
-    let mut flash = nrf_softdevice::Flash::take(sd);
-    info!("Storage: Flash persistence task started (target page 0x{:08x})", CONFIG_FLASH_ADDR);
-
-    loop {
-        match embassy_futures::select::select3(
-            SAVE_REQUEST_CHANNEL.receive(),
-            crate::persist::CONTACTS_SAVE_CHANNEL.receive(),
-            crate::persist::MESSAGES_SAVE_CHANNEL.receive(),
+/// Commit the current configuration snapshot to the config page.
+pub(crate) async fn save_config(flash: &mut nrf_softdevice::Flash) {
+    let config = assemble_current_config();
+    let config_bytes = unsafe {
+        core::slice::from_raw_parts(
+            &config as *const _ as *const u8,
+            core::mem::size_of::<PersistentConfig>(),
         )
-        .await
-        {
-            embassy_futures::select::Either3::First(_) => {
-                // Debounce slightly in case multiple settings are saved in quick succession
-                embassy_time::Timer::after_millis(200).await;
-                while SAVE_REQUEST_CHANNEL.try_receive().is_ok() {}
+    };
 
-                let config = assemble_current_config();
-                let config_bytes = unsafe {
-                    core::slice::from_raw_parts(
-                        &config as *const _ as *const u8,
-                        core::mem::size_of::<PersistentConfig>(),
-                    )
-                };
-
-                info!("Storage: Committing persistent configuration to flash at 0x{:08x}...", CONFIG_FLASH_ADDR);
-                if let Err(e) = flash.erase(CONFIG_FLASH_ADDR, CONFIG_FLASH_ADDR + 4096).await {
-                    error!("Storage: Flash page erase error: {:?}", e);
-                    continue;
-                }
-                if let Err(e) = flash.write(CONFIG_FLASH_ADDR, config_bytes).await {
-                    error!("Storage: Flash write error: {:?}", e);
-                    continue;
-                }
-                info!("Storage: Configuration successfully saved to flash!");
-            }
-            embassy_futures::select::Either3::Second(_) => {
-                // Coalesce a burst of advert/app updates before snapshotting.
-                embassy_time::Timer::after_millis(1000).await;
-                while crate::persist::CONTACTS_SAVE_CHANNEL.try_receive().is_ok() {}
-                crate::persist::save_contacts(&mut flash).await;
-            }
-            embassy_futures::select::Either3::Third(_) => {
-                embassy_time::Timer::after_millis(1000).await;
-                while crate::persist::MESSAGES_SAVE_CHANNEL.try_receive().is_ok() {}
-                crate::persist::save_messages(&mut flash).await;
-            }
-        }
+    info!(
+        "Storage: Committing persistent configuration to flash at 0x{:08x}...",
+        CONFIG_FLASH_ADDR
+    );
+    if let Err(e) = flash.erase(CONFIG_FLASH_ADDR, CONFIG_FLASH_ADDR + 4096).await {
+        error!("Storage: Flash page erase error: {:?}", e);
+        return;
     }
+    if let Err(e) = flash.write(CONFIG_FLASH_ADDR, config_bytes).await {
+        error!("Storage: Flash write error: {:?}", e);
+        return;
+    }
+    info!("Storage: Configuration successfully saved to flash!");
 }

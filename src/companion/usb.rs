@@ -995,7 +995,7 @@ async fn handle_text_cli(
             DISCOVERED_CONTACTS.lock(|c| {
                 c.borrow_mut().clear();
             });
-            crate::persist::request_contacts();
+            crate::storage::request_contacts();
             let _ = write_all(sender, b"  -> OK (Contacts cleared)\r\n").await;
         }
         "messages" | "inbox" | "get messages" => {
@@ -1020,7 +1020,7 @@ async fn handle_text_cli(
             MESSAGE_LOG.lock(|m| {
                 m.borrow_mut().clear();
             });
-            crate::persist::request_messages();
+            crate::storage::request_messages();
             let _ = write_all(sender, b"  -> OK (Messages cleared)\r\n").await;
         }
         "stats-radio" => {

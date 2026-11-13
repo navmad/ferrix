@@ -747,7 +747,7 @@ impl CompanionNode {
                 });
                 if next_msg.is_some() {
                     // The app consumed a message; persist the shorter queue.
-                    crate::persist::request_messages();
+                    crate::storage::request_messages();
                 }
 
                 if let Some(msg) = next_msg {
