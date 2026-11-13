@@ -275,8 +275,8 @@ impl CompanionNode {
                 let mut resp = Vec::<u8, 128>::new();
                 let _ = resp.push(RESP_CODE_DEVICE_INFO);
                 let _ = resp.push(14); // firmware_ver: 14 (v10+ required for path_hash_mode in apps)
-                let _ = resp.push(50); // max_contacts_div_2 (100 contacts)
-                let _ = resp.push(8); // max_channels
+                let _ = resp.push((crate::companion::usb::MAX_CONTACTS / 2).min(255) as u8);
+                let _ = resp.push(crate::companion::usb::MAX_CHANNELS as u8);
                 let _ = resp.extend_from_slice(
                     &crate::companion::ble::BLE_PIN
                         .load(Ordering::Relaxed)
@@ -690,7 +690,7 @@ impl CompanionNode {
                 // Inbound: [CMD(32 / 0x20), channel_idx, name(32 bytes), secret(16 bytes)]
                 if payload.len() >= 50 {
                     let channel_idx = payload[1] as usize;
-                    if channel_idx < 8 {
+                    if channel_idx < crate::companion::usb::MAX_CHANNELS {
                         let mut name = [0u8; 32];
                         name.copy_from_slice(&payload[2..34]);
                         let mut secret = [0u8; 16];
@@ -752,36 +752,13 @@ impl CompanionNode {
             }
 
             CMD_GET_CONTACTS => {
-                // Do not clone the whole contact list: each entry is large and
-                // this runs in the BLE task. Read one contact at a time.
-                let count =
-                    crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| c.borrow().len()) as u32;
-
-                // 1. RESP_CODE_CONTACTS_START (2) [code(2), count(u32_le)]
-                let mut start_resp = Vec::<u8, 8>::new();
-                let _ = start_resp.push(RESP_CODE_CONTACTS_START);
-                let _ = start_resp.extend_from_slice(&count.to_le_bytes());
-                emit(&start_resp);
-
-                // 2. Stream individual RESP_CODE_CONTACT (3)
-                // Layout: [code(3), pubkey(32), type(1), flags(1), out_path_len(1), out_path(64), adv_name(32), last_advert(u32_le), adv_lat(i32_le), adv_lon(i32_le), lastmod(u32_le)]
-                let mut max_lastmod = 0u32;
-                for idx in 0..count as usize {
-                    let item = crate::companion::usb::DISCOVERED_CONTACTS
-                        .lock(|c| c.borrow().get(idx).cloned());
-                    if let Some(c) = item {
-                        if c.last_seen_epoch > max_lastmod {
-                            max_lastmod = c.last_seen_epoch;
-                        }
-                        emit(&serialize_contact(&c));
-                    }
-                }
-
-                // 3. RESP_CODE_END_OF_CONTACTS (4) [code(4), most_recent_lastmod(u32_le)]
-                let mut end_resp = Vec::<u8, 8>::new();
-                let _ = end_resp.push(RESP_CODE_END_OF_CONTACTS);
-                let _ = end_resp.extend_from_slice(&max_lastmod.to_le_bytes());
-                emit(&end_resp);
+                // The transports handle this with async streaming: with up to
+                // 350 contacts, the start + N contacts + end burst does not fit
+                // the bounded push channel. See `ble::stream_contacts` and
+                // `usb::stream_contacts_usb`.
+                let mut resp = Vec::<u8, 4>::new();
+                let _ = resp.push(RESP_CODE_ERR);
+                emit(&resp);
             }
 
             CMD_SEND_CHANNEL_MSG => {
@@ -1387,8 +1364,34 @@ impl CompanionNode {
 }
 
 
+/// Number of stored contacts.
+pub fn contacts_count() -> u32 {
+    crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| c.borrow().len()) as u32
+}
+
+/// Clone one contact out of the shared list (a small, fixed-size copy).
+pub fn contact_at(idx: usize) -> Option<crate::meshcore::mesh::DiscoveredContact> {
+    crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| c.borrow().get(idx).cloned())
+}
+
+/// `RESP_CODE_CONTACTS_START` (2) `[code(2), count(u32_le)]`.
+pub fn encode_contacts_start(count: u32) -> Vec<u8, 8> {
+    let mut resp = Vec::<u8, 8>::new();
+    let _ = resp.push(RESP_CODE_CONTACTS_START);
+    let _ = resp.extend_from_slice(&count.to_le_bytes());
+    resp
+}
+
+/// `RESP_CODE_END_OF_CONTACTS` (4) `[code(4), most_recent_lastmod(u32_le)]`.
+pub fn encode_contacts_end(max_lastmod: u32) -> Vec<u8, 8> {
+    let mut resp = Vec::<u8, 8>::new();
+    let _ = resp.push(RESP_CODE_END_OF_CONTACTS);
+    let _ = resp.extend_from_slice(&max_lastmod.to_le_bytes());
+    resp
+}
+
 /// Serialize one contact in the companion `PACKET_CONTACT` layout.
-fn serialize_contact(c: &crate::meshcore::mesh::DiscoveredContact) -> Vec<u8, 160> {
+pub(crate) fn serialize_contact(c: &crate::meshcore::mesh::DiscoveredContact) -> Vec<u8, 160> {
     let mut resp = Vec::<u8, 160>::new();
     let _ = resp.push(RESP_CODE_CONTACT);
     let _ = resp.extend_from_slice(&c.pub_key);

@@ -22,7 +22,7 @@ use crate::companion::usb::ChannelData;
 /// (Top page of application flash, immediately preceding bootloader at 0x000ED000)
 pub const CONFIG_FLASH_ADDR: u32 = 0x000EC000;
 pub const CONFIG_MAGIC: u32 = 0x4D434647; // 'MCFG' (MeshCore Config)
-pub const CONFIG_VERSION: u32 = 2;
+pub const CONFIG_VERSION: u32 = 3;
 
 #[repr(C, align(4))]
 #[derive(Clone, Copy)]
@@ -42,8 +42,30 @@ pub struct PersistentConfig {
     pub autoadd_max_hops: u8,   // 0 = no limit, N = up to N-1 hops
     pub radio_freq_hz: u32,
     pub radio_bw_khz: u32,
-    pub channels: [ChannelData; 8],
+    pub channels: [ChannelData; crate::companion::usb::MAX_CHANNELS],
     pub checksum: u32,
+}
+
+/// v2 layout: 8 channels. Read only for migration.
+#[repr(C, align(4))]
+#[derive(Clone, Copy)]
+struct PersistentConfigV2 {
+    magic: u32,
+    version: u32,
+    callsign: [u8; 32],
+    custom_priv_key: [u8; 64],
+    has_custom_key: u8,
+    is_repeater: u8,
+    radio_tx_power: i8,
+    radio_sf: u8,
+    radio_cr: u8,
+    path_hash_mode: u8,
+    autoadd_config: u8,
+    autoadd_max_hops: u8,
+    radio_freq_hz: u32,
+    radio_bw_khz: u32,
+    channels: [ChannelData; 8],
+    checksum: u32,
 }
 
 /// v1 layout: the private key was a 32-byte seed. Read only for migration.
@@ -92,6 +114,15 @@ fn compute_checksum<T>(cfg: &T) -> u32 {
     sum
 }
 
+fn expand_channels(src: [ChannelData; 8]) -> [ChannelData; crate::companion::usb::MAX_CHANNELS] {
+    let mut dst = [ChannelData {
+        name: [0u8; 32],
+        secret: [0u8; 16],
+    }; crate::companion::usb::MAX_CHANNELS];
+    dst[..8].copy_from_slice(&src);
+    dst
+}
+
 fn migrate_v1(v1: PersistentConfigV1) -> PersistentConfig {
     let custom_priv_key = if v1.has_custom_key != 0 {
         // Use the seed path so a reserved public key is regenerated exactly as
@@ -116,7 +147,30 @@ fn migrate_v1(v1: PersistentConfigV1) -> PersistentConfig {
         autoadd_max_hops: v1.autoadd_max_hops,
         radio_freq_hz: v1.radio_freq_hz,
         radio_bw_khz: v1.radio_bw_khz,
-        channels: v1.channels,
+        channels: expand_channels(v1.channels),
+        checksum: 0,
+    };
+    cfg.checksum = compute_checksum(&cfg);
+    cfg
+}
+
+fn migrate_v2(v2: PersistentConfigV2) -> PersistentConfig {
+    let mut cfg = PersistentConfig {
+        magic: CONFIG_MAGIC,
+        version: CONFIG_VERSION,
+        callsign: v2.callsign,
+        custom_priv_key: v2.custom_priv_key,
+        has_custom_key: v2.has_custom_key,
+        is_repeater: v2.is_repeater,
+        radio_tx_power: v2.radio_tx_power,
+        radio_sf: v2.radio_sf,
+        radio_cr: v2.radio_cr,
+        path_hash_mode: v2.path_hash_mode,
+        autoadd_config: v2.autoadd_config,
+        autoadd_max_hops: v2.autoadd_max_hops,
+        radio_freq_hz: v2.radio_freq_hz,
+        radio_bw_khz: v2.radio_bw_khz,
+        channels: expand_channels(v2.channels),
         checksum: 0,
     };
     cfg.checksum = compute_checksum(&cfg);
@@ -132,6 +186,12 @@ pub fn read_config() -> Option<(PersistentConfig, bool)> {
     }
     if cfg.version == CONFIG_VERSION && compute_checksum(&cfg) == cfg.checksum {
         return Some((cfg, false));
+    }
+    if cfg.version == 2 {
+        let v2 = unsafe { (CONFIG_FLASH_ADDR as *const PersistentConfigV2).read_volatile() };
+        if compute_checksum(&v2) == v2.checksum {
+            return Some((migrate_v2(v2), true));
+        }
     }
     if cfg.version == 1 {
         let v1 = unsafe { (CONFIG_FLASH_ADDR as *const PersistentConfigV1).read_volatile() };
@@ -234,7 +294,7 @@ pub fn init_config() -> (String<32>, Option<[u8; 64]>) {
         };
 
         if migrated {
-            info!("Storage: Migrated config v1 -> v2 (seed -> 64-byte expanded key)");
+            info!("Storage: Migrated config to v3 (up to {} contacts / {} channels)", crate::companion::usb::MAX_CONTACTS, crate::companion::usb::MAX_CHANNELS);
             request_save_config();
         }
 

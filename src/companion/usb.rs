@@ -57,7 +57,12 @@ pub static RADIO_SETTINGS: Mutex<SharedRawMutex, RefCell<RadioSettings>> = Mutex
     path_hash_mode: 0,
 }));
 
-pub static DISCOVERED_CONTACTS: Mutex<SharedRawMutex, RefCell<heapless::Vec<DiscoveredContact, 32>>> =
+/// the reference firmware's companion defaults on nRF52840 (see `REFERENCE_MAX_CONTACTS`).
+pub const MAX_CONTACTS: usize = 350;
+/// the reference firmware's companion default (`REFERENCE_MAX_CHANNELS`).
+pub const MAX_CHANNELS: usize = 40;
+
+pub static DISCOVERED_CONTACTS: Mutex<SharedRawMutex, RefCell<heapless::Vec<DiscoveredContact, MAX_CONTACTS>>> =
     Mutex::new(RefCell::new(heapless::Vec::new()));
 
 pub static MESSAGE_LOG: Mutex<SharedRawMutex, RefCell<heapless::Vec<ReceivedMessage, 16>>> =
@@ -74,11 +79,11 @@ pub const DEFAULT_PUBLIC_SECRET: [u8; 16] = [
     0xc9, 0xe5, 0xed, 0xba, 0xa1, 0x15, 0xcd, 0x72,
 ];
 
-const fn default_channels() -> [ChannelData; 8] {
+pub(crate) const fn default_channels() -> [ChannelData; MAX_CHANNELS] {
     let mut chs = [ChannelData {
         name: [0u8; 32],
         secret: [0u8; 16],
-    }; 8];
+    }; MAX_CHANNELS];
     chs[0].name[0] = b'P';
     chs[0].name[1] = b'u';
     chs[0].name[2] = b'b';
@@ -89,7 +94,7 @@ const fn default_channels() -> [ChannelData; 8] {
     chs
 }
 
-pub static CHANNELS: Mutex<SharedRawMutex, RefCell<[ChannelData; 8]>> =
+pub static CHANNELS: Mutex<SharedRawMutex, RefCell<[ChannelData; MAX_CHANNELS]>> =
     Mutex::new(RefCell::new(default_channels()));
 
 #[derive(Clone, Copy, Debug)]
@@ -241,6 +246,36 @@ pub fn reboot_to_bootloader() -> ! {
 }
 
 /// Helper: Write an entire byte slice across USB CDC-ACM packet boundaries
+/// Send one companion response over the USB binary framing.
+async fn send_usb_companion_frame(sender: &mut Sender<'static, UsbDriver>, resp: &[u8]) {
+    let mut out_frame = [0u8; 300];
+    if let Ok(flen) = encode_usb_frame(resp, &mut out_frame) {
+        let _ = write_all(sender, &out_frame[..flen]).await;
+    }
+}
+
+/// Stream `GET_CONTACTS` over USB with the same framing as the other responses.
+async fn stream_contacts_usb(sender: &mut Sender<'static, UsbDriver>) {
+    use crate::companion::protocol;
+
+    let count = protocol::contacts_count();
+    send_usb_companion_frame(sender, &protocol::encode_contacts_start(count)).await;
+
+    let mut max_lastmod = 0u32;
+    for idx in 0..count as usize {
+        let Some(c) = protocol::contact_at(idx) else {
+            continue;
+        };
+        if c.last_seen_epoch > max_lastmod {
+            max_lastmod = c.last_seen_epoch;
+        }
+        let resp = protocol::serialize_contact(&c);
+        send_usb_companion_frame(sender, &resp).await;
+    }
+
+    send_usb_companion_frame(sender, &protocol::encode_contacts_end(max_lastmod)).await;
+}
+
 async fn write_all(sender: &mut Sender<'static, UsbDriver>, mut data: &[u8]) -> Result<(), ()> {
     while !data.is_empty() {
         let chunk = data.len().min(64);
@@ -711,15 +746,18 @@ async fn handle_text_cli(
             }
         }
         "contacts" | "get contacts" => {
-            let contacts_snapshot: heapless::Vec<DiscoveredContact, 32> = DISCOVERED_CONTACTS.lock(|c| c.borrow().clone());
-            if contacts_snapshot.is_empty() {
+            let count = DISCOVERED_CONTACTS.lock(|c| c.borrow().len());
+            if count == 0 {
                 let _ = write_all(sender, b"  -> No contacts discovered yet (listening for adverts...)\r\n").await;
             } else {
                 let mut hdr = heapless::String::<64>::new();
-                let _ = write!(hdr, "  -> Discovered Contacts ({}):\r\n", contacts_snapshot.len());
+                let _ = write!(hdr, "  -> Discovered Contacts ({}):\r\n", count);
                 let _ = write_all(sender, hdr.as_bytes()).await;
                 let _ = write_all(sender, b"  -> ID        TYPE  CALLSIGN        RSSI     SNR   BAT   SEEN\r\n").await;
-                for c in contacts_snapshot.iter() {
+                for idx in 0..count {
+                    let Some(c) = DISCOVERED_CONTACTS.lock(|c| c.borrow().get(idx).cloned()) else {
+                        continue;
+                    };
                     let ty = match c.contact_type {
                         2 => "RPT",
                         3 => "ROOM",
@@ -962,16 +1000,20 @@ pub async fn cdc_acm_task(
                                     in_binary_mode = true;
                                     if let Some(payload) = frame_reader.push_byte(b) {
                                         in_binary_mode = false;
-                                        let mut responses = heapless::Vec::<heapless::Vec<u8, 200>, 10>::new();
-                                        node.handle_command(payload, |resp| {
-                                            let mut v = heapless::Vec::new();
-                                            let _ = v.extend_from_slice(resp);
-                                            let _ = responses.push(v);
-                                        });
-                                        for resp in responses {
-                                            let mut out_frame = [0u8; 300];
-                                            if let Ok(flen) = encode_usb_frame(&resp, &mut out_frame) {
-                                                let _ = write_all(&mut sender, &out_frame[..flen]).await;
+                                        if payload.first() == Some(&crate::companion::protocol::CMD_GET_CONTACTS) {
+                                            stream_contacts_usb(&mut sender).await;
+                                        } else {
+                                            let mut responses = heapless::Vec::<heapless::Vec<u8, 200>, 10>::new();
+                                            node.handle_command(payload, |resp| {
+                                                let mut v = heapless::Vec::new();
+                                                let _ = v.extend_from_slice(resp);
+                                                let _ = responses.push(v);
+                                            });
+                                            for resp in responses {
+                                                let mut out_frame = [0u8; 300];
+                                                if let Ok(flen) = encode_usb_frame(&resp, &mut out_frame) {
+                                                    let _ = write_all(&mut sender, &out_frame[..flen]).await;
+                                                }
                                             }
                                         }
                                     }

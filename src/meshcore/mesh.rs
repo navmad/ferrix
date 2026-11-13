@@ -251,7 +251,7 @@ impl MeshEngine {
                     // Running SHA-256 hashing and AES-128 decryption inside a lock callback
                     // can block the BLE SoftDevice (S140) and freeze the device.
                     //
-                    // The array ([ChannelData; 8] = 320 bytes) is copied by value here,
+                    // The array ([ChannelData; 40] = 1920 bytes) is copied by value here,
                     // which is cheap compared to the crypto operations below.
                     let channels = crate::companion::usb::CHANNELS.lock(|chs| *chs.borrow());
                     let mut matched = None;

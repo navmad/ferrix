@@ -262,6 +262,36 @@ pub async fn contact_task() -> ! {
     }
 }
 
+/// Stream `GET_CONTACTS` responses with backpressure so a large contact list
+/// (up to `MAX_CONTACTS`) never overflows `COMPANION_PUSH_CHANNEL`.
+async fn stream_contacts() {
+    use crate::companion::protocol;
+
+    let count = protocol::contacts_count();
+
+    let mut start = Vec::<u8, 256>::new();
+    let _ = start.extend_from_slice(&protocol::encode_contacts_start(count));
+    let _ = COMPANION_PUSH_CHANNEL.send(start).await;
+
+    let mut max_lastmod = 0u32;
+    for idx in 0..count as usize {
+        let Some(c) = protocol::contact_at(idx) else {
+            continue;
+        };
+        if c.last_seen_epoch > max_lastmod {
+            max_lastmod = c.last_seen_epoch;
+        }
+        let resp = protocol::serialize_contact(&c);
+        let mut vec = Vec::<u8, 256>::new();
+        let _ = vec.extend_from_slice(&resp);
+        let _ = COMPANION_PUSH_CHANNEL.send(vec).await;
+    }
+
+    let mut end = Vec::<u8, 256>::new();
+    let _ = end.extend_from_slice(&protocol::encode_contacts_end(max_lastmod));
+    let _ = COMPANION_PUSH_CHANNEL.send(end).await;
+}
+
 pub struct MeshCoreSecurityHandler;
 
 impl SecurityHandler for MeshCoreSecurityHandler {
@@ -438,14 +468,18 @@ pub async fn ble_companion_task(
                     if drops != 0 {
                         debug!("BLE: dropped {} command(s) because the ring was full", drops);
                     }
-                    node.handle_command(&cmd_buf[..len], |resp| {
-                        let mut vec = Vec::<u8, 256>::new();
-                        let copy_len = resp.len().min(247);
-                        let _ = vec.extend_from_slice(&resp[..copy_len]);
-                        if COMPANION_PUSH_CHANNEL.try_send(vec).is_err() {
-                            debug!("BLE: response queue full, dropping response");
-                        }
-                    });
+                    if cmd_buf[..len].first() == Some(&crate::companion::protocol::CMD_GET_CONTACTS) {
+                        stream_contacts().await;
+                    } else {
+                        node.handle_command(&cmd_buf[..len], |resp| {
+                            let mut vec = Vec::<u8, 256>::new();
+                            let copy_len = resp.len().min(247);
+                            let _ = vec.extend_from_slice(&resp[..copy_len]);
+                            if COMPANION_PUSH_CHANNEL.try_send(vec).is_err() {
+                                debug!("BLE: response queue full, dropping response");
+                            }
+                        });
+                    }
                     embassy_futures::yield_now().await;
                 } else {
                     // Register before the emptiness check to avoid a lost wake.
