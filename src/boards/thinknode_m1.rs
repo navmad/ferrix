@@ -204,10 +204,10 @@ impl Board for ThinkNodeM1 {
         };
 
         // --- Buttons & User Inputs ---
-        // P1.07 is PIN_BUTTON2 (Main / Page Turn button)
-        // P1.10 is PIN_BUTTON1 (Aux / Function button)
-        let page_btn = Input::new(p.P1_07, Pull::Up);
-        let function_btn = Input::new(p.P1_10, Pull::Up);
+        // P1.07 is the top button: page action.
+        // P1.10 is the bottom button: next page.
+        let function_btn = Input::new(p.P1_07, Pull::Up);
+        let page_btn = Input::new(p.P1_10, Pull::Up);
         let inputs = ThinkNodeInputs::new(function_btn, page_btn);
 
         // --- Telemetry & LEDs ---
