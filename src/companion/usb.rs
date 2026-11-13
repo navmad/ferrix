@@ -822,6 +822,19 @@ async fn handle_text_cli(
                     }
                     let _ = write!(h, "\r\n");
                     let _ = write_all(sender, h.as_bytes()).await;
+
+                    let mut c: heapless::String<512> = heapless::String::new();
+                    let _ = write!(
+                        c,
+                        "  -> chan_flags rx={} tx={} cfg={} sp=0x{:08x}\r\n  -> stack=",
+                        p.chan_flags[0], p.chan_flags[1], p.chan_flags[2], p.sp
+                    );
+                    let n = (p.stack_len as usize).min(p.stack.len());
+                    for w in &p.stack[..n] {
+                        let _ = write!(c, "{:08x}", w);
+                    }
+                    let _ = write!(c, "\r\n");
+                    let _ = write_all(sender, c.as_bytes()).await;
                 }
                 None => {
                     let _ = write!(s, "  -> No panic/hardfault record\r\n");

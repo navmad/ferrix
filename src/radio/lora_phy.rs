@@ -31,6 +31,18 @@ pub static LORA_RX_CHANNEL: Channel<SharedRawMutex, (usize, i16, i8, [u8; 256]),
 pub static LORA_TX_CHANNEL: Channel<SharedRawMutex, TxPacket, 4> = Channel::new();
 pub static LORA_CFG_CHANNEL: Channel<SharedRawMutex, LoraConfig, 4> = Channel::new();
 
+/// Read the first word of each channel (embassy-sync's `RefCell` borrow flag).
+/// Used only by the panic recorder to diagnose a re-entrant channel borrow.
+pub fn channel_borrow_flags() -> (u32, u32, u32) {
+    unsafe {
+        (
+            *(&LORA_RX_CHANNEL as *const _ as *const u32),
+            *(&LORA_TX_CHANNEL as *const _ as *const u32),
+            *(&LORA_CFG_CHANNEL as *const _ as *const u32),
+        )
+    }
+}
+
 /// Ask the radio task to apply the current `RADIO_SETTINGS`.
 pub fn request_radio_config() -> bool {
     let cfg = crate::companion::usb::RADIO_SETTINGS.lock(|r| {

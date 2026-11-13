@@ -101,6 +101,17 @@ def main():
         text = (out or b"").decode("utf-8", "replace").strip().replace("\r", " | ").replace("\n", " | ")
         if err:
             emit("cmd=%s ERR=%s out=%r" % (cmd, err, text))
+            misses += 1
+            if misses >= 3:
+                emit("3 errors: closing port for reopen")
+                try:
+                    os.close(fd)
+                except Exception:
+                    pass
+                fd = None
+                misses = 0
+                time.sleep(1.0)
+                continue
         elif "->" in text:
             emit("cmd=%s OK %s" % (cmd, text))
             misses = 0

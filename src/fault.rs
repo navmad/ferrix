@@ -41,6 +41,12 @@ pub struct PanicRecord {
     pub rtt_len: u8,
     pub _pad2: [u8; 3],
     pub rtt_tail: [u8; RTT_TAIL_MAX],
+    /// embassy-sync `RefCell` borrow flags for LORA_RX/TX/CFG at panic time.
+    pub chan_flags: [u32; 3],
+    pub sp: u32,
+    pub stack_len: u8,
+    pub _pad3: [u8; 3],
+    pub stack: [u32; 48],
 }
 
 /// Layout of defmt-rtt's `_SEGGER_RTT` (see `defmt-rtt/src/lib.rs`).
@@ -64,6 +70,31 @@ struct RttHeader {
 
 extern "C" {
     static _SEGGER_RTT: RttHeader;
+}
+
+/// Capture the stack pointer, a stack window and the radio channel borrow
+/// flags so a re-entrant `Channel` borrow can be diagnosed after the reset.
+fn capture_context(rec: &mut PanicRecord) {
+    rec.chan_flags = crate::radio::lora_phy::channel_borrow_flags().into();
+    let sp: u32;
+    // SAFETY: reading SP has no side effects.
+    unsafe {
+        core::arch::asm!("mov {}, sp", out(reg) sp);
+    }
+    rec.sp = sp;
+
+    const RAM_START: u32 = 0x2000_6000;
+    const RAM_TOP: u32 = 0x2004_0000;
+    let mut n = 0usize;
+    if sp >= RAM_START && sp < RAM_TOP {
+        let avail = ((RAM_TOP - sp) / 4) as usize;
+        n = avail.min(rec.stack.len());
+        for (i, slot) in rec.stack.iter_mut().enumerate().take(n) {
+            // SAFETY: sp..sp+n*4 is inside application RAM and is the live stack.
+            *slot = unsafe { ((sp as usize + i * 4) as *const u32).read_volatile() };
+        }
+    }
+    rec.stack_len = n as u8;
 }
 
 /// Snapshot the tail of the defmt RTT buffer, which holds the message logged
@@ -106,6 +137,11 @@ impl PanicRecord {
             rtt_len: 0,
             _pad2: [0; 3],
             rtt_tail: [0; RTT_TAIL_MAX],
+            chan_flags: [0; 3],
+            sp: 0,
+            stack_len: 0,
+            _pad3: [0; 3],
+            stack: [0; 48],
         }
     }
 }
@@ -154,6 +190,7 @@ pub fn record_panic(info: &core::panic::PanicInfo) {
         0
     };
 
+    capture_context(rec);
     capture_rtt(rec);
     rec.magic = 0; // in-progress marker
     rec.line = 0;
@@ -191,6 +228,7 @@ pub fn record_hardfault(pc: u32, lr: u32) {
         0
     };
 
+    capture_context(rec);
     capture_rtt(rec);
     rec.magic = 0;
     rec.line = 0;
@@ -237,6 +275,10 @@ pub struct PanicSnapshot {
     pub rtt_size: u32,
     pub rtt_len: u8,
     pub rtt_tail: [u8; RTT_TAIL_MAX],
+    pub chan_flags: [u32; 3],
+    pub sp: u32,
+    pub stack_len: u8,
+    pub stack: [u32; 48],
 }
 
 /// Read the record without clearing it.
@@ -261,6 +303,10 @@ pub fn peek() -> Option<PanicSnapshot> {
         rtt_size: rec.rtt_size,
         rtt_len: rec.rtt_len,
         rtt_tail: rec.rtt_tail,
+        chan_flags: rec.chan_flags,
+        sp: rec.sp,
+        stack_len: rec.stack_len,
+        stack: rec.stack,
     })
 }
 
