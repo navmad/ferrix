@@ -687,6 +687,7 @@ pub const CMD_GET_TUNING_PARAMS: u8 = 0x2B;
 pub const CMD_GET_CHANNEL: u8 = 31;
 pub const CMD_SET_CHANNEL: u8 = 32;
 pub const CMD_SEND_BINARY_REQ: u8 = 0x32;
+pub const CMD_FACTORY_RESET: u8 = 0x33;
 pub const CMD_SEND_PATH_DISCOVERY_REQ: u8 = 0x34;
 pub const CMD_SET_FLOOD_SCOPE_KEY: u8 = 0x36;
 pub const CMD_SEND_CONTROL_DATA: u8 = 0x37;
@@ -2713,6 +2714,20 @@ impl CompanionNode {
                     emit(&resp);
                 } else {
                     let mut resp = Vec::<u8, 2>::new();
+                    let _ = resp.push(RESP_CODE_ERR);
+                    let _ = resp.push(ERR_ILLEGAL_ARG);
+                    emit(&resp);
+                }
+            }
+
+            CMD_FACTORY_RESET => {
+                // Arduino-compatible safety magic: "reset".
+                let mut resp = Vec::<u8, 2>::new();
+                if payload.len() >= 6 && &payload[1..6] == b"reset" {
+                    let _ = resp.push(RESP_CODE_OK);
+                    emit(&resp);
+                    crate::storage::request_factory_reset();
+                } else {
                     let _ = resp.push(RESP_CODE_ERR);
                     let _ = resp.push(ERR_ILLEGAL_ARG);
                     emit(&resp);

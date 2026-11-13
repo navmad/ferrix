@@ -11,8 +11,9 @@ pub mod contacts;
 pub mod messages;
 pub mod snapshot;
 
-use defmt::info;
-use embassy_futures::select::{select4, Either4};
+use defmt::{error, info};
+use embedded_storage_async::nor_flash::NorFlash;
+use embassy_futures::select::{select, select4, Either, Either4};
 use embassy_time::Timer;
 
 pub use config::{
@@ -21,6 +22,17 @@ pub use config::{
 };
 pub use contacts::request as request_contacts;
 pub use messages::request as request_messages;
+
+/// Request a factory reset: erase all data pages, then reboot.
+static RESET_CHANNEL: embassy_sync::channel::Channel<
+    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+    (),
+    1,
+> = embassy_sync::channel::Channel::new();
+
+pub fn request_factory_reset() {
+    let _ = RESET_CHANNEL.try_send(());
+}
 
 /// Load the contact and message snapshots into RAM. Called once at boot,
 /// before the tasks start.
@@ -37,14 +49,21 @@ pub async fn storage_task(sd: &'static nrf_softdevice::Softdevice) -> ! {
     info!("Storage: Flash persistence task started");
 
     loop {
-        match select4(
+        let select4_fut = select4(
             config::SAVE_REQUEST_CHANNEL.receive(),
             contacts::SAVE_CHANNEL.receive(),
             messages::SAVE_CHANNEL.receive(),
             adverts::SAVE_CHANNEL.receive(),
-        )
-        .await
-        {
+        );
+        match select(select4_fut, RESET_CHANNEL.receive()).await {
+            Either::Second(_) => {
+                info!("Storage: factory reset - erasing data pages");
+                if flash.erase(0x000A_0000, 0x000E_D000).await.is_err() {
+                    error!("Storage: factory reset erase failed");
+                }
+                cortex_m::peripheral::SCB::sys_reset();
+            }
+            Either::First(selected) => match selected {
             Either4::First(_) => {
                 // Debounce in case several settings are saved together.
                 Timer::after_millis(200).await;
@@ -70,6 +89,7 @@ pub async fn storage_task(sd: &'static nrf_softdevice::Softdevice) -> ! {
                 while adverts::SAVE_CHANNEL.try_receive().is_ok() {}
                 adverts::save(&mut flash).await;
             }
+            },
         }
     }
 }
