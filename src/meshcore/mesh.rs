@@ -10,7 +10,8 @@ use crate::meshcore::identity::LocalIdentity;
 use crate::meshcore::packet::{
     Packet, PAYLOAD_TYPE_ACK, PAYLOAD_TYPE_ADVERT, PAYLOAD_TYPE_ANON_REQ, PAYLOAD_TYPE_GRP_DATA,
     PAYLOAD_TYPE_GRP_TXT, PAYLOAD_TYPE_PATH, PAYLOAD_TYPE_REQ, PAYLOAD_TYPE_RESPONSE,
-    PAYLOAD_TYPE_TRACE, PAYLOAD_TYPE_TXT_MSG, ROUTE_TYPE_DIRECT, ROUTE_TYPE_FLOOD,
+    PAYLOAD_TYPE_CONTROL, PAYLOAD_TYPE_TRACE, PAYLOAD_TYPE_TXT_MSG, ROUTE_TYPE_DIRECT,
+    ROUTE_TYPE_FLOOD,
 };
 use crate::meshcore::packets::advert::{ADV_TYPE_CHAT, ADV_TYPE_REPEATER};
 use crate::meshcore::packets::{
@@ -117,6 +118,11 @@ pub enum InboundAction {
         plain: heapless::Vec<u8, 167>,
         sender_pub: [u8; 32],
     },
+    /// Zero-hop control data addressed to the companion (discovery, etc.).
+    ReceivedControl {
+        data: heapless::Vec<u8, 184>,
+        path_len: u8,
+    },
     /// TRACE reached the end of its path.
     ReceivedTrace {
         tag: u32,
@@ -196,6 +202,21 @@ impl MeshEngine {
 
     /// Process a packet received over the LoRa radio interface
     pub fn handle_inbound_packet(&mut self, pkt: Packet, snr: i8) -> InboundAction {
+        // Zero-hop control data is delivered to the app (discovery, etc.).
+        if pkt.route_type() == ROUTE_TYPE_DIRECT
+            && pkt.payload_type() == PAYLOAD_TYPE_CONTROL
+            && pkt.path_hash_count() == 0
+            && pkt.payload_len > 0
+            && (pkt.payload[0] & 0x80) != 0
+        {
+            let mut data = heapless::Vec::<u8, 184>::new();
+            let _ = data.extend_from_slice(&pkt.payload[..pkt.payload_len]);
+            return InboundAction::ReceivedControl {
+                data,
+                path_len: pkt.path_len,
+            };
+        }
+
         // TRACE is direct but its path field carries SNR values, not hops, so
         // it must be handled before the normal direct-forwarding logic.
         if pkt.route_type() == crate::meshcore::packet::ROUTE_TYPE_DIRECT

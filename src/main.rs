@@ -725,6 +725,21 @@ async fn main(spawner: Spawner) {
                             plain.len()
                         );
                     }
+                    InboundAction::ReceivedControl { data, path_len } => {
+                        info!("MeshCore CONTROL data ({} bytes)", data.len());
+                        let mut push = heapless::Vec::<u8, 256>::new();
+                        let _ = push.push(
+                            crate::companion::protocol::PUSH_CODE_CONTROL_DATA,
+                        );
+                        let _ = push.push((snr.saturating_mul(4)) as u8);
+                        let _ = push.push(rssi as i8 as u8);
+                        let _ = push.push(path_len);
+                        let _ = push.extend_from_slice(&data);
+                        if push.len() <= 176 {
+                            let _ = crate::companion::ble::COMPANION_PUSH_CHANNEL
+                                .try_send(push);
+                        }
+                    }
                     InboundAction::ReceivedTrace {
                         tag,
                         auth,
