@@ -807,13 +807,28 @@ async fn handle_text_cli(
                         p.pc,
                         p.msg.as_str()
                     );
+                    let _ = write_all(sender, s.as_bytes()).await;
+                    // Raw tail of the defmt RTT buffer: the real message logged
+                    // just before the panic. Decoded on the host with the ELF.
+                    let mut h: heapless::String<160> = heapless::String::new();
+                    let _ = write!(
+                        h,
+                        "  -> RTT write={} size={} len={} bytes=",
+                        p.rtt_write, p.rtt_size, p.rtt_len
+                    );
+                    let n = (p.rtt_len as usize).min(p.rtt_tail.len());
+                    for &b in &p.rtt_tail[..n] {
+                        let _ = write!(h, "{:02x}", b);
+                    }
+                    let _ = write!(h, "\r\n");
+                    let _ = write_all(sender, h.as_bytes()).await;
                 }
                 None => {
                     let _ = write!(s, "  -> No panic/hardfault record\r\n");
+                    let _ = write_all(sender, s.as_bytes()).await;
                 }
             }
             crate::fault::clear();
-            let _ = write_all(sender, s.as_bytes()).await;
         }
         "stats-core" => {
             let uptime = embassy_time::Instant::now().as_secs();

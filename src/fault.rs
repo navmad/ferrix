@@ -18,6 +18,8 @@ pub const PANIC_MAGIC: u32 = 0x5041_4E43; // "PANC"
 const MSG_MAX: usize = 112;
 const FILE_MAX: usize = 64;
 
+const RTT_TAIL_MAX: usize = 64;
+
 #[repr(C)]
 pub struct PanicRecord {
     pub magic: u32,
@@ -31,6 +33,59 @@ pub struct PanicRecord {
     pub _pad: u8,
     pub msg: [u8; MSG_MAX],
     pub file: [u8; FILE_MAX],
+    /// defmt-rtt write cursor and the last encoded bytes at panic time. defmt
+    /// logs the real panic message (e.g. "unwrap failed: ...") before calling
+    /// core::panic!(), so this is the only place it can be recovered from.
+    pub rtt_write: u32,
+    pub rtt_size: u32,
+    pub rtt_len: u8,
+    pub _pad2: [u8; 3],
+    pub rtt_tail: [u8; RTT_TAIL_MAX],
+}
+
+/// Layout of defmt-rtt's `_SEGGER_RTT` (see `defmt-rtt/src/lib.rs`).
+#[repr(C)]
+struct RttChannel {
+    name: *const u8,
+    buffer: *mut u8,
+    size: usize,
+    write: usize,
+    read: usize,
+    flags: usize,
+}
+
+#[repr(C)]
+struct RttHeader {
+    id: [u8; 16],
+    max_up_channels: usize,
+    max_down_channels: usize,
+    up_channel: RttChannel,
+}
+
+extern "C" {
+    static _SEGGER_RTT: RttHeader;
+}
+
+/// Snapshot the tail of the defmt RTT buffer, which holds the message logged
+/// immediately before the panic.
+fn capture_rtt(rec: &mut PanicRecord) {
+    rec.rtt_len = 0;
+    let hdr = unsafe { &_SEGGER_RTT };
+    let size = hdr.up_channel.size;
+    let write = hdr.up_channel.write;
+    let buf = hdr.up_channel.buffer;
+    rec.rtt_size = size as u32;
+    rec.rtt_write = write as u32;
+    if buf.is_null() || size == 0 {
+        return;
+    }
+    let n = RTT_TAIL_MAX.min(size);
+    for i in 0..n {
+        let idx = (write + size - n + i) % size;
+        // SAFETY: idx is within the RTT buffer.
+        rec.rtt_tail[i] = unsafe { *buf.add(idx) };
+    }
+    rec.rtt_len = n as u8;
 }
 
 impl PanicRecord {
@@ -46,6 +101,11 @@ impl PanicRecord {
             _pad: 0,
             msg: [0; MSG_MAX],
             file: [0; FILE_MAX],
+            rtt_write: 0,
+            rtt_size: 0,
+            rtt_len: 0,
+            _pad2: [0; 3],
+            rtt_tail: [0; RTT_TAIL_MAX],
         }
     }
 }
@@ -94,6 +154,7 @@ pub fn record_panic(info: &core::panic::PanicInfo) {
         0
     };
 
+    capture_rtt(rec);
     rec.magic = 0; // in-progress marker
     rec.line = 0;
     rec.column = 0;
@@ -130,6 +191,7 @@ pub fn record_hardfault(pc: u32, lr: u32) {
         0
     };
 
+    capture_rtt(rec);
     rec.magic = 0;
     rec.line = 0;
     rec.column = 0;
@@ -171,6 +233,10 @@ pub struct PanicSnapshot {
     pub pc: u32,
     pub msg: heapless::String<MSG_MAX>,
     pub file: heapless::String<FILE_MAX>,
+    pub rtt_write: u32,
+    pub rtt_size: u32,
+    pub rtt_len: u8,
+    pub rtt_tail: [u8; RTT_TAIL_MAX],
 }
 
 /// Read the record without clearing it.
@@ -191,6 +257,10 @@ pub fn peek() -> Option<PanicSnapshot> {
         pc: rec.pc,
         msg,
         file,
+        rtt_write: rec.rtt_write,
+        rtt_size: rec.rtt_size,
+        rtt_len: rec.rtt_len,
+        rtt_tail: rec.rtt_tail,
     })
 }
 
