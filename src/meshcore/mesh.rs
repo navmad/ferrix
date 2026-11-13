@@ -41,6 +41,10 @@ pub struct DiscoveredContact {
     pub latitude: i32,       // Changed from f32 to i32 (degrees * 1,000,000)
     pub longitude: i32,      // Changed from f32 to i32 (degrees * 1,000,000)
     pub flags: u8,           // raw advert app_data[0] (kind nibble + masks)
+    /// Authoritative contact type (`ADV_TYPE_CHAT/REPEATER/ROOM/SENSOR`).
+    /// Set from the companion `type` byte for app-added contacts and derived
+    /// from the advert flags for auto-added/imported contacts.
+    pub contact_type: u8,
     /// Learned return path (encoded path byte in `out_path_len`).
     pub out_path: [u8; 64],
     /// `0xFF` means unknown; otherwise a validated encoded path byte.

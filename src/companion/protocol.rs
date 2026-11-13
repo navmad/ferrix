@@ -914,7 +914,7 @@ impl CompanionNode {
                 if payload.len() >= 1 + 32 + 1 + 1 + 1 + 64 + 32 + 4 {
                     let mut i = 1;
                     let pub_key: [u8; 32] = payload[i..i+32].try_into().unwrap(); i += 32;
-                    let _node_type = payload[i]; i += 1;
+                    let contact_type = payload[i]; i += 1;
                     let flags = payload[i]; i += 1;
                     let out_path_len = payload[i]; i += 1;
                     let mut out_path = [0u8; 64];
@@ -956,6 +956,7 @@ impl CompanionNode {
                             latitude: adv_lat,
                             longitude: adv_lon,
                             flags,
+                            contact_type,
                             out_path,
                             out_path_len,
                             last_advert_ts: last_advert,
@@ -1135,6 +1136,7 @@ impl CompanionNode {
                                             latitude: adv.latitude,
                                             longitude: adv.longitude,
                                             flags: adv.flags,
+                                            contact_type: CompanionNode::get_contact_type_from_flags(adv.flags),
                                             out_path,
                                             out_path_len: pkt.path_len,
                                             last_advert_ts: adv.timestamp,
@@ -1390,7 +1392,7 @@ fn serialize_contact(c: &crate::meshcore::mesh::DiscoveredContact) -> Vec<u8, 16
     let mut resp = Vec::<u8, 160>::new();
     let _ = resp.push(RESP_CODE_CONTACT);
     let _ = resp.extend_from_slice(&c.pub_key);
-    let _ = resp.push(CompanionNode::get_contact_type_from_flags(c.flags));
+    let _ = resp.push(c.contact_type);
     let _ = resp.push(c.flags);
     let _ = resp.push(c.out_path_len);
     let _ = resp.extend_from_slice(&c.out_path);

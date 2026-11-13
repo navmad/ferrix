@@ -172,6 +172,7 @@ pub enum ContactOperation {
         latitude: i32,
         longitude: i32,
         flags: u8,
+        contact_type: u8,
         out_path: [u8; 64],
         out_path_len: u8,
         last_advert_ts: u32,
@@ -204,6 +205,7 @@ pub async fn contact_task() -> ! {
                 latitude,
                 longitude,
                 flags,
+                contact_type,
                 out_path,
                 out_path_len,
                 last_advert_ts,
@@ -217,6 +219,7 @@ pub async fn contact_task() -> ! {
                         ct.latitude = latitude;
                         ct.longitude = longitude;
                         ct.flags = flags;
+                        ct.contact_type = contact_type;
                         ct.out_path = out_path;
                         ct.out_path_len = out_path_len;
                         ct.last_advert_ts = last_advert_ts;
@@ -231,6 +234,7 @@ pub async fn contact_task() -> ! {
                             latitude,
                             longitude,
                             flags,
+                            contact_type,
                             out_path,
                             out_path_len,
                             last_advert_ts,

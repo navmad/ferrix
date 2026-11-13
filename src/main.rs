@@ -376,6 +376,7 @@ async fn main(spawner: Spawner) {
                                 existing.latitude = adv.latitude;
                                 existing.longitude = adv.longitude;
                                 existing.flags = adv.flags;
+                                existing.contact_type = contact_type;
                             } else {
                                 // New contact - apply auto-add rules
                                 if !should_add {
@@ -398,6 +399,7 @@ async fn main(spawner: Spawner) {
                                         latitude: adv.latitude,
                                         longitude: adv.longitude,
                                         flags: adv.flags,
+                                        contact_type,
                                         out_path: [0u8; 64],
                                         out_path_len: 0xFF,
                                         last_advert_ts: adv.timestamp,
@@ -434,6 +436,7 @@ async fn main(spawner: Spawner) {
                                             latitude: adv.latitude,
                                             longitude: adv.longitude,
                                             flags: adv.flags,
+                                            contact_type,
                                             out_path: [0u8; 64],
                                             out_path_len: 0xFF,
                                             last_advert_ts: adv.timestamp,
