@@ -92,6 +92,12 @@ pub const CMD_SEND_RAW_DATA: u8 = 0x19;
 
 pub const RESP_CODE_OK: u8 = 0;
 pub const RESP_CODE_ERR: u8 = 1;
+/// Second byte of an error frame: `[RESP_CODE_ERR, code]`.
+pub const ERR_UNSUPPORTED: u8 = 0x01;
+pub const ERR_NOT_FOUND: u8 = 0x02;
+pub const ERR_TABLE_FULL: u8 = 0x03;
+pub const ERR_BAD_STATE: u8 = 0x04;
+pub const ERR_ILLEGAL_ARG: u8 = 0x06;
 pub const RESP_CODE_CONTACTS_START: u8 = 2;
 pub const RESP_CODE_CONTACT: u8 = 3;
 pub const RESP_CODE_END_OF_CONTACTS: u8 = 4;
@@ -1168,14 +1174,29 @@ impl CompanionNode {
             CMD_REMOVE_CONTACT => {
                 // Inbound: [CMD(15), public_key(32)]
                 // Defer the actual removal to `contact_task`, like AddOrUpdate.
+                // Report NOT_FOUND synchronously for an unknown key, as the
+                // reference does.
+                let mut resp = Vec::<u8, 2>::new();
                 if payload.len() >= 33 {
                     let pub_key: [u8; 32] = payload[1..33].try_into().unwrap();
-                    let _ = crate::companion::ble::CONTACT_OP_CHANNEL.try_send(
-                        crate::companion::ble::ContactOperation::Remove { pub_key }
-                    );
+                    let found = crate::companion::usb::DISCOVERED_CONTACTS
+                        .lock(|c| c.borrow().iter().any(|ct| ct.pub_key == pub_key));
+                    if !found {
+                        let _ = resp.push(RESP_CODE_ERR);
+                        let _ = resp.push(ERR_NOT_FOUND);
+                    } else if crate::companion::ble::CONTACT_OP_CHANNEL
+                        .try_send(crate::companion::ble::ContactOperation::Remove { pub_key })
+                        .is_ok()
+                    {
+                        let _ = resp.push(RESP_CODE_OK);
+                    } else {
+                        let _ = resp.push(RESP_CODE_ERR);
+                        let _ = resp.push(ERR_BAD_STATE);
+                    }
+                } else {
+                    let _ = resp.push(RESP_CODE_ERR);
+                    let _ = resp.push(ERR_ILLEGAL_ARG);
                 }
-                let mut resp = Vec::<u8, 4>::new();
-                let _ = resp.push(RESP_CODE_OK);
                 emit(&resp);
             }
 
@@ -1629,8 +1650,9 @@ impl CompanionNode {
 
             _ => {
                 // Unsupported command: report an error rather than a misleading OK.
-                let mut resp = Vec::<u8, 4>::new();
+                let mut resp = Vec::<u8, 2>::new();
                 let _ = resp.push(RESP_CODE_ERR);
+                let _ = resp.push(ERR_UNSUPPORTED);
                 emit(&resp);
             }
         }
