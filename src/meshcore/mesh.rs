@@ -237,7 +237,7 @@ impl MeshEngine {
                 // Look up matching channel by channel_hash (pkt.payload[0])
                 if pkt.payload_len > 0 {
                     let ch_hash = pkt.payload[0];
-                    // Forward flood packets BEFORE trying to decrypt, matching the reference firmware behavior.
+                    // Forward flood packets BEFORE trying to decrypt, matching MeshCore behavior.
                     // This ensures repeater nodes propagate group texts even when they can't
                     // decrypt them (e.g., unknown channel hash). The packet continues through
                     // the mesh regardless of whether this node can read its contents.

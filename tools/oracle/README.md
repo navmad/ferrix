@@ -56,5 +56,5 @@ drift.
 ## Next steps
 
 1. Add seeded random valid packets and more rejection/adversarial cases.
-2. Add real captures from the reference firmware on the M1 as an additional validation set.
+2. Add real captures from MeshCore on the M1 as an additional validation set.
 3. Flip the Rust `#[ignore]` tests to active as each phase lands.

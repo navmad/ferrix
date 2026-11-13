@@ -115,8 +115,8 @@ if [ -f "${NRFUTIL}" ]; then
 fi
 
 echo "==> Checking device state..."
-# If Ferrix/MeshCore/the reference firmware companion firmware is running, trigger 1200-baud touch to enter bootloader
-if ioreg -p IOUSB -l -w 0 2>/dev/null | grep -E -q "Ferrix|MeshCore|the reference firmware"; then
+# If Ferrix/MeshCore/MeshCore companion firmware is running, trigger 1200-baud touch to enter bootloader
+if ioreg -p IOUSB -l -w 0 2>/dev/null | grep -E -q "Ferrix|MeshCore|MeshCore"; then
     echo "==> Ferrix/MeshCore application active. Sending 1200-baud touch to enter bootloader..."
     PYTHON_CMD=""
     if [ -x "${NRFUTIL_PYTHON}" ]; then

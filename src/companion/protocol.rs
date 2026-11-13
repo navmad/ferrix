@@ -116,7 +116,7 @@ pub const PUSH_CODE_LOG_RX_DATA: u8 = 0x88;
 pub const PUSH_CODE_CONTACTS_FULL: u8 = 0x89;
 pub const PUSH_CODE_CONTACT_DELETED: u8 = 0x8A;
 
-/// Auto-add configuration bitmask (matches the reference firmware)
+/// Auto-add configuration bitmask (matches MeshCore)
 pub const AUTO_ADD_OVERWRITE_OLDEST: u8 = 1 << 0;
 pub const AUTO_ADD_CHAT: u8 = 1 << 1;
 pub const AUTO_ADD_REPEATER: u8 = 1 << 2;
@@ -160,7 +160,7 @@ pub struct CompanionNode {
     pub last_snr: i8,
     pub current_page: u8,
     pub path_hash_mode: u8,
-    /// Auto-add configuration bitmask (matches the reference firmware)
+    /// Auto-add configuration bitmask (matches MeshCore)
     pub autoadd_config: u8,
     /// Max hops for auto-adding contacts (0 = no limit)
     pub autoadd_max_hops: u8,
@@ -388,8 +388,8 @@ impl CompanionNode {
                         u32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]);
                     let sf = payload[9];
                     let cr = payload[10];
-                    // v9+ appends the client-repeat (off-grid) flag. Like
-                    // the reference firmware, it is only valid on an allowed repeat band.
+                    // v9+ appends the client-repeat (off-grid) flag. It is
+                    // only valid on an allowed repeat band.
                     let repeat = payload.get(11).map_or(false, |&b| b != 0);
                     if (100_000..=1_000_000).contains(&freq_khz)
                         && (7_800..=500_000).contains(&bw_hz)
@@ -417,8 +417,8 @@ impl CompanionNode {
                                 s.sf = sf;
                                 s.cr = cr;
                                 s.client_repeat = repeat;
-                                // the reference firmware offgridFreqEdited(): the app owns
-                                // the frequency, so forget the saved home.
+                                // The app owns the frequency, so forget the
+                                // saved home frequency.
                                 s.offgrid_home_freq = 0;
                                 let forward = s.is_repeater
                                     || (repeat
@@ -920,7 +920,7 @@ impl CompanionNode {
             CMD_ADD_UPDATE_CONTACT => {
                 // Inbound: [CMD(9), public_key(32), type(1), flags(1), out_path_len(1), out_path(64), adv_name(32), last_advert(4)]
                 // Optional: gps_lat(4), gps_lon(4), lastmod(4)
-                // Minimum required: 1 + 32 + 1 + 1 + 1 + 64 + 32 + 4 = 136 bytes (matches the reference firmware)
+                // Minimum required: 1 + 32 + 1 + 1 + 1 + 64 + 32 + 4 = 136 bytes (matches MeshCore)
                 //
                 // This handler runs in `command_fut` (normal task context), but contact
                 // storage is still deferred to `contact_task` via CONTACT_OP_CHANNEL so
@@ -978,7 +978,7 @@ impl CompanionNode {
                     );
 
                     // Return OK immediately — the actual storage happens asynchronously.
-                    // the reference firmware also returns OK before the contact is fully persisted.
+                    // The companion also returns OK before the contact is fully persisted.
                     let mut resp = Vec::<u8, 4>::new();
                     let _ = resp.push(RESP_CODE_OK);
                     emit(&resp);
@@ -1219,7 +1219,7 @@ impl CompanionNode {
             }
 
             CMD_GET_ALLOWED_REPEAT_FREQ => {
-                // the reference firmware's allowed client-repeat bands (kHz, lower/upper).
+                // Allowed client-repeat (off-grid) bands (kHz, lower/upper).
                 let mut resp = Vec::<u8, 32>::new();
                 let _ = resp.push(RESP_CODE_ALLOWED_REPEAT_FREQ);
                 for (lo, hi) in crate::companion::usb::OFFGRID_FREQ_RANGES {

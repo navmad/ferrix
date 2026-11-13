@@ -84,7 +84,7 @@ fn cr_from_u8(cr: u8) -> CodingRate {
     }
 }
 
-/// the reference firmware parity: longer preamble for SF <= 8 (32 symbols), 16 otherwise.
+/// MeshCore parity: longer preamble for SF <= 8 (32 symbols), 16 otherwise.
 fn preamble_for(sf: u8) -> u16 {
     if sf <= 8 {
         32

@@ -34,7 +34,7 @@ pub struct PersistentConfig {
     pub custom_priv_key: [u8; 64],
     pub has_custom_key: u8,
     pub is_repeater: u8,
-    /// Off-grid client-repeat mode (the reference firmware `client_repeat`).
+    /// Off-grid client-repeat mode (MeshCore `client_repeat`).
     pub client_repeat: u8,
     /// Frequency to restore when off-grid mode is disabled.
     pub offgrid_home_freq: u32,
@@ -420,7 +420,7 @@ pub fn assemble_current_config() -> PersistentConfig {
         radio_sf: sf,
         radio_cr: cr,
         path_hash_mode: path_mode,
-        autoadd_config: 0x1E,   // default: auto-add all types with overwrite oldest (the reference firmware default)
+        autoadd_config: 0x1E,   // default: auto-add all types with overwrite oldest (MeshCore default)
         autoadd_max_hops: 0,    // 0 = no hop limit
         radio_freq_hz: freq,
         radio_bw_khz: bw,

@@ -20,7 +20,7 @@ pub fn battery_percentage() -> u8 {
 /// ThinkNode M1 battery ADC: AIN2 (P0.04), 150K+150K divider (2:1), SAADC
 /// gain 1/6 with the internal 0.6 V reference.
 ///
-/// `7236 / 4096` matches the reference firmware's `vbat-mv-multiplier` (2:1 divider,
+/// `7236 / 4096` matches the board's `vbat-mv-multiplier` (2:1 divider,
 /// 3.6 V full scale, +0.5% SAADC gain trim).
 pub fn adc_raw_to_battery_millivolts(raw: u16) -> u16 {
     let mv = (raw as u32 * 7236) / 4096;

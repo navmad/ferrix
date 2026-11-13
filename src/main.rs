@@ -201,7 +201,7 @@ async fn main(spawner: Spawner) {
 
     // Battery ADC: ThinkNode M1 AIN2 (P0.04), 150K+150K divider (2:1).
     // `single_ended` defaults to gain 1/6 and the internal 0.6 V reference,
-    // which is the 3.6 V full-scale range the reference firmware's multiplier assumes.
+    // which is the 3.6 V full-scale range the board's multiplier assumes.
     let mut battery_adc = saadc::Saadc::new(
         board.saadc,
         Irqs,

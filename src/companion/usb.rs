@@ -44,7 +44,7 @@ pub struct RadioSettings {
     pub bw_khz: u32,
     pub cr: u8,
     pub is_repeater: bool,
-    /// Off-grid "client repeat" mode (the reference firmware `client_repeat`). Distinct from
+    /// Off-grid "client repeat" mode (`client_repeat`). Distinct from
     /// the repeater node role: it enables forwarding only on an allowed
     /// off-grid frequency.
     pub client_repeat: bool,
@@ -65,9 +65,9 @@ pub static RADIO_SETTINGS: Mutex<SharedRawMutex, RefCell<RadioSettings>> = Mutex
     path_hash_mode: 0,
 }));
 
-/// the reference firmware's companion defaults on nRF52840 (see `REFERENCE_MAX_CONTACTS`).
+/// Companion defaults on nRF52840: 350 contacts, 40 channels.
 pub const MAX_CONTACTS: usize = 350;
-/// the reference firmware's companion default (`REFERENCE_MAX_CHANNELS`).
+/// Companion default group-channel count.
 pub const MAX_CHANNELS: usize = 40;
 
 pub static DISCOVERED_CONTACTS: Mutex<SharedRawMutex, RefCell<heapless::Vec<DiscoveredContact, MAX_CONTACTS>>> =
@@ -157,7 +157,7 @@ fn parse_bw_khz(val: &str) -> Option<u32> {
     matches!(bw, 7 | 10 | 15 | 20 | 31 | 41 | 62 | 125 | 250 | 500).then_some(bw)
 }
 
-/// Render a bandwidth the way the reference firmware does: 62.5, 125, 250, 500, 31.25...
+/// Render a bandwidth with trailing zeros stripped: 62.5, 125, 250, 500, 31.25...
 fn format_bw(bw_khz: u32) -> heapless::String<16> {
     let hz = bw_khz_to_hz(bw_khz);
     let mut s = heapless::String::<16>::new();
@@ -173,7 +173,7 @@ fn format_bw(bw_khz: u32) -> heapless::String<16> {
     s
 }
 
-/// the reference firmware's allowed client-repeat frequencies (kHz).
+/// Allowed client-repeat (off-grid) frequencies (kHz).
 pub const OFFGRID_FREQ_RANGES: [(u32, u32); 3] = [
     (433_000, 433_000),
     (869_495, 869_495),
@@ -190,7 +190,7 @@ pub fn is_offgrid_freq_hz(hz: u32) -> bool {
     is_offgrid_freq_khz(hz / 1000)
 }
 
-/// the reference firmware `offgridActive`: client repeat set AND on an allowed frequency.
+/// Off-grid active: client repeat set AND on an allowed frequency.
 pub fn offgrid_active() -> bool {
     RADIO_SETTINGS.lock(|r| {
         let s = r.borrow();
@@ -228,7 +228,7 @@ pub struct OffgridChange {
     pub no_band: bool,
 }
 
-/// the reference firmware `offgridSet`: toggle client-repeat/off-grid mode. Turning it on
+/// Toggle client-repeat/off-grid mode. Turning it on
 /// retunes to the nearest allowed band and remembers the previous frequency;
 /// turning it off restores that frequency.
 pub fn offgrid_set(on: bool) -> OffgridChange {
@@ -801,7 +801,7 @@ async fn handle_text_cli(
             }
         }
         "get repeat" => {
-            // the reference firmware: for a companion this reflects off-grid mode.
+            // For a companion this reflects off-grid mode.
             let on = crate::companion::usb::offgrid_active();
             let mut s: heapless::String<16> = heapless::String::new();
             let _ = write!(s, "> {}\r\n", if on { "on" } else { "off" });

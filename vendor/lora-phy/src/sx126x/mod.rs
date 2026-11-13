@@ -271,7 +271,7 @@ where
         }
 
         // LDRO is required when the LoRa symbol time exceeds 16.38 ms
-        // (SX126x datasheet / the reference firmware `should_enable_ldro`). The formula is
+        // (SX126x datasheet / MeshCore `should_enable_ldro`). The formula is
         // bandwidth-dependent; hard-coding SF11/12 was only correct at
         // 125 kHz and missed SF10-12 at 62.5 kHz.
         let symbol_time_ns =
