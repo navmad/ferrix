@@ -16,6 +16,8 @@ pub struct LoraConfig {
     pub bandwidth_khz: u32,
     pub coding_rate: u8,
     pub preamble_length: u16,
+    /// Listen in duty-cycle/sniff mode instead of continuous RX.
+    pub rx_duty_cycle: bool,
 }
 
 impl Default for LoraConfig {
@@ -27,6 +29,7 @@ impl Default for LoraConfig {
             bandwidth_khz: 62,
             coding_rate: 5, // CR 4/5 (denominator, matching RADIO_SETTINGS)
             preamble_length: 16,
+            rx_duty_cycle: false,
         }
     }
 }

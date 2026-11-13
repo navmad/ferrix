@@ -15,7 +15,7 @@ type SharedRawMutex = embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex
 use embassy_time::Delay;
 use embedded_hal_bus::spi::ExclusiveDevice;
 use lora_phy::iv::GenericSx126xInterfaceVariant;
-use lora_phy::mod_params::{Bandwidth, CodingRate, RxMode, SpreadingFactor};
+use lora_phy::mod_params::{Bandwidth, CodingRate, DutyCycleParams, RadioError, RxMode, SpreadingFactor};
 use lora_phy::sx126x::{Config as Sx126xConfig, Sx1262, Sx126x, TcxoCtrlVoltage};
 use lora_phy::LoRa;
 
@@ -42,6 +42,7 @@ pub fn request_radio_config() -> bool {
             bandwidth_khz: s.bw_khz,
             coding_rate: s.cr,
             preamble_length: 0,
+            rx_duty_cycle: s.rx_duty_cycle,
         }
     });
     LORA_CFG_CHANNEL.try_send(cfg).is_ok()
@@ -91,6 +92,50 @@ fn preamble_for(sf: u8) -> u16 {
     } else {
         16
     }
+}
+
+/// Estimate SX126x RX duty-cycle timings. The RX window only needs to catch
+/// a preamble (`SetStopTimerOnPreamble` keeps the radio listening once it
+/// does), but it must also leave room to finish a short packet.
+fn duty_cycle_params(sf: u8, bw_khz: u32, preamble: u16) -> Option<DutyCycleParams> {
+    let bw_hz = crate::companion::usb::bw_khz_to_hz(bw_khz) as u64;
+    let sym_us = ((1u64 << sf) * 1_000_000) / bw_hz;
+    let detect = if sf >= 7 { 8u64 } else { 12u64 };
+    let p = preamble as u64;
+
+    if p <= 2 * detect + 1 {
+        return None;
+    }
+
+    let deaf_budget = (p - 2 * detect - 1) * sym_us;
+    let deaf_us = deaf_budget * 90 / 100; // 10% margin for RC timer drift
+    let wake_us = 3_000u64;
+    if deaf_us <= wake_us + 2_000 {
+        return None;
+    }
+
+    let sleep_us = deaf_us - wake_us;
+    let complete_us = (p + 14) * sym_us;
+    let mut rx_us = (detect + 1) * sym_us;
+    if complete_us > sleep_us && rx_us < (complete_us - sleep_us + 1) / 2 {
+        rx_us = (complete_us - sleep_us + 1) / 2;
+    }
+
+    // SetRxDutyCycle units are 15.625 us.
+    let units = |us: u64| ((us * 64 + 500) / 1000).min(0xFF_FFFF) as u32;
+    Some(DutyCycleParams {
+        rx_time: units(rx_us),
+        sleep_time: units(sleep_us),
+    })
+}
+
+fn make_rx_mode(sf: u8, bw_khz: u32, duty_cycle: bool) -> RxMode {
+    if duty_cycle {
+        if let Some(params) = duty_cycle_params(sf, bw_khz, preamble_for(sf)) {
+            return RxMode::DutyCycle(params);
+        }
+    }
+    RxMode::Continuous
 }
 
 /// ThinkNode M1 LoRa Radio Adapter implementing `LoraRadio` via channels
@@ -192,14 +237,15 @@ pub async fn lora_phy_task(
     };
 
     // 6. Read the persisted radio settings and build the modulation params.
-    let (freq_hz, tx_power, sf, bw_khz, cr) =
+    let (freq_hz, tx_power, sf, bw_khz, cr, duty_cycle) =
         crate::companion::usb::RADIO_SETTINGS.lock(|r| {
             let s = r.borrow();
-            (s.frequency_hz, s.tx_power_dbm, s.sf, s.bw_khz, s.cr)
+            (s.frequency_hz, s.tx_power_dbm, s.sf, s.bw_khz, s.cr, s.rx_duty_cycle)
         });
     let mut tx_power_dbm = tx_power;
     let mut preamble = preamble_for(sf);
-    let mut current_cfg = (freq_hz, tx_power, sf, bw_khz, cr);
+    let mut rx_mode = make_rx_mode(sf, bw_khz, duty_cycle);
+    let mut current_cfg = (freq_hz, tx_power, sf, bw_khz, cr, duty_cycle);
     let mut mdltn_params = match lora.create_modulation_params(
         sf_from_u8(sf),
         bw_from_khz(bw_khz),
@@ -222,15 +268,15 @@ pub async fn lora_phy_task(
         }
     };
 
-    // 8. Prepare for continuous reception
-    if let Err(e) = lora.prepare_for_rx(RxMode::Continuous, &mdltn_params, &rx_pkt_params).await {
+    // 8. Prepare for reception (continuous or duty cycle).
+    if let Err(e) = lora.prepare_for_rx(rx_mode, &mdltn_params, &rx_pkt_params).await {
         error!("lora-phy: Failed to prepare for RX: {:?}", e);
         return;
     }
 
     info!(
-        "lora-phy: Radio listening on {} Hz (SF{}/BW{}k, CR 4/{})",
-        freq_hz, sf, bw_khz, cr
+        "lora-phy: Radio listening on {} Hz (SF{}/BW{}k, CR 4/{}, RX {})",
+        freq_hz, sf, bw_khz, cr, rx_mode
     );
 
     let mut rx_buf = [0u8; 256];
@@ -260,6 +306,20 @@ pub async fn lora_phy_task(
                     let _ = LORA_RX_CHANNEL.try_send((copy_len, status.rssi, status.snr as i8, packet_data));
                 }
                 Ok(Err(e)) => {
+                    // A duty-cycle window ending without a preamble is normal.
+                    if matches!(rx_mode, RxMode::DutyCycle(_)) && e == RadioError::ReceiveTimeout {
+                        match embassy_time::with_timeout(
+                            embassy_time::Duration::from_secs(1),
+                            lora.prepare_for_rx(rx_mode, &mdltn_params, &rx_pkt_params),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => continue,
+                            Ok(Err(e)) => error!("lora-phy: duty-cycle re-arm failed: {:?}", e),
+                            Err(_) => error!("lora-phy: duty-cycle re-arm timed out"),
+                        }
+                    }
+
                     if rx_backoff_ms <= 50 {
                         debug!("lora-phy: RX error or timeout: {:?}", e);
                     }
@@ -269,11 +329,11 @@ pub async fn lora_phy_task(
                     embassy_time::Timer::after_millis(rx_backoff_ms).await;
                     rx_backoff_ms = (rx_backoff_ms * 2).min(1000);
 
-                    // Re-enter RX continuous if an error occurred, but never
-                    // let a stuck BUSY line wedge the whole task forever.
+                    // Re-enter RX if an error occurred, but never let a stuck
+                    // BUSY line wedge the whole task forever.
                     match embassy_time::with_timeout(
                         embassy_time::Duration::from_secs(1),
-                        lora.prepare_for_rx(RxMode::Continuous, &mdltn_params, &rx_pkt_params),
+                        lora.prepare_for_rx(rx_mode, &mdltn_params, &rx_pkt_params),
                     )
                     .await
                     {
@@ -287,7 +347,7 @@ pub async fn lora_phy_task(
                     debug!("lora-phy: RX watchdog re-arm");
                     match embassy_time::with_timeout(
                         embassy_time::Duration::from_secs(1),
-                        lora.prepare_for_rx(RxMode::Continuous, &mdltn_params, &rx_pkt_params),
+                        lora.prepare_for_rx(rx_mode, &mdltn_params, &rx_pkt_params),
                     )
                     .await
                     {
@@ -327,10 +387,10 @@ pub async fn lora_phy_task(
                     Ok(Err(e)) => error!("lora-phy: Transmission failed: {:?}", e),
                     Err(_) => error!("lora-phy: Transmission timed out; forcing RX recovery"),
                 }
-                // Return to continuous RX mode after transmission
+                // Return to the configured RX mode after transmission.
                 let _ = embassy_time::with_timeout(
                     embassy_time::Duration::from_secs(1),
-                    lora.prepare_for_rx(RxMode::Continuous, &mdltn_params, &rx_pkt_params),
+                    lora.prepare_for_rx(rx_mode, &mdltn_params, &rx_pkt_params),
                 )
                 .await;
             }
@@ -341,6 +401,7 @@ pub async fn lora_phy_task(
                     cfg.spreading_factor,
                     cfg.bandwidth_khz,
                     cfg.coding_rate,
+                    cfg.rx_duty_cycle,
                 );
                 if requested == current_cfg {
                     // The app re-sends its stored settings on every connect.
@@ -368,12 +429,17 @@ pub async fn lora_phy_task(
                                 rx_pkt_params = new_rx;
                                 preamble = new_preamble;
                                 tx_power_dbm = cfg.tx_power_dbm;
+                                rx_mode = make_rx_mode(
+                                    cfg.spreading_factor,
+                                    cfg.bandwidth_khz,
+                                    cfg.rx_duty_cycle,
+                                );
                                 current_cfg = requested;
                                 rx_backoff_ms = 50;
                                 match embassy_time::with_timeout(
                                     embassy_time::Duration::from_secs(1),
                                     lora.prepare_for_rx(
-                                        RxMode::Continuous,
+                                        rx_mode,
                                         &mdltn_params,
                                         &rx_pkt_params,
                                     ),
@@ -387,12 +453,13 @@ pub async fn lora_phy_task(
                                     Err(_) => error!("lora-phy: re-enter RX after cfg timed out"),
                                 }
                                 info!(
-                                    "lora-phy: reconfigured to {} Hz (SF{}, BW{}k, CR 4/{}), {} dBm",
+                                    "lora-phy: reconfigured to {} Hz (SF{}, BW{}k, CR 4/{}), {} dBm, RX {}",
                                     cfg.frequency_hz,
                                     cfg.spreading_factor,
                                     cfg.bandwidth_khz,
                                     cfg.coding_rate,
-                                    cfg.tx_power_dbm
+                                    cfg.tx_power_dbm,
+                                    rx_mode
                                 );
                             }
                             Err(e) => {
@@ -402,7 +469,7 @@ pub async fn lora_phy_task(
                                 let _ = embassy_time::with_timeout(
                                     embassy_time::Duration::from_secs(1),
                                     lora.prepare_for_rx(
-                                        RxMode::Continuous,
+                                        rx_mode,
                                         &mdltn_params,
                                         &rx_pkt_params,
                                     ),
@@ -416,7 +483,7 @@ pub async fn lora_phy_task(
                         let _ = embassy_time::with_timeout(
                             embassy_time::Duration::from_secs(1),
                             lora.prepare_for_rx(
-                                RxMode::Continuous,
+                                rx_mode,
                                 &mdltn_params,
                                 &rx_pkt_params,
                             ),

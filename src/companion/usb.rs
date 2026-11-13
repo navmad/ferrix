@@ -52,6 +52,8 @@ pub struct RadioSettings {
     /// Frequency to return to when off-grid mode is turned off.
     pub offgrid_home_freq: u32,
     pub path_hash_mode: u8,
+    /// Listen in duty-cycle/sniff mode instead of continuous RX.
+    pub rx_duty_cycle: bool,
 }
 
 pub static RADIO_SETTINGS: Mutex<SharedRawMutex, RefCell<RadioSettings>> = Mutex::new(RefCell::new(RadioSettings {
@@ -64,6 +66,7 @@ pub static RADIO_SETTINGS: Mutex<SharedRawMutex, RefCell<RadioSettings>> = Mutex
     client_repeat: false,
     offgrid_home_freq: 0,
     path_hash_mode: 0,
+    rx_duty_cycle: false,
 }));
 
 /// Contact auto-add policy, shared by every companion transport and the main
@@ -1145,6 +1148,27 @@ async fn handle_text_cli(
             )
             .await;
         }
+        "get rxduty" | "get rx.duty" => {
+            let on = RADIO_SETTINGS.lock(|r| r.borrow().rx_duty_cycle);
+            let mut s: heapless::String<32> = heapless::String::new();
+            let _ = write!(s, "  -> {}\r\n", if on { "on" } else { "off" });
+            let _ = write_all(sender, s.as_bytes()).await;
+        }
+        "set rxduty on" | "set rxduty off" => {
+            let on = trimmed == "set rxduty on";
+            RADIO_SETTINGS.lock(|r| r.borrow_mut().rx_duty_cycle = on);
+            crate::storage::request_save_config();
+            let _ = crate::radio::lora_phy::request_radio_config();
+            let _ = write_all(
+                sender,
+                if on {
+                    b"  -> OK (RX duty cycle on)\r\n" as &[u8]
+                } else {
+                    b"  -> OK (RX duty cycle off)\r\n" as &[u8]
+                },
+            )
+            .await;
+        }
         "get autoadd" | "get auto-add" => {
             let a = AUTOADD_SETTINGS.lock(|x| *x.borrow());
             let enabled = (a.manual_add_contacts & 1) == 0 || a.config != 0;
@@ -1422,7 +1446,7 @@ async fn handle_text_cli(
             let _ = write_all(sender, b"  -> OK (Config save queued to flash)\r\n").await;
         }
         "help" => {
-            let _ = write_all(sender, b"  -> Commands:\r\n  ->   Identity: get/set name, get/set prv.key, get public.key\r\n  ->   Radio:    get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq/tx/sf/bw/cr, get/set repeat, get/set hash-mode, stats-radio\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, get/set autoadd, advert, time, channels\r\n  ->   System:   save, ver, board, get/set leds, stats-core, stats-packets, clear stats/contacts/messages, reboot\r\n").await;
+            let _ = write_all(sender, b"  -> Commands:\r\n  ->   Identity: get/set name, get/set prv.key, get public.key\r\n  ->   Radio:    get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq/tx/sf/bw/cr, get/set repeat, get/set rxduty, get/set hash-mode, stats-radio\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, get/set autoadd, advert, time, channels\r\n  ->   System:   save, ver, board, get/set leds, stats-core, stats-packets, clear stats/contacts/messages, reboot\r\n").await;
         }
         _ => {
             let _ = write_all(sender, b"  -> Unknown command\r\n").await;

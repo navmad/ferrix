@@ -28,7 +28,7 @@ use crate::companion::protocol::CompanionNode;
 use crate::display::epd::{EpdFrameBuffer, EPD_WIDTH};
 
 /// Number of dashboard pages. Keep in sync with `main`'s page-turn modulo.
-pub const PAGE_COUNT: u8 = 7;
+pub const PAGE_COUNT: u8 = 8;
 
 const DISP_W: i32 = EPD_WIDTH as i32;
 const SMALL_W: i32 = 6;
@@ -64,7 +64,8 @@ pub fn render_page(page: u8, node: &CompanionNode, fb: &mut EpdFrameBuffer) {
         3 => render_traffic(fb, small),
         4 => render_gps(node, fb, small),
         5 => render_offgrid(fb, small),
-        _ => render_leds(fb, small),
+        6 => render_leds(fb, small),
+        _ => render_power(fb, small),
     }
     draw_action_bar(page, fb, small);
 }
@@ -83,7 +84,8 @@ fn draw_action_bar(page: u8, fb: &mut EpdFrameBuffer, small: SmallStyle) {
         3 => "FK: reset counters",
         4 => "FK: toggle GPS",
         5 => "FK: toggle offgrid",
-        _ => "FK: toggle blue LED",
+        6 => "FK: toggle blue LED",
+        _ => "FK: toggle RX duty",
     };
     draw_text(fb, action, 2, 192, small);
 }
@@ -220,10 +222,18 @@ fn render_recent(node: &CompanionNode, fb: &mut EpdFrameBuffer, small: SmallStyl
 }
 
 fn render_radio(fb: &mut EpdFrameBuffer, small: SmallStyle) {
-    let (freq_hz, bw_khz, sf, cr, tx_power) = crate::companion::usb::RADIO_SETTINGS.lock(|r| {
-        let s = r.borrow();
-        (s.frequency_hz, s.bw_khz, s.sf, s.cr, s.tx_power_dbm)
-    });
+    let (freq_hz, bw_khz, sf, cr, tx_power, rx_duty) =
+        crate::companion::usb::RADIO_SETTINGS.lock(|r| {
+            let s = r.borrow();
+            (
+                s.frequency_hz,
+                s.bw_khz,
+                s.sf,
+                s.cr,
+                s.tx_power_dbm,
+                s.rx_duty_cycle,
+            )
+        });
     let (rx, tx) = crate::companion::usb::RADIO_TELEMETRY.lock(|t| {
         let t = t.borrow();
         (t.rx_packets, t.tx_beacons)
@@ -245,7 +255,12 @@ fn render_radio(fb: &mut EpdFrameBuffer, small: SmallStyle) {
     draw_text(fb, buf.as_str(), 2, CONTENT_Y + LINE_H, small);
 
     buf.clear();
-    let _ = write!(buf, "TX:{}dBm RX/CONT", tx_power);
+    let _ = write!(
+        buf,
+        "TX:{}dBm RX/{}",
+        tx_power,
+        if rx_duty { "DC" } else { "CONT" }
+    );
     draw_text(fb, buf.as_str(), 2, CONTENT_Y + 2 * LINE_H, small);
 
     buf.clear();
@@ -302,6 +317,24 @@ fn render_leds(fb: &mut EpdFrameBuffer, small: SmallStyle) {
     draw_centered(fb, "Blue LED", CONTENT_Y + 10, small);
     draw_centered(fb, if disabled { "OFF" } else { "ON" }, CONTENT_Y + 30, small);
     draw_centered(fb, "FK: toggle", CONTENT_Y + 50, small);
+}
+
+fn render_power(fb: &mut EpdFrameBuffer, small: SmallStyle) {
+    let (duty, tx) = crate::companion::usb::RADIO_SETTINGS.lock(|r| {
+        let s = r.borrow();
+        (s.rx_duty_cycle, s.tx_power_dbm)
+    });
+
+    let mut buf: String<32> = String::new();
+    draw_centered(fb, "Power", CONTENT_Y + 10, small);
+    draw_centered(
+        fb,
+        if duty { "RX duty: ON" } else { "RX duty: OFF" },
+        CONTENT_Y + 30,
+        small,
+    );
+    let _ = write!(buf, "TX: {} dBm", tx);
+    draw_centered(fb, buf.as_str(), CONTENT_Y + 50, small);
 }
 
 fn render_offgrid(fb: &mut EpdFrameBuffer, small: SmallStyle) {

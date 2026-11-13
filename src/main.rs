@@ -1003,7 +1003,7 @@ async fn main(spawner: Spawner) {
                                 info!("Input: offgrid {}", if active { "off" } else { "on" });
                             }
                         }
-                        _ => {
+                        6 => {
                             let disabled = !crate::companion::usb::leds_disabled();
                             crate::companion::usb::set_leds_disabled(disabled);
                             set_blue_led(&mut board.telemetry.blue_led, !disabled);
@@ -1011,6 +1011,16 @@ async fn main(spawner: Spawner) {
                                 "Input: blue LED {}",
                                 if disabled { "disabled" } else { "enabled" }
                             );
+                        }
+                        _ => {
+                            let on = crate::companion::usb::RADIO_SETTINGS.lock(|r| {
+                                let mut s = r.borrow_mut();
+                                s.rx_duty_cycle = !s.rx_duty_cycle;
+                                s.rx_duty_cycle
+                            });
+                            crate::storage::request_save_config();
+                            let _ = crate::radio::lora_phy::request_radio_config();
+                            info!("Input: RX duty cycle {}", if on { "on" } else { "off" });
                         }
                     }
 
