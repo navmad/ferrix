@@ -1101,6 +1101,20 @@ async fn handle_text_cli(
             );
             let _ = write_all(sender, s.as_bytes()).await;
         }
+        "get companion" => {
+            use core::sync::atomic::Ordering;
+            let dq = crate::companion::protocol::DEVICE_QUERY_COUNT.load(Ordering::Relaxed);
+            let ga = crate::companion::protocol::GET_AUTOADD_COUNT.load(Ordering::Relaxed);
+            let sa = crate::companion::protocol::SET_AUTOADD_COUNT.load(Ordering::Relaxed);
+            let lc = crate::companion::protocol::LAST_CMD.load(Ordering::Relaxed);
+            let mut s: heapless::String<128> = heapless::String::new();
+            let _ = write!(
+                s,
+                "  -> device_query={} get_autoadd={} set_autoadd={} last_cmd=0x{:02X}\r\n",
+                dq, ga, sa, lc
+            );
+            let _ = write_all(sender, s.as_bytes()).await;
+        }
         s if s == "set autoadd" || s.starts_with("set autoadd ") => {
             let arg = s["set autoadd".len()..].trim();
             let (manual, config, max_hops, label) = if arg.eq_ignore_ascii_case("on") {

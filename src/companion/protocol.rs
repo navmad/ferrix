@@ -4,7 +4,7 @@
 //! and generates protocol response frames.
 
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
@@ -18,6 +18,13 @@ pub const MAX_SIGN_DATA: usize = 4096;
 static SIGN_ACTIVE: AtomicBool = AtomicBool::new(false);
 static SIGN_BUFFER: Mutex<CriticalSectionRawMutex, RefCell<Vec<u8, MAX_SIGN_DATA>>> =
     Mutex::new(RefCell::new(Vec::new()));
+
+/// Diagnostics for companion app capability negotiation. These are shared by
+/// every transport so `get companion` can show what the connected app asked.
+pub static DEVICE_QUERY_COUNT: AtomicU32 = AtomicU32::new(0);
+pub static GET_AUTOADD_COUNT: AtomicU32 = AtomicU32::new(0);
+pub static SET_AUTOADD_COUNT: AtomicU32 = AtomicU32::new(0);
+pub static LAST_CMD: AtomicU8 = AtomicU8::new(0);
 
 #[derive(Clone, Copy)]
 struct ScopeState {
@@ -281,6 +288,19 @@ impl CompanionNode {
         self.battery_percentage = crate::telemetry::battery_percentage();
 
         let cmd = payload[0];
+        LAST_CMD.store(cmd, Ordering::Relaxed);
+        match cmd {
+            CMD_DEVICE_QUERY => {
+                DEVICE_QUERY_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
+            CMD_GET_AUTOADD_CONFIG => {
+                GET_AUTOADD_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
+            CMD_SET_AUTOADD_CONFIG => {
+                SET_AUTOADD_COUNT.fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
         // NOTE: this runs in `command_fut` (normal task context), never inside
         // the SoftDevice GATT callback. Logging is therefore safe here.
 
@@ -313,7 +333,9 @@ impl CompanionNode {
                 let _ = resp.extend_from_slice(&mmodel);
 
                 let mut sver = [0u8; 20];
-                let s = b"0.1.0-ferrix";
+                // The app gates several settings on the firmware version
+                // string, so report the MeshCore-compatible one.
+                let s = b"v1.18.0";
                 sver[..s.len()].copy_from_slice(s);
                 let _ = resp.extend_from_slice(&sver);
 
