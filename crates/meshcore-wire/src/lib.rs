@@ -10,6 +10,7 @@
 
 pub mod crypto;
 pub mod identity;
+pub mod message_record;
 pub mod packet;
 pub mod packets;
 pub mod queue;

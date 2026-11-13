@@ -1397,7 +1397,7 @@ async fn handle_text_cli(
             MESSAGE_LOG.lock(|m| {
                 m.borrow_mut().clear();
             });
-            crate::storage::request_messages();
+            crate::storage::messages::queue_clear().await;
             let _ = write_all(sender, b"  -> OK (Messages cleared)\r\n").await;
         }
         "stats-radio" => {
@@ -1413,6 +1413,35 @@ async fn handle_text_cli(
                 snr as f32,
                 tx_ms / 1000,
                 rx_ms / 1000
+            );
+            let _ = write_all(sender, s.as_bytes()).await;
+        }
+        "stats-flash" => {
+            use core::sync::atomic::Ordering::Relaxed;
+            let mut s: heapless::String<256> = heapless::String::new();
+            let _ = write!(
+                s,
+                "  -> contacts: {} saves / {} erases\r\n",
+                crate::storage::contacts::SAVES.load(Relaxed),
+                crate::storage::contacts::ERASES.load(Relaxed)
+            );
+            let _ = write!(
+                s,
+                "  -> messages: {} records / {} page erases\r\n",
+                crate::storage::messages::RECORD_SAVES.load(Relaxed),
+                crate::storage::messages::PAGE_ERASES.load(Relaxed)
+            );
+            let _ = write!(
+                s,
+                "  -> adverts: {} records / {} erases\r\n",
+                crate::storage::adverts::RECORD_SAVES.load(Relaxed),
+                crate::storage::adverts::ERASES.load(Relaxed)
+            );
+            let _ = write!(
+                s,
+                "  -> config: {} saves / {} erases\r\n",
+                crate::storage::config::CONFIG_SAVES.load(Relaxed),
+                crate::storage::config::CONFIG_ERASES.load(Relaxed)
             );
             let _ = write_all(sender, s.as_bytes()).await;
         }

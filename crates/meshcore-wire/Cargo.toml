@@ -16,3 +16,5 @@ ed25519-dalek = { version = "2.1", default-features = false, features = ["hazmat
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+futures = "0.3"
+sequential-storage = { version = "8", features = ["_test"] }

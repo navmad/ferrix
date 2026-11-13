@@ -24,6 +24,12 @@ pub const CONFIG_FLASH_ADDR: u32 = 0x000EC000;
 pub const CONFIG_MAGIC: u32 = 0x4D434647; // 'MCFG' (MeshCore Config)
 pub const CONFIG_VERSION: u32 = 10;
 
+/// Completed config-page writes and erases since boot.
+pub static CONFIG_SAVES: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+pub static CONFIG_ERASES: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
 #[repr(C, align(4))]
 #[derive(Clone, Copy)]
 pub struct PersistentConfig {
@@ -687,10 +693,15 @@ pub fn get_path_hash_mode() -> u8 {
 /// Set a new path hash mode and queue a persistent flash save
 pub fn set_path_hash_mode(mode: u8) {
     if mode <= 2 {
-        crate::companion::usb::RADIO_SETTINGS.lock(|r| {
-            r.borrow_mut().path_hash_mode = mode;
+        let changed = crate::companion::usb::RADIO_SETTINGS.lock(|r| {
+            let mut s = r.borrow_mut();
+            let changed = s.path_hash_mode != mode;
+            s.path_hash_mode = mode;
+            changed
         });
-        request_save_config();
+        if changed {
+            request_save_config();
+        }
     }
 }
 
@@ -903,9 +914,11 @@ pub(crate) async fn save_config(flash: &mut nrf_softdevice::Flash) {
         error!("Storage: Flash page erase error: {:?}", e);
         return;
     }
+    CONFIG_ERASES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if let Err(e) = flash.write(CONFIG_FLASH_ADDR, config_bytes).await {
         error!("Storage: Flash write error: {:?}", e);
         return;
     }
+    CONFIG_SAVES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     info!("Storage: Configuration successfully saved to flash!");
 }

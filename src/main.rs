@@ -629,28 +629,34 @@ async fn main(spawner: Spawner) {
                     InboundAction::ReceivedGroupText { channel_idx, path_len, packet: grp } => {
                         info!("MeshCore Group Text [ch {}]: <{}> {}", channel_idx, grp.sender.as_str(), grp.message.as_str());
                         node.unread_messages = node.unread_messages.saturating_add(1);
-                        crate::companion::usb::MESSAGE_LOG.lock(|m| {
+                        let mut s_sender = heapless::String::new();
+                        let _ = s_sender.push_str(grp.sender.as_str());
+                        let mut s_text = heapless::String::new();
+                        let _ = s_text.push_str(grp.message.as_str());
+                        let message = crate::meshcore::mesh::ReceivedMessage {
+                            channel_idx,
+                            path_len,
+                            sender: s_sender,
+                            sender_pub: [0u8; 32],
+                            text: s_text,
+                            timestamp: grp.timestamp,
+                            rssi,
+                            snr,
+                            is_direct: false,
+                        };
+                        let dropped = crate::companion::usb::MESSAGE_LOG.lock(|m| {
                             let mut list = m.borrow_mut();
-                            if list.is_full() {
+                            let dropped = list.is_full();
+                            if dropped {
                                 list.remove(0);
                             }
-                            let mut s_sender = heapless::String::new();
-                            let _ = s_sender.push_str(grp.sender.as_str());
-                            let mut s_text = heapless::String::new();
-                            let _ = s_text.push_str(grp.message.as_str());
-                            let _ = list.push(crate::meshcore::mesh::ReceivedMessage {
-                                channel_idx,
-                                path_len,
-                                sender: s_sender,
-                                sender_pub: [0u8; 32],
-                                text: s_text,
-                                timestamp: grp.timestamp,
-                                rssi,
-                                snr,
-                                is_direct: false,
-                            });
+                            let _ = list.push(message.clone());
+                            dropped
                         });
-                        crate::storage::request_messages();
+                        if dropped {
+                            crate::storage::messages::queue_consume().await;
+                        }
+                        crate::storage::messages::queue_append(message).await;
 
                         // Prompt companion app with PUSH_CODE_MSG_WAITING (0x83)
                         let mut msg_wait = heapless::Vec::<u8, 256>::new();
@@ -665,38 +671,44 @@ async fn main(spawner: Spawner) {
                             msg.text.as_str()
                         );
                         node.unread_messages = node.unread_messages.saturating_add(1);
-                        crate::companion::usb::MESSAGE_LOG.lock(|m| {
+                        let mut s_sender = heapless::String::new();
+                        use core::fmt::Write;
+                        let _ = write!(
+                            s_sender,
+                            "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                            sender_pub[0],
+                            sender_pub[1],
+                            sender_pub[2],
+                            sender_pub[3],
+                            sender_pub[4],
+                            sender_pub[5]
+                        );
+                        let mut s_text = heapless::String::new();
+                        let _ = s_text.push_str(msg.text.as_str());
+                        let message = crate::meshcore::mesh::ReceivedMessage {
+                            channel_idx: 0,
+                            path_len: 0,
+                            sender: s_sender,
+                            sender_pub,
+                            text: s_text,
+                            timestamp: msg.timestamp,
+                            rssi,
+                            snr,
+                            is_direct: true,
+                        };
+                        let dropped = crate::companion::usb::MESSAGE_LOG.lock(|m| {
                             let mut list = m.borrow_mut();
-                            if list.is_full() {
+                            let dropped = list.is_full();
+                            if dropped {
                                 list.remove(0);
                             }
-                            let mut s_sender = heapless::String::new();
-                            use core::fmt::Write;
-                            let _ = write!(
-                                s_sender,
-                                "{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-                                sender_pub[0],
-                                sender_pub[1],
-                                sender_pub[2],
-                                sender_pub[3],
-                                sender_pub[4],
-                                sender_pub[5]
-                            );
-                            let mut s_text = heapless::String::new();
-                            let _ = s_text.push_str(msg.text.as_str());
-                            let _ = list.push(crate::meshcore::mesh::ReceivedMessage {
-                                channel_idx: 0,
-                                path_len: 0,
-                                sender: s_sender,
-                                sender_pub,
-                                text: s_text,
-                                timestamp: msg.timestamp,
-                                rssi,
-                                snr,
-                                is_direct: true,
-                            });
+                            let _ = list.push(message.clone());
+                            dropped
                         });
-                        crate::storage::request_messages();
+                        if dropped {
+                            crate::storage::messages::queue_consume().await;
+                        }
+                        crate::storage::messages::queue_append(message).await;
 
                         // Prompt companion app with PUSH_CODE_MSG_WAITING (0x83)
                         let mut msg_wait = heapless::Vec::<u8, 256>::new();

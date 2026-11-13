@@ -2,7 +2,7 @@
 //!
 //! - `config`   — identity, radio settings, channels (one 4 KB page).
 //! - `contacts` — two-bank contact snapshots, written only on structural change.
-//! - `messages` — two-bank message-log snapshots.
+//! - `messages` — wear-levelled persistent message queue.
 //! - `snapshot` — shared two-bank snapshot format and save/load logic.
 
 pub mod adverts;
@@ -21,7 +21,7 @@ pub use config::{
     set_custom_priv_key, set_path_hash_mode,
 };
 pub use contacts::request as request_contacts;
-pub use messages::request as request_messages;
+pub use messages::MessageCommand;
 
 /// Request a factory reset: erase all data pages, then reboot.
 static RESET_CHANNEL: embassy_sync::channel::Channel<
@@ -34,11 +34,11 @@ pub fn request_factory_reset() {
     let _ = RESET_CHANNEL.try_send(());
 }
 
-/// Load the contact and message snapshots into RAM. Called once at boot,
-/// before the tasks start.
+/// Load the contact snapshot and advert log into RAM. Called once at boot,
+/// before the tasks start. Messages are loaded by the storage task itself
+/// because the queue owns the flash instance.
 pub fn load() {
     contacts::load();
-    messages::load();
     adverts::init();
 }
 
@@ -47,12 +47,13 @@ pub fn load() {
 pub async fn storage_task(sd: &'static nrf_softdevice::Softdevice) -> ! {
     let mut flash = nrf_softdevice::Flash::take(sd);
     info!("Storage: Flash persistence task started");
+    messages::load(&mut flash).await;
 
     loop {
         let select4_fut = select4(
             config::SAVE_REQUEST_CHANNEL.receive(),
             contacts::SAVE_CHANNEL.receive(),
-            messages::SAVE_CHANNEL.receive(),
+            messages::COMMAND_CHANNEL.receive(),
             adverts::SAVE_CHANNEL.receive(),
         );
         match select(select4_fut, RESET_CHANNEL.receive()).await {
@@ -76,13 +77,17 @@ pub async fn storage_task(sd: &'static nrf_softdevice::Softdevice) -> ! {
                 while contacts::SAVE_CHANNEL.try_receive().is_ok() {}
                 contacts::save(&mut flash).await;
             }
-            Either4::Third(_) => {
-                // Coalesce bursts: a 256-message snapshot writes ~60 KB, so
-                // don't do it once per received message.
-                Timer::after_millis(5000).await;
-                while messages::SAVE_CHANNEL.try_receive().is_ok() {}
-                messages::save(&mut flash).await;
-            }
+            Either4::Third(command) => match command {
+                // One record per message; the FIFO erases a page only when
+                // it wraps, so no batching is needed or wanted.
+                messages::MessageCommand::Append(msg) => {
+                    messages::append(&mut flash, &msg).await
+                }
+                messages::MessageCommand::Consume => {
+                    messages::consume(&mut flash).await
+                }
+                messages::MessageCommand::Clear => messages::clear(&mut flash).await,
+            },
             Either4::Fourth(_) => {
                 // New contacts are rare; batch a discovery burst first.
                 Timer::after_millis(1000).await;

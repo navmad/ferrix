@@ -7,7 +7,7 @@
 //! blobs are re-learned from the next advert, so a torn append is harmless.
 
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use defmt::{error, info};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
@@ -48,6 +48,8 @@ static NEED_ERASE: AtomicBool = AtomicBool::new(false);
 static READY: AtomicBool = AtomicBool::new(false);
 
 pub(crate) static SAVE_CHANNEL: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
+pub static RECORD_SAVES: AtomicU32 = AtomicU32::new(0);
+pub static ERASES: AtomicU32 = AtomicU32::new(0);
 
 fn read_slot(index: usize) -> PersistBlob {
     let addr = BANK + index as u32 * RECORD_SIZE as u32;
@@ -201,6 +203,7 @@ pub async fn save(flash: &mut Flash) {
             NEED_ERASE.store(true, Ordering::Relaxed);
             return;
         }
+        ERASES.fetch_add(1, Ordering::Relaxed);
         CURSOR.store(0, Ordering::Relaxed);
     }
 
@@ -230,6 +233,7 @@ pub async fn save(flash: &mut Flash) {
             error!("Persistence: advert log write failed");
             break;
         }
+        RECORD_SAVES.fetch_add(1, Ordering::Relaxed);
         cursor += 1;
     }
     CURSOR.store(cursor, Ordering::Relaxed);

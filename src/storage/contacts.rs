@@ -47,6 +47,8 @@ const _: () = assert!(core::mem::size_of::<PersistContact>() == CONTACT_RECORD_S
 
 /// Skip snapshots when only volatile fields (RSSI/timestamps) changed.
 static HASH: AtomicU32 = AtomicU32::new(0);
+pub static SAVES: AtomicU32 = AtomicU32::new(0);
+pub static ERASES: AtomicU32 = AtomicU32::new(0);
 
 pub(crate) static SAVE_CHANNEL: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
 
@@ -154,5 +156,7 @@ pub async fn save(flash: &mut Flash) {
         .await;
     if result.is_ok() {
         HASH.store(hash, Ordering::Relaxed);
+        SAVES.fetch_add(1, Ordering::Relaxed);
+        ERASES.fetch_add(1, Ordering::Relaxed);
     }
 }

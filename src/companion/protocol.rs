@@ -1247,11 +1247,16 @@ impl CompanionNode {
                     let af_milli =
                         u32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]);
                     let af_tenths = ((af_milli / 100) as u8).min(90);
-                    crate::companion::usb::RADIO_SETTINGS.lock(|r| {
-                        r.borrow_mut().airtime_factor_tenths = af_tenths;
+                    let changed = crate::companion::usb::RADIO_SETTINGS.lock(|r| {
+                        let mut s = r.borrow_mut();
+                        let changed = s.airtime_factor_tenths != af_tenths;
+                        s.airtime_factor_tenths = af_tenths;
+                        changed
                     });
                     self.airtime_factor_milli = af_tenths as u32 * 100;
-                    crate::storage::request_save_config();
+                    if changed {
+                        crate::storage::request_save_config();
+                    }
                     ok = true;
                 }
                 let mut resp = Vec::<u8, 4>::new();
@@ -1465,10 +1470,17 @@ impl CompanionNode {
                         name.copy_from_slice(&payload[2..34]);
                         let mut secret = [0u8; 16];
                         secret.copy_from_slice(&payload[34..50]);
-                        crate::companion::usb::CHANNELS.lock(|c| {
-                            c.borrow_mut()[channel_idx] = crate::companion::usb::ChannelData { name, secret };
+                        let changed = crate::companion::usb::CHANNELS.lock(|c| {
+                            let mut chs = c.borrow_mut();
+                            let old = &chs[channel_idx];
+                            let changed = old.name != name || old.secret != secret;
+                            chs[channel_idx] =
+                                crate::companion::usb::ChannelData { name, secret };
+                            changed
                         });
-                        crate::storage::request_save_config();
+                        if changed {
+                            crate::storage::request_save_config();
+                        }
                     }
                 }
                 let mut resp = Vec::<u8, 4>::new();
@@ -1486,8 +1498,9 @@ impl CompanionNode {
                     }
                 });
                 if next_msg.is_some() {
-                    // The app consumed a message; persist the shorter queue.
-                    crate::storage::request_messages();
+                    // Pop the record from flash too, so a reboot does not
+                    // resurrect a message the app already received.
+                    crate::storage::messages::queue_consume_now();
                 }
 
                 if let Some(msg) = next_msg {
@@ -2227,23 +2240,39 @@ impl CompanionNode {
                         crate::storage::request_save_config();
                     }
                     if payload.len() >= 3 {
-                        self.telemetry_mode_base = payload[2] & 0x03;
-                        self.telemetry_mode_loc = (payload[2] >> 2) & 0x03;
-                        self.telemetry_mode_env = (payload[2] >> 4) & 0x03;
-                        if payload.len() >= 4 {
-                            self.advert_loc_policy = payload[3];
-                        }
-                        if payload.len() >= 5 {
-                            self.multi_acks = payload[4];
-                        }
+                        let new_base = payload[2] & 0x03;
+                        let new_loc = (payload[2] >> 2) & 0x03;
+                        let new_env = (payload[2] >> 4) & 0x03;
+                        let new_policy = if payload.len() >= 4 {
+                            payload[3]
+                        } else {
+                            self.advert_loc_policy
+                        };
+                        let new_multi = if payload.len() >= 5 {
+                            payload[4]
+                        } else {
+                            self.multi_acks
+                        };
+                        let changed = new_base != self.telemetry_mode_base
+                            || new_loc != self.telemetry_mode_loc
+                            || new_env != self.telemetry_mode_env
+                            || new_policy != self.advert_loc_policy
+                            || new_multi != self.multi_acks;
+                        self.telemetry_mode_base = new_base;
+                        self.telemetry_mode_loc = new_loc;
+                        self.telemetry_mode_env = new_env;
+                        self.advert_loc_policy = new_policy;
+                        self.multi_acks = new_multi;
                         update_prefs(|p| {
-                            p.telemetry_mode_base = self.telemetry_mode_base;
-                            p.telemetry_mode_loc = self.telemetry_mode_loc;
-                            p.telemetry_mode_env = self.telemetry_mode_env;
-                            p.advert_loc_policy = self.advert_loc_policy;
-                            p.multi_acks = self.multi_acks;
+                            p.telemetry_mode_base = new_base;
+                            p.telemetry_mode_loc = new_loc;
+                            p.telemetry_mode_env = new_env;
+                            p.advert_loc_policy = new_policy;
+                            p.multi_acks = new_multi;
                         });
-                        crate::storage::request_save_config();
+                        if changed {
+                            crate::storage::request_save_config();
+                        }
                     }
                     ok = true;
                 }
@@ -2327,20 +2356,35 @@ impl CompanionNode {
                     let name = &payload[1..32];
                     let n = name.iter().position(|&b| b == 0).unwrap_or(31);
                     if n > 0 && n < 31 {
+                        let mut new_name = [0u8; 31];
+                        new_name[..n].copy_from_slice(&name[..n]);
+                        let mut new_key = [0u8; 16];
+                        new_key.copy_from_slice(&payload[32..48]);
+                        let changed = {
+                            let p = prefs();
+                            p.scope_name != new_name || p.scope_key != new_key
+                        };
                         update_prefs(|p| {
-                            p.scope_name = [0u8; 31];
-                            p.scope_name[..n].copy_from_slice(&name[..n]);
-                            p.scope_key.copy_from_slice(&payload[32..48]);
+                            p.scope_name = new_name;
+                            p.scope_key = new_key;
                         });
-                        crate::storage::request_save_config();
+                        if changed {
+                            crate::storage::request_save_config();
+                        }
                         ok = true;
                     }
                 } else if payload.len() == 1 {
+                    let changed = {
+                        let p = prefs();
+                        p.scope_name != [0u8; 31] || p.scope_key != [0u8; 16]
+                    };
                     update_prefs(|p| {
                         p.scope_name = [0u8; 31];
                         p.scope_key = [0u8; 16];
                     });
-                    crate::storage::request_save_config();
+                    if changed {
+                        crate::storage::request_save_config();
+                    }
                     ok = true;
                 }
                 let mut resp = Vec::<u8, 4>::new();

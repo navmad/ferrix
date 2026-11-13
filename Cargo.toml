@@ -48,6 +48,7 @@ nrf-softdevice = { git = "https://github.com/embassy-rs/nrf-softdevice.git", rev
 
 heapless = { version = "0.8", features = ["defmt-03"] }
 static_cell = "2.1"
+sequential-storage = { version = "8", features = ["defmt"] }
 nmea = { version = "0.6", default-features = false }
 
 meshcore-wire = { path = "crates/meshcore-wire" }
