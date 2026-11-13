@@ -11,7 +11,11 @@ use crate::companion::usb::{MESSAGE_LOG, MAX_MESSAGES};
 use crate::meshcore::mesh::ReceivedMessage;
 
 const MESSAGE_RECORD_SIZE: usize = 236;
-const STORE: SnapshotStore = SnapshotStore::new(0x000C_C000, 0x000C_D000, 4096);
+// Two 64 KB banks fill 0xCC000..0xEC000; the config page starts at 0xEC000.
+// 256 records * 236 bytes + 32-byte header = 60,480 bytes per bank.
+const MESSAGE_BANK_SIZE: u32 = 16 * 4096;
+const STORE: SnapshotStore =
+    SnapshotStore::new(0x000C_C000, 0x000D_C000, MESSAGE_BANK_SIZE);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -36,6 +40,10 @@ impl SnapshotRecord for PersistMessage {
 }
 
 const _: () = assert!(core::mem::size_of::<PersistMessage>() == MESSAGE_RECORD_SIZE);
+const _: () = assert!(
+    super::snapshot::HEADER_SIZE + MAX_MESSAGES * MESSAGE_RECORD_SIZE
+        <= MESSAGE_BANK_SIZE as usize
+);
 
 pub(crate) static SAVE_CHANNEL: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
 

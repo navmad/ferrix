@@ -55,7 +55,9 @@ pub async fn storage_task(sd: &'static nrf_softdevice::Softdevice) -> ! {
                 contacts::save(&mut flash).await;
             }
             Either3::Third(_) => {
-                Timer::after_millis(1000).await;
+                // Coalesce bursts: a 256-message snapshot writes ~60 KB, so
+                // don't do it once per received message.
+                Timer::after_millis(5000).await;
                 while messages::SAVE_CHANNEL.try_receive().is_ok() {}
                 messages::save(&mut flash).await;
             }

@@ -114,7 +114,7 @@ pub static DISCOVERED_CONTACTS: Mutex<SharedRawMutex, RefCell<heapless::Vec<Disc
     Mutex::new(RefCell::new(heapless::Vec::new()));
 
 /// Number of retained messages (matched by the persistent snapshot size).
-pub const MAX_MESSAGES: usize = 16;
+pub const MAX_MESSAGES: usize = 256;
 
 pub static MESSAGE_LOG: Mutex<SharedRawMutex, RefCell<heapless::Vec<ReceivedMessage, MAX_MESSAGES>>> =
     Mutex::new(RefCell::new(heapless::Vec::new()));
@@ -1207,20 +1207,45 @@ async fn handle_text_cli(
             let _ = write_all(sender, b"  -> OK (Contacts cleared)\r\n").await;
         }
         "messages" | "inbox" | "get messages" => {
-            let msg_snapshot: heapless::Vec<ReceivedMessage, MAX_MESSAGES> = MESSAGE_LOG.lock(|m| m.borrow().clone());
-            if msg_snapshot.is_empty() {
+            let total = MESSAGE_LOG.lock(|m| m.borrow().len());
+            if total == 0 {
                 let _ = write_all(sender, b"  -> No messages received yet\r\n").await;
             } else {
                 let _ = write_all(sender, b"  -> === Recent Messages ===\r\n").await;
-                for msg in msg_snapshot.iter() {
-                    let mut s = heapless::String::<320>::new();
-                    let mode = if msg.is_direct { "[DM]" } else { "[GRP]" };
-                    let _ = write!(
-                        s,
-                        "  -> {} <{}> {}: {} (RSSI: {}dBm, SNR: {}dB)\r\n",
-                        mode, msg.sender.as_str(), msg.timestamp, msg.text.as_str(), msg.rssi, msg.snr
-                    );
-                    let _ = write_all(sender, s.as_bytes()).await;
+                // Stream in small chunks: a 256-entry clone would overflow the
+                // CLI task stack.
+                let mut start = 0usize;
+                while start < total {
+                    let mut chunk: heapless::Vec<ReceivedMessage, 16> = heapless::Vec::new();
+                    MESSAGE_LOG.lock(|m| {
+                        let list = m.borrow();
+                        if start >= list.len() {
+                            return;
+                        }
+                        let end = (start + 16).min(list.len());
+                        for msg in &list[start..end] {
+                            let _ = chunk.push(msg.clone());
+                        }
+                    });
+                    if chunk.is_empty() {
+                        break;
+                    }
+                    for msg in chunk.iter() {
+                        let mut s = heapless::String::<320>::new();
+                        let mode = if msg.is_direct { "[DM]" } else { "[GRP]" };
+                        let _ = write!(
+                            s,
+                            "  -> {} <{}> {}: {} (RSSI: {}dBm, SNR: {}dB)\r\n",
+                            mode,
+                            msg.sender.as_str(),
+                            msg.timestamp,
+                            msg.text.as_str(),
+                            msg.rssi,
+                            msg.snr
+                        );
+                        let _ = write_all(sender, s.as_bytes()).await;
+                    }
+                    start += chunk.len();
                 }
             }
         }
