@@ -111,6 +111,11 @@ pub static REQ_RX_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static REQ_RX_TAG: AtomicU32 = AtomicU32::new(0);
 pub static REQ_RX_LEN: AtomicU32 = AtomicU32::new(0);
 
+/// Outstanding telemetry request: (tag, destination).
+static PENDING_TELEMETRY: Mutex<CriticalSectionRawMutex, RefCell<Option<(u32, [u8; 32])>>> =
+    Mutex::new(RefCell::new(None));
+const REQ_TYPE_GET_TELEMETRY_DATA: u8 = 0x03;
+
 /// Outstanding binary/anon request: (tag, destination).
 static PENDING_REQ: Mutex<CriticalSectionRawMutex, RefCell<Option<(u32, [u8; 32])>>> =
     Mutex::new(RefCell::new(None));
@@ -126,6 +131,10 @@ fn note_pending_login(pub_key: [u8; 32]) {
 
 fn note_pending_req(tag: u32, pub_key: [u8; 32]) {
     PENDING_REQ.lock(|p| *p.borrow_mut() = Some((tag, pub_key)));
+}
+
+fn note_pending_telemetry(tag: u32, pub_key: [u8; 32]) {
+    PENDING_TELEMETRY.lock(|p| *p.borrow_mut() = Some((tag, pub_key)));
 }
 
 fn start_connection(pub_key: [u8; 32], keep_alive_secs: u16) {
@@ -370,6 +379,27 @@ pub fn handle_response(plain: &[u8], sender_pub: &[u8; 32]) -> bool {
         return true;
     }
 
+    // Telemetry response.
+    let telem_match = PENDING_TELEMETRY.lock(|p| {
+        let mut pending = p.borrow_mut();
+        if pending.map_or(false, |(t, k)| t == tag && k == *sender_pub) {
+            *pending = None;
+            true
+        } else {
+            false
+        }
+    });
+    if telem_match {
+        let mut push = Vec::<u8, 256>::new();
+        let _ = push.push(PUSH_CODE_TELEMETRY_RESPONSE);
+        let _ = push.push(0);
+        let _ = push.extend_from_slice(&sender_pub[..6]);
+        let data = &plain[4..];
+        let _ = push.extend_from_slice(&data[..data.len().min(256 - push.len())]);
+        let _ = DELAYED_PUSH.try_send(push);
+        return true;
+    }
+
     let matched = PENDING_STATUS.lock(|p| {
         let mut pending = p.borrow_mut();
         if pending.map_or(false, |(t, k)| t == tag && k == *sender_pub) {
@@ -581,6 +611,7 @@ pub const CMD_LOGOUT: u8 = 0x1D;
 pub const CMD_SEND_TRACE_PATH: u8 = 0x24;
 pub const CMD_SET_DEVICE_PIN: u8 = 0x25;
 pub const CMD_SET_OTHER_PARAMS: u8 = 0x26;
+pub const CMD_SEND_TELEMETRY_REQ: u8 = 0x27;
 pub const CMD_GET_CUSTOM_VARS: u8 = 0x28;
 pub const CMD_SET_CUSTOM_VAR: u8 = 0x29;
 pub const CMD_DEVICE_QUERY: u8 = 22;
@@ -2491,6 +2522,133 @@ impl CompanionNode {
                 let mut resp = Vec::<u8, 2>::new();
                 let _ = resp.push(RESP_CODE_OK);
                 emit(&resp);
+            }
+
+            CMD_SEND_TELEMETRY_REQ => {
+                // Self: [cmd][0][0][0]; contact: [cmd][3 reserved][pubkey 32]
+                if payload.len() == 4 {
+                    // Cayenne LPP voltage: channel 1, type 0x74, 0.01 V BE.
+                    let mv = crate::telemetry::battery_millivolts();
+                    let scaled = ((mv as u32 + 5) / 10) as u16;
+                    let mut push = Vec::<u8, 256>::new();
+                    let _ = push.push(PUSH_CODE_TELEMETRY_RESPONSE);
+                    let _ = push.push(0);
+                    let _ = push.extend_from_slice(&self.public_key[..6]);
+                    let _ = push.push(1);
+                    let _ = push.push(0x74);
+                    let _ = push.push((scaled >> 8) as u8);
+                    let _ = push.push(scaled as u8);
+                    let _ = crate::companion::ble::COMPANION_PUSH_CHANNEL.try_send(push);
+                } else if payload.len() >= 4 + 32 {
+                    let mut dest_key = [0u8; 32];
+                    dest_key.copy_from_slice(&payload[4..36]);
+                    let mut resp = Vec::<u8, 10>::new();
+                    let mut reply = None;
+                    let contact = crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| {
+                        c.borrow()
+                            .iter()
+                            .find(|ct| ct.pub_key == dest_key)
+                            .map(|ct| (ct.out_path_len, ct.out_path))
+                    });
+                    if let Some((out_path_len, out_path)) = contact {
+                        let identity =
+                            crate::meshcore::identity::LocalIdentity::from_private(
+                                self.callsign.as_str(),
+                                &self.private_key,
+                            );
+                        if let Some(id) = identity {
+                            if let Some(secret) = id.shared_secret(&dest_key) {
+                                let tag = next_tag();
+                                let mut plain = [0u8; 13];
+                                plain[..4].copy_from_slice(&tag.to_le_bytes());
+                                plain[4] = REQ_TYPE_GET_TELEMETRY_DATA;
+                                plain[9..13].copy_from_slice(
+                                    &tag.wrapping_mul(0x9E37_79B1).to_le_bytes(),
+                                );
+                                if let Ok(addressed) = AddressedPacket::new(
+                                    dest_key[0],
+                                    self.public_key[0],
+                                    &plain,
+                                ) {
+                                    let direct = out_path_len != 0xFF
+                                        && Packet::is_valid_path_len(out_path_len);
+                                    let route = if direct {
+                                        ROUTE_TYPE_DIRECT
+                                    } else {
+                                        ROUTE_TYPE_FLOOD
+                                    };
+                                    if let Ok(mut pkt) =
+                                        addressed.to_packet(PAYLOAD_TYPE_REQ, route, &secret)
+                                    {
+                                        if direct {
+                                            pkt.path_len = out_path_len;
+                                            let n = pkt.path_byte_len();
+                                            pkt.path[..n].copy_from_slice(&out_path[..n]);
+                                        } else {
+                                            apply_flood_scope(&mut pkt);
+                                        }
+                                        let mut buf = [0u8; 255];
+                                        if let Ok(n) = pkt.write_to(&mut buf) {
+                                            let mut raw = heapless::Vec::<u8, 255>::new();
+                                            if raw.extend_from_slice(&buf[..n]).is_ok()
+                                                && crate::companion::usb::USB_COMMAND_CHANNEL
+                                                    .try_send(
+                                                        crate::companion::usb::UsbCommand::SendRawPacket {
+                                                            raw,
+                                                        },
+                                                    )
+                                                    .is_ok()
+                                            {
+                                                let (sf, bw_khz, cr) =
+                                                    crate::companion::usb::RADIO_SETTINGS.lock(|r| {
+                                                        let s = r.borrow();
+                                                        (s.sf, s.bw_khz, s.cr)
+                                                    });
+                                                let air_ms = crate::radio::estimate_airtime_ms(
+                                                    n,
+                                                    sf,
+                                                    bw_khz,
+                                                    cr,
+                                                    if sf <= 8 { 32 } else { 16 },
+                                                );
+                                                let hops = if direct {
+                                                    (out_path_len & 63) as u32
+                                                } else {
+                                                    0
+                                                };
+                                                let est_timeout = if direct {
+                                                    500 + (air_ms * 6 + 250) * (hops + 1)
+                                                } else {
+                                                    500 + 16 * air_ms
+                                                };
+                                                note_pending_telemetry(tag, dest_key);
+                                                reply = Some((direct, tag, est_timeout.max(6000)));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    match reply {
+                        Some((direct, tag, est_timeout)) => {
+                            let _ = resp.push(RESP_CODE_SENT);
+                            let _ = resp.push(if direct { 0 } else { 1 });
+                            let _ = resp.extend_from_slice(&tag.to_le_bytes());
+                            let _ = resp.extend_from_slice(&est_timeout.to_le_bytes());
+                        }
+                        None => {
+                            let _ = resp.push(RESP_CODE_ERR);
+                            let _ = resp.push(ERR_NOT_FOUND);
+                        }
+                    }
+                    emit(&resp);
+                } else {
+                    let mut resp = Vec::<u8, 2>::new();
+                    let _ = resp.push(RESP_CODE_ERR);
+                    let _ = resp.push(ERR_ILLEGAL_ARG);
+                    emit(&resp);
+                }
             }
 
             CMD_SEND_BINARY_REQ => {
