@@ -77,8 +77,11 @@ pub struct AutoAddSettings {
 
 pub static AUTOADD_SETTINGS: Mutex<SharedRawMutex, RefCell<AutoAddSettings>> =
     Mutex::new(RefCell::new(AutoAddSettings {
-        manual_add_contacts: 1,
-        config: 0x1E,
+        // MeshCore's fresh-node default: auto-add all advert types. The type
+        // mask starts empty because it is only consulted when manual mode is
+        // selected.
+        manual_add_contacts: 0,
+        config: 0x00,
         max_hops: 0,
     }));
 
@@ -1101,7 +1104,7 @@ async fn handle_text_cli(
         s if s == "set autoadd" || s.starts_with("set autoadd ") => {
             let arg = s["set autoadd".len()..].trim();
             let (manual, config, max_hops, label) = if arg.eq_ignore_ascii_case("on") {
-                (0u8, 0x1Eu8, 0u8, 1u8)
+                (0u8, 0x00u8, 0u8, 1u8)
             } else if arg.eq_ignore_ascii_case("off") {
                 (1u8, 0x00u8, 0u8, 2u8)
             } else {

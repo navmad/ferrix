@@ -22,7 +22,7 @@ use crate::companion::usb::ChannelData;
 /// (Top page of application flash, immediately preceding bootloader at 0x000ED000)
 pub const CONFIG_FLASH_ADDR: u32 = 0x000EC000;
 pub const CONFIG_MAGIC: u32 = 0x4D434647; // 'MCFG' (MeshCore Config)
-pub const CONFIG_VERSION: u32 = 5;
+pub const CONFIG_VERSION: u32 = 6;
 
 #[repr(C, align(4))]
 #[derive(Clone, Copy)]
@@ -196,9 +196,9 @@ fn migrate_v1(v1: PersistentConfigV1) -> PersistentConfig {
         radio_sf: v1.radio_sf,
         radio_cr: v1.radio_cr,
         path_hash_mode: v1.path_hash_mode,
-        autoadd_config: v1.autoadd_config,
+        autoadd_config: 0,
         autoadd_max_hops: v1.autoadd_max_hops,
-        manual_add_contacts: 1,
+        manual_add_contacts: 0,
         radio_freq_hz: v1.radio_freq_hz,
         radio_bw_khz: v1.radio_bw_khz,
         channels: expand_channels(v1.channels),
@@ -222,9 +222,9 @@ fn migrate_v2(v2: PersistentConfigV2) -> PersistentConfig {
         radio_sf: v2.radio_sf,
         radio_cr: v2.radio_cr,
         path_hash_mode: v2.path_hash_mode,
-        autoadd_config: v2.autoadd_config,
+        autoadd_config: 0,
         autoadd_max_hops: v2.autoadd_max_hops,
-        manual_add_contacts: 1,
+        manual_add_contacts: 0,
         radio_freq_hz: v2.radio_freq_hz,
         radio_bw_khz: v2.radio_bw_khz,
         channels: expand_channels(v2.channels),
@@ -248,9 +248,9 @@ fn migrate_v3(v3: PersistentConfigV3) -> PersistentConfig {
         radio_sf: v3.radio_sf,
         radio_cr: v3.radio_cr,
         path_hash_mode: v3.path_hash_mode,
-        autoadd_config: v3.autoadd_config,
+        autoadd_config: 0,
         autoadd_max_hops: v3.autoadd_max_hops,
-        manual_add_contacts: 1,
+        manual_add_contacts: 0,
         radio_freq_hz: v3.radio_freq_hz,
         radio_bw_khz: v3.radio_bw_khz,
         channels: v3.channels,
@@ -274,9 +274,9 @@ fn migrate_v4(v4: PersistentConfigV4) -> PersistentConfig {
         radio_sf: v4.radio_sf,
         radio_cr: v4.radio_cr,
         path_hash_mode: v4.path_hash_mode,
-        autoadd_config: v4.autoadd_config,
+        autoadd_config: 0,
         autoadd_max_hops: v4.autoadd_max_hops,
-        manual_add_contacts: 1,
+        manual_add_contacts: 0,
         radio_freq_hz: v4.radio_freq_hz,
         radio_bw_khz: v4.radio_bw_khz,
         channels: v4.channels,
@@ -284,6 +284,19 @@ fn migrate_v4(v4: PersistentConfigV4) -> PersistentConfig {
     };
     cfg.checksum = compute_checksum(&cfg);
     cfg
+}
+
+/// v5 had no layout change, but its auto-add defaults were wrong for the
+/// companion app's manual mode (`0x1E` meant "manual" still matched every
+/// type). Resetting to MeshCore's fresh-node defaults makes the app's
+/// manual/off switch behave as expected.
+fn migrate_v5(mut v5: PersistentConfig) -> PersistentConfig {
+    v5.version = CONFIG_VERSION;
+    v5.autoadd_config = 0;
+    v5.manual_add_contacts = 0;
+    v5.checksum = 0;
+    v5.checksum = compute_checksum(&v5);
+    v5
 }
 
 /// Synchronously read and validate persistent configuration from internal
@@ -295,6 +308,12 @@ pub fn read_config() -> Option<(PersistentConfig, bool)> {
     }
     if cfg.version == CONFIG_VERSION && compute_checksum(&cfg) == cfg.checksum {
         return Some((cfg, false));
+    }
+    if cfg.version == 5 {
+        let v5 = unsafe { (CONFIG_FLASH_ADDR as *const PersistentConfig).read_volatile() };
+        if compute_checksum(&v5) == v5.checksum {
+            return Some((migrate_v5(v5), true));
+        }
     }
     if cfg.version == 4 {
         let v4 = unsafe { (CONFIG_FLASH_ADDR as *const PersistentConfigV4).read_volatile() };
@@ -426,7 +445,7 @@ pub fn init_config() -> (String<32>, Option<[u8; 64]>) {
         };
 
         if migrated {
-            info!("Storage: Migrated config to v5 (up to {} contacts / {} channels)", crate::companion::usb::MAX_CONTACTS, crate::companion::usb::MAX_CHANNELS);
+            info!("Storage: Migrated config to v6 (up to {} contacts / {} channels)", crate::companion::usb::MAX_CONTACTS, crate::companion::usb::MAX_CHANNELS);
             request_save_config();
         }
 
