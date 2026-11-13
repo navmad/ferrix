@@ -146,6 +146,22 @@ fn parse_bw_khz(val: &str) -> Option<u32> {
     matches!(bw, 7 | 10 | 15 | 20 | 31 | 41 | 62 | 125 | 250 | 500).then_some(bw)
 }
 
+/// Render a bandwidth the way the reference firmware does: 62.5, 125, 250, 500, 31.25...
+fn format_bw(bw_khz: u32) -> heapless::String<16> {
+    let hz = bw_khz_to_hz(bw_khz);
+    let mut s = heapless::String::<16>::new();
+    if hz % 1000 == 0 {
+        let _ = write!(s, "{}", hz / 1000);
+    } else if hz % 100 == 0 {
+        let _ = write!(s, "{}.{}", hz / 1000, (hz % 1000) / 100);
+    } else if hz % 10 == 0 {
+        let _ = write!(s, "{}.{:02}", hz / 1000, (hz % 1000) / 10);
+    } else {
+        let _ = write!(s, "{}.{:03}", hz / 1000, hz % 1000);
+    }
+    s
+}
+
 pub const DEFAULT_PUBLIC_SECRET: [u8; 16] = [
     0x8b, 0x33, 0x87, 0xe9, 0xc5, 0xcd, 0xea, 0x6a,
     0xc9, 0xe5, 0xed, 0xba, 0xa1, 0x15, 0xcd, 0x72,
@@ -495,17 +511,17 @@ async fn handle_text_cli(
         "get freq" => {
             let f = RADIO_SETTINGS.lock(|r| r.borrow().frequency_hz);
             let mut s: heapless::String<48> = heapless::String::new();
-            let _ = write!(s, "  -> {:.3} MHz\r\n", f as f32 / 1_000_000.0);
+            let _ = write!(s, "> {:.3}\r\n", f as f32 / 1_000_000.0);
             let _ = write_all(sender, s.as_bytes()).await;
         }
         "get radio" | "radio" => {
-            let (f, sf, bw, cr, tx, mode) = RADIO_SETTINGS.lock(|r| {
+            let (f, sf, bw, cr) = RADIO_SETTINGS.lock(|r| {
                 let cfg = r.borrow();
-                (cfg.frequency_hz, cfg.sf, cfg.bw_khz, cfg.cr, cfg.tx_power_dbm, cfg.path_hash_mode)
+                (cfg.frequency_hz, cfg.sf, cfg.bw_khz, cfg.cr)
             });
-            let mut s: heapless::String<128> = heapless::String::new();
-            let bw_hz = bw_khz_to_hz(bw);
-            let _ = write!(s, "  -> {:.3} MHz, SF{}, BW {:.1} kHz, CR 4/{}, {} dBm, hash-size {}B\r\n", f as f32 / 1_000_000.0, sf, bw_hz as f32 / 1000.0, cr, tx, mode + 1);
+            let mut s: heapless::String<64> = heapless::String::new();
+            let bw_str = format_bw(bw);
+            let _ = write!(s, "> {:.3},{},{},{}\r\n", f as f32 / 1_000_000.0, bw_str.as_str(), sf, cr);
             let _ = write_all(sender, s.as_bytes()).await;
         }
         s if s.starts_with("set freq ") => {
@@ -519,19 +535,19 @@ async fn handle_text_cli(
                     crate::storage::request_save_config();
                     let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetFrequency(f));
                     let mut s: heapless::String<64> = heapless::String::new();
-                    let _ = write!(s, "  -> OK (Freq set to {:.3} MHz)\r\n", f as f32 / 1_000_000.0);
+                    let _ = write!(s, "OK - {:.3}\r\n", f as f32 / 1_000_000.0);
                     let _ = write_all(sender, s.as_bytes()).await;
                 } else {
-                    let _ = write_all(sender, b"  -> Error: frequency out of range (150-960 MHz)\r\n").await;
+                    let _ = write_all(sender, b"Error: frequency out of range (150-960 MHz)\r\n").await;
                 }
             } else {
-                let _ = write_all(sender, b"  -> Error: invalid frequency format\r\n").await;
+                let _ = write_all(sender, b"Error: invalid frequency format\r\n").await;
             }
         }
         "get tx" => {
             let tx = RADIO_SETTINGS.lock(|r| r.borrow().tx_power_dbm);
             let mut s: heapless::String<32> = heapless::String::new();
-            let _ = write!(s, "  -> {} dBm\r\n", tx);
+            let _ = write!(s, "> {}\r\n", tx);
             let _ = write_all(sender, s.as_bytes()).await;
         }
         s if s.starts_with("set tx ") => {
@@ -543,19 +559,19 @@ async fn handle_text_cli(
                     crate::storage::request_save_config();
                     let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetTxPower(tx));
                     let mut s: heapless::String<32> = heapless::String::new();
-                    let _ = write!(s, "  -> OK (TX set to {} dBm)\r\n", tx);
+                    let _ = write!(s, "OK - tx power={} dBm\r\n", tx);
                     let _ = write_all(sender, s.as_bytes()).await;
                 } else {
-                    let _ = write_all(sender, b"  -> Error: TX power must be between -9 and 22 dBm\r\n").await;
+                    let _ = write_all(sender, b"Error: TX power must be between -9 and 22 dBm\r\n").await;
                 }
             } else {
-                let _ = write_all(sender, b"  -> Error: invalid TX power number\r\n").await;
+                let _ = write_all(sender, b"Error: invalid TX power number\r\n").await;
             }
         }
         "get sf" => {
             let sf = RADIO_SETTINGS.lock(|r| r.borrow().sf);
             let mut s: heapless::String<32> = heapless::String::new();
-            let _ = write!(s, "  -> SF{}\r\n", sf);
+            let _ = write!(s, "> {}\r\n", sf);
             let _ = write_all(sender, s.as_bytes()).await;
         }
         s if s.starts_with("set sf ") => {
@@ -568,19 +584,20 @@ async fn handle_text_cli(
                     crate::storage::request_save_config();
                     let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetSpreadingFactor(sf));
                     let mut s: heapless::String<32> = heapless::String::new();
-                    let _ = write!(s, "  -> OK (SF set to {})\r\n", sf);
+                    let _ = write!(s, "OK - {}\r\n", sf);
                     let _ = write_all(sender, s.as_bytes()).await;
                 } else {
-                    let _ = write_all(sender, b"  -> Error: SF must be between 5 and 12\r\n").await;
+                    let _ = write_all(sender, b"Error: SF must be between 5 and 12\r\n").await;
                 }
             } else {
-                let _ = write_all(sender, b"  -> Error: invalid SF\r\n").await;
+                let _ = write_all(sender, b"Error: invalid SF\r\n").await;
             }
         }
         "get bw" => {
             let bw = RADIO_SETTINGS.lock(|r| r.borrow().bw_khz);
             let mut s: heapless::String<32> = heapless::String::new();
-            let _ = write!(s, "  -> {:.1} kHz\r\n", bw_khz_to_hz(bw) as f32 / 1000.0);
+            let bw_str = format_bw(bw);
+            let _ = write!(s, "> {}\r\n", bw_str.as_str());
             let _ = write_all(sender, s.as_bytes()).await;
         }
         s if s.starts_with("set bw ") => {
@@ -592,16 +609,17 @@ async fn handle_text_cli(
                 crate::storage::request_save_config();
                 let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetBandwidth(bw));
                 let mut s: heapless::String<32> = heapless::String::new();
-                let _ = write!(s, "  -> OK (BW set to {:.1} kHz)\r\n", bw_khz_to_hz(bw) as f32 / 1000.0);
+                let bw_str = format_bw(bw);
+                let _ = write!(s, "OK - {}\r\n", bw_str.as_str());
                 let _ = write_all(sender, s.as_bytes()).await;
             } else {
-                let _ = write_all(sender, b"  -> Error: supported BW are 7.8, 10.4, 15.6, 20.8, 31.25, 41.67, 62.5, 125, 250, 500 kHz (or Hz)\r\n").await;
+                let _ = write_all(sender, b"Error: supported BW are 7.8, 10.4, 15.6, 20.8, 31.25, 41.67, 62.5, 125, 250, 500 kHz (or Hz)\r\n").await;
             }
         }
         "get cr" => {
             let cr = RADIO_SETTINGS.lock(|r| r.borrow().cr);
             let mut s: heapless::String<32> = heapless::String::new();
-            let _ = write!(s, "  -> 4/{}\r\n", cr);
+            let _ = write!(s, "> {}\r\n", cr);
             let _ = write_all(sender, s.as_bytes()).await;
         }
         s if s.starts_with("set cr ") => {
@@ -624,16 +642,16 @@ async fn handle_text_cli(
                 crate::storage::request_save_config();
                 let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetCodingRate(cr));
                 let mut s: heapless::String<32> = heapless::String::new();
-                let _ = write!(s, "  -> OK (CR set to 4/{})\r\n", cr);
+                let _ = write!(s, "OK - 4/{}\r\n", cr);
                 let _ = write_all(sender, s.as_bytes()).await;
             } else {
-                let _ = write_all(sender, b"  -> Error: supported CR values are 4/5, 4/6, 4/7, 4/8\r\n").await;
+                let _ = write_all(sender, b"Error: supported CR values are 4/5, 4/6, 4/7, 4/8\r\n").await;
             }
         }
         "get path.hash.mode" | "get hash-mode" | "get hash-size" => {
             let mode = RADIO_SETTINGS.lock(|r| r.borrow().path_hash_mode);
             let mut resp = heapless::String::<64>::new();
-            let _ = write!(resp, "  -> path.hash.mode = {} ({} bytes/hop)\r\n", mode, mode + 1);
+            let _ = write!(resp, "> {}\r\n", mode);
             let _ = write_all(sender, resp.as_bytes()).await;
         }
         s if s.starts_with("set path.hash.mode ") || s.starts_with("set hash-mode ") => {
@@ -646,10 +664,10 @@ async fn handle_text_cli(
                     crate::storage::request_save_config();
                     let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetPathHashMode(mode));
                     let mut resp = heapless::String::<64>::new();
-                    let _ = write!(resp, "  -> OK (path.hash.mode set to {}, {} bytes/hop)\r\n", mode, mode + 1);
+                    let _ = write!(resp, "OK\r\n");
                     let _ = write_all(sender, resp.as_bytes()).await;
                 } else {
-                    let _ = write_all(sender, b"  -> Error: path.hash.mode must be 0 (1B), 1 (2B), or 2 (3B)\r\n").await;
+                    let _ = write_all(sender, b"Error: path.hash.mode must be 0, 1 or 2\r\n").await;
                 }
             } else {
                 let _ = write_all(sender, b"  -> Error: invalid number\r\n").await;
@@ -666,10 +684,10 @@ async fn handle_text_cli(
                     crate::storage::request_save_config();
                     let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetPathHashMode(mode));
                     let mut resp = heapless::String::<64>::new();
-                    let _ = write!(resp, "  -> OK (hash-size set to {} bytes, mode {})\r\n", size, mode);
+                    let _ = write!(resp, "OK\r\n");
                     let _ = write_all(sender, resp.as_bytes()).await;
                 } else {
-                    let _ = write_all(sender, b"  -> Error: hash-size must be 1, 2, or 3 bytes\r\n").await;
+                    let _ = write_all(sender, b"Error: hash-size must be 1, 2 or 3 bytes\r\n").await;
                 }
             } else {
                 let _ = write_all(sender, b"  -> Error: invalid number\r\n").await;
@@ -678,9 +696,9 @@ async fn handle_text_cli(
         "get repeat" | "get role" => {
             let is_rep = RADIO_SETTINGS.lock(|r| r.borrow().is_repeater);
             if is_rep {
-                let _ = write_all(sender, b"  -> on (repeater)\r\n").await;
+                let _ = write_all(sender, b"> on\r\n").await;
             } else {
-                let _ = write_all(sender, b"  -> off (client)\r\n").await;
+                let _ = write_all(sender, b"> off\r\n").await;
             }
         }
         s if s.starts_with("set repeat ") || s.starts_with("set role ") => {
@@ -692,7 +710,7 @@ async fn handle_text_cli(
             crate::storage::request_save_config();
             let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetRepeat(is_rep));
             let mut s: heapless::String<32> = heapless::String::new();
-            let _ = write!(s, "  -> OK (Repeater: {})\r\n", if is_rep { "on" } else { "off" });
+            let _ = write!(s, "OK - repeater={}\r\n", if is_rep { "on" } else { "off" });
             let _ = write_all(sender, s.as_bytes()).await;
         }
         s if s.starts_with("send ") => {
