@@ -388,6 +388,8 @@ impl CompanionNode {
                         u32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]);
                     let sf = payload[9];
                     let cr = payload[10];
+                    // v9+ appends the client-repeat flag.
+                    let repeat = payload.get(11).map_or(false, |&b| b != 0);
                     if (100_000..=1_000_000).contains(&freq_khz)
                         && (7_800..=500_000).contains(&bw_hz)
                         && (5..=12).contains(&sf)
@@ -395,23 +397,33 @@ impl CompanionNode {
                     {
                         // The app re-sends its stored settings on every connect.
                         // Only touch flash and interrupt RX when something changed.
-                        let changed = crate::companion::usb::RADIO_SETTINGS.lock(|r| {
-                            let mut s = r.borrow_mut();
-                            let new_freq = freq_khz * 1000;
-                            let new_bw = bw_hz / 1000;
-                            let changed = s.frequency_hz != new_freq
-                                || s.bw_khz != new_bw
-                                || s.sf != sf
-                                || s.cr != cr;
-                            s.frequency_hz = new_freq;
-                            s.bw_khz = new_bw;
-                            s.sf = sf;
-                            s.cr = cr;
-                            changed
-                        });
-                        if changed {
+                        let (rf_changed, repeat_changed) =
+                            crate::companion::usb::RADIO_SETTINGS.lock(|r| {
+                                let mut s = r.borrow_mut();
+                                let new_freq = freq_khz * 1000;
+                                let new_bw = bw_hz / 1000;
+                                let rf_changed = s.frequency_hz != new_freq
+                                    || s.bw_khz != new_bw
+                                    || s.sf != sf
+                                    || s.cr != cr;
+                                let repeat_changed = s.is_repeater != repeat;
+                                s.frequency_hz = new_freq;
+                                s.bw_khz = new_bw;
+                                s.sf = sf;
+                                s.cr = cr;
+                                s.is_repeater = repeat;
+                                (rf_changed, repeat_changed)
+                            });
+                        if rf_changed || repeat_changed {
                             crate::storage::request_save_config();
+                        }
+                        if rf_changed {
                             crate::radio::lora_phy::request_radio_config();
+                        }
+                        if repeat_changed {
+                            let _ = crate::companion::usb::USB_COMMAND_CHANNEL.try_send(
+                                crate::companion::usb::UsbCommand::SetRepeat(repeat),
+                            );
                         }
                         ok = true;
                     }
