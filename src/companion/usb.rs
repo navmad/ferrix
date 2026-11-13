@@ -517,90 +517,6 @@ async fn write_all(sender: &mut Sender<'static, UsbDriver>, mut data: &[u8]) -> 
     Ok(())
 }
 
-/// Partial private-key import. Some terminals split long lines, so the CLI
-/// accepts a 128-character key in several chunks.
-struct KeyImport {
-    buf: [u8; 128],
-    len: usize,
-}
-
-static KEY_IMPORT: Mutex<SharedRawMutex, RefCell<KeyImport>> =
-    Mutex::new(RefCell::new(KeyImport {
-        buf: [0u8; 128],
-        len: 0,
-    }));
-
-fn normalize_hex(input: &str) -> Option<heapless::String<256>> {
-    let mut out = heapless::String::<256>::new();
-    let mut s = input.trim();
-    if s.len() >= 2 && (s.starts_with("0x") || s.starts_with("0X")) {
-        s = &s[2..];
-    }
-    for c in s.chars() {
-        if c.is_ascii_hexdigit() {
-            out.push(c).ok()?;
-        } else if c.is_ascii_whitespace() || matches!(c, ':' | '-' | '_' | '\'' | '"' | ',') {
-            continue;
-        } else {
-            return None;
-        }
-    }
-    Some(out)
-}
-
-/// Append a normalized hex chunk. Returns `(length, Some(key))` once 128
-/// characters have been collected, or `Err(())` if the total would overflow.
-fn key_import_append(hex: &str) -> Result<(usize, Option<[u8; 64]>), ()> {
-    KEY_IMPORT.lock(|cell| {
-        let mut state = cell.borrow_mut();
-
-        // If a complete key is pasted again while a partial one is buffered,
-        // restart with the complete key instead of overflowing.
-        if hex.len() == 128 {
-            state.len = 0;
-        } else if state.len + hex.len() > 128 {
-            state.len = 0;
-            return Err(());
-        }
-        for &b in hex.as_bytes() {
-            let idx = state.len;
-            state.buf[idx] = b;
-            state.len = idx + 1;
-        }
-        if state.len == 128 {
-            let mut key = [0u8; 64];
-            for i in 0..64 {
-                key[i] = (hex_to_nibble(state.buf[i * 2]) << 4)
-                    | hex_to_nibble(state.buf[i * 2 + 1]);
-            }
-            state.len = 0;
-            Ok((128, Some(key)))
-        } else {
-            Ok((state.len, None))
-        }
-    })
-}
-
-async fn apply_private_key(
-    sender: &mut Sender<'static, UsbDriver>,
-    node: &mut CompanionNode,
-    key: [u8; 64],
-) {
-    match crate::meshcore::identity::LocalIdentity::from_private(node.callsign.as_str(), &key) {
-        Some(id) => {
-            node.private_key = key;
-            node.public_key = *id.pub_key();
-            crate::storage::set_custom_priv_key(key);
-            info!("Node expanded private & public key updated via CLI");
-            let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetPrivateKey(key));
-            let _ = write_all(sender, b"  -> OK\r\n").await;
-        }
-        None => {
-            let _ = write_all(sender, b"  -> Error, reserved public key\r\n").await;
-        }
-    }
-}
-
 /// Handle a text command line from `meshcore-cli -r`
 async fn handle_text_cli(
     sender: &mut Sender<'static, UsbDriver>,
@@ -615,50 +531,6 @@ async fn handle_text_cli(
     // Echo the command line back to the host terminal
     let _ = write_all(sender, cmd_line.as_bytes()).await;
     let _ = write_all(sender, b"\r\n").await;
-
-    // If a private key was split across lines, keep consuming hex chunks.
-    // Any non-hex line cancels the pending import and is handled normally.
-    if KEY_IMPORT.lock(|k| k.borrow().len) > 0 {
-        if let Some(hex) = normalize_hex(trimmed) {
-            match key_import_append(hex.as_str()) {
-                Ok((_, Some(key))) => {
-                    apply_private_key(sender, node, key).await;
-                    return;
-                }
-                Ok((len, None)) => {
-                    let mut s: heapless::String<96> = heapless::String::new();
-                    let _ = write!(
-                        s,
-                        "  -> Key incomplete ({}/128), paste the remaining {} hex chars\r\n",
-                        len,
-                        128 - len
-                    );
-                    let _ = write_all(sender, s.as_bytes()).await;
-                    return;
-                }
-                Err(()) => {
-                    let _ = write_all(sender, b"  -> Error, key too long\r\n").await;
-                    return;
-                }
-            }
-        }
-        KEY_IMPORT.lock(|k| k.borrow_mut().len = 0);
-    }
-
-    // Terminal line editors often cap input at 128 characters, which is
-    // exactly one key but not "set prv.key " + key. Accept a bare key as a
-    // first-class command so the full value fits the limit.
-    if let Some(hex) = normalize_hex(trimmed) {
-        if hex.len() == 128 {
-            let mut key = [0u8; 64];
-            for i in 0..64 {
-                key[i] = (hex_to_nibble(hex.as_bytes()[i * 2]) << 4)
-                    | hex_to_nibble(hex.as_bytes()[i * 2 + 1]);
-            }
-            apply_private_key(sender, node, key).await;
-            return;
-        }
-    }
 
     match trimmed {
         "get name" | "name" => {
@@ -685,67 +557,54 @@ async fn handle_text_cli(
             let _ = write!(s, "\r\n");
             let _ = write_all(sender, s.as_bytes()).await;
         }
-        s if s == "set prv.key" || s.starts_with("set prv.key ") => {
-            let arg = s.strip_prefix("set prv.key").unwrap_or("").trim();
-            let normalized = if arg.is_empty() {
-                Some(heapless::String::<256>::new())
+        s if s.starts_with("set prv.key ") => {
+            let hex_str = s[12..].trim();
+            let valid_hex = hex_str.bytes().all(|b| b.is_ascii_hexdigit());
+            if valid_hex && hex_str.len() == 128 {
+                // MeshCore's 64-byte expanded key (`scalar ‖ nonce_prefix`).
+                let mut key = [0u8; 64];
+                for i in 0..64 {
+                    let hi = hex_to_nibble(hex_str.as_bytes()[i * 2]);
+                    let lo = hex_to_nibble(hex_str.as_bytes()[i * 2 + 1]);
+                    key[i] = (hi << 4) | lo;
+                }
+                match crate::meshcore::identity::LocalIdentity::from_private(
+                    node.callsign.as_str(),
+                    &key,
+                ) {
+                    Some(id) => {
+                        node.private_key = key;
+                        node.public_key = *id.pub_key();
+                        crate::storage::set_custom_priv_key(key);
+                        info!("Node expanded private & public key updated via CLI");
+                        let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetPrivateKey(key));
+                        let _ = write_all(sender, b"  -> OK\r\n").await;
+                    }
+                    None => {
+                        let _ = write_all(sender, b"  -> Error, reserved public key\r\n").await;
+                    }
+                }
+            } else if valid_hex && hex_str.len() == 64 {
+                // Convenience: accept a 32-byte seed and expand it for storage.
+                let mut seed = [0u8; 32];
+                for i in 0..32 {
+                    let hi = hex_to_nibble(hex_str.as_bytes()[i * 2]);
+                    let lo = hex_to_nibble(hex_str.as_bytes()[i * 2 + 1]);
+                    seed[i] = (hi << 4) | lo;
+                }
+                let id = crate::meshcore::identity::LocalIdentity::from_seed(
+                    node.callsign.as_str(),
+                    &seed,
+                );
+                let key = id.private_key_bytes();
+                node.private_key = key;
+                node.public_key = *id.pub_key();
+                crate::storage::set_custom_priv_key(key);
+                info!("Node seed imported and expanded; public key updated via CLI");
+                let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetPrivateKey(key));
+                let _ = write_all(sender, b"  -> OK\r\n").await;
             } else {
-                normalize_hex(arg)
-            };
-
-            match normalized {
-                Some(hex) if hex.len() == 128 => {
-                    let mut key = [0u8; 64];
-                    for i in 0..64 {
-                        key[i] = (hex_to_nibble(hex.as_bytes()[i * 2]) << 4)
-                            | hex_to_nibble(hex.as_bytes()[i * 2 + 1]);
-                    }
-                    apply_private_key(sender, node, key).await;
-                }
-                Some(hex) if hex.len() == 64 => {
-                    // Convenience: accept a 32-byte seed and expand it.
-                    let mut seed = [0u8; 32];
-                    for i in 0..32 {
-                        seed[i] = (hex_to_nibble(hex.as_bytes()[i * 2]) << 4)
-                            | hex_to_nibble(hex.as_bytes()[i * 2 + 1]);
-                    }
-                    let id = crate::meshcore::identity::LocalIdentity::from_seed(
-                        node.callsign.as_str(),
-                        &seed,
-                    );
-                    let key = id.private_key_bytes();
-                    apply_private_key(sender, node, key).await;
-                }
-                Some(hex) if hex.len() < 128 => {
-                    match key_import_append(hex.as_str()) {
-                        Ok((_, Some(key))) => apply_private_key(sender, node, key).await,
-                        Ok((len, None)) => {
-                            let mut out: heapless::String<96> = heapless::String::new();
-                            let _ = write!(
-                                out,
-                                "  -> Key incomplete ({}/128), paste the remaining {} hex chars\r\n",
-                                len,
-                                128 - len
-                            );
-                            let _ = write_all(sender, out.as_bytes()).await;
-                        }
-                        Err(()) => {
-                            let _ = write_all(sender, b"  -> Error, key too long\r\n").await;
-                        }
-                    }
-                }
-                Some(hex) => {
-                    let mut out: heapless::String<64> = heapless::String::new();
-                    let _ = write!(
-                        out,
-                        "  -> Error, expected 64 or 128 hex chars (got {})\r\n",
-                        hex.len()
-                    );
-                    let _ = write_all(sender, out.as_bytes()).await;
-                }
-                None => {
-                    let _ = write_all(sender, b"  -> Error, invalid hex characters\r\n").await;
-                }
+                let _ = write_all(sender, b"  -> Error, expected 64 or 128 hex chars\r\n").await;
             }
         }
         "set name" => {
@@ -1479,7 +1338,7 @@ async fn handle_text_cli(
             let _ = write_all(sender, b"  -> OK (Config save queued to flash)\r\n").await;
         }
         "help" => {
-            let _ = write_all(sender, b"  -> Commands:\r\n  ->   Identity: get/set name, get/set prv.key, get public.key (or paste a bare 128-char key)\r\n  ->   Radio:    get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq/tx/sf/bw/cr, get/set repeat, get/set hash-mode, stats-radio\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, get/set autoadd, advert, time, channels\r\n  ->   System:   save, ver, board, stats-core, stats-packets, clear stats/contacts/messages, reboot\r\n").await;
+            let _ = write_all(sender, b"  -> Commands:\r\n  ->   Identity: get/set name, get/set prv.key, get public.key\r\n  ->   Radio:    get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq/tx/sf/bw/cr, get/set repeat, get/set hash-mode, stats-radio\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, get/set autoadd, advert, time, channels\r\n  ->   System:   save, ver, board, stats-core, stats-packets, clear stats/contacts/messages, reboot\r\n").await;
         }
         _ => {
             let _ = write_all(sender, b"  -> Unknown command\r\n").await;
