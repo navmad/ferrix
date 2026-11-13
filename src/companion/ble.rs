@@ -397,7 +397,7 @@ pub async fn ble_companion_task(
     adv_data[5..21].copy_from_slice(&nus_uuid_128);
 
     // Scan response data: Complete Local Name (MeshCore-ThinkNode)
-    let name = b"Ferrix-M1";
+    let name = b"MeshCore-M1";
     scan_data[0] = (name.len() + 1) as u8;
     scan_data[1] = 0x09; // Complete Local Name
     scan_data[2..2 + name.len()].copy_from_slice(name);
@@ -408,7 +408,7 @@ pub async fn ble_companion_task(
     };
 
     let mut model = Vec::<u8, 32>::new();
-    let _ = model.extend_from_slice(b"Ferrix Companion");
+    let _ = model.extend_from_slice(b"ThinkNode M1");
     let _ = server.dis.model_number_set(&model);
 
     let mut fw = Vec::<u8, 32>::new();
@@ -619,7 +619,7 @@ pub async fn ble_companion_supervisor_task(
             && spawner.spawn(crate::storage::storage_task(sd)).is_ok()
             && spawner.spawn(ble_companion_task(sd, server, public_key, private_key)).is_ok()
         {
-            info!("Ferrix BLE companion service successfully started!");
+            info!("MeshCore BLE companion service successfully started!");
             BLE_STATUS.store(3, Ordering::Relaxed);
         } else {
             BLE_STATUS.store(4, Ordering::Relaxed);

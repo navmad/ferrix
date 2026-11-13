@@ -79,7 +79,7 @@ fn render_page_main(
         .into_styled(line_style)
         .draw(fb);
 
-    let _ = Text::new("Ferrix Node", Point::new(12, 70), title_style).draw(fb);
+    let _ = Text::new("MeshCore Node", Point::new(12, 70), title_style).draw(fb);
     let _ = Text::new("Status: Online & Ready", Point::new(12, 88), text_style).draw(fb);
 
     let mut unread_str: heapless::String<32> = heapless::String::new();

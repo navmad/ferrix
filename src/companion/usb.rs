@@ -1043,7 +1043,7 @@ async fn handle_text_cli(
                 0 => { let _ = write!(s, "  -> BLE: Not started\r\n"); }
                 1 => { let _ = write!(s, "  -> BLE: Probing SoftDevice...\r\n"); }
                 2 => { let _ = write!(s, "  -> BLE: SoftDevice enabled, setting vector table...\r\n"); }
-                3 => { let _ = write!(s, "  -> BLE: Active & Advertising (Ferrix NUS)\r\n"); }
+                3 => { let _ = write!(s, "  -> BLE: Active & Advertising (MeshCore-M1 NUS)\r\n"); }
                 code if code >= 0x1000 => {
                     let w0 = unsafe { *(0x1000 as *const u32) };
                     let w1 = unsafe { *(0x1004 as *const u32) };
@@ -1280,7 +1280,7 @@ pub fn init_usb(
     // 0x239A is Adafruit VID, 0x8029 is Feather nRF52840 / ThinkNode M1
     let mut config = Config::new(0x239A, 0x8029);
     config.manufacturer = Some("MeshCore");
-    config.product = Some("Ferrix Companion");
+    config.product = Some("ThinkNode M1 Companion");
     // Omit serial number so macOS uses USB location ID (/dev/cu.usbmodem1101),
     // matching the bootloader port name for seamless 1200-baud touch flashing!
     config.serial_number = None;

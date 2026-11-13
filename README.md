@@ -2,7 +2,7 @@
 
 A generic, native `no_std` embedded Rust companion firmware for **MeshCore** LoRa mesh nodes.
 
-> **Firmware identity: Ferrix.** Ferrix is the firmware identity used in the BLE name, USB product string and version banner.
+> **Firmware identity: Ferrix.** Ferrix is the firmware identity used in the version strings (`0.1.0-ferrix`) and boot banner. Protocol and board identities remain `MeshCore-M1` / `ThinkNode M1` for companion-app compatibility.
 
 Built on the **Embassy** asynchronous runtime for the Nordic **nRF52840** ARM Cortex-M4F microcontroller, with a modular board abstraction layer and extensible Semtech transceiver support (`LoraRadio`).
 

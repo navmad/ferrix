@@ -294,7 +294,7 @@ impl CompanionNode {
                 let _ = resp.extend_from_slice(&bdate);
 
                 let mut mmodel = [0u8; 40];
-                let m = b"Ferrix Companion";
+                let m = b"Elecrow ThinkNode M1";
                 mmodel[..m.len()].copy_from_slice(m);
                 let _ = resp.extend_from_slice(&mmodel);
 
