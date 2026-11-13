@@ -351,6 +351,13 @@ pub async fn softdevice_task(sd: &'static Softdevice) -> ! {
     sd.run().await
 }
 
+const FAST_ADV_SECS: u64 = 30;
+/// 1 second in 625 us advertising units.
+const ADVERTISING_SLOW_INTERVAL: u32 = 1600;
+/// Keep low-latency connection events during the initial sync burst, then
+/// restore the controller's slave-latency setting.
+const SLAVE_LATENCY_RESTORE_SECS: u64 = 15;
+
 #[embassy_executor::task]
 pub async fn ble_companion_task(
     sd: &'static Softdevice,
@@ -369,9 +376,9 @@ pub async fn ble_companion_task(
         private_key,
     );
 
-    // Use fast advertising initially (20ms interval) for faster discovery,
-    // then switch to slow (211ms) after the first connection to save power.
-    // Interval is in 625µs units: 20ms = 32, 211ms = 338.
+    // Use fast advertising (20ms) for the first 30 seconds for discovery,
+    // then fall back to 1s even if no app ever connects. Interval is in
+    // 625 us units: 20ms = 32, 1s = 1600.
     let mut adv_config = peripheral::Config {
         interval: 32, // 20ms fast advertising
         ..peripheral::Config::default()
@@ -422,8 +429,16 @@ pub async fn ble_companion_task(
     loop {
         info!("BLE: Waiting for pairable connection from MeshCore companion app (PIN 123456)...");
 
-        let conn = match peripheral::advertise_pairable(sd, adv, &adv_config, &SECURITY_HANDLER).await {
-            Ok(mut c) => {
+        let advertise_fut =
+            peripheral::advertise_pairable(sd, adv, &adv_config, &SECURITY_HANDLER);
+        let fast_window = if adv_config.interval == 32 {
+            embassy_time::Timer::after_secs(FAST_ADV_SECS)
+        } else {
+            // Already on the slow interval; this is just a long no-op window.
+            embassy_time::Timer::after_secs(3600)
+        };
+        let conn = match embassy_futures::select::select(advertise_fut, fast_window).await {
+            embassy_futures::select::Either::First(Ok(mut c)) => {
                 info!("BLE: Phone connected & pairing!");
                 BLE_CONNECTED.store(true, Ordering::Relaxed);
                 // Request maximum BLE data length (251 bytes) instead of the default 27 bytes.
@@ -433,12 +448,23 @@ pub async fn ble_companion_task(
                 let _ = c.ignore_slave_latency(true);
                 c
             }
-            Err(e) => {
+            embassy_futures::select::Either::First(Err(e)) => {
                 error!("BLE: Advertising error: {:?}", e);
                 embassy_time::Timer::after_secs(1).await;
                 continue;
             }
+            embassy_futures::select::Either::Second(_) => {
+                if adv_config.interval == 32 {
+                    adv_config.interval = ADVERTISING_SLOW_INTERVAL;
+                    info!("BLE: fast advertising window expired; using 1s interval");
+                }
+                continue;
+            }
         };
+
+        // Keep a second handle so slave latency can be restored while the
+        // session futures still borrow `conn`.
+        let mut latency_conn = conn.clone();
 
         // The GATT callback only copies the command into the lock-free ring and
         // wakes `command_fut`. It must not parse commands, take locks, allocate
@@ -523,7 +549,29 @@ pub async fn ble_companion_task(
             }
         };
 
-        match embassy_futures::select::select3(gatt_fut, command_fut, push_fut).await {
+        let mut session = core::pin::pin!(embassy_futures::select::select3(
+            gatt_fut,
+            command_fut,
+            push_fut
+        ));
+        let mut latency_timer =
+            embassy_time::Timer::after_secs(SLAVE_LATENCY_RESTORE_SECS);
+        let mut latency_restored = false;
+        let session_result = loop {
+            match embassy_futures::select::select(session.as_mut(), &mut latency_timer).await {
+                embassy_futures::select::Either::First(result) => break result,
+                embassy_futures::select::Either::Second(_) => {
+                    if !latency_restored {
+                        let _ = latency_conn.ignore_slave_latency(false);
+                        latency_restored = true;
+                        info!("BLE: restored slave latency after sync window");
+                    }
+                    latency_timer = embassy_time::Timer::after_secs(3600);
+                }
+            }
+        };
+
+        match session_result {
             embassy_futures::select::Either3::First(e) => {
                 info!("BLE: Phone disconnected ({:?}), resuming advertising...", e);
                 BLE_CONNECTED.store(false, Ordering::Relaxed);
@@ -531,11 +579,9 @@ pub async fn ble_companion_task(
                 // next app session never receives stale responses.
                 BLE_CMD_RING.clear();
                 while COMPANION_PUSH_CHANNEL.try_receive().is_ok() {}
-                // Switch to slow advertising (211ms) after the first connection to save power.
-                if adv_config.interval == 32 {
-                    adv_config.interval = 338; // 211ms slow advertising
-                    info!("BLE: Switched to slow advertising (211ms)");
-                }
+                // After a connection, use the 1s interval for power saving.
+                adv_config.interval = ADVERTISING_SLOW_INTERVAL;
+                info!("BLE: resumed advertising at 1s interval");
             }
             embassy_futures::select::Either3::Second(_) => {}
             embassy_futures::select::Either3::Third(_) => {}
