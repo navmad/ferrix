@@ -223,6 +223,8 @@ async fn main(spawner: Spawner) {
     let pub_key = local_id.pub_key_bytes();
     let priv_key = local_id.private_key_bytes();
     let mut mesh = MeshEngine::new(local_id, false);
+    // Forwarding is enabled for a dedicated repeater role or off-grid mode.
+    mesh.is_repeater = crate::companion::usb::forwarding_enabled();
 
     // 0. Initialize USB CDC-ACM Serial & 1200-baud DFU Auto-Reset FIRST
     // This guarantees serial CLI, packet logging, and DFU auto-reset are always available.
@@ -763,6 +765,8 @@ async fn main(spawner: Spawner) {
                 }
                 UsbCommand::SetFrequency(f) => {
                     info!("Frequency updated to: {} Hz", f);
+                    // Moving off an off-grid band can disable client repeat.
+                    mesh.is_repeater = crate::companion::usb::forwarding_enabled();
                     let _ = crate::radio::lora_phy::request_radio_config();
                 }
                 UsbCommand::SetTxPower(tx) => {
