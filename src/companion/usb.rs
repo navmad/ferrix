@@ -1101,9 +1101,9 @@ async fn handle_text_cli(
         s if s == "set autoadd" || s.starts_with("set autoadd ") => {
             let arg = s["set autoadd".len()..].trim();
             let (manual, config, max_hops, label) = if arg.eq_ignore_ascii_case("on") {
-                (0u8, 0x1Eu8, AUTOADD_SETTINGS.lock(|a| a.borrow().max_hops), 1u8)
+                (0u8, 0x1Eu8, 0u8, 1u8)
             } else if arg.eq_ignore_ascii_case("off") {
-                (1u8, 0x00u8, AUTOADD_SETTINGS.lock(|a| a.borrow().max_hops), 2u8)
+                (1u8, 0x00u8, 0u8, 2u8)
             } else {
                 let mut parts = arg
                     .split(|c: char| c == ',' || c.is_whitespace())
