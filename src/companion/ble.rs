@@ -259,6 +259,9 @@ pub async fn contact_task() -> ! {
                 });
             }
         }
+        // Persist a structural change. The storage task's hash check means
+        // volatile-only updates do not write flash.
+        crate::persist::request_contacts();
     }
 }
 

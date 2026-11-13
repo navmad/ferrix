@@ -7,6 +7,7 @@ pub mod display;
 pub mod gps;
 pub mod input;
 pub mod meshcore;
+pub mod persist;
 pub mod radio;
 pub mod storage;
 pub mod telemetry;
@@ -208,6 +209,9 @@ async fn main(spawner: Spawner) {
 
     // Initialize persistent configuration from flash
     let (node_name, custom_key) = crate::storage::init_config();
+
+    // Load the contact and message snapshots into RAM.
+    crate::persist::load();
 
     // Initialize native MeshCore Routing Engine & Local Cryptographic Identity.
     // The stored key is MeshCore's 64-byte expanded form; old configs are
@@ -473,6 +477,7 @@ async fn main(spawner: Spawner) {
                                 }
                             }
                         });
+                        crate::persist::request_contacts();
                     }
                     InboundAction::ReceivedGroupText { channel_idx, path_len, packet: grp } => {
                         info!("MeshCore Group Text [ch {}]: <{}> {}", channel_idx, grp.sender.as_str(), grp.message.as_str());
@@ -498,6 +503,7 @@ async fn main(spawner: Spawner) {
                                 is_direct: false,
                             });
                         });
+                        crate::persist::request_messages();
 
                         // Prompt companion app with PUSH_CODE_MSG_WAITING (0x83)
                         let mut msg_wait = heapless::Vec::<u8, 256>::new();
@@ -543,6 +549,7 @@ async fn main(spawner: Spawner) {
                                 is_direct: true,
                             });
                         });
+                        crate::persist::request_messages();
 
                         // Prompt companion app with PUSH_CODE_MSG_WAITING (0x83)
                         let mut msg_wait = heapless::Vec::<u8, 256>::new();
@@ -569,6 +576,7 @@ async fn main(spawner: Spawner) {
                                 ct.out_path_len = path.path_len;
                             }
                         });
+                        crate::persist::request_contacts();
                         // A PATH return can carry an ACK as its extra.
                         if path.extra_type & 0x0F == 3 && path.extra.len() >= 4 {
                             if let Ok(ack) =

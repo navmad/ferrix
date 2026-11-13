@@ -438,28 +438,48 @@ pub async fn storage_task(sd: &'static nrf_softdevice::Softdevice) -> ! {
     info!("Storage: Flash persistence task started (target page 0x{:08x})", CONFIG_FLASH_ADDR);
 
     loop {
-        SAVE_REQUEST_CHANNEL.receive().await;
-        // Debounce slightly in case multiple settings are saved in quick succession
-        embassy_time::Timer::after_millis(200).await;
-        while SAVE_REQUEST_CHANNEL.try_receive().is_ok() {}
+        match embassy_futures::select::select3(
+            SAVE_REQUEST_CHANNEL.receive(),
+            crate::persist::CONTACTS_SAVE_CHANNEL.receive(),
+            crate::persist::MESSAGES_SAVE_CHANNEL.receive(),
+        )
+        .await
+        {
+            embassy_futures::select::Either3::First(_) => {
+                // Debounce slightly in case multiple settings are saved in quick succession
+                embassy_time::Timer::after_millis(200).await;
+                while SAVE_REQUEST_CHANNEL.try_receive().is_ok() {}
 
-        let config = assemble_current_config();
-        let config_bytes = unsafe {
-            core::slice::from_raw_parts(
-                &config as *const _ as *const u8,
-                core::mem::size_of::<PersistentConfig>(),
-            )
-        };
+                let config = assemble_current_config();
+                let config_bytes = unsafe {
+                    core::slice::from_raw_parts(
+                        &config as *const _ as *const u8,
+                        core::mem::size_of::<PersistentConfig>(),
+                    )
+                };
 
-        info!("Storage: Committing persistent configuration to flash at 0x{:08x}...", CONFIG_FLASH_ADDR);
-        if let Err(e) = flash.erase(CONFIG_FLASH_ADDR, CONFIG_FLASH_ADDR + 4096).await {
-            error!("Storage: Flash page erase error: {:?}", e);
-            continue;
+                info!("Storage: Committing persistent configuration to flash at 0x{:08x}...", CONFIG_FLASH_ADDR);
+                if let Err(e) = flash.erase(CONFIG_FLASH_ADDR, CONFIG_FLASH_ADDR + 4096).await {
+                    error!("Storage: Flash page erase error: {:?}", e);
+                    continue;
+                }
+                if let Err(e) = flash.write(CONFIG_FLASH_ADDR, config_bytes).await {
+                    error!("Storage: Flash write error: {:?}", e);
+                    continue;
+                }
+                info!("Storage: Configuration successfully saved to flash!");
+            }
+            embassy_futures::select::Either3::Second(_) => {
+                // Coalesce a burst of advert/app updates before snapshotting.
+                embassy_time::Timer::after_millis(1000).await;
+                while crate::persist::CONTACTS_SAVE_CHANNEL.try_receive().is_ok() {}
+                crate::persist::save_contacts(&mut flash).await;
+            }
+            embassy_futures::select::Either3::Third(_) => {
+                embassy_time::Timer::after_millis(1000).await;
+                while crate::persist::MESSAGES_SAVE_CHANNEL.try_receive().is_ok() {}
+                crate::persist::save_messages(&mut flash).await;
+            }
         }
-        if let Err(e) = flash.write(CONFIG_FLASH_ADDR, config_bytes).await {
-            error!("Storage: Flash write error: {:?}", e);
-            continue;
-        }
-        info!("Storage: Configuration successfully saved to flash!");
     }
 }

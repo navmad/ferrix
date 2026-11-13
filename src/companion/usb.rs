@@ -73,7 +73,10 @@ pub const MAX_CHANNELS: usize = 40;
 pub static DISCOVERED_CONTACTS: Mutex<SharedRawMutex, RefCell<heapless::Vec<DiscoveredContact, MAX_CONTACTS>>> =
     Mutex::new(RefCell::new(heapless::Vec::new()));
 
-pub static MESSAGE_LOG: Mutex<SharedRawMutex, RefCell<heapless::Vec<ReceivedMessage, 16>>> =
+/// Number of retained messages (matched by the persistent snapshot size).
+pub const MAX_MESSAGES: usize = 16;
+
+pub static MESSAGE_LOG: Mutex<SharedRawMutex, RefCell<heapless::Vec<ReceivedMessage, MAX_MESSAGES>>> =
     Mutex::new(RefCell::new(heapless::Vec::new()));
 
 #[derive(Clone, Copy, Debug)]
@@ -992,10 +995,11 @@ async fn handle_text_cli(
             DISCOVERED_CONTACTS.lock(|c| {
                 c.borrow_mut().clear();
             });
+            crate::persist::request_contacts();
             let _ = write_all(sender, b"  -> OK (Contacts cleared)\r\n").await;
         }
         "messages" | "inbox" | "get messages" => {
-            let msg_snapshot: heapless::Vec<ReceivedMessage, 16> = MESSAGE_LOG.lock(|m| m.borrow().clone());
+            let msg_snapshot: heapless::Vec<ReceivedMessage, MAX_MESSAGES> = MESSAGE_LOG.lock(|m| m.borrow().clone());
             if msg_snapshot.is_empty() {
                 let _ = write_all(sender, b"  -> No messages received yet\r\n").await;
             } else {
@@ -1016,6 +1020,7 @@ async fn handle_text_cli(
             MESSAGE_LOG.lock(|m| {
                 m.borrow_mut().clear();
             });
+            crate::persist::request_messages();
             let _ = write_all(sender, b"  -> OK (Messages cleared)\r\n").await;
         }
         "stats-radio" => {
