@@ -3,6 +3,12 @@ resolver = "2"
 members = [".", "crates/meshcore-wire"]
 default-members = ["."]
 
+# Local patch: nrf-softdevice panics when a GAP/GATTS event arrives after the
+# peer disconnected (e.g. a late CONN_PARAM_UPDATE). See the patch notes in
+# vendor/nrf-softdevice/nrf-softdevice/src/ble/connection.rs.
+[patch."https://github.com/embassy-rs/nrf-softdevice.git"]
+nrf-softdevice = { path = "vendor/nrf-softdevice/nrf-softdevice" }
+
 [package]
 name = "ferrix"
 version = "0.1.0"
