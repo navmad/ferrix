@@ -34,6 +34,9 @@ const DISP_W: i32 = EPD_WIDTH as i32;
 const SMALL_W: i32 = 6;
 const TITLE_W: i32 = 9;
 const LINE_H: i32 = 12;
+const SEPARATOR_Y: i32 = 28;
+/// Baseline of the first content row. Increase this to add space between the
+/// separator line and every page's content.
 const CONTENT_Y: i32 = 34;
 
 type SmallStyle = MonoTextStyle<'static, BinaryColor>;
@@ -50,7 +53,7 @@ pub fn render_page(page: u8, node: &CompanionNode, fb: &mut EpdFrameBuffer) {
     let page = page.min(PAGE_COUNT - 1);
     draw_top_bar(node, fb, small, title);
     draw_page_dots(page, fb);
-    let _ = Line::new(Point::new(0, 28), Point::new(DISP_W - 1, 28))
+    let _ = Line::new(Point::new(0, SEPARATOR_Y), Point::new(DISP_W - 1, SEPARATOR_Y))
         .into_styled(line)
         .draw(fb);
 
@@ -128,9 +131,9 @@ fn render_messages(node: &CompanionNode, fb: &mut EpdFrameBuffer, small: SmallSt
 
     let mut buf: String<32> = String::new();
     let _ = write!(buf, "MSG: {}", node.unread_messages);
-    draw_centered(fb, buf.as_str(), 58, small);
+    draw_centered(fb, buf.as_str(), CONTENT_Y + 24, small);
 
-    draw_centered(fb, link, 80, small);
+    draw_centered(fb, link, CONTENT_Y + 46, small);
 
     buf.clear();
     let _ = write!(
@@ -138,7 +141,7 @@ fn render_messages(node: &CompanionNode, fb: &mut EpdFrameBuffer, small: SmallSt
         "Offgrid: {}",
         if crate::companion::usb::offgrid_active() { "ON" } else { "OFF" }
     );
-    draw_centered(fb, buf.as_str(), 102, small);
+    draw_centered(fb, buf.as_str(), CONTENT_Y + 68, small);
 
     let up = embassy_time::Instant::now().as_secs();
     buf.clear();
@@ -149,7 +152,7 @@ fn render_messages(node: &CompanionNode, fb: &mut EpdFrameBuffer, small: SmallSt
         (up % 86_400) / 3600,
         (up % 3600) / 60
     );
-    draw_centered(fb, buf.as_str(), 124, small);
+    draw_centered(fb, buf.as_str(), CONTENT_Y + 90, small);
 }
 
 fn render_recent(node: &CompanionNode, fb: &mut EpdFrameBuffer, small: SmallStyle) {
@@ -184,7 +187,7 @@ fn render_recent(node: &CompanionNode, fb: &mut EpdFrameBuffer, small: SmallStyl
     });
 
     if recent.is_empty() {
-        draw_centered(fb, "(no contacts heard)", 76, small);
+        draw_centered(fb, "(no contacts heard)", CONTENT_Y + 42, small);
         return;
     }
 
@@ -235,36 +238,36 @@ fn render_traffic(fb: &mut EpdFrameBuffer, small: SmallStyle) {
         (t.rx_packets, t.tx_beacons)
     });
 
-    draw_centered(fb, "Traffic", 52, small);
+    draw_centered(fb, "Traffic", CONTENT_Y + 18, small);
 
     let mut buf: String<32> = String::new();
     let _ = write!(buf, "RX: {}   TX: {}", rx, tx);
-    draw_centered(fb, buf.as_str(), 76, small);
+    draw_centered(fb, buf.as_str(), CONTENT_Y + 42, small);
 
     buf.clear();
     let _ = write!(buf, "ERR: 0");
-    draw_centered(fb, buf.as_str(), 92, small);
+    draw_centered(fb, buf.as_str(), CONTENT_Y + 58, small);
 }
 
 fn render_gps(node: &CompanionNode, fb: &mut EpdFrameBuffer, small: SmallStyle) {
     let mut buf: String<32> = String::new();
 
     if node.gps_fix {
-        draw_centered(fb, "GPS: 3D fix", 44, small);
+        draw_centered(fb, "GPS: 3D fix", CONTENT_Y + 10, small);
         let _ = write!(buf, "Lat: {:.5}", node.latitude);
-        draw_text(fb, buf.as_str(), 2, 64, small);
+        draw_text(fb, buf.as_str(), 2, CONTENT_Y + 30, small);
         buf.clear();
         let _ = write!(buf, "Lon: {:.5}", node.longitude);
-        draw_text(fb, buf.as_str(), 2, 78, small);
-        draw_text(fb, "Sats: --   Age: --", 2, 92, small);
+        draw_text(fb, buf.as_str(), 2, CONTENT_Y + 44, small);
+        draw_text(fb, "Sats: --   Age: --", 2, CONTENT_Y + 58, small);
     } else {
-        draw_centered(fb, "GPS: acquiring", 44, small);
-        draw_centered(fb, "No fix yet", 64, small);
+        draw_centered(fb, "GPS: acquiring", CONTENT_Y + 10, small);
+        draw_centered(fb, "No fix yet", CONTENT_Y + 30, small);
         let _ = write!(buf, "Lat: {:.5}", node.latitude);
-        draw_text(fb, buf.as_str(), 2, 84, small);
+        draw_text(fb, buf.as_str(), 2, CONTENT_Y + 50, small);
         buf.clear();
         let _ = write!(buf, "Lon: {:.5}", node.longitude);
-        draw_text(fb, buf.as_str(), 2, 98, small);
+        draw_text(fb, buf.as_str(), 2, CONTENT_Y + 64, small);
     }
 }
 
@@ -276,7 +279,12 @@ fn render_offgrid(fb: &mut EpdFrameBuffer, small: SmallStyle) {
     let active = crate::companion::usb::offgrid_active();
 
     let mut buf: String<32> = String::new();
-    draw_centered(fb, if active { "Offgrid: ON" } else { "Offgrid: OFF" }, 52, small);
+    draw_centered(
+        fb,
+        if active { "Offgrid: ON" } else { "Offgrid: OFF" },
+        CONTENT_Y + 18,
+        small,
+    );
 
     buf.clear();
     let _ = write!(
@@ -285,7 +293,7 @@ fn render_offgrid(fb: &mut EpdFrameBuffer, small: SmallStyle) {
         freq_hz / 1_000_000,
         (freq_hz % 1_000_000 + 500) / 1000
     );
-    draw_centered(fb, buf.as_str(), 76, small);
+    draw_centered(fb, buf.as_str(), CONTENT_Y + 42, small);
 
     buf.clear();
     let _ = write!(
@@ -293,7 +301,7 @@ fn render_offgrid(fb: &mut EpdFrameBuffer, small: SmallStyle) {
         "Client repeat: {}",
         if client_repeat { "on" } else { "off" }
     );
-    draw_centered(fb, buf.as_str(), 96, small);
+    draw_centered(fb, buf.as_str(), CONTENT_Y + 62, small);
 }
 
 fn age_label(last_seen: u32, now_epoch: u64) -> String<8> {
