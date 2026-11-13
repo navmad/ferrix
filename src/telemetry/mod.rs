@@ -5,8 +5,15 @@ use core::sync::atomic::{AtomicU16, Ordering};
 /// Latest measured battery voltage. 0 means "not sampled / no battery".
 static BATTERY_MV: AtomicU16 = AtomicU16::new(0);
 
+/// A single Li-ion cell is protection-cut well above 2 V. Lower readings are
+/// ADC noise, a failed sample, or a board without a battery, and must not
+/// replace the last good value (which would briefly show 0%).
+pub const MIN_PLAUSIBLE_BATTERY_MV: u16 = 2000;
+
 pub fn set_battery_millivolts(mv: u16) {
-    BATTERY_MV.store(mv, Ordering::Relaxed);
+    if mv >= MIN_PLAUSIBLE_BATTERY_MV {
+        BATTERY_MV.store(mv, Ordering::Relaxed);
+    }
 }
 
 pub fn battery_millivolts() -> u16 {

@@ -209,6 +209,17 @@ async fn main(spawner: Spawner) {
         [saadc::ChannelConfig::single_ended(board.bat_adc_pin)],
     );
 
+    // Take one sample before the companion/display start so a freshly booted
+    // device never reports 0 mV (and therefore 0%) to the app.
+    let mut battery_buf = [0i16; 1];
+    if CurrentBoard::HAS_BATTERY_ADC {
+        battery_adc.sample(&mut battery_buf).await;
+        let raw = battery_buf[0].max(0) as u16;
+        crate::telemetry::set_battery_millivolts(
+            crate::telemetry::adc_raw_to_battery_millivolts(raw),
+        );
+    }
+
     // Initialize persistent configuration from flash
     let (node_name, custom_key) = crate::storage::init_config();
 
@@ -340,7 +351,6 @@ async fn main(spawner: Spawner) {
     board.telemetry.blue_led.set_low();
 
     let mut rx_buf = [0u8; 256];
-    let mut battery_buf = [0i16; 1];
     let mut tick = 0u32;
     let mut page_turns = 0u32;
 
@@ -924,9 +934,11 @@ async fn main(spawner: Spawner) {
             battery_adc.sample(&mut battery_buf).await;
             let raw = battery_buf[0].max(0) as u16;
             let mv = crate::telemetry::adc_raw_to_battery_millivolts(raw);
-            crate::telemetry::set_battery_millivolts(mv);
-            node.battery_millivolts = mv;
-            node.battery_percentage = crate::telemetry::millivolts_to_percentage(mv);
+            if mv >= crate::telemetry::MIN_PLAUSIBLE_BATTERY_MV {
+                crate::telemetry::set_battery_millivolts(mv);
+                node.battery_millivolts = mv;
+                node.battery_percentage = crate::telemetry::millivolts_to_percentage(mv);
+            }
         }
 
         // Heartbeat LED flash every 2 seconds

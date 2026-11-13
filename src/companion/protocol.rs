@@ -197,6 +197,13 @@ impl CompanionNode {
         let mut cs = String::new();
         let _ = cs.push_str(callsign);
         let auto = crate::companion::usb::AUTOADD_SETTINGS.lock(|a| *a.borrow());
+        let battery_mv = crate::telemetry::battery_millivolts();
+        let (battery_millivolts, battery_percentage) =
+            if battery_mv >= crate::telemetry::MIN_PLAUSIBLE_BATTERY_MV {
+                (battery_mv, crate::telemetry::millivolts_to_percentage(battery_mv))
+            } else {
+                (4120, 95)
+            };
 
         Self {
             callsign: cs,
@@ -204,8 +211,8 @@ impl CompanionNode {
             capabilities,
             public_key,
             private_key,
-            battery_millivolts: 4120, // 4.12V default nominal
-            battery_percentage: 95,
+            battery_millivolts,
+            battery_percentage,
             epoch_time: 0,
             unread_messages: 0,
             gps_fix: false,
@@ -283,9 +290,14 @@ impl CompanionNode {
         }
 
         // Refresh the battery snapshot from the shared telemetry state (the
-        // ADC is sampled by the main loop).
-        self.battery_millivolts = crate::telemetry::battery_millivolts();
-        self.battery_percentage = crate::telemetry::battery_percentage();
+        // ADC is sampled by the main loop). Keep the last good value while the
+        // ADC has not produced a plausible sample yet; overwriting it with 0
+        // makes the app briefly show 0%.
+        let battery_mv = crate::telemetry::battery_millivolts();
+        if battery_mv >= crate::telemetry::MIN_PLAUSIBLE_BATTERY_MV {
+            self.battery_millivolts = battery_mv;
+            self.battery_percentage = crate::telemetry::battery_percentage();
+        }
 
         let cmd = payload[0];
         LAST_CMD.store(cmd, Ordering::Relaxed);
