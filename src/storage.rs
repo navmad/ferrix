@@ -22,7 +22,7 @@ use crate::companion::usb::ChannelData;
 /// (Top page of application flash, immediately preceding bootloader at 0x000ED000)
 pub const CONFIG_FLASH_ADDR: u32 = 0x000EC000;
 pub const CONFIG_MAGIC: u32 = 0x4D434647; // 'MCFG' (MeshCore Config)
-pub const CONFIG_VERSION: u32 = 3;
+pub const CONFIG_VERSION: u32 = 4;
 
 #[repr(C, align(4))]
 #[derive(Clone, Copy)]
@@ -34,6 +34,10 @@ pub struct PersistentConfig {
     pub custom_priv_key: [u8; 64],
     pub has_custom_key: u8,
     pub is_repeater: u8,
+    /// Off-grid client-repeat mode (the reference firmware `client_repeat`).
+    pub client_repeat: u8,
+    /// Frequency to restore when off-grid mode is disabled.
+    pub offgrid_home_freq: u32,
     pub radio_tx_power: i8,
     pub radio_sf: u8,
     pub radio_cr: u8,
@@ -65,6 +69,28 @@ struct PersistentConfigV2 {
     radio_freq_hz: u32,
     radio_bw_khz: u32,
     channels: [ChannelData; 8],
+    checksum: u32,
+}
+
+/// v3 layout: 40 channels, no client-repeat field. Read only for migration.
+#[repr(C, align(4))]
+#[derive(Clone, Copy)]
+struct PersistentConfigV3 {
+    magic: u32,
+    version: u32,
+    callsign: [u8; 32],
+    custom_priv_key: [u8; 64],
+    has_custom_key: u8,
+    is_repeater: u8,
+    radio_tx_power: i8,
+    radio_sf: u8,
+    radio_cr: u8,
+    path_hash_mode: u8,
+    autoadd_config: u8,
+    autoadd_max_hops: u8,
+    radio_freq_hz: u32,
+    radio_bw_khz: u32,
+    channels: [ChannelData; crate::companion::usb::MAX_CHANNELS],
     checksum: u32,
 }
 
@@ -139,6 +165,8 @@ fn migrate_v1(v1: PersistentConfigV1) -> PersistentConfig {
         custom_priv_key,
         has_custom_key: v1.has_custom_key,
         is_repeater: v1.is_repeater,
+        client_repeat: 0,
+        offgrid_home_freq: 0,
         radio_tx_power: v1.radio_tx_power,
         radio_sf: v1.radio_sf,
         radio_cr: v1.radio_cr,
@@ -162,6 +190,8 @@ fn migrate_v2(v2: PersistentConfigV2) -> PersistentConfig {
         custom_priv_key: v2.custom_priv_key,
         has_custom_key: v2.has_custom_key,
         is_repeater: v2.is_repeater,
+        client_repeat: 0,
+        offgrid_home_freq: 0,
         radio_tx_power: v2.radio_tx_power,
         radio_sf: v2.radio_sf,
         radio_cr: v2.radio_cr,
@@ -177,6 +207,31 @@ fn migrate_v2(v2: PersistentConfigV2) -> PersistentConfig {
     cfg
 }
 
+fn migrate_v3(v3: PersistentConfigV3) -> PersistentConfig {
+    let mut cfg = PersistentConfig {
+        magic: CONFIG_MAGIC,
+        version: CONFIG_VERSION,
+        callsign: v3.callsign,
+        custom_priv_key: v3.custom_priv_key,
+        has_custom_key: v3.has_custom_key,
+        is_repeater: v3.is_repeater,
+        client_repeat: 0,
+        offgrid_home_freq: 0,
+        radio_tx_power: v3.radio_tx_power,
+        radio_sf: v3.radio_sf,
+        radio_cr: v3.radio_cr,
+        path_hash_mode: v3.path_hash_mode,
+        autoadd_config: v3.autoadd_config,
+        autoadd_max_hops: v3.autoadd_max_hops,
+        radio_freq_hz: v3.radio_freq_hz,
+        radio_bw_khz: v3.radio_bw_khz,
+        channels: v3.channels,
+        checksum: 0,
+    };
+    cfg.checksum = compute_checksum(&cfg);
+    cfg
+}
+
 /// Synchronously read and validate persistent configuration from internal
 /// flash. Returns `(config, migrated_from_v1)`.
 pub fn read_config() -> Option<(PersistentConfig, bool)> {
@@ -186,6 +241,12 @@ pub fn read_config() -> Option<(PersistentConfig, bool)> {
     }
     if cfg.version == CONFIG_VERSION && compute_checksum(&cfg) == cfg.checksum {
         return Some((cfg, false));
+    }
+    if cfg.version == 3 {
+        let v3 = unsafe { (CONFIG_FLASH_ADDR as *const PersistentConfigV3).read_volatile() };
+        if compute_checksum(&v3) == v3.checksum {
+            return Some((migrate_v3(v3), true));
+        }
     }
     if cfg.version == 2 {
         let v2 = unsafe { (CONFIG_FLASH_ADDR as *const PersistentConfigV2).read_volatile() };
@@ -283,6 +344,8 @@ pub fn init_config() -> (String<32>, Option<[u8; 64]>) {
             s.bw_khz = cfg.radio_bw_khz;
             s.cr = cfg.radio_cr;
             s.is_repeater = cfg.is_repeater != 0;
+            s.client_repeat = cfg.client_repeat != 0;
+            s.offgrid_home_freq = cfg.offgrid_home_freq;
             s.path_hash_mode = if cfg.path_hash_mode <= 2 { cfg.path_hash_mode } else { 0 };
         });
 
@@ -318,10 +381,21 @@ pub fn assemble_current_config() -> PersistentConfig {
         callsign_bytes[..len].copy_from_slice(&s.as_bytes()[..len]);
     });
 
-    let (freq, tx, sf, bw, cr, is_rep, path_mode) = crate::companion::usb::RADIO_SETTINGS.lock(|r| {
-        let s = r.borrow();
-        (s.frequency_hz, s.tx_power_dbm, s.sf, s.bw_khz, s.cr, s.is_repeater, s.path_hash_mode)
-    });
+    let (freq, tx, sf, bw, cr, is_rep, client_repeat, offgrid_home_freq, path_mode) =
+        crate::companion::usb::RADIO_SETTINGS.lock(|r| {
+            let s = r.borrow();
+            (
+                s.frequency_hz,
+                s.tx_power_dbm,
+                s.sf,
+                s.bw_khz,
+                s.cr,
+                s.is_repeater,
+                s.client_repeat,
+                s.offgrid_home_freq,
+                s.path_hash_mode,
+            )
+        });
 
     let channels = crate::companion::usb::CHANNELS.lock(|c| *c.borrow());
 
@@ -340,6 +414,8 @@ pub fn assemble_current_config() -> PersistentConfig {
         custom_priv_key,
         has_custom_key,
         is_repeater: if is_rep { 1 } else { 0 },
+        client_repeat: if client_repeat { 1 } else { 0 },
+        offgrid_home_freq,
         radio_tx_power: tx,
         radio_sf: sf,
         radio_cr: cr,

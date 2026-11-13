@@ -44,6 +44,12 @@ pub struct RadioSettings {
     pub bw_khz: u32,
     pub cr: u8,
     pub is_repeater: bool,
+    /// Off-grid "client repeat" mode (the reference firmware `client_repeat`). Distinct from
+    /// the repeater node role: it enables forwarding only on an allowed
+    /// off-grid frequency.
+    pub client_repeat: bool,
+    /// Frequency to return to when off-grid mode is turned off.
+    pub offgrid_home_freq: u32,
     pub path_hash_mode: u8,
 }
 
@@ -54,6 +60,8 @@ pub static RADIO_SETTINGS: Mutex<SharedRawMutex, RefCell<RadioSettings>> = Mutex
     bw_khz: 62,
     cr: 5,
     is_repeater: false,
+    client_repeat: false,
+    offgrid_home_freq: 0,
     path_hash_mode: 0,
 }));
 
@@ -160,6 +168,102 @@ fn format_bw(bw_khz: u32) -> heapless::String<16> {
         let _ = write!(s, "{}.{:03}", hz / 1000, hz % 1000);
     }
     s
+}
+
+/// the reference firmware's allowed client-repeat frequencies (kHz).
+pub const OFFGRID_FREQ_RANGES: [(u32, u32); 3] = [
+    (433_000, 433_000),
+    (869_495, 869_495),
+    (918_000, 918_000),
+];
+
+pub fn is_offgrid_freq_khz(khz: u32) -> bool {
+    OFFGRID_FREQ_RANGES
+        .iter()
+        .any(|&(lo, hi)| khz >= lo && khz <= hi)
+}
+
+pub fn is_offgrid_freq_hz(hz: u32) -> bool {
+    is_offgrid_freq_khz(hz / 1000)
+}
+
+/// the reference firmware `offgridActive`: client repeat set AND on an allowed frequency.
+pub fn offgrid_active() -> bool {
+    RADIO_SETTINGS.lock(|r| {
+        let s = r.borrow();
+        s.client_repeat && is_offgrid_freq_hz(s.frequency_hz)
+    })
+}
+
+/// Effective forwarding flag: a dedicated repeater role, or off-grid mode.
+pub fn forwarding_enabled() -> bool {
+    RADIO_SETTINGS.lock(|r| r.borrow().is_repeater) || offgrid_active()
+}
+
+/// Nearest allowed off-grid frequency to `freq_hz`, or None above 960 MHz.
+pub fn nearest_offgrid_freq_hz(freq_hz: u32) -> Option<u32> {
+    let khz = freq_hz / 1000;
+    if khz > 960_000 {
+        return None;
+    }
+    let mut best = None;
+    let mut best_dist = u32::MAX;
+    for (lo, hi) in OFFGRID_FREQ_RANGES {
+        let c = khz.clamp(lo, hi);
+        let dist = c.abs_diff(khz);
+        if dist < best_dist {
+            best_dist = dist;
+            best = Some(c * 1000);
+        }
+    }
+    best
+}
+
+pub struct OffgridChange {
+    pub changed: bool,
+    pub freq_changed: bool,
+    pub no_band: bool,
+}
+
+/// the reference firmware `offgridSet`: toggle client-repeat/off-grid mode. Turning it on
+/// retunes to the nearest allowed band and remembers the previous frequency;
+/// turning it off restores that frequency.
+pub fn offgrid_set(on: bool) -> OffgridChange {
+    RADIO_SETTINGS.lock(|r| {
+        let mut s = r.borrow_mut();
+        if on {
+            if s.client_repeat && is_offgrid_freq_hz(s.frequency_hz) {
+                return OffgridChange { changed: false, freq_changed: false, no_band: false };
+            }
+            if is_offgrid_freq_hz(s.frequency_hz) {
+                s.client_repeat = true;
+                s.offgrid_home_freq = 0;
+                return OffgridChange { changed: true, freq_changed: false, no_band: false };
+            }
+            if let Some(hz) = nearest_offgrid_freq_hz(s.frequency_hz) {
+                s.offgrid_home_freq = s.frequency_hz;
+                s.frequency_hz = hz;
+                s.client_repeat = true;
+                return OffgridChange { changed: true, freq_changed: true, no_band: false };
+            }
+            OffgridChange { changed: false, freq_changed: false, no_band: true }
+        } else {
+            let was_set = s.client_repeat;
+            let home = if s.client_repeat && is_offgrid_freq_hz(s.frequency_hz) {
+                s.offgrid_home_freq
+            } else {
+                0
+            };
+            s.client_repeat = false;
+            s.offgrid_home_freq = 0;
+            if home != 0 {
+                s.frequency_hz = home;
+                OffgridChange { changed: true, freq_changed: true, no_band: false }
+            } else {
+                OffgridChange { changed: was_set, freq_changed: false, no_band: false }
+            }
+        }
+    })
 }
 
 pub const DEFAULT_PUBLIC_SECRET: [u8; 16] = [
@@ -693,24 +797,64 @@ async fn handle_text_cli(
                 let _ = write_all(sender, b"  -> Error: invalid number\r\n").await;
             }
         }
-        "get repeat" | "get role" => {
+        "get repeat" => {
+            // the reference firmware: for a companion this reflects off-grid mode.
+            let on = crate::companion::usb::offgrid_active();
+            let mut s: heapless::String<16> = heapless::String::new();
+            let _ = write!(s, "> {}\r\n", if on { "on" } else { "off" });
+            let _ = write_all(sender, s.as_bytes()).await;
+        }
+        "get role" => {
             let is_rep = RADIO_SETTINGS.lock(|r| r.borrow().is_repeater);
-            if is_rep {
-                let _ = write_all(sender, b"> on\r\n").await;
+            let mut s: heapless::String<16> = heapless::String::new();
+            let _ = write!(s, "> {}\r\n", if is_rep { "on" } else { "off" });
+            let _ = write_all(sender, s.as_bytes()).await;
+        }
+        s if s.starts_with("set repeat ") => {
+            let val = s[11..].trim();
+            let on = matches!(val, "on" | "1" | "true");
+            let off = matches!(val, "off" | "0" | "false");
+            if !on && !off {
+                let _ = write_all(sender, b"Error: must be on or off\r\n").await;
             } else {
-                let _ = write_all(sender, b"> off\r\n").await;
+                let change = crate::companion::usb::offgrid_set(on);
+                if change.no_band {
+                    let _ = write_all(
+                        sender,
+                        b"Error: no off-grid frequency in this band\r\n",
+                    )
+                    .await;
+                } else {
+                    if change.changed {
+                        crate::storage::request_save_config();
+                    }
+                    if change.freq_changed {
+                        let _ = crate::radio::lora_phy::request_radio_config();
+                    }
+                    let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetRepeat(
+                        crate::companion::usb::forwarding_enabled(),
+                    ));
+                    let msg: &[u8] = if on {
+                        b"OK - repeat is now ON\r\n"
+                    } else {
+                        b"OK - repeat is now OFF\r\n"
+                    };
+                    let _ = write_all(sender, msg).await;
+                }
             }
         }
-        s if s.starts_with("set repeat ") || s.starts_with("set role ") => {
-            let val = if s.starts_with("set repeat ") { &s[11..] } else { &s[9..] }.trim();
-            let is_rep = val == "on" || val == "1" || val == "repeater" || val == "true";
+        s if s.starts_with("set role ") => {
+            let val = s[9..].trim();
+            let is_rep = matches!(val, "on" | "1" | "repeater" | "true");
             RADIO_SETTINGS.lock(|r| {
                 r.borrow_mut().is_repeater = is_rep;
             });
             crate::storage::request_save_config();
-            let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetRepeat(is_rep));
+            let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetRepeat(
+                crate::companion::usb::forwarding_enabled(),
+            ));
             let mut s: heapless::String<32> = heapless::String::new();
-            let _ = write!(s, "OK - repeater={}\r\n", if is_rep { "on" } else { "off" });
+            let _ = write!(s, "OK - role={}\r\n", if is_rep { "repeater" } else { "client" });
             let _ = write_all(sender, s.as_bytes()).await;
         }
         s if s.starts_with("send ") => {

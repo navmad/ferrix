@@ -303,7 +303,7 @@ impl CompanionNode {
                 sver[..s.len()].copy_from_slice(s);
                 let _ = resp.extend_from_slice(&sver);
 
-                let _ = resp.push(0); // offgrid mode
+                let _ = resp.push(if crate::companion::usb::offgrid_active() { 1 } else { 0 }); // offgrid mode
                 let _ = resp.push(self.path_hash_mode); // path_hash_mode (0=1B, 1=2B, 2=3B)
 
                 emit(&resp);
@@ -388,31 +388,42 @@ impl CompanionNode {
                         u32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]);
                     let sf = payload[9];
                     let cr = payload[10];
-                    // v9+ appends the client-repeat flag.
+                    // v9+ appends the client-repeat (off-grid) flag. Like
+                    // the reference firmware, it is only valid on an allowed repeat band.
                     let repeat = payload.get(11).map_or(false, |&b| b != 0);
                     if (100_000..=1_000_000).contains(&freq_khz)
                         && (7_800..=500_000).contains(&bw_hz)
                         && (5..=12).contains(&sf)
                         && (5..=8).contains(&cr)
+                        && (!repeat || crate::companion::usb::is_offgrid_freq_khz(freq_khz))
                     {
                         // The app re-sends its stored settings on every connect.
                         // Only touch flash and interrupt RX when something changed.
-                        let (rf_changed, repeat_changed) =
+                        let (rf_changed, repeat_changed, forward_changed, forward) =
                             crate::companion::usb::RADIO_SETTINGS.lock(|r| {
                                 let mut s = r.borrow_mut();
+                                let old_forward = s.is_repeater
+                                    || (s.client_repeat
+                                        && crate::companion::usb::is_offgrid_freq_hz(s.frequency_hz));
                                 let new_freq = freq_khz * 1000;
                                 let new_bw = bw_hz / 1000;
                                 let rf_changed = s.frequency_hz != new_freq
                                     || s.bw_khz != new_bw
                                     || s.sf != sf
                                     || s.cr != cr;
-                                let repeat_changed = s.is_repeater != repeat;
+                                let repeat_changed = s.client_repeat != repeat;
                                 s.frequency_hz = new_freq;
                                 s.bw_khz = new_bw;
                                 s.sf = sf;
                                 s.cr = cr;
-                                s.is_repeater = repeat;
-                                (rf_changed, repeat_changed)
+                                s.client_repeat = repeat;
+                                // the reference firmware offgridFreqEdited(): the app owns
+                                // the frequency, so forget the saved home.
+                                s.offgrid_home_freq = 0;
+                                let forward = s.is_repeater
+                                    || (repeat
+                                        && crate::companion::usb::is_offgrid_freq_khz(freq_khz));
+                                (rf_changed, repeat_changed, forward != old_forward, forward)
                             });
                         if rf_changed || repeat_changed {
                             crate::storage::request_save_config();
@@ -420,9 +431,9 @@ impl CompanionNode {
                         if rf_changed {
                             crate::radio::lora_phy::request_radio_config();
                         }
-                        if repeat_changed {
+                        if forward_changed {
                             let _ = crate::companion::usb::USB_COMMAND_CHANNEL.try_send(
-                                crate::companion::usb::UsbCommand::SetRepeat(repeat),
+                                crate::companion::usb::UsbCommand::SetRepeat(forward),
                             );
                         }
                         ok = true;
@@ -1204,9 +1215,13 @@ impl CompanionNode {
             }
 
             CMD_GET_ALLOWED_REPEAT_FREQ => {
-                // The companion is a client; no repeat bands are advertised.
-                let mut resp = Vec::<u8, 4>::new();
+                // the reference firmware's allowed client-repeat bands (kHz, lower/upper).
+                let mut resp = Vec::<u8, 32>::new();
                 let _ = resp.push(RESP_CODE_ALLOWED_REPEAT_FREQ);
+                for (lo, hi) in crate::companion::usb::OFFGRID_FREQ_RANGES {
+                    let _ = resp.extend_from_slice(&lo.to_le_bytes());
+                    let _ = resp.extend_from_slice(&hi.to_le_bytes());
+                }
                 emit(&resp);
             }
 
