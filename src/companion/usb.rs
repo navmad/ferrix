@@ -85,6 +85,26 @@ pub static AUTOADD_SETTINGS: Mutex<SharedRawMutex, RefCell<AutoAddSettings>> =
         max_hops: 0,
     }));
 
+/// Current local identity, shared by every companion transport. A key import
+/// over one transport must be visible to the others without a reboot.
+pub static NODE_PUBLIC_KEY: Mutex<SharedRawMutex, RefCell<[u8; 32]>> =
+    Mutex::new(RefCell::new([0u8; 32]));
+pub static NODE_PRIVATE_KEY: Mutex<SharedRawMutex, RefCell<[u8; 64]>> =
+    Mutex::new(RefCell::new([0u8; 64]));
+
+pub fn set_identity(public_key: [u8; 32], private_key: [u8; 64]) {
+    NODE_PUBLIC_KEY.lock(|k| *k.borrow_mut() = public_key);
+    NODE_PRIVATE_KEY.lock(|k| *k.borrow_mut() = private_key);
+}
+
+pub fn current_public_key() -> [u8; 32] {
+    NODE_PUBLIC_KEY.lock(|k| *k.borrow())
+}
+
+pub fn current_private_key() -> [u8; 64] {
+    NODE_PRIVATE_KEY.lock(|k| *k.borrow())
+}
+
 /// Companion defaults on nRF52840: 350 contacts, 40 channels.
 pub const MAX_CONTACTS: usize = 350;
 /// Companion default group-channel count.
@@ -575,6 +595,7 @@ async fn handle_text_cli(
                     Some(id) => {
                         node.private_key = key;
                         node.public_key = *id.pub_key();
+                        set_identity(*id.pub_key(), key);
                         crate::storage::set_custom_priv_key(key);
                         info!("Node expanded private & public key updated via CLI");
                         let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetPrivateKey(key));
@@ -599,6 +620,7 @@ async fn handle_text_cli(
                 let key = id.private_key_bytes();
                 node.private_key = key;
                 node.public_key = *id.pub_key();
+                set_identity(*id.pub_key(), key);
                 crate::storage::set_custom_priv_key(key);
                 info!("Node seed imported and expanded; public key updated via CLI");
                 let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetPrivateKey(key));

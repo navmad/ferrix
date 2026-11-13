@@ -239,6 +239,8 @@ async fn main(spawner: Spawner) {
     };
     let pub_key = local_id.pub_key_bytes();
     let priv_key = local_id.private_key_bytes();
+    // Publish the identity so every transport (USB, BLE) reads the same keys.
+    crate::companion::usb::set_identity(pub_key, priv_key);
     let mut mesh = MeshEngine::new(local_id, false);
     // Forwarding is enabled for a dedicated repeater role or off-grid mode.
     mesh.is_repeater = crate::companion::usb::forwarding_enabled();
@@ -642,6 +644,7 @@ async fn main(spawner: Spawner) {
                     if mesh.set_private_key(&priv_key) {
                         node.private_key = priv_key;
                         node.public_key = *mesh.identity.pub_key();
+                        crate::companion::usb::set_identity(*mesh.identity.pub_key(), priv_key);
                         // Idempotent for the companion-app path (which already
                         // persisted it) and required for any other caller.
                         crate::storage::set_custom_priv_key(priv_key);

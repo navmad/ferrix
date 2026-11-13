@@ -197,6 +197,17 @@ impl CompanionNode {
         let mut cs = String::new();
         let _ = cs.push_str(callsign);
         let auto = crate::companion::usb::AUTOADD_SETTINGS.lock(|a| *a.borrow());
+        // Prefer the shared identity: another transport may have imported a
+        // key after this task was spawned.
+        let shared_pub = crate::companion::usb::current_public_key();
+        let (public_key, private_key) = if shared_pub == [0u8; 32] {
+            (public_key, private_key)
+        } else {
+            (
+                shared_pub,
+                crate::companion::usb::current_private_key(),
+            )
+        };
         let battery_mv = crate::telemetry::battery_millivolts();
         let (battery_millivolts, battery_percentage) =
             if battery_mv >= crate::telemetry::MIN_PLAUSIBLE_BATTERY_MV {
@@ -372,7 +383,8 @@ impl CompanionNode {
                 let _ = resp.push(if is_rep { 2 } else { 1 }); // 1 = client, 2 = repeater
                 let _ = resp.push(tx as u8); // current tx power
                 let _ = resp.push(22); // max tx power
-                let _ = resp.extend_from_slice(&self.public_key);
+                let public_key = crate::companion::usb::current_public_key();
+                let _ = resp.extend_from_slice(&public_key);
                 let _ = resp.extend_from_slice(&0i32.to_le_bytes()); // adv_lat
                 let _ = resp.extend_from_slice(&0i32.to_le_bytes()); // adv_lon
                 let _ = resp.push(0); // reserved
@@ -556,7 +568,7 @@ impl CompanionNode {
                 // [PACKET_PRIVATE_KEY][64-byte expanded private key]
                 let mut resp = Vec::<u8, 66>::new();
                 let _ = resp.push(RESP_CODE_PRIVATE_KEY);
-                let _ = resp.extend_from_slice(&self.private_key);
+                let _ = resp.extend_from_slice(&crate::companion::usb::current_private_key());
                 emit(&resp);
             }
 
@@ -571,6 +583,7 @@ impl CompanionNode {
                     ) {
                         self.private_key = key;
                         self.public_key = *id.pub_key();
+                        crate::companion::usb::set_identity(*id.pub_key(), key);
                         // Persist before acknowledging: otherwise the import
                         // appears to succeed but the old identity returns on
                         // the next reboot.
@@ -1112,9 +1125,10 @@ impl CompanionNode {
                     SIGN_BUFFER.lock(|b| {
                         let data = b.borrow();
                         if !data.is_empty() {
+                            let private_key = crate::companion::usb::current_private_key();
                             if let Some(id) = crate::meshcore::identity::LocalIdentity::from_private(
                                 self.callsign.as_str(),
-                                &self.private_key,
+                                &private_key,
                             ) {
                                 signature = Some(id.sign(&data));
                             }
@@ -1141,9 +1155,10 @@ impl CompanionNode {
                 // Export self as a signed advert packet. Exporting a stored
                 // contact would require retaining its original advert blob.
                 if payload.len() < 33 {
+                    let private_key = crate::companion::usb::current_private_key();
                     let id = crate::meshcore::identity::LocalIdentity::from_private(
                         self.callsign.as_str(),
-                        &self.private_key,
+                        &private_key,
                     );
                     match id {
                         Some(id) => {
