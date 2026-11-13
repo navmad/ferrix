@@ -794,55 +794,6 @@ async fn handle_text_cli(
             }
             let _ = write_all(sender, s.as_bytes()).await;
         }
-        "get panic" | "last-panic" | "panic" | "crash" => {
-            let mut s: heapless::String<256> = heapless::String::new();
-            match crate::fault::peek() {
-                Some(p) => {
-                    let _ = write!(
-                        s,
-                        "  -> PANIC at {}:{}:{} pc=0x{:08x}\r\n     {}\r\n",
-                        p.file.as_str(),
-                        p.line,
-                        p.column,
-                        p.pc,
-                        p.msg.as_str()
-                    );
-                    let _ = write_all(sender, s.as_bytes()).await;
-                    // Raw tail of the defmt RTT buffer: the real message logged
-                    // just before the panic. Decoded on the host with the ELF.
-                    let mut h: heapless::String<160> = heapless::String::new();
-                    let _ = write!(
-                        h,
-                        "  -> RTT write={} size={} len={} bytes=",
-                        p.rtt_write, p.rtt_size, p.rtt_len
-                    );
-                    let n = (p.rtt_len as usize).min(p.rtt_tail.len());
-                    for &b in &p.rtt_tail[..n] {
-                        let _ = write!(h, "{:02x}", b);
-                    }
-                    let _ = write!(h, "\r\n");
-                    let _ = write_all(sender, h.as_bytes()).await;
-
-                    let mut c: heapless::String<512> = heapless::String::new();
-                    let _ = write!(
-                        c,
-                        "  -> chan_flags rx={} tx={} cfg={} sp=0x{:08x}\r\n  -> stack=",
-                        p.chan_flags[0], p.chan_flags[1], p.chan_flags[2], p.sp
-                    );
-                    let n = (p.stack_len as usize).min(p.stack.len());
-                    for w in &p.stack[..n] {
-                        let _ = write!(c, "{:08x}", w);
-                    }
-                    let _ = write!(c, "\r\n");
-                    let _ = write_all(sender, c.as_bytes()).await;
-                }
-                None => {
-                    let _ = write!(s, "  -> No panic/hardfault record\r\n");
-                    let _ = write_all(sender, s.as_bytes()).await;
-                }
-            }
-            crate::fault::clear();
-        }
         "stats-core" => {
             let uptime = embassy_time::Instant::now().as_secs();
             let mut s: heapless::String<128> = heapless::String::new();
