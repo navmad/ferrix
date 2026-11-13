@@ -314,18 +314,23 @@ impl ConnectionState {
     }
 
     pub(crate) fn on_disconnected(&mut self, ble_evt: *const raw::ble_evt_t) {
-        let conn_handle = unwrap!(
-            self.conn_handle.handle(),
-            "bug: on_disconnected when already disconnected"
-        );
+        // A duplicate or stale disconnect event must be ignored, not panic.
+        // The SoftDevice can deliver more than one event around teardown, and
+        // a stale handle mapping can survive a lost event.
+        let Some(conn_handle) = self.conn_handle.handle() else {
+            return;
+        };
 
         let ibh = index_by_handle(conn_handle);
-        let _index = unwrap!(ibh.get(), "bug: conn_handle has no index");
+        let Some(_index) = ibh.get() else {
+            return;
+        };
 
         #[cfg(all(feature = "ble-gatt-server", feature = "ble-sec"))]
         if let Some(handler) = self.security.handler {
-            let conn = unwrap!(Connection::from_handle(conn_handle), "bug: conn_handle has no index");
-            handler.save_sys_attrs(&conn);
+            if let Some(conn) = Connection::from_handle(conn_handle) {
+                handler.save_sys_attrs(&conn);
+            }
         }
 
         ibh.set(None);

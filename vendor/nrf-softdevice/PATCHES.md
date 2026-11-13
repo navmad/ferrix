@@ -24,6 +24,10 @@ which looked like a full-device freeze when adding a companion contact.
 - `nrf-softdevice/src/ble/connection.rs`
   - Added `try_with_state_by_conn_handle()`, returning `Option<T>`.
   - Removed the panicking `with_state_by_conn_handle()`.
+  - `ConnectionState::on_disconnected()` is now idempotent: a duplicate/stale
+    disconnect event (state already disconnected, or handle mapping gone)
+    returns instead of panicking with `bug: on_disconnected when already
+    disconnected` / `bug: conn_handle has no index`.
 - `nrf-softdevice/src/ble/gap.rs`
   - All event handlers use `try_with_state_by_conn_handle()` and ignore the
     event when the connection is already gone.
