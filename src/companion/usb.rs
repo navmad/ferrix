@@ -553,7 +553,12 @@ fn normalize_hex(input: &str) -> Option<heapless::String<256>> {
 fn key_import_append(hex: &str) -> Result<(usize, Option<[u8; 64]>), ()> {
     KEY_IMPORT.lock(|cell| {
         let mut state = cell.borrow_mut();
-        if state.len + hex.len() > 128 {
+
+        // If a complete key is pasted again while a partial one is buffered,
+        // restart with the complete key instead of overflowing.
+        if hex.len() == 128 {
+            state.len = 0;
+        } else if state.len + hex.len() > 128 {
             state.len = 0;
             return Err(());
         }
@@ -622,7 +627,12 @@ async fn handle_text_cli(
                 }
                 Ok((len, None)) => {
                     let mut s: heapless::String<64> = heapless::String::new();
-                    let _ = write!(s, "  -> Key incomplete ({}/128), paste the rest\r\n", len);
+                    let _ = write!(
+                        s,
+                        "  -> Key incomplete ({}/128), paste the remaining {} hex chars\r\n",
+                        len,
+                        128 - len
+                    );
                     let _ = write_all(sender, s.as_bytes()).await;
                     return;
                 }
@@ -698,8 +708,9 @@ async fn handle_text_cli(
                             let mut out: heapless::String<64> = heapless::String::new();
                             let _ = write!(
                                 out,
-                                "  -> Key incomplete ({}/128), paste the rest\r\n",
-                                len
+                                "  -> Key incomplete ({}/128), paste the remaining {} hex chars\r\n",
+                                len,
+                                128 - len
                             );
                             let _ = write_all(sender, out.as_bytes()).await;
                         }
