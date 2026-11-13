@@ -191,6 +191,15 @@ fn set_blue_led(led: &mut embassy_nrf::gpio::Output<'static>, on: bool) {
     }
 }
 
+async fn advert_feedback(led: &mut embassy_nrf::gpio::Output<'static>) {
+    for _ in 0..2 {
+        set_blue_led(led, true);
+        Timer::after_millis(40).await;
+        set_blue_led(led, false);
+        Timer::after_millis(40).await;
+    }
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     use embassy_nrf::interrupt::{InterruptExt, Priority};
@@ -208,6 +217,14 @@ async fn main(spawner: Spawner) {
     embassy_nrf::interrupt::SAADC.set_priority(Priority::P3);
 
     let mut board = CurrentBoard::init(p);
+
+    // Keep the GPS module held in reset until the user enables it from the
+    // dashboard. P1.02 is GPS_EN, P1.05 is the active-low reset.
+    let mut gps = board.gps;
+    if let Some(g) = gps.as_mut() {
+        g.standby.set_low();
+        g.reinit.set_low();
+    }
 
     // Battery ADC: ThinkNode M1 AIN2 (P0.04), 150K+150K divider (2:1).
     // `single_ended` defaults to gain 1/6 and the internal 0.6 V reference,
@@ -908,40 +925,98 @@ async fn main(spawner: Spawner) {
                     }
                 }
                 InputEvent::ActionPrimary => {
-                    if node.current_page == crate::display::ui::PAGE_COUNT - 1 {
-                        // LEDs page: toggle the blue status LED.
-                        let disabled = !crate::companion::usb::leds_disabled();
-                        crate::companion::usb::set_leds_disabled(disabled);
-                        set_blue_led(&mut board.telemetry.blue_led, !disabled);
-                        info!("Input: blue LED {}", if disabled { "disabled" } else { "enabled" });
-                        #[cfg(feature = "thinknode-m1")]
-                        if let Some(d) = &mut display {
-                            d.render_dashboard(&node).await.ok();
+                    match node.current_page {
+                        0 => {
+                            info!("Input: flood advert");
+                            node.tx_beacons = node.tx_beacons.saturating_add(1);
+                            advert_feedback(&mut board.telemetry.blue_led).await;
+                            let _ = mesh.queue_advert(
+                                node.epoch_time as u32,
+                                node.latitude,
+                                node.longitude,
+                                true,
+                            );
                         }
-                    } else {
-                        info!("Input: Primary Action (broadcasting MeshCore Advert)...");
-                        node.tx_beacons = node.tx_beacons.saturating_add(1);
-
-                        // Quick double-flash on blue LED to give immediate visual feedback
-                        for _ in 0..2 {
-                            set_blue_led(&mut board.telemetry.blue_led, true);
-                            Timer::after_millis(40).await;
-                            set_blue_led(&mut board.telemetry.blue_led, false);
-                            Timer::after_millis(40).await;
+                        1 => {
+                            info!("Input: zero-hop advert");
+                            node.tx_beacons = node.tx_beacons.saturating_add(1);
+                            advert_feedback(&mut board.telemetry.blue_led).await;
+                            let _ = mesh.queue_advert(
+                                node.epoch_time as u32,
+                                node.latitude,
+                                node.longitude,
+                                false,
+                            );
                         }
-
-                        // Queue standard MeshCore Advertisement packet over LoRa
-                        let _ = mesh.queue_advert(
-                            node.epoch_time as u32,
-                            node.latitude,
-                            node.longitude,
-                            true,
-                        );
-
-                        #[cfg(feature = "thinknode-m1")]
-                        if let Some(d) = &mut display {
-                            d.render_dashboard(&node).await.ok();
+                        2 => {
+                            let next = crate::companion::usb::RADIO_SETTINGS.lock(|r| {
+                                let mut s = r.borrow_mut();
+                                s.tx_power_dbm = match s.tx_power_dbm {
+                                    22 => 17,
+                                    17 => 14,
+                                    14 => 10,
+                                    _ => 22,
+                                };
+                                s.tx_power_dbm
+                            });
+                            crate::storage::request_save_config();
+                            let _ = crate::radio::lora_phy::request_radio_config();
+                            info!("Input: TX power -> {} dBm", next);
                         }
+                        3 => {
+                            crate::companion::usb::RADIO_TELEMETRY.lock(|t| {
+                                let mut t = t.borrow_mut();
+                                t.tx_beacons = 0;
+                                t.rx_packets = 0;
+                            });
+                            node.tx_beacons = 0;
+                            node.rx_packets = 0;
+                            info!("Input: counters reset");
+                        }
+                        4 => {
+                            let on = !crate::gps::gps_enabled();
+                            if let Some(g) = gps.as_mut() {
+                                if on {
+                                    g.standby.set_high();
+                                    g.reinit.set_high();
+                                } else {
+                                    g.standby.set_low();
+                                    g.reinit.set_low();
+                                }
+                            }
+                            crate::gps::set_gps_enabled(on);
+                            info!("Input: GPS power {}", if on { "on" } else { "off" });
+                        }
+                        5 => {
+                            let active = crate::companion::usb::offgrid_active();
+                            let change = crate::companion::usb::offgrid_set(!active);
+                            if change.no_band {
+                                info!("Input: no off-grid frequency in this band");
+                            } else {
+                                if change.changed {
+                                    crate::storage::request_save_config();
+                                }
+                                if change.freq_changed {
+                                    let _ = crate::radio::lora_phy::request_radio_config();
+                                }
+                                mesh.is_repeater = crate::companion::usb::forwarding_enabled();
+                                info!("Input: offgrid {}", if active { "off" } else { "on" });
+                            }
+                        }
+                        _ => {
+                            let disabled = !crate::companion::usb::leds_disabled();
+                            crate::companion::usb::set_leds_disabled(disabled);
+                            set_blue_led(&mut board.telemetry.blue_led, !disabled);
+                            info!(
+                                "Input: blue LED {}",
+                                if disabled { "disabled" } else { "enabled" }
+                            );
+                        }
+                    }
+
+                    #[cfg(feature = "thinknode-m1")]
+                    if let Some(d) = &mut display {
+                        d.render_dashboard(&node).await.ok();
                     }
                 }
                 _ => {}

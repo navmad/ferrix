@@ -66,6 +66,26 @@ pub fn render_page(page: u8, node: &CompanionNode, fb: &mut EpdFrameBuffer) {
         5 => render_offgrid(fb, small),
         _ => render_leds(fb, small),
     }
+    draw_action_bar(page, fb, small);
+}
+
+/// Bottom action bar: describes what the top button does on this page.
+fn draw_action_bar(page: u8, fb: &mut EpdFrameBuffer, small: SmallStyle) {
+    let line = PrimitiveStyle::with_stroke(BinaryColor::On, 1);
+    let _ = Line::new(Point::new(0, 178), Point::new(DISP_W - 1, 178))
+        .into_styled(line)
+        .draw(fb);
+
+    let action = match page {
+        0 => "FK: flood advert",
+        1 => "FK: zero-hop advert",
+        2 => "FK: cycle TX power",
+        3 => "FK: reset counters",
+        4 => "FK: toggle GPS",
+        5 => "FK: toggle offgrid",
+        _ => "FK: toggle blue LED",
+    };
+    draw_text(fb, action, 2, 192, small);
 }
 
 /// Top bar: node name on the left, clock + battery right-aligned.
@@ -253,22 +273,27 @@ fn render_traffic(fb: &mut EpdFrameBuffer, small: SmallStyle) {
 fn render_gps(node: &CompanionNode, fb: &mut EpdFrameBuffer, small: SmallStyle) {
     let mut buf: String<32> = String::new();
 
+    let power = crate::gps::gps_enabled();
+    let power_text = if power { "Power: ON" } else { "Power: OFF" };
+
     if node.gps_fix {
         draw_centered(fb, "GPS: 3D fix", CONTENT_Y + 10, small);
+        draw_text(fb, power_text, 2, CONTENT_Y + 26, small);
         let _ = write!(buf, "Lat: {:.5}", node.latitude);
-        draw_text(fb, buf.as_str(), 2, CONTENT_Y + 30, small);
+        draw_text(fb, buf.as_str(), 2, CONTENT_Y + 42, small);
         buf.clear();
         let _ = write!(buf, "Lon: {:.5}", node.longitude);
-        draw_text(fb, buf.as_str(), 2, CONTENT_Y + 44, small);
-        draw_text(fb, "Sats: --   Age: --", 2, CONTENT_Y + 58, small);
+        draw_text(fb, buf.as_str(), 2, CONTENT_Y + 56, small);
+        draw_text(fb, "Sats: --   Age: --", 2, CONTENT_Y + 70, small);
     } else {
         draw_centered(fb, "GPS: acquiring", CONTENT_Y + 10, small);
-        draw_centered(fb, "No fix yet", CONTENT_Y + 30, small);
+        draw_text(fb, power_text, 2, CONTENT_Y + 26, small);
+        draw_centered(fb, "No fix yet", CONTENT_Y + 42, small);
         let _ = write!(buf, "Lat: {:.5}", node.latitude);
-        draw_text(fb, buf.as_str(), 2, CONTENT_Y + 50, small);
+        draw_text(fb, buf.as_str(), 2, CONTENT_Y + 58, small);
         buf.clear();
         let _ = write!(buf, "Lon: {:.5}", node.longitude);
-        draw_text(fb, buf.as_str(), 2, CONTENT_Y + 64, small);
+        draw_text(fb, buf.as_str(), 2, CONTENT_Y + 72, small);
     }
 }
 
