@@ -645,6 +645,21 @@ async fn handle_text_cli(
         KEY_IMPORT.lock(|k| k.borrow_mut().len = 0);
     }
 
+    // Terminal line editors often cap input at 128 characters, which is
+    // exactly one key but not "set prv.key " + key. Accept a bare key as a
+    // first-class command so the full value fits the limit.
+    if let Some(hex) = normalize_hex(trimmed) {
+        if hex.len() == 128 {
+            let mut key = [0u8; 64];
+            for i in 0..64 {
+                key[i] = (hex_to_nibble(hex.as_bytes()[i * 2]) << 4)
+                    | hex_to_nibble(hex.as_bytes()[i * 2 + 1]);
+            }
+            apply_private_key(sender, node, key).await;
+            return;
+        }
+    }
+
     match trimmed {
         "get name" | "name" => {
             let mut s: heapless::String<64> = heapless::String::new();
@@ -1464,7 +1479,7 @@ async fn handle_text_cli(
             let _ = write_all(sender, b"  -> OK (Config save queued to flash)\r\n").await;
         }
         "help" => {
-            let _ = write_all(sender, b"  -> Commands:\r\n  ->   Identity: get/set name, get/set prv.key, get public.key\r\n  ->   Radio:    get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq/tx/sf/bw/cr, get/set repeat, get/set hash-mode, stats-radio\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, get/set autoadd, advert, time, channels\r\n  ->   System:   save, ver, board, stats-core, stats-packets, clear stats/contacts/messages, reboot\r\n").await;
+            let _ = write_all(sender, b"  -> Commands:\r\n  ->   Identity: get/set name, get/set prv.key, get public.key (or paste a bare 128-char key)\r\n  ->   Radio:    get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq/tx/sf/bw/cr, get/set repeat, get/set hash-mode, stats-radio\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, get/set autoadd, advert, time, channels\r\n  ->   System:   save, ver, board, stats-core, stats-packets, clear stats/contacts/messages, reboot\r\n").await;
         }
         _ => {
             let _ = write_all(sender, b"  -> Unknown command\r\n").await;
