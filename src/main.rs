@@ -495,7 +495,7 @@ async fn main(spawner: Spawner) {
                     } else {
                         None
                     };
-                match mesh.handle_inbound_packet(pkt) {
+                match mesh.handle_inbound_packet(pkt, snr) {
                     InboundAction::ReceivedAdvert(adv) => {
                         info!("MeshCore Advert from: {}", adv.name.as_str());
                         let had_blob =
@@ -709,6 +709,53 @@ async fn main(spawner: Spawner) {
                         info!("MeshCore ACK received (crc {:08x})", ack.crc);
                         handle_direct_message_confirmed(ack.crc);
                     }
+                    InboundAction::ReceivedResponse { plain, sender_pub } => {
+                        if !crate::companion::protocol::handle_response(&plain, &sender_pub) {
+                            info!(
+                                "MeshCore RESPONSE from {:02x}{:02x} (no pending request)",
+                                sender_pub[0], sender_pub[1]
+                            );
+                        }
+                    }
+                    InboundAction::ReceivedRequest { plain, sender_pub } => {
+                        info!(
+                            "MeshCore REQ from {:02x}{:02x} ({} bytes, ignored)",
+                            sender_pub[0],
+                            sender_pub[1],
+                            plain.len()
+                        );
+                    }
+                    InboundAction::ReceivedTrace {
+                        tag,
+                        auth,
+                        flags,
+                        hashes,
+                        snrs,
+                        final_snr,
+                    } => {
+                        info!(
+                            "MeshCore TRACE {:08x}: {} hash bytes, {} hops",
+                            tag,
+                            hashes.len(),
+                            snrs.len()
+                        );
+                        let mut push = heapless::Vec::<u8, 256>::new();
+                        let _ = push.push(
+                            crate::companion::protocol::PUSH_CODE_TRACE_DATA,
+                        );
+                        let _ = push.push(0);
+                        let _ = push.push(hashes.len() as u8);
+                        let _ = push.push(flags);
+                        let _ = push.extend_from_slice(&tag.to_le_bytes());
+                        let _ = push.extend_from_slice(&auth.to_le_bytes());
+                        let _ = push.extend_from_slice(&hashes);
+                        let _ = push.extend_from_slice(&snrs);
+                        let _ = push.push((final_snr.saturating_mul(4)) as u8);
+                        if push.len() <= 176 {
+                            let _ = crate::companion::ble::COMPANION_PUSH_CHANNEL
+                                .try_send(push);
+                        }
+                    }
                     InboundAction::ReceivedPath { packet: path, sender_pub } => {
                         info!(
                             "MeshCore PATH from {:02x}{:02x}: {} hops, extra {}",
@@ -903,19 +950,18 @@ async fn main(spawner: Spawner) {
                     path_len,
                     path,
                 } => {
-                    let hash_bytes = 1u8 << (flags & 0x03);
-                    if hash_bytes <= 2 && path_len as usize <= 64 {
-                        if let Ok(tp) =
-                            crate::meshcore::packets::TracePacket::new(tag, auth, flags, &[])
-                        {
-                            if let Ok(mut pkt) = tp.to_packet(
+                    // TRACE paths are a list of hashes carried in the payload,
+                    // not the packet's routing path. Send it zero-hop.
+                    if path_len as usize <= 64 {
+                        if let Ok(tp) = crate::meshcore::packets::TracePacket::new(
+                            tag,
+                            auth,
+                            flags,
+                            &path[..path_len as usize],
+                        ) {
+                            if let Ok(pkt) = tp.to_packet(
                                 crate::meshcore::packet::ROUTE_TYPE_DIRECT,
                             ) {
-                                let hops = path_len / hash_bytes;
-                                pkt.path_len =
-                                    ((hash_bytes - 1) << 6) | (hops & 63);
-                                pkt.path[..path_len as usize]
-                                    .copy_from_slice(&path[..path_len as usize]);
                                 mesh.seen_filter.mark_seen(pkt.calculate_packet_hash());
                                 let _ = mesh.tx_queue.push(pkt);
                             }

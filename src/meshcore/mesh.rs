@@ -9,12 +9,13 @@
 use crate::meshcore::identity::LocalIdentity;
 use crate::meshcore::packet::{
     Packet, PAYLOAD_TYPE_ACK, PAYLOAD_TYPE_ADVERT, PAYLOAD_TYPE_ANON_REQ, PAYLOAD_TYPE_GRP_DATA,
-    PAYLOAD_TYPE_GRP_TXT, PAYLOAD_TYPE_PATH, PAYLOAD_TYPE_TXT_MSG, ROUTE_TYPE_DIRECT,
-    ROUTE_TYPE_FLOOD,
+    PAYLOAD_TYPE_GRP_TXT, PAYLOAD_TYPE_PATH, PAYLOAD_TYPE_REQ, PAYLOAD_TYPE_RESPONSE,
+    PAYLOAD_TYPE_TRACE, PAYLOAD_TYPE_TXT_MSG, ROUTE_TYPE_DIRECT, ROUTE_TYPE_FLOOD,
 };
 use crate::meshcore::packets::advert::{ADV_TYPE_CHAT, ADV_TYPE_REPEATER};
 use crate::meshcore::packets::{
-    AckPacket, AdvertPacket, AnonReqPacket, GrpDataPacket, GrpTextPacket, PathPacket, TxtMsgPacket,
+    AckPacket, AddressedPacket, AdvertPacket, AnonReqPacket, GrpDataPacket, GrpTextPacket,
+    PathPacket, TxtMsgPacket,
 };
 use crate::meshcore::queue::{PacketQueue, SeenPacketFilter};
 
@@ -106,6 +107,25 @@ pub enum InboundAction {
     },
     /// Received anonymous request
     ReceivedAnonReq(AnonReqPacket),
+    /// Received addressed request (REQ) for this node
+    ReceivedRequest {
+        plain: heapless::Vec<u8, 167>,
+        sender_pub: [u8; 32],
+    },
+    /// Received addressed response (RESPONSE) for this node
+    ReceivedResponse {
+        plain: heapless::Vec<u8, 167>,
+        sender_pub: [u8; 32],
+    },
+    /// TRACE reached the end of its path.
+    ReceivedTrace {
+        tag: u32,
+        auth: u32,
+        flags: u8,
+        hashes: heapless::Vec<u8, 175>,
+        snrs: heapless::Vec<u8, 64>,
+        final_snr: i8,
+    },
     /// Retransmitted a direct packet addressed to the next hop
     Forwarded,
     /// Unhandled or unknown packet payload
@@ -175,7 +195,63 @@ impl MeshEngine {
     }
 
     /// Process a packet received over the LoRa radio interface
-    pub fn handle_inbound_packet(&mut self, pkt: Packet) -> InboundAction {
+    pub fn handle_inbound_packet(&mut self, pkt: Packet, snr: i8) -> InboundAction {
+        // TRACE is direct but its path field carries SNR values, not hops, so
+        // it must be handled before the normal direct-forwarding logic.
+        if pkt.route_type() == crate::meshcore::packet::ROUTE_TYPE_DIRECT
+            && pkt.payload_type() == PAYLOAD_TYPE_TRACE
+        {
+            if pkt.payload_len < 9 {
+                return InboundAction::Unhandled;
+            }
+            let flags = pkt.payload[8];
+            let hash_size = 1usize << (flags & 0x03);
+            let len = pkt.payload_len as usize - 9;
+            let offset = (pkt.path_len as usize) << (flags & 0x03);
+
+            if offset >= len {
+                let mut hashes = heapless::Vec::<u8, 175>::new();
+                let _ = hashes.extend_from_slice(&pkt.payload[9..9 + len]);
+                let mut snrs = heapless::Vec::<u8, 64>::new();
+                let _ = snrs.extend_from_slice(&pkt.path[..pkt.path_len as usize]);
+                return InboundAction::ReceivedTrace {
+                    tag: u32::from_le_bytes([
+                        pkt.payload[0],
+                        pkt.payload[1],
+                        pkt.payload[2],
+                        pkt.payload[3],
+                    ]),
+                    auth: u32::from_le_bytes([
+                        pkt.payload[4],
+                        pkt.payload[5],
+                        pkt.payload[6],
+                        pkt.payload[7],
+                    ]),
+                    flags,
+                    hashes,
+                    snrs,
+                    final_snr: snr,
+                };
+            }
+
+            if offset + hash_size <= len
+                && self.identity.pub_key()[..hash_size]
+                    == pkt.payload[9 + offset..9 + offset + hash_size]
+            {
+                if self.seen_filter.check_and_mark(&pkt) {
+                    return InboundAction::DropDuplicate;
+                }
+                let mut relay = pkt.clone();
+                if relay.path_len < 64 {
+                    relay.path[relay.path_len as usize] = (snr.saturating_mul(4)) as u8;
+                    relay.path_len += 1;
+                    let _ = self.tx_queue.push(relay);
+                }
+                return InboundAction::Forwarded;
+            }
+            return InboundAction::Unhandled;
+        }
+
         // 1. Check hop limits
         if pkt.path_hash_count() >= self.max_hops as usize {
             return InboundAction::DropHopLimitExceeded;
@@ -404,6 +480,50 @@ impl MeshEngine {
                             return InboundAction::ReceivedGroupData {
                                 channel_idx: idx as u8,
                                 packet: grp,
+                            };
+                        }
+                    }
+                }
+                InboundAction::Unhandled
+            }
+            PAYLOAD_TYPE_REQ | PAYLOAD_TYPE_RESPONSE => {
+                let payload = &pkt.payload[..pkt.payload_len];
+                if payload.len() <= 4 {
+                    return InboundAction::Unhandled;
+                }
+                let dest = payload[0];
+                let src = payload[1];
+
+                if dest != self.identity.pub_key()[0]
+                    && self.is_repeater
+                    && pkt.is_flood()
+                    && !is_dupe
+                    && !already_in_path
+                {
+                    let mut repeat_pkt = pkt.clone();
+                    repeat_pkt.append_hop_bytes(self.identity.pub_key());
+                    let _ = self.tx_queue.push(repeat_pkt);
+                }
+                if is_dupe {
+                    return InboundAction::DropDuplicate;
+                }
+                if dest != self.identity.pub_key()[0] {
+                    return InboundAction::Unhandled;
+                }
+
+                for peer in self.peers_by_hash(src).iter() {
+                    if let Some(secret) = self.identity.shared_secret(peer) {
+                        if let Ok(ap) = AddressedPacket::decode(payload, &secret) {
+                            return if pkt.payload_type() == PAYLOAD_TYPE_RESPONSE {
+                                InboundAction::ReceivedResponse {
+                                    plain: ap.plain,
+                                    sender_pub: *peer,
+                                }
+                            } else {
+                                InboundAction::ReceivedRequest {
+                                    plain: ap.plain,
+                                    sender_pub: *peer,
+                                }
                             };
                         }
                     }

@@ -10,8 +10,10 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
 use heapless::{String, Vec};
 
-use crate::meshcore::packet::{Packet, PAYLOAD_TYPE_ADVERT};
-use crate::meshcore::packets::AdvertPacket;
+use crate::meshcore::packet::{
+    Packet, PAYLOAD_TYPE_ADVERT, PAYLOAD_TYPE_REQ, ROUTE_TYPE_DIRECT, ROUTE_TYPE_FLOOD,
+};
+use crate::meshcore::packets::{AddressedPacket, AdvertPacket};
 
 /// Signing scratch buffer. Advertised to the app by `SIGN_START`.
 pub const MAX_SIGN_DATA: usize = 4096;
@@ -27,6 +29,51 @@ pub static SET_AUTOADD_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static LAST_CMD: AtomicU8 = AtomicU8::new(0);
 /// Diagnostics for advert processing and blob backfill.
 pub static ADVERT_COUNT: AtomicU32 = AtomicU32::new(0);
+
+/// Tag of the outstanding status/ping request, if any.
+static PENDING_STATUS: Mutex<CriticalSectionRawMutex, RefCell<Option<(u32, [u8; 32])>>> =
+    Mutex::new(RefCell::new(None));
+static NEXT_TAG: AtomicU32 = AtomicU32::new(0);
+const REQ_TYPE_GET_STATUS: u8 = 0x01;
+
+fn next_tag() -> u32 {
+    let base = crate::companion::usb::get_device_time();
+    base.wrapping_add(NEXT_TAG.fetch_add(1, Ordering::Relaxed))
+}
+
+fn note_status(tag: u32, pub_key: [u8; 32]) {
+    PENDING_STATUS.lock(|p| *p.borrow_mut() = Some((tag, pub_key)));
+}
+
+/// Route a received RESPONSE to the app when it matches a pending request.
+/// Returns true when the response was consumed.
+pub fn handle_response(plain: &[u8], sender_pub: &[u8; 32]) -> bool {
+    if plain.len() < 4 {
+        return false;
+    }
+    let tag = u32::from_le_bytes([plain[0], plain[1], plain[2], plain[3]]);
+    let matched = PENDING_STATUS.lock(|p| {
+        let mut pending = p.borrow_mut();
+        if pending.map_or(false, |(t, k)| t == tag && k == *sender_pub) {
+            *pending = None;
+            true
+        } else {
+            false
+        }
+    });
+    if !matched {
+        return false;
+    }
+
+    let mut push = Vec::<u8, 256>::new();
+    let _ = push.push(PUSH_CODE_STATUS_RESPONSE);
+    let _ = push.push(0);
+    let _ = push.extend_from_slice(&sender_pub[..6]);
+    let data = &plain[4..];
+    let _ = push.extend_from_slice(&data[..data.len().min(256 - push.len())]);
+    let _ = crate::companion::ble::COMPANION_PUSH_CHANNEL.try_send(push);
+    true
+}
 pub static ADVERT_LAST_KEY: AtomicU32 = AtomicU32::new(0);
 pub static ADVERT_LAST_TS: AtomicU32 = AtomicU32::new(0);
 pub static ADVERT_LAST_HAD_BLOB: AtomicBool = AtomicBool::new(false);
@@ -83,6 +130,7 @@ pub const CMD_GET_CONTACT_BY_KEY: u8 = 0x1E;
 pub const CMD_SIGN_START: u8 = 0x21;
 pub const CMD_SIGN_DATA: u8 = 0x22;
 pub const CMD_SIGN_FINISH: u8 = 0x23;
+pub const CMD_SEND_STATUS_REQ: u8 = 0x1B;
 pub const CMD_SEND_TRACE_PATH: u8 = 0x24;
 pub const CMD_SET_DEVICE_PIN: u8 = 0x25;
 pub const CMD_SET_OTHER_PARAMS: u8 = 0x26;
@@ -1703,8 +1751,115 @@ impl CompanionNode {
                 emit(&resp);
             }
 
+            CMD_SEND_STATUS_REQ => {
+                // Inbound: [CMD(0x1B), public_key(32)]
+                let mut resp = Vec::<u8, 10>::new();
+                let mut reply = None;
+                if payload.len() >= 33 {
+                    let mut dest_key = [0u8; 32];
+                    dest_key.copy_from_slice(&payload[1..33]);
+                    let contact = crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| {
+                        c.borrow()
+                            .iter()
+                            .find(|ct| ct.pub_key == dest_key)
+                            .map(|ct| (ct.out_path_len, ct.out_path))
+                    });
+                    if let Some((out_path_len, out_path)) = contact {
+                        let identity = crate::meshcore::identity::LocalIdentity::from_private(
+                            self.callsign.as_str(),
+                            &self.private_key,
+                        );
+                        if let Some(id) = identity {
+                            if let Some(secret) = id.shared_secret(&dest_key) {
+                                let tag = next_tag();
+                                let mut plain = [0u8; 13];
+                                plain[..4].copy_from_slice(&tag.to_le_bytes());
+                                plain[4] = REQ_TYPE_GET_STATUS;
+                                plain[9..13]
+                                    .copy_from_slice(&tag.wrapping_mul(0x9E37_79B1).to_le_bytes());
+                                if let Ok(addressed) = AddressedPacket::new(
+                                    dest_key[0],
+                                    self.public_key[0],
+                                    &plain,
+                                ) {
+                                    let direct = out_path_len != 0xFF
+                                        && Packet::is_valid_path_len(out_path_len);
+                                    let route = if direct {
+                                        ROUTE_TYPE_DIRECT
+                                    } else {
+                                        ROUTE_TYPE_FLOOD
+                                    };
+                                    if let Ok(mut pkt) =
+                                        addressed.to_packet(PAYLOAD_TYPE_REQ, route, &secret)
+                                    {
+                                        if direct {
+                                            pkt.path_len = out_path_len;
+                                            let n = pkt.path_byte_len();
+                                            pkt.path[..n].copy_from_slice(&out_path[..n]);
+                                        }
+                                        let mut buf = [0u8; 255];
+                                        if let Ok(n) = pkt.write_to(&mut buf) {
+                                            let mut raw = heapless::Vec::<u8, 255>::new();
+                                            if raw.extend_from_slice(&buf[..n]).is_ok()
+                                                && crate::companion::usb::USB_COMMAND_CHANNEL
+                                                    .try_send(
+                                                        crate::companion::usb::UsbCommand::SendRawPacket {
+                                                            raw,
+                                                        },
+                                                    )
+                                                    .is_ok()
+                                            {
+                                                let (sf, bw_khz, cr) =
+                                                    crate::companion::usb::RADIO_SETTINGS.lock(|r| {
+                                                        let s = r.borrow();
+                                                        (s.sf, s.bw_khz, s.cr)
+                                                    });
+                                                let air_ms = crate::radio::estimate_airtime_ms(
+                                                    n,
+                                                    sf,
+                                                    bw_khz,
+                                                    cr,
+                                                    if sf <= 8 { 32 } else { 16 },
+                                                );
+                                                let hops = if direct {
+                                                    (out_path_len & 63) as u32
+                                                } else {
+                                                    0
+                                                };
+                                                let est_timeout = if direct {
+                                                    500 + (air_ms * 6 + 250) * (hops + 1)
+                                                } else {
+                                                    500 + 16 * air_ms
+                                                };
+                                                note_status(tag, dest_key);
+                                                reply = Some((direct, tag, est_timeout));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                match reply {
+                    Some((direct, tag, est_timeout)) => {
+                        let _ = resp.push(RESP_CODE_SENT);
+                        let _ = resp.push(if direct { 0 } else { 1 });
+                        let _ = resp.extend_from_slice(&tag.to_le_bytes());
+                        let _ = resp.extend_from_slice(&est_timeout.to_le_bytes());
+                    }
+                    None => {
+                        let _ = resp.push(RESP_CODE_ERR);
+                        let _ = resp.push(ERR_NOT_FOUND);
+                    }
+                }
+                emit(&resp);
+            }
+
             CMD_SEND_TRACE_PATH => {
-                let mut ok = false;
+                let mut resp = Vec::<u8, 10>::new();
+                let mut reply = None;
                 if payload.len() > 10 {
                     let tag = u32::from_le_bytes([
                         payload[1], payload[2], payload[3], payload[4],
@@ -1715,11 +1870,10 @@ impl CompanionNode {
                     let flags = payload[9];
                     let path_len = payload.len() - 10;
                     let hash_bytes = 1usize << (flags & 0x03);
-                    // Our Packet path encoding supports 1- and 2-byte hashes.
-                    if hash_bytes <= 2 && path_len <= 64 && path_len % hash_bytes == 0 {
+                    if path_len <= 64 && path_len % hash_bytes == 0 {
                         let mut path = [0u8; 64];
                         path[..path_len].copy_from_slice(&payload[10..]);
-                        ok = crate::companion::usb::USB_COMMAND_CHANNEL
+                        if crate::companion::usb::USB_COMMAND_CHANNEL
                             .try_send(crate::companion::usb::UsbCommand::SendTracePath {
                                 tag,
                                 auth,
@@ -1727,11 +1881,39 @@ impl CompanionNode {
                                 path_len: path_len as u8,
                                 path,
                             })
-                            .is_ok();
+                            .is_ok()
+                        {
+                            let (sf, bw_khz, cr) =
+                                crate::companion::usb::RADIO_SETTINGS.lock(|r| {
+                                    let s = r.borrow();
+                                    (s.sf, s.bw_khz, s.cr)
+                                });
+                            let air_ms = crate::radio::estimate_airtime_ms(
+                                11 + path_len,
+                                sf,
+                                bw_khz,
+                                cr,
+                                if sf <= 8 { 32 } else { 16 },
+                            );
+                            let hops = (path_len >> (flags & 0x03)) as u32;
+                            let est_timeout = 500 + (air_ms * 6 + 250) * (hops + 1);
+                            reply = Some((tag, est_timeout));
+                        }
                     }
                 }
-                let mut resp = Vec::<u8, 4>::new();
-                let _ = resp.push(if ok { RESP_CODE_OK } else { RESP_CODE_ERR });
+
+                match reply {
+                    Some((tag, est_timeout)) => {
+                        let _ = resp.push(RESP_CODE_SENT);
+                        let _ = resp.push(0); // direct, never flood
+                        let _ = resp.extend_from_slice(&tag.to_le_bytes());
+                        let _ = resp.extend_from_slice(&est_timeout.to_le_bytes());
+                    }
+                    None => {
+                        let _ = resp.push(RESP_CODE_ERR);
+                        let _ = resp.push(ERR_ILLEGAL_ARG);
+                    }
+                }
                 emit(&resp);
             }
 
