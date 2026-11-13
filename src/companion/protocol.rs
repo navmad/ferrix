@@ -774,7 +774,8 @@ impl CompanionNode {
                     let timestamp = u32::from_le_bytes([payload[3], payload[4], payload[5], payload[6]]);
                     let text_bytes = &payload[7..];
                     if let Ok(msg_str) = core::str::from_utf8(text_bytes) {
-                        let mut s = String::<128>::new();
+                        let msg_str = msg_str.trim_end_matches('\0');
+                        let mut s = String::<160>::new();
                         let _ = s.push_str(msg_str);
                         let _ = crate::companion::usb::USB_COMMAND_CHANNEL.try_send(crate::companion::usb::UsbCommand::SendGroupText {
                             channel_idx,
@@ -802,7 +803,8 @@ impl CompanionNode {
                         let _data_type = u16::from_le_bytes([payload[data_offset], payload[data_offset + 1]]);
                         let text_bytes = &payload[data_offset + 2..];
                         if let Ok(msg_str) = core::str::from_utf8(text_bytes) {
-                            let mut s = String::<128>::new();
+                            let msg_str = msg_str.trim_end_matches('\0');
+                            let mut s = String::<160>::new();
                             let _ = s.push_str(msg_str);
                             let now = crate::companion::usb::get_device_time();
                             let _ = crate::companion::usb::USB_COMMAND_CHANNEL.try_send(crate::companion::usb::UsbCommand::SendGroupText {
@@ -832,6 +834,7 @@ impl CompanionNode {
                     let mut dest_prefix = [0u8; 6];
                     dest_prefix.copy_from_slice(&payload[7..13]);
                     if let Ok(text_str) = core::str::from_utf8(&payload[13..]) {
+                        let text_str = text_str.trim_end_matches('\0');
                         let mut s = String::<160>::new();
                         if s.push_str(text_str).is_ok() {
                             queued = crate::companion::usb::USB_COMMAND_CHANNEL

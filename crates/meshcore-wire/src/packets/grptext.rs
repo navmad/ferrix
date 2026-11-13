@@ -4,6 +4,18 @@
 
 use heapless::String;
 use crate::packet::{Packet, PAYLOAD_TYPE_GRP_TXT};
+use crate::packets::txtmsg::MAX_TEXT_LEN;
+
+/// Append as much of `src` as fits, without splitting a UTF-8 code point.
+/// heapless `push_str` copies nothing on overflow, which would turn a long
+/// message into an empty one.
+fn push_chars<const N: usize>(dst: &mut String<N>, src: &str) {
+    for c in src.chars() {
+        if dst.push(c).is_err() {
+            break;
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct GrpTextPacket {
@@ -13,7 +25,9 @@ pub struct GrpTextPacket {
     pub txt_type: u8,
     pub attempt: u8,
     pub sender: String<32>,
-    pub message: String<96>,
+    /// `sender: message` plaintext is at most 160 bytes (MeshCore
+    /// `MAX_TEXT_LEN`), so the message itself can be up to 160.
+    pub message: String<MAX_TEXT_LEN>,
 }
 
 impl GrpTextPacket {
@@ -26,9 +40,9 @@ impl GrpTextPacket {
 
     pub fn new(channel_hash: u8, sender: &str, message: &str, timestamp: u32, txt_type: u8, attempt: u8) -> Self {
         let mut s = String::new();
-        let _ = s.push_str(sender);
+        push_chars(&mut s, sender);
         let mut m = String::new();
-        let _ = m.push_str(message);
+        push_chars(&mut m, message);
 
         Self {
             channel_hash,
@@ -69,9 +83,10 @@ impl GrpTextPacket {
         pt[offset] = b' ';
         offset += 1;
 
+        // MeshCore caps the whole `sender: message` plaintext at MAX_TEXT_LEN.
+        let max_msg = MAX_TEXT_LEN.saturating_sub(s_bytes.len() + 2);
         let m_bytes = self.message.as_bytes();
-        let avail = pt.len() - offset - 1;
-        let take = m_bytes.len().min(avail);
+        let take = m_bytes.len().min(max_msg);
         pt[offset..offset + take].copy_from_slice(&m_bytes[..take]);
         offset += take;
         // No explicit NUL: the AES zero-padding terminates the string, as in
@@ -118,9 +133,9 @@ impl GrpTextPacket {
         };
 
         let mut sender = String::new();
-        let _ = sender.push_str(sender_str);
+        push_chars(&mut sender, sender_str);
         let mut message = String::new();
-        let _ = message.push_str(msg_str);
+        push_chars(&mut message, msg_str);
 
         Ok(Self {
             channel_hash,
@@ -140,5 +155,37 @@ impl GrpTextPacket {
         let len = self.encode_encrypted(secret, &mut buf)?;
         pkt.set_payload(&buf[..len])?;
         Ok(pkt)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn round_trip(sender: &str, message: &str) -> GrpTextPacket {
+        let secret = [0x5Au8; 16];
+        let p = GrpTextPacket::new(0x42, sender, message, 1234, GrpTextPacket::TXT_TYPE_PLAIN, 0);
+        let mut buf = [0u8; 192];
+        let n = p.encode_encrypted(&secret, &mut buf).expect("encode");
+        GrpTextPacket::decode_encrypted(&buf[..n], &secret).expect("decode")
+    }
+
+    #[test]
+    fn long_group_message_is_not_truncated_to_96() {
+        // 150-byte message + "n7jmv: " prefix = 157 bytes, within MAX_TEXT_LEN.
+        let msg = "x".repeat(150);
+        let d = round_trip("n7jmv", &msg);
+        assert_eq!(d.sender.as_str(), "n7jmv");
+        assert_eq!(d.message.as_str(), msg.as_str());
+    }
+
+    #[test]
+    fn oversized_group_message_truncates_instead_of_emptying() {
+        // 200-byte message + "n7jmv: " prefix is capped at MAX_TEXT_LEN (160).
+        let msg = "y".repeat(200);
+        let d = round_trip("n7jmv", &msg);
+        assert_eq!(d.sender.as_str(), "n7jmv");
+        assert_eq!(d.message.len(), 160 - "n7jmv".len() - 2);
+        assert!(d.message.as_str().chars().all(|c| c == 'y'));
     }
 }

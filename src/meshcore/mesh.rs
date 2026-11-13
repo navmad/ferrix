@@ -61,7 +61,7 @@ pub struct ReceivedMessage {
     pub sender: heapless::String<32>,
     /// Full sender public key for direct messages; zero for channel messages.
     pub sender_pub: [u8; 32],
-    pub text: heapless::String<128>,
+    pub text: heapless::String<160>,
     pub timestamp: u32,
     pub rssi: i16,
     pub snr: i8,

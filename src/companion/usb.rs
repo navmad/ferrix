@@ -158,7 +158,7 @@ pub enum UsbCommand {
     SendGroupText {
         channel_idx: u8,
         timestamp: u32,
-        text: heapless::String<128>,
+        text: heapless::String<160>,
     },
     SendDirectText {
         /// First six bytes of the destination public key.
@@ -651,7 +651,7 @@ async fn handle_text_cli(
             if msg.is_empty() {
                 let _ = write_all(sender, b"  -> Error: message cannot be empty\r\n").await;
             } else {
-                let mut s_msg = heapless::String::<128>::new();
+                let mut s_msg = heapless::String::<160>::new();
                 let _ = s_msg.push_str(msg);
                 let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SendGroupText {
                     channel_idx: 0,
@@ -790,7 +790,7 @@ async fn handle_text_cli(
             } else {
                 let _ = write_all(sender, b"  -> === Recent Messages ===\r\n").await;
                 for msg in msg_snapshot.iter() {
-                    let mut s = heapless::String::<256>::new();
+                    let mut s = heapless::String::<320>::new();
                     let mode = if msg.is_direct { "[DM]" } else { "[GRP]" };
                     let _ = write!(
                         s,
