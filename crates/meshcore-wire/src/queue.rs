@@ -80,6 +80,11 @@ impl PacketQueue {
         self.queue.pop_front()
     }
 
+    /// Peek at the next packet without removing it.
+    pub fn front(&self) -> Option<&Packet> {
+        self.queue.front()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.queue.is_empty()
     }

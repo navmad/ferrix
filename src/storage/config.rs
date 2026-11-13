@@ -22,7 +22,7 @@ use crate::companion::usb::ChannelData;
 /// (Top page of application flash, immediately preceding bootloader at 0x000ED000)
 pub const CONFIG_FLASH_ADDR: u32 = 0x000EC000;
 pub const CONFIG_MAGIC: u32 = 0x4D434647; // 'MCFG' (MeshCore Config)
-pub const CONFIG_VERSION: u32 = 8;
+pub const CONFIG_VERSION: u32 = 9;
 
 #[repr(C, align(4))]
 #[derive(Clone, Copy)]
@@ -47,6 +47,7 @@ pub struct PersistentConfig {
     pub manual_add_contacts: u8, // bit 0: 0 = auto-add all, 1 = use autoadd_config
     pub leds_disabled: u8,      // 1 = all user LEDs off
     pub rx_duty_cycle: u8,      // 1 = duty-cycle/sniff RX
+    pub airtime_factor_tenths: u8, // 0..90; 90 = 9.0 -> 10% duty
     pub radio_freq_hz: u32,
     pub radio_bw_khz: u32,
     pub channels: [ChannelData; crate::companion::usb::MAX_CHANNELS],
@@ -98,6 +99,33 @@ struct PersistentConfigV7 {
     autoadd_max_hops: u8,
     manual_add_contacts: u8,
     leds_disabled: u8,
+    radio_freq_hz: u32,
+    radio_bw_khz: u32,
+    channels: [ChannelData; crate::companion::usb::MAX_CHANNELS],
+    checksum: u32,
+}
+
+/// v8 layout: no `airtime_factor`. Read only for migration.
+#[repr(C, align(4))]
+#[derive(Clone, Copy)]
+struct PersistentConfigV8 {
+    magic: u32,
+    version: u32,
+    callsign: [u8; 32],
+    custom_priv_key: [u8; 64],
+    has_custom_key: u8,
+    is_repeater: u8,
+    client_repeat: u8,
+    offgrid_home_freq: u32,
+    radio_tx_power: i8,
+    radio_sf: u8,
+    radio_cr: u8,
+    path_hash_mode: u8,
+    autoadd_config: u8,
+    autoadd_max_hops: u8,
+    manual_add_contacts: u8,
+    leds_disabled: u8,
+    rx_duty_cycle: u8,
     radio_freq_hz: u32,
     radio_bw_khz: u32,
     channels: [ChannelData; crate::companion::usb::MAX_CHANNELS],
@@ -254,6 +282,7 @@ fn migrate_v1(v1: PersistentConfigV1) -> PersistentConfig {
         manual_add_contacts: 0,
         leds_disabled: 0,
         rx_duty_cycle: 0,
+        airtime_factor_tenths: 90,
         radio_freq_hz: v1.radio_freq_hz,
         radio_bw_khz: v1.radio_bw_khz,
         channels: expand_channels(v1.channels),
@@ -282,6 +311,7 @@ fn migrate_v2(v2: PersistentConfigV2) -> PersistentConfig {
         manual_add_contacts: 0,
         leds_disabled: 0,
         rx_duty_cycle: 0,
+        airtime_factor_tenths: 90,
         radio_freq_hz: v2.radio_freq_hz,
         radio_bw_khz: v2.radio_bw_khz,
         channels: expand_channels(v2.channels),
@@ -310,6 +340,7 @@ fn migrate_v3(v3: PersistentConfigV3) -> PersistentConfig {
         manual_add_contacts: 0,
         leds_disabled: 0,
         rx_duty_cycle: 0,
+        airtime_factor_tenths: 90,
         radio_freq_hz: v3.radio_freq_hz,
         radio_bw_khz: v3.radio_bw_khz,
         channels: v3.channels,
@@ -338,6 +369,7 @@ fn migrate_v4(v4: PersistentConfigV4) -> PersistentConfig {
         manual_add_contacts: 0,
         leds_disabled: 0,
         rx_duty_cycle: 0,
+        airtime_factor_tenths: 90,
         radio_freq_hz: v4.radio_freq_hz,
         radio_bw_khz: v4.radio_bw_khz,
         channels: v4.channels,
@@ -366,6 +398,7 @@ fn migrate_v6(v6: PersistentConfigV6) -> PersistentConfig {
         manual_add_contacts: v6.manual_add_contacts,
         leds_disabled: 0,
         rx_duty_cycle: 0,
+        airtime_factor_tenths: 90,
         radio_freq_hz: v6.radio_freq_hz,
         radio_bw_khz: v6.radio_bw_khz,
         channels: v6.channels,
@@ -394,9 +427,39 @@ fn migrate_v7(v7: PersistentConfigV7) -> PersistentConfig {
         manual_add_contacts: v7.manual_add_contacts,
         leds_disabled: v7.leds_disabled,
         rx_duty_cycle: 0,
+        airtime_factor_tenths: 90,
         radio_freq_hz: v7.radio_freq_hz,
         radio_bw_khz: v7.radio_bw_khz,
         channels: v7.channels,
+        checksum: 0,
+    };
+    cfg.checksum = compute_checksum(&cfg);
+    cfg
+}
+
+fn migrate_v8(v8: PersistentConfigV8) -> PersistentConfig {
+    let mut cfg = PersistentConfig {
+        magic: v8.magic,
+        version: CONFIG_VERSION,
+        callsign: v8.callsign,
+        custom_priv_key: v8.custom_priv_key,
+        has_custom_key: v8.has_custom_key,
+        is_repeater: v8.is_repeater,
+        client_repeat: v8.client_repeat,
+        offgrid_home_freq: v8.offgrid_home_freq,
+        radio_tx_power: v8.radio_tx_power,
+        radio_sf: v8.radio_sf,
+        radio_cr: v8.radio_cr,
+        path_hash_mode: v8.path_hash_mode,
+        autoadd_config: v8.autoadd_config,
+        autoadd_max_hops: v8.autoadd_max_hops,
+        manual_add_contacts: v8.manual_add_contacts,
+        leds_disabled: v8.leds_disabled,
+        rx_duty_cycle: v8.rx_duty_cycle,
+        airtime_factor_tenths: 90,
+        radio_freq_hz: v8.radio_freq_hz,
+        radio_bw_khz: v8.radio_bw_khz,
+        channels: v8.channels,
         checksum: 0,
     };
     cfg.checksum = compute_checksum(&cfg);
@@ -425,6 +488,12 @@ pub fn read_config() -> Option<(PersistentConfig, bool)> {
     }
     if cfg.version == CONFIG_VERSION && compute_checksum(&cfg) == cfg.checksum {
         return Some((cfg, false));
+    }
+    if cfg.version == 8 {
+        let v8 = unsafe { (CONFIG_FLASH_ADDR as *const PersistentConfigV8).read_volatile() };
+        if compute_checksum(&v8) == v8.checksum {
+            return Some((migrate_v8(v8), true));
+        }
     }
     if cfg.version == 7 {
         let v7 = unsafe { (CONFIG_FLASH_ADDR as *const PersistentConfigV7).read_volatile() };
@@ -556,6 +625,7 @@ pub fn init_config() -> (String<32>, Option<[u8; 64]>) {
             s.offgrid_home_freq = cfg.offgrid_home_freq;
             s.path_hash_mode = if cfg.path_hash_mode <= 2 { cfg.path_hash_mode } else { 0 };
             s.rx_duty_cycle = cfg.rx_duty_cycle != 0;
+            s.airtime_factor_tenths = cfg.airtime_factor_tenths.min(90);
         });
 
         // Load the contact auto-add policy.
@@ -577,7 +647,7 @@ pub fn init_config() -> (String<32>, Option<[u8; 64]>) {
         };
 
         if migrated {
-            info!("Storage: Migrated config to v8 (up to {} contacts / {} channels)", crate::companion::usb::MAX_CONTACTS, crate::companion::usb::MAX_CHANNELS);
+            info!("Storage: Migrated config to v9 (up to {} contacts / {} channels)", crate::companion::usb::MAX_CONTACTS, crate::companion::usb::MAX_CHANNELS);
             request_save_config();
         }
 
@@ -601,7 +671,7 @@ pub fn assemble_current_config() -> PersistentConfig {
         callsign_bytes[..len].copy_from_slice(&s.as_bytes()[..len]);
     });
 
-    let (freq, tx, sf, bw, cr, is_rep, client_repeat, offgrid_home_freq, path_mode, rx_duty) =
+    let (freq, tx, sf, bw, cr, is_rep, client_repeat, offgrid_home_freq, path_mode, rx_duty, af) =
         crate::companion::usb::RADIO_SETTINGS.lock(|r| {
             let s = r.borrow();
             (
@@ -615,6 +685,7 @@ pub fn assemble_current_config() -> PersistentConfig {
                 s.offgrid_home_freq,
                 s.path_hash_mode,
                 s.rx_duty_cycle,
+                s.airtime_factor_tenths,
             )
         });
 
@@ -648,6 +719,7 @@ pub fn assemble_current_config() -> PersistentConfig {
         manual_add_contacts: auto.manual_add_contacts,
         leds_disabled: if crate::companion::usb::leds_disabled() { 1 } else { 0 },
         rx_duty_cycle: if rx_duty { 1 } else { 0 },
+        airtime_factor_tenths: af,
         radio_freq_hz: freq,
         radio_bw_khz: bw,
         channels,

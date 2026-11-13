@@ -54,6 +54,8 @@ pub struct RadioSettings {
     pub path_hash_mode: u8,
     /// Listen in duty-cycle/sniff mode instead of continuous RX.
     pub rx_duty_cycle: bool,
+    /// Transmit airtime factor in tenths (0..90; af=90 -> 10% duty).
+    pub airtime_factor_tenths: u8,
 }
 
 pub static RADIO_SETTINGS: Mutex<SharedRawMutex, RefCell<RadioSettings>> = Mutex::new(RefCell::new(RadioSettings {
@@ -67,6 +69,7 @@ pub static RADIO_SETTINGS: Mutex<SharedRawMutex, RefCell<RadioSettings>> = Mutex
     offgrid_home_freq: 0,
     path_hash_mode: 0,
     rx_duty_cycle: false,
+    airtime_factor_tenths: 90,
 }));
 
 /// Contact auto-add policy, shared by every companion transport and the main
@@ -228,6 +231,28 @@ fn parse_cr(val: &str) -> Option<u8> {
         "8" | "4/8" => Some(8),
         _ => None,
     }
+}
+
+/// Parse a decimal value into tenths (`9`, `9.0`, `2.5` -> 90, 90, 25).
+fn parse_decimal_tenths(val: &str) -> Option<u16> {
+    let val = val.trim().trim_end_matches('%').trim();
+    let (int_s, frac_s) = match val.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (val, None),
+    };
+    let int: u16 = int_s.parse().ok()?;
+    let frac: u16 = match frac_s {
+        Some(f) if f.is_empty() => 0,
+        Some(f) => {
+            let b = *f.as_bytes().first()?;
+            if !b.is_ascii_digit() {
+                return None;
+            }
+            (b - b'0') as u16
+        }
+        None => 0,
+    };
+    Some(int.saturating_mul(10).saturating_add(frac))
 }
 
 /// Render a bandwidth with trailing zeros stripped: 62.5, 125, 250, 500, 31.25...
@@ -1169,6 +1194,54 @@ async fn handle_text_cli(
             )
             .await;
         }
+        "get af" => {
+            let af = RADIO_SETTINGS.lock(|r| r.borrow().airtime_factor_tenths);
+            let mut s: heapless::String<32> = heapless::String::new();
+            let _ = write!(s, "  -> {}.{:02}\r\n", af / 10, af % 10);
+            let _ = write_all(sender, s.as_bytes()).await;
+        }
+        s if s.starts_with("set af ") => {
+            if let Some(af) = parse_decimal_tenths(&s[7..]).map(|v| v.min(90) as u8) {
+                RADIO_SETTINGS.lock(|r| r.borrow_mut().airtime_factor_tenths = af);
+                crate::storage::request_save_config();
+                let mut out: heapless::String<48> = heapless::String::new();
+                let _ = write!(out, "  -> OK - af={}.{:02}\r\n", af / 10, af % 10);
+                let _ = write_all(sender, out.as_bytes()).await;
+            } else {
+                let _ = write_all(sender, b"Error: af must be between 0 and 9\r\n").await;
+            }
+        }
+        "get dutycycle" | "get duty" => {
+            let af = RADIO_SETTINGS.lock(|r| r.borrow().airtime_factor_tenths) as u32;
+            let duty_x10 = 10_000 / (af + 10);
+            let mut s: heapless::String<32> = heapless::String::new();
+            let _ = write!(s, "  -> {}.{}%\r\n", duty_x10 / 10, duty_x10 % 10);
+            let _ = write_all(sender, s.as_bytes()).await;
+        }
+        s if s.starts_with("set dutycycle ") || s.starts_with("set duty ") => {
+            let arg = s.split_once(' ').map(|(_, v)| v).unwrap_or("").trim();
+            if let Some(dc_x10) = parse_decimal_tenths(arg) {
+                let dc_x10 = dc_x10.clamp(100, 1000);
+                let af = if dc_x10 <= 100 {
+                    90u8
+                } else {
+                    ((10_000 / dc_x10 as u32) - 10).min(90) as u8
+                };
+                RADIO_SETTINGS.lock(|r| r.borrow_mut().airtime_factor_tenths = af);
+                crate::storage::request_save_config();
+                let duty_x10 = 10_000 / (af as u32 + 10);
+                let mut out: heapless::String<64> = heapless::String::new();
+                let _ = write!(
+                    out,
+                    "  -> OK - dutycycle={}.{}%\r\n",
+                    duty_x10 / 10,
+                    duty_x10 % 10
+                );
+                let _ = write_all(sender, out.as_bytes()).await;
+            } else {
+                let _ = write_all(sender, b"Error: dutycycle must be 10-100%\r\n").await;
+            }
+        }
         "get autoadd" | "get auto-add" => {
             let a = AUTOADD_SETTINGS.lock(|x| *x.borrow());
             let enabled = (a.manual_add_contacts & 1) == 0 || a.config != 0;
@@ -1446,7 +1519,7 @@ async fn handle_text_cli(
             let _ = write_all(sender, b"  -> OK (Config save queued to flash)\r\n").await;
         }
         "help" => {
-            let _ = write_all(sender, b"  -> Commands:\r\n  ->   Identity: get/set name, get/set prv.key, get public.key\r\n  ->   Radio:    get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq/tx/sf/bw/cr, get/set repeat, get/set rxduty, get/set hash-mode, stats-radio\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, get/set autoadd, advert, time, channels\r\n  ->   System:   save, ver, board, get/set leds, stats-core, stats-packets, clear stats/contacts/messages, reboot\r\n").await;
+            let _ = write_all(sender, b"  -> Commands:\r\n  ->   Identity: get/set name, get/set prv.key, get public.key\r\n  ->   Radio:    get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq/tx/sf/bw/cr, get/set repeat, get/set rxduty, get/set af, get/set dutycycle, get/set hash-mode, stats-radio\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, get/set autoadd, advert, time, channels\r\n  ->   System:   save, ver, board, get/set leds, stats-core, stats-packets, clear stats/contacts/messages, reboot\r\n").await;
         }
         _ => {
             let _ = write_all(sender, b"  -> Unknown command\r\n").await;

@@ -320,12 +320,16 @@ fn render_leds(fb: &mut EpdFrameBuffer, small: SmallStyle) {
 }
 
 fn render_power(fb: &mut EpdFrameBuffer, small: SmallStyle) {
-    let (duty, tx) = crate::companion::usb::RADIO_SETTINGS.lock(|r| {
+    let (duty, tx, af) = crate::companion::usb::RADIO_SETTINGS.lock(|r| {
         let s = r.borrow();
-        (s.rx_duty_cycle, s.tx_power_dbm)
+        (
+            s.rx_duty_cycle,
+            s.tx_power_dbm,
+            s.airtime_factor_tenths,
+        )
     });
 
-    let mut buf: String<32> = String::new();
+    let mut buf: String<48> = String::new();
     draw_centered(fb, "Power", CONTENT_Y + 10, small);
     draw_centered(
         fb,
@@ -333,8 +337,21 @@ fn render_power(fb: &mut EpdFrameBuffer, small: SmallStyle) {
         CONTENT_Y + 30,
         small,
     );
-    let _ = write!(buf, "TX: {} dBm", tx);
+
+    let duty_x10 = 10_000 / (af as u32 + 10);
+    let _ = write!(
+        buf,
+        "AF: {}.{:02} / {}.{}%",
+        af / 10,
+        af % 10,
+        duty_x10 / 10,
+        duty_x10 % 10
+    );
     draw_centered(fb, buf.as_str(), CONTENT_Y + 50, small);
+
+    buf.clear();
+    let _ = write!(buf, "TX: {} dBm", tx);
+    draw_centered(fb, buf.as_str(), CONTENT_Y + 70, small);
 }
 
 fn render_offgrid(fb: &mut EpdFrameBuffer, small: SmallStyle) {

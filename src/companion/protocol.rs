@@ -310,6 +310,10 @@ impl CompanionNode {
             self.battery_percentage = crate::telemetry::battery_percentage();
         }
 
+        // Keep the tuning reply in sync with the shared settings.
+        self.airtime_factor_milli = crate::companion::usb::RADIO_SETTINGS
+            .lock(|r| r.borrow().airtime_factor_tenths as u32 * 100);
+
         let cmd = payload[0];
         LAST_CMD.store(cmd, Ordering::Relaxed);
         match cmd {
@@ -603,8 +607,14 @@ impl CompanionNode {
                 if payload.len() >= 9 {
                     self.rx_delay_ms =
                         u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
-                    self.airtime_factor_milli =
+                    let af_milli =
                         u32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]);
+                    let af_tenths = ((af_milli / 100) as u8).min(90);
+                    crate::companion::usb::RADIO_SETTINGS.lock(|r| {
+                        r.borrow_mut().airtime_factor_tenths = af_tenths;
+                    });
+                    self.airtime_factor_milli = af_tenths as u32 * 100;
+                    crate::storage::request_save_config();
                     ok = true;
                 }
                 let mut resp = Vec::<u8, 4>::new();
