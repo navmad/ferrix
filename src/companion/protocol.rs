@@ -314,7 +314,7 @@ impl CompanionNode {
                 // Layout:
                 // [code(5), type, tx_power, max_tx_power, pubkey(32), adv_lat(i32_le), adv_lon(i32_le),
                 //  reserved(0), advert_loc_policy(0), telemetry_modes(0), manual_add_contacts(0),
-                //  radio_freq(u32_le_hz), radio_bw(u32_le_hz), radio_sf(u8), radio_cr(u8), name(str)]
+                //  radio_freq(u32_le_khz), radio_bw(u32_le_hz), radio_sf(u8), radio_cr(u8), name(str)]
                 let mut resp = Vec::<u8, 128>::new();
                 let _ = resp.push(RESP_CODE_SELF_INFO);
                 let (is_rep, f, tx, sf, bw, cr) = crate::companion::usb::RADIO_SETTINGS.lock(|r| {
@@ -335,8 +335,10 @@ impl CompanionNode {
                         | self.telemetry_mode_base,
                 );
                 let _ = resp.push(self.manual_add_contacts);
-                let _ = resp.extend_from_slice(&f.to_le_bytes()); // radio_freq in Hz
-                let bw_hz = bw * 1000;
+                // MeshCore SELF_INFO carries frequency in kHz and bandwidth in
+                // Hz (the app divides freq by 1000 to show MHz).
+                let _ = resp.extend_from_slice(&(f / 1000).to_le_bytes()); // radio_freq in kHz
+                let bw_hz = crate::companion::usb::bw_khz_to_hz(bw);
                 let _ = resp.extend_from_slice(&bw_hz.to_le_bytes()); // radio_bw in Hz
                 let _ = resp.push(sf);
                 let _ = resp.push(cr);

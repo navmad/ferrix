@@ -74,6 +74,78 @@ pub struct ChannelData {
     pub secret: [u8; 16],
 }
 
+/// Convert the internal integer kHz bandwidth to the precise Hz value used by
+/// the companion protocol and the SX1262 (62 -> 62.5 kHz, 7 -> 7.8 kHz, ...).
+pub fn bw_khz_to_hz(bw_khz: u32) -> u32 {
+    match bw_khz {
+        7 => 7_800,
+        10 => 10_400,
+        15 => 15_600,
+        20 => 20_800,
+        31 => 31_250,
+        41 => 41_670,
+        62 => 62_500,
+        other => other * 1000,
+    }
+}
+
+/// Parse a frequency from the USB CLI. Accepts:
+/// - `910.525` (MHz, decimal)
+/// - `910525` (kHz, integer)
+/// - `910525000` (Hz)
+/// - `910` (MHz)
+pub(crate) fn parse_freq_hz(val: &str) -> Option<u32> {
+    if val.contains('.') {
+        let (int_part, frac_part) = val.split_once('.')?;
+        let mhz: u32 = int_part.parse().ok()?;
+        let mut frac = heapless::String::<6>::new();
+        for c in frac_part.chars() {
+            if !c.is_ascii_digit() || frac.len() == 6 {
+                return None;
+            }
+            let _ = frac.push(c);
+        }
+        while frac.len() < 6 {
+            let _ = frac.push('0');
+        }
+        let frac_num: u32 = frac.parse().ok()?;
+        mhz.checked_mul(1_000_000)?.checked_add(frac_num)
+    } else {
+        let n: u32 = val.parse().ok()?;
+        if n >= 100_000_000 {
+            Some(n) // Hz
+        } else if n >= 100_000 {
+            Some(n.checked_mul(1000)?) // kHz
+        } else if n >= 100 {
+            Some(n.checked_mul(1_000_000)?) // MHz
+        } else {
+            None
+        }
+    }
+}
+
+/// Parse a bandwidth from the USB CLI. Accepts `62.5`, `62`, or `62500`.
+fn parse_bw_khz(val: &str) -> Option<u32> {
+    let val = val.trim_end_matches("kHz").trim_end_matches("k").trim();
+    let exact = match val {
+        "7.8" => Some(7),
+        "10.4" => Some(10),
+        "15.6" => Some(15),
+        "20.8" => Some(20),
+        "31.25" => Some(31),
+        "41.67" => Some(41),
+        "62.5" => Some(62),
+        _ => None,
+    };
+    if exact.is_some() {
+        return exact;
+    }
+    let n: u32 = val.parse().ok()?;
+    // >= 7000 is Hz (62500 -> 62); smaller values are already kHz.
+    let bw = if n >= 7_000 { n / 1000 } else { n };
+    matches!(bw, 7 | 10 | 15 | 20 | 31 | 41 | 62 | 125 | 250 | 500).then_some(bw)
+}
+
 pub const DEFAULT_PUBLIC_SECRET: [u8; 16] = [
     0x8b, 0x33, 0x87, 0xe9, 0xc5, 0xcd, 0xea, 0x6a,
     0xc9, 0xe5, 0xed, 0xba, 0xa1, 0x15, 0xcd, 0x72,
@@ -426,32 +498,14 @@ async fn handle_text_cli(
                 (cfg.frequency_hz, cfg.sf, cfg.bw_khz, cfg.cr, cfg.tx_power_dbm, cfg.path_hash_mode)
             });
             let mut s: heapless::String<128> = heapless::String::new();
-            let _ = write!(s, "  -> {:.3} MHz, SF{}, BW {} kHz, CR 4/{}, {} dBm, hash-size {}B\r\n", f as f32 / 1_000_000.0, sf, bw, cr, tx, mode + 1);
+            let bw_hz = bw_khz_to_hz(bw);
+            let _ = write!(s, "  -> {:.3} MHz, SF{}, BW {:.1} kHz, CR 4/{}, {} dBm, hash-size {}B\r\n", f as f32 / 1_000_000.0, sf, bw_hz as f32 / 1000.0, cr, tx, mode + 1);
             let _ = write_all(sender, s.as_bytes()).await;
         }
         s if s.starts_with("set freq ") => {
             let val = s[9..].trim();
-            // Accepts e.g. "910525000" or "910.525"
-            let freq_hz: Option<u32> = if val.contains('.') {
-                // parse as MHz float
-                let parts: heapless::Vec<&str, 2> = val.split('.').collect();
-                if parts.len() == 2 {
-                    let mhz: u32 = parts[0].parse().unwrap_or(0);
-                    let mut khz_str = heapless::String::<6>::new();
-                    let _ = khz_str.push_str(parts[1]);
-                    while khz_str.len() < 6 {
-                        let _ = khz_str.push('0');
-                    }
-                    let frac: u32 = khz_str.parse().unwrap_or(0);
-                    Some(mhz * 1_000_000 + frac)
-                } else {
-                    None
-                }
-            } else {
-                val.parse().ok()
-            };
-
-            if let Some(f) = freq_hz {
+            // Accepts "910.525" (MHz), "910525" (kHz), or "910525000" (Hz).
+            if let Some(f) = parse_freq_hz(val) {
                 if f >= 150_000_000 && f <= 960_000_000 {
                     RADIO_SETTINGS.lock(|r| {
                         r.borrow_mut().frequency_hz = f;
@@ -520,33 +574,22 @@ async fn handle_text_cli(
         "get bw" => {
             let bw = RADIO_SETTINGS.lock(|r| r.borrow().bw_khz);
             let mut s: heapless::String<32> = heapless::String::new();
-            let _ = write!(s, "  -> {} kHz\r\n", bw);
+            let _ = write!(s, "  -> {:.1} kHz\r\n", bw_khz_to_hz(bw) as f32 / 1000.0);
             let _ = write_all(sender, s.as_bytes()).await;
         }
         s if s.starts_with("set bw ") => {
-            let val = s[7..].trim().trim_end_matches("k").trim_end_matches("kHz");
-            let bw_khz: Option<u32> = if val == "62.5" || val == "62" {
-                Some(62)
-            } else if val == "125" {
-                Some(125)
-            } else if val == "250" {
-                Some(250)
-            } else if val == "500" {
-                Some(500)
-            } else {
-                None
-            };
-            if let Some(bw) = bw_khz {
+            let val = s[7..].trim();
+            if let Some(bw) = parse_bw_khz(val) {
                 RADIO_SETTINGS.lock(|r| {
                     r.borrow_mut().bw_khz = bw;
                 });
                 crate::storage::request_save_config();
                 let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetBandwidth(bw));
                 let mut s: heapless::String<32> = heapless::String::new();
-                let _ = write!(s, "  -> OK (BW set to {} kHz)\r\n", bw);
+                let _ = write!(s, "  -> OK (BW set to {:.1} kHz)\r\n", bw_khz_to_hz(bw) as f32 / 1000.0);
                 let _ = write_all(sender, s.as_bytes()).await;
             } else {
-                let _ = write_all(sender, b"  -> Error: supported BW values are 62.5, 125, 250, 500\r\n").await;
+                let _ = write_all(sender, b"  -> Error: supported BW are 7.8, 10.4, 15.6, 20.8, 31.25, 41.67, 62.5, 125, 250, 500 kHz (or Hz)\r\n").await;
             }
         }
         "get cr" => {
