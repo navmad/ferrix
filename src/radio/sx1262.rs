@@ -365,4 +365,13 @@ impl<'a, T: embassy_nrf::spim::Instance> LoraRadio for Sx1262<'a, T> {
     async fn poll_receive(&mut self, buf: &mut [u8]) -> Option<(usize, i16, i8)> {
         self.poll_receive(buf).await
     }
+
+    async fn receive(&mut self, buf: &mut [u8]) -> (usize, i16, i8) {
+        loop {
+            if let Some(packet) = self.poll_receive(buf).await {
+                return packet;
+            }
+            Timer::after_millis(10).await;
+        }
+    }
 }

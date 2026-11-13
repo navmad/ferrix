@@ -13,6 +13,7 @@ pub mod telemetry;
 
 use defmt::info;
 use defmt_rtt as _;
+use embassy_futures::select::{select4, Either4};
 
 use embassy_executor::Spawner;
 use embassy_nrf::bind_interrupts;
@@ -20,7 +21,7 @@ use embassy_nrf::peripherals;
 use embassy_nrf::saadc;
 use embassy_nrf::spim::{self, Spim};
 use embassy_nrf::usb;
-use embassy_time::Timer;
+use embassy_time::{Duration, Ticker, Timer};
 #[cfg(feature = "thinknode-m1")]
 use static_cell::StaticCell;
 
@@ -29,7 +30,7 @@ use crate::companion::protocol::CompanionNode;
 use crate::companion::usb::{UsbCommand, USB_COMMAND_CHANNEL};
 #[cfg(feature = "thinknode-m1")]
 use crate::display::{EpdFrameBuffer, NodeDisplay, Ssd1681, ThinkNodeDisplay};
-use crate::input::{InputDevice, InputEvent};
+use crate::input::{InputEvent, INPUT_EVENT_CHANNEL};
 use crate::meshcore::{InboundAction, LocalIdentity, MeshEngine, Packet};
 use crate::radio::{lora_phy_task, LoraConfig, LoraPhyChannelRadio, LoraRadio};
 
@@ -254,6 +255,9 @@ async fn main(spawner: Spawner) {
     spawner.spawn(crate::companion::usb::usb_task(usb_dev)).unwrap();
     spawner.spawn(crate::companion::usb::cdc_acm_task(cdc_class, pub_key, priv_key)).unwrap();
     spawner.spawn(crate::companion::ble::contact_task()).unwrap();
+    spawner
+        .spawn(crate::boards::thinknode_m1::thinknode_input_task(board.inputs))
+        .unwrap();
 
     // Initial node companion state
     let mut node = CompanionNode::new(
@@ -353,7 +357,6 @@ async fn main(spawner: Spawner) {
     board.telemetry.blue_led.set_low();
 
     let mut rx_buf = [0u8; 256];
-    let mut tick = 0u32;
     let mut page_turns = 0u32;
 
     // The frontlight starts on at boot; turn it off once the user stops
@@ -365,9 +368,20 @@ async fn main(spawner: Spawner) {
         .checked_add(embassy_time::Duration::from_secs(BACKLIGHT_IDLE_SECS))
         .unwrap();
 
+    let mut ticker = Ticker::every(Duration::from_secs(2));
+    let mut tick: u32 = 0;
+
     loop {
-        // Poll for incoming LoRa packets
-        if let Some((len, rssi, snr)) = lora.poll_receive(&mut rx_buf).await {
+        let wake = select4(
+            lora.receive(&mut rx_buf),
+            USB_COMMAND_CHANNEL.receive(),
+            INPUT_EVENT_CHANNEL.receive(),
+            ticker.next(),
+        )
+        .await;
+
+        match wake {
+        Either4::First((len, rssi, snr)) => {
             info!("Received LoRa packet: {} bytes, RSSI: {} dBm, SNR: {} dB", len, rssi, snr);
             board.telemetry.blue_led.set_high(); // ON
             node.rx_packets = node.rx_packets.saturating_add(1);
@@ -626,9 +640,7 @@ async fn main(spawner: Spawner) {
             Timer::after_millis(50).await;
             board.telemetry.blue_led.set_low(); // OFF
         }
-
-        // Check for commands from USB CDC-ACM CLI (e.g. set name, time sync, manual advert trigger)
-        if let Ok(cmd) = USB_COMMAND_CHANNEL.try_receive() {
+        Either4::Second(cmd) => {
             match cmd {
                 UsbCommand::SetName(new_name) => {
                     info!("Updating node callsign to: {}", new_name.as_str());
@@ -853,9 +865,7 @@ async fn main(spawner: Spawner) {
                 }
             }
         }
-
-        // Poll semantic input events (buttons, D-pads, gestures)
-        if let Some(event) = board.inputs.poll_event().await {
+        Either4::Third(event) => {
             // Any interaction wakes the frontlight and restarts its idle timer.
             #[cfg(feature = "thinknode-m1")]
             {
@@ -908,6 +918,44 @@ async fn main(spawner: Spawner) {
                 _ => {}
             }
         }
+        Either4::Fourth(_) => {
+            tick = tick.wrapping_add(1);
+
+            // Turn the frontlight off after 15 s of no button presses.
+            #[cfg(feature = "thinknode-m1")]
+            if backlight_on && embassy_time::Instant::now() >= backlight_deadline {
+                if let Some(d) = &mut display {
+                    d.set_backlight(false);
+                }
+                backlight_on = false;
+            }
+
+            // Refresh the dashboard every 30 s (15 ticks).
+            if tick % 15 == 0 {
+                #[cfg(feature = "thinknode-m1")]
+                if let Some(d) = &mut display {
+                    d.render_dashboard(&node).await.ok();
+                }
+            }
+
+            // Sample the battery every 10 s (5 ticks).
+            if tick % 5 == 0 && CurrentBoard::HAS_BATTERY_ADC {
+                battery_adc.sample(&mut battery_buf).await;
+                let raw = battery_buf[0].max(0) as u16;
+                let mv = crate::telemetry::adc_raw_to_battery_millivolts(raw);
+                if mv >= crate::telemetry::MIN_PLAUSIBLE_BATTERY_MV {
+                    crate::telemetry::set_battery_millivolts(mv);
+                    node.battery_millivolts = mv;
+                    node.battery_percentage = crate::telemetry::millivolts_to_percentage(mv);
+                }
+            }
+
+            // Heartbeat LED flash every 2 s (each tick).
+            board.telemetry.blue_led.set_high(); // ON
+            Timer::after_millis(20).await;
+            board.telemetry.blue_led.set_low(); // OFF
+        }
+        }
 
         // Transmit any pending packets from MeshEngine tx queue (adverts, text, repeats)
         while let Some(out_pkt) = mesh.tx_queue.pop() {
@@ -921,46 +969,6 @@ async fn main(spawner: Spawner) {
                     tel.tx_beacons = tel.tx_beacons.saturating_add(1);
                 });
             }
-        }
-
-        Timer::after_millis(20).await;
-        tick = tick.wrapping_add(1);
-
-        // Turn the frontlight off after 15 s of no button presses.
-        #[cfg(feature = "thinknode-m1")]
-        if backlight_on && embassy_time::Instant::now() >= backlight_deadline {
-            if let Some(d) = &mut display {
-                d.set_backlight(false);
-            }
-            backlight_on = false;
-        }
-
-        // Refresh the dashboard every 30 s so battery, ages and counters stay
-        // current without wearing the panel on every loop.
-        if tick != 0 && tick % 1500 == 0 {
-            #[cfg(feature = "thinknode-m1")]
-            if let Some(d) = &mut display {
-                d.render_dashboard(&node).await.ok();
-            }
-        }
-
-        // Sample the battery every ~10 seconds (500 * 20 ms loop).
-        if tick % 500 == 0 && CurrentBoard::HAS_BATTERY_ADC {
-            battery_adc.sample(&mut battery_buf).await;
-            let raw = battery_buf[0].max(0) as u16;
-            let mv = crate::telemetry::adc_raw_to_battery_millivolts(raw);
-            if mv >= crate::telemetry::MIN_PLAUSIBLE_BATTERY_MV {
-                crate::telemetry::set_battery_millivolts(mv);
-                node.battery_millivolts = mv;
-                node.battery_percentage = crate::telemetry::millivolts_to_percentage(mv);
-            }
-        }
-
-        // Heartbeat LED flash every 2 seconds
-        if tick % 100 == 0 {
-            board.telemetry.blue_led.set_high(); // ON
-            Timer::after_millis(20).await;
-            board.telemetry.blue_led.set_low(); // OFF
         }
     }
 }

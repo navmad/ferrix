@@ -66,6 +66,21 @@ impl ThinkNodeInputs {
 }
 
 impl InputDevice for ThinkNodeInputs {
+    async fn wait_event(&mut self) -> Option<InputEvent> {
+        let event = embassy_futures::select::select(
+            self.function_btn.wait_for_falling_edge(),
+            self.page_btn.wait_for_falling_edge(),
+        )
+        .await;
+
+        Timer::after_millis(80).await; // debounce
+
+        Some(match event {
+            embassy_futures::select::Either::First(_) => InputEvent::ActionPrimary,
+            embassy_futures::select::Either::Second(_) => InputEvent::NextPage,
+        })
+    }
+
     async fn poll_event(&mut self) -> Option<InputEvent> {
         let fk_active = self.function_btn.is_low();
         let tk_active = self.page_btn.is_low();
@@ -89,6 +104,16 @@ impl InputDevice for ThinkNodeInputs {
         }
 
         None
+    }
+}
+
+/// Background button task: blocks on GPIOTE edges and forwards semantic events.
+#[embassy_executor::task]
+pub async fn thinknode_input_task(mut inputs: ThinkNodeInputs) -> ! {
+    loop {
+        if let Some(event) = inputs.wait_event().await {
+            let _ = crate::input::INPUT_EVENT_CHANNEL.send(event).await;
+        }
     }
 }
 

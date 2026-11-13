@@ -137,6 +137,13 @@ impl LoraRadio for LoraPhyChannelRadio {
             None
         }
     }
+
+    async fn receive(&mut self, buf: &mut [u8]) -> (usize, i16, i8) {
+        let (len, rssi, snr, data) = LORA_RX_CHANNEL.receive().await;
+        let copy_len = len.min(buf.len());
+        buf[..copy_len].copy_from_slice(&data[..copy_len]);
+        (copy_len, rssi, snr)
+    }
 }
 
 /// Standalone Embassy task managing the SX1262 radio via `lora-phy`

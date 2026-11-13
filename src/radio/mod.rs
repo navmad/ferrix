@@ -50,4 +50,8 @@ pub trait LoraRadio {
     /// Poll for an incoming packet.
     /// Returns `Some((payload_len, rssi_dbm, snr_db))` if a valid packet arrived.
     async fn poll_receive(&mut self, buf: &mut [u8]) -> Option<(usize, i16, i8)>;
+
+    /// Wait for the next packet without polling.
+    /// Returns `(payload_len, rssi_dbm, snr_db)`.
+    async fn receive(&mut self, buf: &mut [u8]) -> (usize, i16, i8);
 }
