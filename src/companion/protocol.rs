@@ -96,6 +96,8 @@ pub const RESP_CODE_CONTACTS_START: u8 = 2;
 pub const RESP_CODE_CONTACT: u8 = 3;
 pub const RESP_CODE_END_OF_CONTACTS: u8 = 4;
 pub const RESP_CODE_SELF_INFO: u8 = 5;
+/// Reply to a direct send: `[is_flood][expected_ack:4][est_timeout_ms:4]`.
+pub const RESP_CODE_SENT: u8 = 0x06;
 pub const RESP_CODE_CURR_TIME: u8 = 9;
 pub const RESP_CODE_NO_MORE_MESSAGES: u8 = 10;
 pub const RESP_CODE_DEVICE_INFO: u8 = 13;
@@ -944,8 +946,13 @@ impl CompanionNode {
             CMD_SEND_MSG => {
                 // [cmd][txt_type][attempt][timestamp u32 LE][pubkey_prefix 6][text...]
                 // Minimum: 1 + 1 + 1 + 4 + 6 + 1 = 14 bytes.
-                let mut resp = Vec::<u8, 4>::new();
-                let mut queued = false;
+                //
+                // Reply with RESP_CODE_SENT so the app can arm its ACK-based
+                // retry timer: [is_flood][expected_ack:4][est_timeout:4].
+                // Retries themselves are app-driven; the node sends one packet
+                // per request, matching MeshCore.
+                let mut resp = Vec::<u8, 10>::new();
+                let mut reply = None;
                 if payload.len() >= 14 {
                     let txt_type = payload[1];
                     let attempt = payload[2];
@@ -956,21 +963,83 @@ impl CompanionNode {
                     dest_prefix.copy_from_slice(&payload[7..13]);
                     if let Ok(text_str) = core::str::from_utf8(&payload[13..]) {
                         let text_str = text_str.trim_end_matches('\0');
-                        let mut s = String::<160>::new();
-                        if s.push_str(text_str).is_ok() {
-                            queued = crate::companion::usb::USB_COMMAND_CHANNEL
-                                .try_send(crate::companion::usb::UsbCommand::SendDirectText {
-                                    dest_prefix,
-                                    timestamp,
-                                    txt_type,
-                                    attempt,
-                                    text: s,
-                                })
-                                .is_ok();
+                        let path = crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| {
+                            c.borrow()
+                                .iter()
+                                .find(|ct| &ct.pub_key[..6] == &dest_prefix[..])
+                                .map(|ct| ct.out_path_len)
+                        });
+                        if let Some(out_path_len) = path {
+                            let mut s = String::<160>::new();
+                            if s.push_str(text_str).is_ok()
+                                && crate::companion::usb::USB_COMMAND_CHANNEL
+                                    .try_send(
+                                        crate::companion::usb::UsbCommand::SendDirectText {
+                                            dest_prefix,
+                                            timestamp,
+                                            txt_type,
+                                            attempt,
+                                            text: s,
+                                        },
+                                    )
+                                    .is_ok()
+                            {
+                                reply = Some((txt_type, attempt, timestamp, text_str, out_path_len));
+                            }
                         }
                     }
                 }
-                let _ = resp.push(if queued { RESP_CODE_OK } else { RESP_CODE_ERR });
+
+                if let Some((txt_type, attempt, timestamp, text, out_path_len)) = reply {
+                    let is_direct = out_path_len != 0xFF
+                        && Packet::is_valid_path_len(out_path_len);
+                    let hops = if is_direct {
+                        (out_path_len & 63) as u32
+                    } else {
+                        0
+                    };
+                    let flags = ((txt_type & 0x3F) << 2) | (attempt & 0x03);
+                    let expected_ack = crate::meshcore::crypto::ack_crc(
+                        timestamp,
+                        flags,
+                        text.as_bytes(),
+                        &self.public_key,
+                    );
+
+                    // Estimated on-air time of the complete packet.
+                    let plain_len = 5 + text.len() + if attempt > 3 { 2 } else { 0 };
+                    let path_bytes = if is_direct {
+                        (out_path_len & 63) as usize
+                            * (((out_path_len >> 6) & 3) as usize + 1)
+                    } else {
+                        0
+                    };
+                    let raw_len = 2 + path_bytes + 4 + plain_len;
+                    let (sf, bw_khz, cr) =
+                        crate::companion::usb::RADIO_SETTINGS.lock(|r| {
+                            let s = r.borrow();
+                            (s.sf, s.bw_khz, s.cr)
+                        });
+                    let air_ms = crate::radio::estimate_airtime_ms(
+                        raw_len,
+                        sf,
+                        bw_khz,
+                        cr,
+                        if sf <= 8 { 32 } else { 16 },
+                    );
+                    let est_timeout = if is_direct {
+                        500 + (air_ms * 6 + 250) * (hops + 1)
+                    } else {
+                        500 + 16 * air_ms
+                    };
+
+                    let _ = resp.push(RESP_CODE_SENT);
+                    let _ = resp.push(if is_direct { 0 } else { 1 });
+                    let _ = resp.extend_from_slice(&expected_ack.to_le_bytes());
+                    let _ = resp.extend_from_slice(&est_timeout.to_le_bytes());
+                } else {
+                    let _ = resp.push(RESP_CODE_ERR);
+                }
                 emit(&resp);
             }
 
