@@ -626,7 +626,7 @@ async fn handle_text_cli(
                     return;
                 }
                 Ok((len, None)) => {
-                    let mut s: heapless::String<64> = heapless::String::new();
+                    let mut s: heapless::String<96> = heapless::String::new();
                     let _ = write!(
                         s,
                         "  -> Key incomplete ({}/128), paste the remaining {} hex chars\r\n",
@@ -705,7 +705,7 @@ async fn handle_text_cli(
                     match key_import_append(hex.as_str()) {
                         Ok((_, Some(key))) => apply_private_key(sender, node, key).await,
                         Ok((len, None)) => {
-                            let mut out: heapless::String<64> = heapless::String::new();
+                            let mut out: heapless::String<96> = heapless::String::new();
                             let _ = write!(
                                 out,
                                 "  -> Key incomplete ({}/128), paste the remaining {} hex chars\r\n",
