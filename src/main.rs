@@ -642,6 +642,9 @@ async fn main(spawner: Spawner) {
                     if mesh.set_private_key(&priv_key) {
                         node.private_key = priv_key;
                         node.public_key = *mesh.identity.pub_key();
+                        // Idempotent for the companion-app path (which already
+                        // persisted it) and required for any other caller.
+                        crate::storage::set_custom_priv_key(priv_key);
                     } else {
                         info!("Rejected reserved private key");
                     }

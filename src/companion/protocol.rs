@@ -571,6 +571,10 @@ impl CompanionNode {
                     ) {
                         self.private_key = key;
                         self.public_key = *id.pub_key();
+                        // Persist before acknowledging: otherwise the import
+                        // appears to succeed but the old identity returns on
+                        // the next reboot.
+                        crate::storage::set_custom_priv_key(key);
                         let _ = crate::companion::usb::USB_COMMAND_CHANNEL
                             .try_send(crate::companion::usb::UsbCommand::SetPrivateKey(key));
                         ok = true;
