@@ -5,7 +5,7 @@
 
 use core::cell::UnsafeCell;
 use core::future::poll_fn;
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use core::task::Poll;
 
 use defmt::{debug, error, info};
@@ -425,6 +425,7 @@ pub async fn ble_companion_task(
         let conn = match peripheral::advertise_pairable(sd, adv, &adv_config, &SECURITY_HANDLER).await {
             Ok(mut c) => {
                 info!("BLE: Phone connected & pairing!");
+                BLE_CONNECTED.store(true, Ordering::Relaxed);
                 // Request maximum BLE data length (251 bytes) instead of the default 27 bytes.
                 // This increases throughput for channel sync and other large responses.
                 let _ = c.data_length_update(None);
@@ -525,6 +526,7 @@ pub async fn ble_companion_task(
         match embassy_futures::select::select3(gatt_fut, command_fut, push_fut).await {
             embassy_futures::select::Either3::First(e) => {
                 info!("BLE: Phone disconnected ({:?}), resuming advertising...", e);
+                BLE_CONNECTED.store(false, Ordering::Relaxed);
                 // Drop anything left over from the closed connection so the
                 // next app session never receives stale responses.
                 BLE_CMD_RING.clear();
@@ -542,6 +544,8 @@ pub async fn ble_companion_task(
 }
 
 pub static BLE_STATUS: AtomicU32 = AtomicU32::new(0);
+/// True while a companion app is connected over BLE (for the dashboard).
+pub static BLE_CONNECTED: AtomicBool = AtomicBool::new(false);
 /// Counts commands dropped because the GATT command ring was full.
 static BLE_CMD_DROPS: AtomicU32 = AtomicU32::new(0);
 /// Pairing PIN reported to the app and used by the security handler.

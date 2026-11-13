@@ -866,7 +866,7 @@ async fn main(spawner: Spawner) {
                 InputEvent::NextPage => {
                     info!("Input: Next Page requested");
                     // Cycle through pages: 0 -> 1 -> 2 -> 0
-                    node.current_page = (node.current_page + 1) % 3;
+                    node.current_page = (node.current_page + 1) % crate::display::ui::PAGE_COUNT;
                     page_turns = page_turns.wrapping_add(1);
 
                     #[cfg(feature = "thinknode-m1")]
@@ -927,6 +927,15 @@ async fn main(spawner: Spawner) {
                 d.set_backlight(false);
             }
             backlight_on = false;
+        }
+
+        // Refresh the dashboard every 30 s so battery, ages and counters stay
+        // current without wearing the panel on every loop.
+        if tick != 0 && tick % 1500 == 0 {
+            #[cfg(feature = "thinknode-m1")]
+            if let Some(d) = &mut display {
+                d.render_dashboard(&node).await.ok();
+            }
         }
 
         // Sample the battery every ~10 seconds (500 * 20 ms loop).

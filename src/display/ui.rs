@@ -1,9 +1,19 @@
 //! MeshCore Multi-Page UI Renderer for 1.54" 200x200 EPD
 //!
-//! Provides 3 distinct navigational pages:
-//! 0. Main Companion Dashboard
-//! 1. LoRa Radio & PNW Mesh Stats
-//! 2. GNSS / GPS & Hardware Status
+//! The layout follows the reference companion dashboard: a top bar with the
+//! node name on the left and clock/battery on the right, page-indicator dots,
+//! a separator, then page content. There is no footer; the dots show where you
+//! are.
+//!
+//! Pages:
+//! 0. Messages / connection status
+//! 1. Recently heard contacts
+//! 2. LoRa radio and packet counters
+//! 3. Traffic counters
+//! 4. GPS status
+//! 5. Off-grid (client repeat) status
+
+use core::fmt::Write as _;
 
 use embedded_graphics::mono_font::ascii::{FONT_6X10, FONT_9X15_BOLD};
 use embedded_graphics::mono_font::MonoTextStyle;
@@ -11,168 +21,333 @@ use embedded_graphics::pixelcolor::BinaryColor;
 use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::{Line, PrimitiveStyle, Rectangle};
 use embedded_graphics::text::Text;
+use heapless::String;
 
+use crate::boards::Board;
 use crate::companion::protocol::CompanionNode;
-use crate::display::epd::EpdFrameBuffer;
+use crate::display::epd::{EpdFrameBuffer, EPD_WIDTH};
 
-/// Render the active page onto the framebuffer
+/// Number of dashboard pages. Keep in sync with `main`'s page-turn modulo.
+pub const PAGE_COUNT: u8 = 6;
+
+const DISP_W: i32 = EPD_WIDTH as i32;
+const SMALL_W: i32 = 6;
+const TITLE_W: i32 = 9;
+const LINE_H: i32 = 12;
+const CONTENT_Y: i32 = 34;
+
+type SmallStyle = MonoTextStyle<'static, BinaryColor>;
+type TitleStyle = MonoTextStyle<'static, BinaryColor>;
+
+/// Render the active page onto the framebuffer.
 pub fn render_page(page: u8, node: &CompanionNode, fb: &mut EpdFrameBuffer) {
     fb.clear();
 
-    let text_style = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
-    let title_style = MonoTextStyle::new(&FONT_9X15_BOLD, BinaryColor::On);
-    let line_style = PrimitiveStyle::with_stroke(BinaryColor::On, 1);
+    let small = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
+    let title = MonoTextStyle::new(&FONT_9X15_BOLD, BinaryColor::On);
+    let line = PrimitiveStyle::with_stroke(BinaryColor::On, 1);
 
-    // Common Header: Title & Battery %
-    let header_title = match page {
-        1 => "LoRa Radio PNW",
-        2 => "GNSS / GPS",
-        _ => node.callsign.as_str(),
-    };
-    let _ = Text::new(header_title, Point::new(4, 14), title_style).draw(fb);
-
-    let mut bat_str: heapless::String<12> = heapless::String::new();
-    let _ = core::fmt::write(&mut bat_str, format_args!("{}%", node.battery_percentage));
-    let _ = Text::new(&bat_str, Point::new(165, 14), text_style).draw(fb);
-
-    // Header divider line
-    let _ = Line::new(Point::new(0, 18), Point::new(199, 18))
-        .into_styled(line_style)
+    let page = page.min(PAGE_COUNT - 1);
+    draw_top_bar(node, fb, small, title);
+    draw_page_dots(page, fb);
+    let _ = Line::new(Point::new(0, 28), Point::new(DISP_W - 1, 28))
+        .into_styled(line)
         .draw(fb);
 
     match page {
-        0 => render_page_main(node, fb, text_style, title_style, line_style),
-        1 => render_page_radio(node, fb, text_style, title_style, line_style),
-        _ => render_page_gps(node, fb, text_style, title_style, line_style),
+        0 => render_messages(node, fb, small),
+        1 => render_recent(node, fb, small),
+        2 => render_radio(fb, small),
+        3 => render_traffic(fb, small),
+        4 => render_gps(node, fb, small),
+        _ => render_offgrid(fb, small),
     }
-
-    // Common Footer
-    let _ = Line::new(Point::new(0, 182), Point::new(199, 182))
-        .into_styled(line_style)
-        .draw(fb);
-
-    let footer_text = match page {
-        0 => "[1/3] Main | TK: Next",
-        1 => "[2/3] Radio | TK: Next",
-        _ => "[3/3] GPS | TK: Next",
-    };
-    let _ = Text::new(footer_text, Point::new(4, 194), text_style).draw(fb);
 }
 
-fn render_page_main(
-    node: &CompanionNode,
-    fb: &mut EpdFrameBuffer,
-    text_style: MonoTextStyle<BinaryColor>,
-    title_style: MonoTextStyle<BinaryColor>,
-    line_style: PrimitiveStyle<BinaryColor>,
-) {
-    let _ = Text::new("Link: USB / BLE NUS", Point::new(4, 30), text_style).draw(fb);
-    let _ = Text::new("Radio: 910.525 MHz", Point::new(4, 42), text_style).draw(fb);
+/// Top bar: node name on the left, clock + battery right-aligned.
+fn draw_top_bar(node: &CompanionNode, fb: &mut EpdFrameBuffer, small: SmallStyle, title: TitleStyle) {
+    // Right block first so the name can be clipped to the remaining space.
+    let mut right: String<20> = String::new();
+    if node.epoch_time > 1_700_000_000 {
+        let secs = (node.epoch_time % 86_400) as u32;
+        let _ = write!(right, "{:02}:{:02} ", secs / 3600, (secs % 3600) / 60);
+    }
+    let _ = write!(right, "{}%", node.battery_percentage);
 
-    // Divider
-    let _ = Line::new(Point::new(0, 48), Point::new(199, 48))
-        .into_styled(line_style)
-        .draw(fb);
+    let right_x = DISP_W - 2 - text_width(right.as_str(), SMALL_W);
+    draw_text(fb, right.as_str(), right_x, 14, small);
 
-    // Message / Companion Status Box
-    let _ = Rectangle::new(Point::new(4, 54), Size::new(192, 122))
-        .into_styled(line_style)
-        .draw(fb);
-
-    let _ = Text::new("MeshCore Node", Point::new(12, 70), title_style).draw(fb);
-    let _ = Text::new("Status: Online & Ready", Point::new(12, 88), text_style).draw(fb);
-
-    let mut unread_str: heapless::String<32> = heapless::String::new();
-    let _ = core::fmt::write(&mut unread_str, format_args!("Unread: {} messages", node.unread_messages));
-    let _ = Text::new(&unread_str, Point::new(12, 106), text_style).draw(fb);
-
-    let mut tx_str: heapless::String<32> = heapless::String::new();
-    let _ = core::fmt::write(&mut tx_str, format_args!("TX Beacons: {} sent", node.tx_beacons));
-    let _ = Text::new(&tx_str, Point::new(12, 122), text_style).draw(fb);
-
-    let mut rx_str: heapless::String<32> = heapless::String::new();
-    let _ = core::fmt::write(&mut rx_str, format_args!("RX Packets: {} rcvd", node.rx_packets));
-    let _ = Text::new(&rx_str, Point::new(12, 138), text_style).draw(fb);
-
-    let _ = Text::new("FK: Beacon | TK: Page", Point::new(12, 160), text_style).draw(fb);
+    // Node name — always the active callsign, never a page title.
+    let available = (right_x - 4).max(0);
+    let max_chars = (available / TITLE_W).max(0) as usize;
+    let mut name: String<32> = String::new();
+    for c in node.callsign.chars().take(max_chars) {
+        let _ = name.push(c);
+    }
+    if name.is_empty() {
+        let _ = name.push_str(crate::boards::CurrentBoard::NAME);
+    }
+    draw_text(fb, name.as_str(), 2, 14, title);
 }
 
-fn render_page_radio(
-    node: &CompanionNode,
-    fb: &mut EpdFrameBuffer,
-    text_style: MonoTextStyle<BinaryColor>,
-    title_style: MonoTextStyle<BinaryColor>,
-    line_style: PrimitiveStyle<BinaryColor>,
-) {
-    let _ = Text::new("Profile: US PNW Preset", Point::new(4, 30), text_style).draw(fb);
-    let _ = Text::new("Freq: 910.525 MHz", Point::new(4, 42), text_style).draw(fb);
+/// Page indicator: filled 3x3 block for the current page, single pixels for
+/// the rest, centered under the top bar.
+fn draw_page_dots(page: u8, fb: &mut EpdFrameBuffer) {
+    let total = PAGE_COUNT as i32;
+    let spacing = 10;
+    let start_x = (DISP_W - (total - 1) * spacing) / 2;
+    let fill = PrimitiveStyle::with_fill(BinaryColor::On);
 
-    let _ = Line::new(Point::new(0, 48), Point::new(199, 48))
-        .into_styled(line_style)
-        .draw(fb);
+    for i in 0..total {
+        let x = start_x + i * spacing;
+        if i == page as i32 {
+            let _ = Rectangle::new(Point::new(x - 1, 19), Size::new(3, 3))
+                .into_styled(fill)
+                .draw(fb);
+        } else {
+            let _ = Rectangle::new(Point::new(x, 20), Size::new(1, 1))
+                .into_styled(fill)
+                .draw(fb);
+        }
+    }
+}
 
-    let _ = Rectangle::new(Point::new(4, 54), Size::new(192, 122))
-        .into_styled(line_style)
-        .draw(fb);
+fn render_messages(node: &CompanionNode, fb: &mut EpdFrameBuffer, small: SmallStyle) {
+    let ble_connected =
+        crate::companion::ble::BLE_CONNECTED.load(core::sync::atomic::Ordering::Relaxed);
+    let ble_status = crate::companion::ble::BLE_STATUS.load(core::sync::atomic::Ordering::Relaxed);
 
-    let _ = Text::new("SX1262 Transceiver", Point::new(12, 70), title_style).draw(fb);
-    let _ = Text::new("Modulation: LoRa SF7", Point::new(12, 86), text_style).draw(fb);
-    let _ = Text::new("Bandwidth: 62.5 kHz", Point::new(12, 98), text_style).draw(fb);
-    let _ = Text::new("Coding Rate: 4/5 (CR=1)", Point::new(12, 110), text_style).draw(fb);
-    let _ = Text::new("TX Power: +22 dBm", Point::new(12, 122), text_style).draw(fb);
-
-    let mut stats_str: heapless::String<32> = heapless::String::new();
-    let _ = core::fmt::write(&mut stats_str, format_args!("TX: {} | RX: {}", node.tx_beacons, node.rx_packets));
-    let _ = Text::new(&stats_str, Point::new(12, 140), text_style).draw(fb);
-
-    let mut signal_str: heapless::String<32> = heapless::String::new();
-    if node.last_rssi != 0 {
-        let _ = core::fmt::write(&mut signal_str, format_args!("RSSI: {} | SNR: {}", node.last_rssi, node.last_snr));
+    let link = if ble_connected {
+        "< Connected: BLE >"
+    } else if ble_status <= 3 {
+        // Not started yet, probing, enabled, or advertising.
+        "Waiting for app..."
     } else {
-        let _ = core::fmt::write(&mut signal_str, format_args!("RSSI: None (Listening)"));
-    }
-    let _ = Text::new(&signal_str, Point::new(12, 154), text_style).draw(fb);
+        "BLE: off"
+    };
+
+    let mut buf: String<32> = String::new();
+    let _ = write!(buf, "MSG: {}", node.unread_messages);
+    draw_centered(fb, buf.as_str(), 58, small);
+
+    draw_centered(fb, link, 80, small);
+
+    buf.clear();
+    let _ = write!(
+        buf,
+        "Offgrid: {}",
+        if crate::companion::usb::offgrid_active() { "ON" } else { "OFF" }
+    );
+    draw_centered(fb, buf.as_str(), 102, small);
+
+    let up = embassy_time::Instant::now().as_secs();
+    buf.clear();
+    let _ = write!(
+        buf,
+        "Up: {}d {:02}h {:02}m",
+        up / 86_400,
+        (up % 86_400) / 3600,
+        (up % 3600) / 60
+    );
+    draw_centered(fb, buf.as_str(), 124, small);
 }
 
-fn render_page_gps(
-    node: &CompanionNode,
-    fb: &mut EpdFrameBuffer,
-    text_style: MonoTextStyle<BinaryColor>,
-    title_style: MonoTextStyle<BinaryColor>,
-    line_style: PrimitiveStyle<BinaryColor>,
-) {
-    let _ = Text::new("Receiver: Quectel L76K", Point::new(4, 30), text_style).draw(fb);
-    let _ = Text::new("Baud: 9600 8N1 (UART0)", Point::new(4, 42), text_style).draw(fb);
+fn render_recent(node: &CompanionNode, fb: &mut EpdFrameBuffer, small: SmallStyle) {
+    let mut recent: heapless::Vec<(u32, String<16>), 4> = heapless::Vec::new();
 
-    let _ = Line::new(Point::new(0, 48), Point::new(199, 48))
-        .into_styled(line_style)
-        .draw(fb);
+    crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| {
+        for ct in c.borrow().iter() {
+            if ct.last_seen_epoch == 0 {
+                continue;
+            }
 
-    let _ = Rectangle::new(Point::new(4, 54), Size::new(192, 122))
-        .into_styled(line_style)
-        .draw(fb);
+            let mut name: String<16> = String::new();
+            for ch in ct.callsign.chars().take(15) {
+                let _ = name.push(ch);
+            }
 
-    let _ = Text::new("Position Telemetry", Point::new(12, 70), title_style).draw(fb);
+            let pos = recent
+                .iter()
+                .position(|(ts, _)| *ts < ct.last_seen_epoch)
+                .unwrap_or(recent.len());
+
+            if recent.len() == 4 {
+                if let Some((last_ts, _)) = recent.last() {
+                    if ct.last_seen_epoch <= *last_ts {
+                        continue;
+                    }
+                }
+                let _ = recent.pop();
+            }
+            let _ = recent.insert(pos.min(recent.len()), (ct.last_seen_epoch, name));
+        }
+    });
+
+    if recent.is_empty() {
+        draw_centered(fb, "(no contacts heard)", 76, small);
+        return;
+    }
+
+    for (i, (ts, name)) in recent.iter().enumerate() {
+        let y = CONTENT_Y + 6 + (i as i32 * LINE_H);
+        draw_text(fb, name.as_str(), 2, y, small);
+        draw_right(fb, &age_label(*ts, node.epoch_time), y, small);
+    }
+}
+
+fn render_radio(fb: &mut EpdFrameBuffer, small: SmallStyle) {
+    let (freq_hz, bw_khz, sf, cr, tx_power) = crate::companion::usb::RADIO_SETTINGS.lock(|r| {
+        let s = r.borrow();
+        (s.frequency_hz, s.bw_khz, s.sf, s.cr, s.tx_power_dbm)
+    });
+    let (rx, tx) = crate::companion::usb::RADIO_TELEMETRY.lock(|t| {
+        let t = t.borrow();
+        (t.rx_packets, t.tx_beacons)
+    });
+
+    let mut buf: String<32> = String::new();
+    let _ = write!(
+        buf,
+        "{}.{:03} BW{}",
+        freq_hz / 1_000_000,
+        (freq_hz % 1_000_000 + 500) / 1000,
+        format_bw(bw_khz)
+    );
+    draw_text(fb, buf.as_str(), 2, CONTENT_Y, small);
+
+    let preamble = if sf <= 8 { 32 } else { 16 };
+    buf.clear();
+    let _ = write!(buf, "SF{} CR{} SW12 P{}", sf, cr, preamble);
+    draw_text(fb, buf.as_str(), 2, CONTENT_Y + LINE_H, small);
+
+    buf.clear();
+    let _ = write!(buf, "TX:{}dBm RX/CONT", tx_power);
+    draw_text(fb, buf.as_str(), 2, CONTENT_Y + 2 * LINE_H, small);
+
+    buf.clear();
+    let _ = write!(buf, "NF--  R{} T{} E0", rx, tx);
+    draw_text(fb, buf.as_str(), 2, CONTENT_Y + 3 * LINE_H, small);
+}
+
+fn render_traffic(fb: &mut EpdFrameBuffer, small: SmallStyle) {
+    let (rx, tx) = crate::companion::usb::RADIO_TELEMETRY.lock(|t| {
+        let t = t.borrow();
+        (t.rx_packets, t.tx_beacons)
+    });
+
+    draw_centered(fb, "Traffic", 52, small);
+
+    let mut buf: String<32> = String::new();
+    let _ = write!(buf, "RX: {}   TX: {}", rx, tx);
+    draw_centered(fb, buf.as_str(), 76, small);
+
+    buf.clear();
+    let _ = write!(buf, "ERR: 0");
+    draw_centered(fb, buf.as_str(), 92, small);
+}
+
+fn render_gps(node: &CompanionNode, fb: &mut EpdFrameBuffer, small: SmallStyle) {
+    let mut buf: String<32> = String::new();
 
     if node.gps_fix {
-        let mut lat_str: heapless::String<32> = heapless::String::new();
-        let _ = core::fmt::write(&mut lat_str, format_args!("Lat: {:.5}", node.latitude));
-        let _ = Text::new(&lat_str, Point::new(12, 90), text_style).draw(fb);
-
-        let mut lon_str: heapless::String<32> = heapless::String::new();
-        let _ = core::fmt::write(&mut lon_str, format_args!("Lon: {:.5}", node.longitude));
-        let _ = Text::new(&lon_str, Point::new(12, 104), text_style).draw(fb);
+        draw_centered(fb, "GPS: 3D fix", 44, small);
+        let _ = write!(buf, "Lat: {:.5}", node.latitude);
+        draw_text(fb, buf.as_str(), 2, 64, small);
+        buf.clear();
+        let _ = write!(buf, "Lon: {:.5}", node.longitude);
+        draw_text(fb, buf.as_str(), 2, 78, small);
+        draw_text(fb, "Sats: --   Age: --", 2, 92, small);
     } else {
-        let _ = Text::new("Fix: Acquiring 3D...", Point::new(12, 90), text_style).draw(fb);
-        let _ = Text::new("Toggle GPS switch to ON", Point::new(12, 106), text_style).draw(fb);
-        let _ = Text::new("Standby: Active", Point::new(12, 120), text_style).draw(fb);
+        draw_centered(fb, "GPS: acquiring", 44, small);
+        draw_centered(fb, "No fix yet", 64, small);
+        let _ = write!(buf, "Lat: {:.5}", node.latitude);
+        draw_text(fb, buf.as_str(), 2, 84, small);
+        buf.clear();
+        let _ = write!(buf, "Lon: {:.5}", node.longitude);
+        draw_text(fb, buf.as_str(), 2, 98, small);
     }
-
-    let _ = Text::new("Buttons: FK=TX TK=Page", Point::new(12, 145), text_style).draw(fb);
-    let _ = Text::new("LEDs: Blue=RX/TX Red=Pwr", Point::new(12, 158), text_style).draw(fb);
 }
 
-/// Backward compatibility helper for render_dashboard
+fn render_offgrid(fb: &mut EpdFrameBuffer, small: SmallStyle) {
+    let (client_repeat, freq_hz) = crate::companion::usb::RADIO_SETTINGS.lock(|r| {
+        let s = r.borrow();
+        (s.client_repeat, s.frequency_hz)
+    });
+    let active = crate::companion::usb::offgrid_active();
+
+    let mut buf: String<32> = String::new();
+    draw_centered(fb, if active { "Offgrid: ON" } else { "Offgrid: OFF" }, 52, small);
+
+    buf.clear();
+    let _ = write!(
+        buf,
+        "Channel: {}.{:03}",
+        freq_hz / 1_000_000,
+        (freq_hz % 1_000_000 + 500) / 1000
+    );
+    draw_centered(fb, buf.as_str(), 76, small);
+
+    buf.clear();
+    let _ = write!(
+        buf,
+        "Client repeat: {}",
+        if client_repeat { "on" } else { "off" }
+    );
+    draw_centered(fb, buf.as_str(), 96, small);
+}
+
+fn age_label(last_seen: u32, now_epoch: u64) -> String<8> {
+    let mut s: String<8> = String::new();
+    if now_epoch < 1_700_000_000 || last_seen == 0 {
+        let _ = s.push_str("--");
+        return s;
+    }
+    let now = now_epoch as u32;
+    let age = now.saturating_sub(last_seen);
+    if age < 60 {
+        let _ = write!(s, "{}s", age);
+    } else if age < 3600 {
+        let _ = write!(s, "{}m", age / 60);
+    } else if age < 86_400 {
+        let _ = write!(s, "{}h", age / 3600);
+    } else {
+        let _ = write!(s, "{}d", age / 86_400);
+    }
+    s
+}
+
+fn format_bw(bw_khz: u32) -> String<10> {
+    let hz = crate::companion::usb::bw_khz_to_hz(bw_khz);
+    let mut s: String<10> = String::new();
+    if hz % 1000 == 0 {
+        let _ = write!(s, "{}", hz / 1000);
+    } else if hz % 100 == 0 {
+        let _ = write!(s, "{}.{}", hz / 1000, (hz % 1000) / 100);
+    } else {
+        let _ = write!(s, "{}.{:02}", hz / 1000, (hz % 1000) / 10);
+    }
+    s
+}
+
+fn text_width(text: &str, char_w: i32) -> i32 {
+    text.chars().count() as i32 * char_w
+}
+
+fn draw_text(fb: &mut EpdFrameBuffer, text: &str, x: i32, y: i32, style: SmallStyle) {
+    let _ = Text::new(text, Point::new(x, y), style).draw(fb);
+}
+
+fn draw_right(fb: &mut EpdFrameBuffer, text: &str, y: i32, style: SmallStyle) {
+    let x = DISP_W - 2 - text_width(text, SMALL_W);
+    draw_text(fb, text, x, y, style);
+}
+
+fn draw_centered(fb: &mut EpdFrameBuffer, text: &str, y: i32, style: SmallStyle) {
+    let x = ((DISP_W - text_width(text, SMALL_W)) / 2).max(0);
+    draw_text(fb, text, x, y, style);
+}
+
+/// Backward compatibility helper for render_dashboard.
 pub fn render_dashboard(node: &CompanionNode, fb: &mut EpdFrameBuffer) {
     render_page(node.current_page, node, fb);
 }
