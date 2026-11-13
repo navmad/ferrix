@@ -84,7 +84,7 @@ fn cr_from_u8(cr: u8) -> CodingRate {
     }
 }
 
-/// MeshCore uses 32 preamble symbols for SF <= 8, otherwise 16.
+/// the reference firmware parity: longer preamble for SF <= 8 (32 symbols), 16 otherwise.
 fn preamble_for(sf: u8) -> u16 {
     if sf <= 8 {
         32
@@ -161,12 +161,13 @@ pub async fn lora_phy_task(
     // Note: ThinkNode M1 SX1262 uses internal DIO2 RF switch control, so rf_switch pins are None
     let iv = GenericSx126xInterfaceVariant::new(reset, dio1, busy, None, None).unwrap();
 
-    // 4. Configure SX1262: 3.3V TCXO, DCDC enabled, high-power PA
+    // 4. Configure SX1262: 1.8V TCXO (matches MeshCore ThinkNode M1),
+    //    DCDC enabled, and RX boosted gain for ~3 dB better sensitivity.
     let config = Sx126xConfig {
         chip: Sx1262,
-        tcxo_ctrl: Some(TcxoCtrlVoltage::Ctrl3V3),
+        tcxo_ctrl: Some(TcxoCtrlVoltage::Ctrl1V8),
         use_dcdc: true,
-        rx_boost: false,
+        rx_boost: true,
     };
 
     let radio_kind = Sx126x::new(spi_device, iv, config);

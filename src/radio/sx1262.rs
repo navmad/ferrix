@@ -119,9 +119,10 @@ impl<'a, T: embassy_nrf::spim::Instance> Sx1262<'a, T> {
         // 1. Enter Standby RC mode
         self.write_cmd(CMD_SET_STANDBY, &[STDBY_RC]).await?;
 
-        // 2. Configure TCXO on DIO3 @ 3.3V with 5ms startup delay (0x0140 = 320 * 15.625us)
-        info!("Enabling TCXO power via DIO3 (3.3V)...");
-        self.write_cmd(CMD_SET_DIO3_AS_TCXO_CTRL, &[TCXO_CTRL_3_3V, 0x00, 0x01, 0x40]).await?;
+        // 2. Configure TCXO on DIO3 @ 1.8V with 10ms startup delay
+        //    (matches MeshCore ThinkNode M1; 0x0280 = 640 * 15.625us)
+        info!("Enabling TCXO power via DIO3 (1.8V)...");
+        self.write_cmd(CMD_SET_DIO3_AS_TCXO_CTRL, &[TCXO_CTRL_1_8V, 0x00, 0x02, 0x80]).await?;
 
         // Switch to STDBY_XOSC to start TCXO oscillator
         self.write_cmd(CMD_SET_STANDBY, &[STDBY_XOSC]).await?;

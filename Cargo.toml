@@ -9,6 +9,12 @@ default-members = ["."]
 [patch."https://github.com/embassy-rs/nrf-softdevice.git"]
 nrf-softdevice = { path = "vendor/nrf-softdevice/nrf-softdevice" }
 
+# Local patch: lora-phy 3.0.1 enables LDRO with a hard-coded SF/bandwidth table
+# that is only correct at 125 kHz. the reference firmware computes it from the symbol time, so
+# SF10-12 at 62.5 kHz did not interoperate. See vendor/lora-phy/PATCHES.md.
+[patch.crates-io]
+lora-phy = { path = "vendor/lora-phy" }
+
 [package]
 name = "ferrix"
 version = "0.1.0"
