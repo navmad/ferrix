@@ -739,6 +739,12 @@ async fn main(spawner: Spawner) {
                             hashes.len(),
                             snrs.len()
                         );
+                        crate::companion::protocol::note_trace_rx(
+                            tag,
+                            flags,
+                            hashes.len(),
+                            snrs.len(),
+                        );
                         let mut push = heapless::Vec::<u8, 256>::new();
                         let _ = push.push(
                             crate::companion::protocol::PUSH_CODE_TRACE_DATA,

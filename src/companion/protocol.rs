@@ -78,6 +78,26 @@ pub static ADVERT_LAST_KEY: AtomicU32 = AtomicU32::new(0);
 pub static ADVERT_LAST_TS: AtomicU32 = AtomicU32::new(0);
 pub static ADVERT_LAST_HAD_BLOB: AtomicBool = AtomicBool::new(false);
 
+/// Last TRACE command sent to the app and last TRACE received.
+pub static TRACE_TX_COUNT: AtomicU32 = AtomicU32::new(0);
+pub static TRACE_TX_TAG: AtomicU32 = AtomicU32::new(0);
+pub static TRACE_TX_FLAGS: AtomicU8 = AtomicU8::new(0);
+pub static TRACE_TX_PATH_LEN: AtomicU8 = AtomicU8::new(0);
+pub static TRACE_TX_PATH: AtomicU32 = AtomicU32::new(0);
+pub static TRACE_RX_COUNT: AtomicU32 = AtomicU32::new(0);
+pub static TRACE_RX_TAG: AtomicU32 = AtomicU32::new(0);
+pub static TRACE_RX_FLAGS: AtomicU8 = AtomicU8::new(0);
+pub static TRACE_RX_HASHES: AtomicU8 = AtomicU8::new(0);
+pub static TRACE_RX_SNRS: AtomicU8 = AtomicU8::new(0);
+
+pub fn note_trace_rx(tag: u32, flags: u8, hashes: usize, snrs: usize) {
+    TRACE_RX_COUNT.fetch_add(1, Ordering::Relaxed);
+    TRACE_RX_TAG.store(tag, Ordering::Relaxed);
+    TRACE_RX_FLAGS.store(flags, Ordering::Relaxed);
+    TRACE_RX_HASHES.store(hashes.min(255) as u8, Ordering::Relaxed);
+    TRACE_RX_SNRS.store(snrs.min(255) as u8, Ordering::Relaxed);
+}
+
 pub fn note_advert(pub_key: &[u8; 32], timestamp: u32, had_blob: bool) {
     ADVERT_COUNT.fetch_add(1, Ordering::Relaxed);
     ADVERT_LAST_HAD_BLOB.store(had_blob, Ordering::Relaxed);
@@ -1858,6 +1878,20 @@ impl CompanionNode {
             }
 
             CMD_SEND_TRACE_PATH => {
+                TRACE_TX_COUNT.fetch_add(1, Ordering::Relaxed);
+                if payload.len() >= 10 {
+                    TRACE_TX_TAG.store(
+                        u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]),
+                        Ordering::Relaxed,
+                    );
+                    TRACE_TX_FLAGS.store(payload[9], Ordering::Relaxed);
+                    let plen = payload.len() - 10;
+                    TRACE_TX_PATH_LEN.store(plen.min(255) as u8, Ordering::Relaxed);
+                    let mut path0 = [0u8; 4];
+                    let n = plen.min(4);
+                    path0[..n].copy_from_slice(&payload[10..10 + n]);
+                    TRACE_TX_PATH.store(u32::from_le_bytes(path0), Ordering::Relaxed);
+                }
                 let mut resp = Vec::<u8, 10>::new();
                 let mut reply = None;
                 if payload.len() > 10 {

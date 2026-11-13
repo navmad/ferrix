@@ -1416,6 +1416,28 @@ async fn handle_text_cli(
             );
             let _ = write_all(sender, s.as_bytes()).await;
         }
+        "stats-trace" => {
+            let mut s: heapless::String<160> = heapless::String::new();
+            let _ = write!(
+                s,
+                "  -> tx {} tag {:08x} flags {} path_len {} path0 {:08x}\r\n",
+                crate::companion::protocol::TRACE_TX_COUNT.load(core::sync::atomic::Ordering::Relaxed),
+                crate::companion::protocol::TRACE_TX_TAG.load(core::sync::atomic::Ordering::Relaxed),
+                crate::companion::protocol::TRACE_TX_FLAGS.load(core::sync::atomic::Ordering::Relaxed),
+                crate::companion::protocol::TRACE_TX_PATH_LEN.load(core::sync::atomic::Ordering::Relaxed),
+                crate::companion::protocol::TRACE_TX_PATH.load(core::sync::atomic::Ordering::Relaxed)
+            );
+            let _ = write!(
+                s,
+                "  -> rx {} tag {:08x} flags {} hashes {} snrs {}\r\n",
+                crate::companion::protocol::TRACE_RX_COUNT.load(core::sync::atomic::Ordering::Relaxed),
+                crate::companion::protocol::TRACE_RX_TAG.load(core::sync::atomic::Ordering::Relaxed),
+                crate::companion::protocol::TRACE_RX_FLAGS.load(core::sync::atomic::Ordering::Relaxed),
+                crate::companion::protocol::TRACE_RX_HASHES.load(core::sync::atomic::Ordering::Relaxed),
+                crate::companion::protocol::TRACE_RX_SNRS.load(core::sync::atomic::Ordering::Relaxed)
+            );
+            let _ = write_all(sender, s.as_bytes()).await;
+        }
         "stats-adverts" => {
             let (cursor, pending, erase_pending) = crate::storage::adverts::stats();
             let mut s: heapless::String<96> = heapless::String::new();
