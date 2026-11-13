@@ -1427,9 +1427,10 @@ async fn handle_text_cli(
             );
             let _ = write!(
                 s,
-                "  -> messages: {} records / {} page erases\r\n",
+                "  -> messages: {} records / {} page erases / {} queued\r\n",
                 crate::storage::messages::RECORD_SAVES.load(Relaxed),
-                crate::storage::messages::PAGE_ERASES.load(Relaxed)
+                crate::storage::messages::PAGE_ERASES.load(Relaxed),
+                crate::storage::messages::QUEUED.load(Relaxed)
             );
             let _ = write!(
                 s,
@@ -1578,7 +1579,15 @@ async fn handle_text_cli(
                 0 => { let _ = write!(s, "  -> BLE: Not started\r\n"); }
                 1 => { let _ = write!(s, "  -> BLE: Probing SoftDevice...\r\n"); }
                 2 => { let _ = write!(s, "  -> BLE: SoftDevice enabled, setting vector table...\r\n"); }
-                3 => { let _ = write!(s, "  -> BLE: Active & Advertising (MeshCore-M1 NUS)\r\n"); }
+                3 => {
+                    let connected = crate::companion::ble::BLE_CONNECTED
+                        .load(core::sync::atomic::Ordering::Relaxed);
+                    let _ = write!(
+                        s,
+                        "  -> BLE: Active (MeshCore-M1 NUS), connected: {}\r\n",
+                        connected
+                    );
+                }
                 code if code >= 0x1000 => {
                     let w0 = unsafe { *(0x1000 as *const u32) };
                     let w1 = unsafe { *(0x1004 as *const u32) };

@@ -30,6 +30,8 @@ const REGION: Range<u32> = 0x000C_C000..0x000E_C000;
 /// Completed record writes and page erases since boot.
 pub static RECORD_SAVES: AtomicU32 = AtomicU32::new(0);
 pub static PAGE_ERASES: AtomicU32 = AtomicU32::new(0);
+/// Records currently held by the flash queue.
+pub static QUEUED: AtomicU32 = AtomicU32::new(0);
 
 fn open(flash: &mut Flash) -> MessageQueue<'_> {
     QueueStorage::new(
@@ -156,6 +158,7 @@ pub async fn load(flash: &mut Flash) {
             }
         }
     }
+    QUEUED.store(count.min(MAX_MESSAGES) as u32, Ordering::Relaxed);
     info!("Persistence: loaded {} messages from queue", count);
 }
 
@@ -175,6 +178,7 @@ pub async fn append(flash: &mut Flash, msg: &ReceivedMessage) {
     match queue.push(&aligned.0[..len], true).await {
         Ok(()) => {
             RECORD_SAVES.fetch_add(1, Ordering::Relaxed);
+            QUEUED.fetch_add(1, Ordering::Relaxed);
         }
         Err(e) => error!("Persistence: message queue push failed: {:?}", e),
     }
@@ -184,8 +188,14 @@ pub async fn append(flash: &mut Flash, msg: &ReceivedMessage) {
 pub async fn consume(flash: &mut Flash) {
     let mut buf = [0u8; MESSAGE_RECORD_MAX];
     let mut queue = open(flash);
-    if let Err(e) = queue.pop(&mut buf).await {
-        error!("Persistence: message queue pop failed: {:?}", e);
+    match queue.pop(&mut buf).await {
+        Ok(Some(_)) => {
+            let _ = QUEUED.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some(n.saturating_sub(1))
+            });
+        }
+        Ok(None) => {}
+        Err(e) => error!("Persistence: message queue pop failed: {:?}", e),
     }
 }
 
@@ -194,5 +204,7 @@ pub async fn clear(flash: &mut Flash) {
     let mut queue = open(flash);
     if let Err(e) = queue.erase_all().await {
         error!("Persistence: message queue clear failed: {:?}", e);
+    } else {
+        QUEUED.store(0, Ordering::Relaxed);
     }
 }
