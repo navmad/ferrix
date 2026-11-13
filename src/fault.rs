@@ -219,6 +219,35 @@ pub fn record_panic(info: &core::panic::PanicInfo) {
     rec.magic = PANIC_MAGIC;
 }
 
+/// Record a `defmt::panic!` / `defmt::unwrap!` failure. `lr` is the return
+/// address captured at entry to our `_defmt_panic` hook: because
+/// `defmt::export::panic()` is `#[inline(always)]`, this points at the exact
+/// call site inside the failing expression.
+pub fn record_defmt_panic(lr: u32) {
+    let rec = record_mut();
+    let previous_budget = if rec.magic == PANIC_MAGIC {
+        rec.reset_budget
+    } else {
+        0
+    };
+
+    capture_context(rec);
+    capture_rtt(rec);
+
+    rec.magic = 0;
+    rec.line = 0;
+    rec.column = 0;
+    rec.pc = lr;
+    let msg = b"defmt panic: caller is pc";
+    rec.msg[..msg.len()].copy_from_slice(msg);
+    rec.msg_len = msg.len() as u8;
+    let file = b"defmt-hook";
+    rec.file[..file.len()].copy_from_slice(file);
+    rec.file_len = file.len() as u8;
+    rec.reset_budget = previous_budget.saturating_add(1);
+    rec.magic = PANIC_MAGIC;
+}
+
 /// Record a HardFault, including the faulting PC.
 pub fn record_hardfault(pc: u32, lr: u32) {
     let rec = record_mut();

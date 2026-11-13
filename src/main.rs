@@ -179,6 +179,20 @@ fn fatal_finish(burst: u32) -> ! {
     }
 }
 
+/// defmt's `panic!`/`unwrap!`/`assert!` macros log a message and then call
+/// `_defmt_panic`. Override the default hook so we can capture the return
+/// address, which points directly at the failing expression.
+#[defmt::panic_handler]
+fn defmt_panic() -> ! {
+    let lr: u32;
+    // SAFETY: reading LR has no side effects.
+    unsafe {
+        core::arch::asm!("mov {}, lr", out(reg) lr);
+    }
+    crate::fault::record_defmt_panic(lr);
+    fatal_finish(3)
+}
+
 /// Custom panic handler.
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
