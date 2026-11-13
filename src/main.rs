@@ -17,6 +17,7 @@ use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_nrf::bind_interrupts;
 use embassy_nrf::peripherals;
+use embassy_nrf::saadc;
 use embassy_nrf::spim::{self, Spim};
 use embassy_nrf::usb;
 use embassy_time::Timer;
@@ -36,6 +37,7 @@ bind_interrupts!(struct Irqs {
     USBD => usb::InterruptHandler<peripherals::USBD>;
     TWISPI0 => spim::InterruptHandler<peripherals::TWISPI0>;
     TWISPI1 => spim::InterruptHandler<peripherals::TWISPI1>;
+    SAADC => saadc::InterruptHandler;
 });
 
 static VBUS_DETECT: StaticCell<embassy_nrf::usb::vbus_detect::SoftwareVbusDetect> = StaticCell::new();
@@ -190,8 +192,19 @@ async fn main(spawner: Spawner) {
     embassy_nrf::interrupt::USBD.set_priority(Priority::P3);
     embassy_nrf::interrupt::TWISPI0.set_priority(Priority::P3);
     embassy_nrf::interrupt::TWISPI1.set_priority(Priority::P3);
+    embassy_nrf::interrupt::SAADC.set_priority(Priority::P3);
 
     let mut board = CurrentBoard::init(p);
+
+    // Battery ADC: ThinkNode M1 AIN2 (P0.04), 150K+150K divider (2:1).
+    // `single_ended` defaults to gain 1/6 and the internal 0.6 V reference,
+    // which is the 3.6 V full-scale range the reference firmware's multiplier assumes.
+    let mut battery_adc = saadc::Saadc::new(
+        board.saadc,
+        Irqs,
+        saadc::Config::default(),
+        [saadc::ChannelConfig::single_ended(board.bat_adc_pin)],
+    );
 
     // Initialize persistent configuration from flash
     let (node_name, custom_key) = crate::storage::init_config();
@@ -319,6 +332,7 @@ async fn main(spawner: Spawner) {
     board.telemetry.blue_led.set_low();
 
     let mut rx_buf = [0u8; 256];
+    let mut battery_buf = [0i16; 1];
     let mut tick = 0u32;
     let mut page_turns = 0u32;
 
@@ -834,6 +848,16 @@ async fn main(spawner: Spawner) {
 
         Timer::after_millis(20).await;
         tick = tick.wrapping_add(1);
+
+        // Sample the battery every ~10 seconds (500 * 20 ms loop).
+        if tick % 500 == 0 && CurrentBoard::HAS_BATTERY_ADC {
+            battery_adc.sample(&mut battery_buf).await;
+            let raw = battery_buf[0].max(0) as u16;
+            let mv = crate::telemetry::adc_raw_to_battery_millivolts(raw);
+            crate::telemetry::set_battery_millivolts(mv);
+            node.battery_millivolts = mv;
+            node.battery_percentage = crate::telemetry::millivolts_to_percentage(mv);
+        }
 
         // Heartbeat LED flash every 2 seconds
         if tick % 100 == 0 {

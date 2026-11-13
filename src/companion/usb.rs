@@ -753,7 +753,7 @@ async fn handle_text_cli(
                 let mut hdr = heapless::String::<64>::new();
                 let _ = write!(hdr, "  -> Discovered Contacts ({}):\r\n", count);
                 let _ = write_all(sender, hdr.as_bytes()).await;
-                let _ = write_all(sender, b"  -> ID        TYPE  CALLSIGN        RSSI     SNR   BAT   SEEN\r\n").await;
+                let _ = write_all(sender, b"  -> ID        TYPE  CALLSIGN        RSSI     SNR   LAT        LON        SEEN\r\n").await;
                 for idx in 0..count {
                     let Some(c) = DISCOVERED_CONTACTS.lock(|c| c.borrow().get(idx).cloned()) else {
                         continue;
@@ -767,7 +767,7 @@ async fn handle_text_cli(
                     let mut s = heapless::String::<128>::new();
                     let _ = write!(
                         s,
-                        "  -> {:02x}{:02x}{:02x}{:02x}  {:<4}  {:<14}  {:>4}dBm  {:>3}dB  {:>3}% {:>3}%  {}s\r\n",
+                        "  -> {:02x}{:02x}{:02x}{:02x}  {:<4}  {:<14}  {:>4}dBm  {:>3}dB  {:>10} {:>10}  {}s\r\n",
                         c.node_id[0], c.node_id[1], c.node_id[2], c.node_id[3],
                         ty,
                         c.callsign.as_str(),
@@ -841,8 +841,17 @@ async fn handle_text_cli(
         }
         "stats-core" => {
             let uptime = embassy_time::Instant::now().as_secs();
+            let mv = crate::telemetry::battery_millivolts();
+            let pct = crate::telemetry::battery_percentage();
             let mut s: heapless::String<128> = heapless::String::new();
-            let _ = write!(s, "  -> {{\"battery_mv\":4120,\"uptime_secs\":{},\"errors\":0,\"queue_len\":0}}\r\n", uptime);
+            let _ = write!(s, "  -> {{\"battery_mv\":{},\"battery_pct\":{},\"uptime_secs\":{},\"errors\":0,\"queue_len\":0}}\r\n", mv, pct, uptime);
+            let _ = write_all(sender, s.as_bytes()).await;
+        }
+        "battery" | "get battery" | "batt" | "get batt" => {
+            let mv = crate::telemetry::battery_millivolts();
+            let pct = crate::telemetry::battery_percentage();
+            let mut s: heapless::String<64> = heapless::String::new();
+            let _ = write!(s, "  -> {} mV ({}%)\r\n", mv, pct);
             let _ = write_all(sender, s.as_bytes()).await;
         }
         "stats-packets" => {

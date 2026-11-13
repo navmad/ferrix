@@ -261,6 +261,11 @@ impl CompanionNode {
             return;
         }
 
+        // Refresh the battery snapshot from the shared telemetry state (the
+        // ADC is sampled by the main loop).
+        self.battery_millivolts = crate::telemetry::battery_millivolts();
+        self.battery_percentage = crate::telemetry::battery_percentage();
+
         let cmd = payload[0];
         // NOTE: this runs in `command_fut` (normal task context), never inside
         // the SoftDevice GATT callback. Logging is therefore safe here.
