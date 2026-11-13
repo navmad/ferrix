@@ -1650,11 +1650,27 @@ pub async fn cdc_acm_task(
             reboot_to_bootloader();
         }
 
+        // Pushes are only written once the host has used the framed companion
+        // protocol. A text CLI session must not receive binary frames.
+        let mut binary_session = false;
+        frame_reader.reset();
+        in_binary_mode = false;
+
         loop {
             let changed_fut = control.control_changed();
             let mut rx_buf = [0u8; 64];
             let read_fut = receiver.read_packet(&mut rx_buf);
-            let push_fut = crate::companion::ble::COMPANION_PUSH_CHANNEL.receive();
+            let push_fut = async {
+                if binary_session {
+                    Some(
+                        crate::companion::ble::COMPANION_PUSH_CHANNEL
+                            .receive()
+                            .await,
+                    )
+                } else {
+                    core::future::pending::<Option<heapless::Vec<u8, 256>>>().await
+                }
+            };
 
             match embassy_futures::select::select3(changed_fut, read_fut, push_fut).await {
                 embassy_futures::select::Either3::First(_) => {
@@ -1664,12 +1680,13 @@ pub async fn cdc_acm_task(
                         reboot_to_bootloader();
                     }
                 }
-                embassy_futures::select::Either3::Third(msg) => {
+                embassy_futures::select::Either3::Third(Some(msg)) => {
                     let mut out_frame = [0u8; 300];
                     if let Ok(flen) = encode_usb_frame(&msg, &mut out_frame) {
                         let _ = write_all(&mut sender, &out_frame[..flen]).await;
                     }
                 }
+                embassy_futures::select::Either3::Third(None) => {}
                 embassy_futures::select::Either3::Second(read_res) => {
                     match read_res {
                         Ok(n) => {
@@ -1685,6 +1702,7 @@ pub async fn cdc_acm_task(
                                 // 1. Binary Frame Mode (`< [len_lo] [len_hi] [payload]`)
                                 if in_binary_mode || b == USB_INBOUND_DELIMITER {
                                     in_binary_mode = true;
+                                    binary_session = true;
                                     if let Some(payload) = frame_reader.push_byte(b) {
                                         in_binary_mode = false;
                                         if payload.first() == Some(&crate::companion::protocol::CMD_GET_CONTACTS) {
@@ -1706,6 +1724,9 @@ pub async fn cdc_acm_task(
                                     }
                                 } else {
                                     // 2. Repeater Text CLI Mode (`meshcore-cli -r`)
+                                    // Any text byte switches this connection out of
+                                    // companion mode, so pushes stop immediately.
+                                    binary_session = false;
                                     if b == b'\r' || b == b'\n' {
                                         if text_line_len > 0 {
                                             let cmd_str = core::str::from_utf8(&text_line_buf[..text_line_len]).unwrap_or("");
