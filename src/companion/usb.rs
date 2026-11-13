@@ -1368,7 +1368,7 @@ pub async fn cdc_acm_task(
     );
 
     let mut frame_reader = UsbFrameReader::new();
-    let mut text_line_buf = [0u8; 128];
+    let mut text_line_buf = [0u8; 256];
     let mut text_line_len = 0usize;
     let mut in_binary_mode = false;
 
