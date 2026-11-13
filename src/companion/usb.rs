@@ -718,13 +718,20 @@ async fn handle_text_cli(
                 let mut hdr = heapless::String::<64>::new();
                 let _ = write!(hdr, "  -> Discovered Contacts ({}):\r\n", contacts_snapshot.len());
                 let _ = write_all(sender, hdr.as_bytes()).await;
-                let _ = write_all(sender, b"  -> ID        CALLSIGN        RSSI     SNR   BAT   SEEN\r\n").await;
+                let _ = write_all(sender, b"  -> ID        TYPE  CALLSIGN        RSSI     SNR   BAT   SEEN\r\n").await;
                 for c in contacts_snapshot.iter() {
+                    let ty = match c.contact_type {
+                        2 => "RPT",
+                        3 => "ROOM",
+                        4 => "SENS",
+                        _ => "CHAT",
+                    };
                     let mut s = heapless::String::<128>::new();
                     let _ = write!(
                         s,
-                        "  -> {:02x}{:02x}{:02x}{:02x}  {:<14}  {:>4}dBm  {:>3}dB  {:>3}% {:>3}%  {}s\r\n",
+                        "  -> {:02x}{:02x}{:02x}{:02x}  {:<4}  {:<14}  {:>4}dBm  {:>3}dB  {:>3}% {:>3}%  {}s\r\n",
                         c.node_id[0], c.node_id[1], c.node_id[2], c.node_id[3],
+                        ty,
                         c.callsign.as_str(),
                         c.rssi, c.snr, c.latitude, c.longitude, c.last_seen_epoch
                     );
