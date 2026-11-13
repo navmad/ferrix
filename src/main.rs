@@ -100,6 +100,9 @@ static EPD_FRAMEBUFFER: StaticCell<EpdFrameBuffer> = StaticCell::new();
 /// Number of page turns between full screen refreshes (clears e-ink ghosting)
 const EPD_FULL_REFRESH_INTERVAL: u32 = 9;
 
+/// Seconds the display frontlight stays on after the last button press.
+const BACKLIGHT_IDLE_SECS: u64 = 15;
+
 // ---------------------------------------------------------------------------
 // Fatal-error indicators
 //
@@ -340,6 +343,15 @@ async fn main(spawner: Spawner) {
     let mut battery_buf = [0i16; 1];
     let mut tick = 0u32;
     let mut page_turns = 0u32;
+
+    // The frontlight starts on at boot; turn it off once the user stops
+    // pressing buttons.
+    #[cfg(feature = "thinknode-m1")]
+    let mut backlight_on = true;
+    #[cfg(feature = "thinknode-m1")]
+    let mut backlight_deadline = embassy_time::Instant::now()
+        .checked_add(embassy_time::Duration::from_secs(BACKLIGHT_IDLE_SECS))
+        .unwrap();
 
     loop {
         // Poll for incoming LoRa packets
@@ -802,6 +814,18 @@ async fn main(spawner: Spawner) {
 
         // Poll semantic input events (buttons, D-pads, gestures)
         if let Some(event) = board.inputs.poll_event().await {
+            // Any interaction wakes the frontlight and restarts its idle timer.
+            #[cfg(feature = "thinknode-m1")]
+            {
+                backlight_on = true;
+                backlight_deadline = embassy_time::Instant::now()
+                    .checked_add(embassy_time::Duration::from_secs(BACKLIGHT_IDLE_SECS))
+                    .unwrap();
+                if let Some(d) = &mut display {
+                    d.set_backlight(true);
+                }
+            }
+
             match event {
                 InputEvent::NextPage => {
                     info!("Input: Next Page requested");
@@ -859,6 +883,15 @@ async fn main(spawner: Spawner) {
 
         Timer::after_millis(20).await;
         tick = tick.wrapping_add(1);
+
+        // Turn the frontlight off after 15 s of no button presses.
+        #[cfg(feature = "thinknode-m1")]
+        if backlight_on && embassy_time::Instant::now() >= backlight_deadline {
+            if let Some(d) = &mut display {
+                d.set_backlight(false);
+            }
+            backlight_on = false;
+        }
 
         // Sample the battery every ~10 seconds (500 * 20 ms loop).
         if tick % 500 == 0 && CurrentBoard::HAS_BATTERY_ADC {

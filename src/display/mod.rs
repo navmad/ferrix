@@ -39,6 +39,11 @@ impl<'a, T: embassy_nrf::spim::Instance> ThinkNodeDisplay<'a, T> {
     pub fn new(epd: Ssd1681<'a, T>, fb: &'static mut EpdFrameBuffer) -> Self {
         Self { epd, fb }
     }
+
+    /// Turn the frontlight/backlight on or off.
+    pub fn set_backlight(&mut self, enabled: bool) {
+        self.epd.set_backlight(enabled);
+    }
 }
 
 impl<'a, T: embassy_nrf::spim::Instance> NodeDisplay for ThinkNodeDisplay<'a, T> {
