@@ -1319,16 +1319,63 @@ impl CompanionNode {
                                         adv.pub_key[2],
                                         adv.pub_key[3],
                                     ];
+                                    let last_seen_epoch =
+                                        crate::companion::usb::get_device_time();
+                                    let contact_type =
+                                        CompanionNode::get_contact_type_from_flags(adv.flags);
+
+                                    // The reference loops the imported advert back
+                                    // through the receive path, which also emits the
+                                    // discovery push the app expects.
+                                    let existing = crate::companion::usb::DISCOVERED_CONTACTS
+                                        .lock(|c| {
+                                            c.borrow()
+                                                .iter()
+                                                .find(|ct| ct.pub_key == adv.pub_key)
+                                                .map(|ct| ct.last_advert_ts)
+                                        });
+                                    if existing.map_or(true, |ts| adv.timestamp > ts) {
+                                        let mut frame = Vec::<u8, 256>::new();
+                                        if existing.is_some() {
+                                            let _ = frame.push(PUSH_CODE_ADVERT);
+                                            let _ = frame.extend_from_slice(&adv.pub_key);
+                                        } else {
+                                            let discovered =
+                                                crate::meshcore::mesh::DiscoveredContact {
+                                                    pub_key: adv.pub_key,
+                                                    callsign: callsign.clone(),
+                                                    node_id,
+                                                    last_seen_epoch,
+                                                    rssi: 0,
+                                                    snr: 0,
+                                                    latitude: adv.latitude,
+                                                    longitude: adv.longitude,
+                                                    flags: 0,
+                                                    contact_type,
+                                                    out_path,
+                                                    out_path_len: pkt.path_len,
+                                                    last_advert_ts: adv.timestamp,
+                                                };
+                                            let record = serialize_contact(&discovered);
+                                            let _ = frame.push(PUSH_CODE_NEW_ADVERT);
+                                            let _ = frame.extend_from_slice(&record[1..]);
+                                        }
+                                        let _ =
+                                            crate::companion::ble::COMPANION_PUSH_CHANNEL
+                                                .try_send(frame);
+                                    }
+
                                     ok = crate::companion::ble::CONTACT_OP_CHANNEL
                                         .try_send(crate::companion::ble::ContactOperation::AddOrUpdate {
                                             pub_key: adv.pub_key,
                                             callsign,
                                             node_id,
-                                            last_seen_epoch: crate::companion::usb::get_device_time(),
+                                            last_seen_epoch,
                                             latitude: adv.latitude,
                                             longitude: adv.longitude,
-                                            flags: adv.flags,
-                                            contact_type: CompanionNode::get_contact_type_from_flags(adv.flags),
+                                            // Imported adverts carry no contact flags.
+                                            flags: 0,
+                                            contact_type,
                                             out_path,
                                             out_path_len: pkt.path_len,
                                             last_advert_ts: adv.timestamp,

@@ -1571,6 +1571,12 @@ pub async fn cdc_acm_task(
     loop {
         receiver.wait_connection().await;
         info!("USB CDC-ACM Connected");
+        // Drop pushes left over from a previous session so a new app never
+        // receives stale events (matches the BLE disconnect drain).
+        while crate::companion::ble::COMPANION_PUSH_CHANNEL
+            .try_receive()
+            .is_ok()
+        {}
 
         if receiver.line_coding().data_rate() == 1200 {
             embassy_time::Timer::after_millis(150).await;
@@ -1581,16 +1587,23 @@ pub async fn cdc_acm_task(
             let changed_fut = control.control_changed();
             let mut rx_buf = [0u8; 64];
             let read_fut = receiver.read_packet(&mut rx_buf);
+            let push_fut = crate::companion::ble::COMPANION_PUSH_CHANNEL.receive();
 
-            match embassy_futures::select::select(changed_fut, read_fut).await {
-                embassy_futures::select::Either::First(_) => {
+            match embassy_futures::select::select3(changed_fut, read_fut, push_fut).await {
+                embassy_futures::select::Either3::First(_) => {
                     let rate = receiver.line_coding().data_rate();
                     if rate == 1200 {
                         embassy_time::Timer::after_millis(150).await;
                         reboot_to_bootloader();
                     }
                 }
-                embassy_futures::select::Either::Second(read_res) => {
+                embassy_futures::select::Either3::Third(msg) => {
+                    let mut out_frame = [0u8; 300];
+                    if let Ok(flen) = encode_usb_frame(&msg, &mut out_frame) {
+                        let _ = write_all(&mut sender, &out_frame[..flen]).await;
+                    }
+                }
+                embassy_futures::select::Either3::Second(read_res) => {
                     match read_res {
                         Ok(n) => {
                             let rate = receiver.line_coding().data_rate();

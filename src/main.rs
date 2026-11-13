@@ -54,6 +54,29 @@ static PENDING_MESSAGE_ACKS: embassy_sync::blocking_mutex::Mutex<
     core::cell::RefCell<heapless::Vec<PendingMessageAck, 8>>,
 > = embassy_sync::blocking_mutex::Mutex::new(core::cell::RefCell::new(heapless::Vec::new()));
 
+/// Tell the app that a contact was discovered (full record) or re-advertised.
+fn push_new_advert(ct: &crate::meshcore::mesh::DiscoveredContact) {
+    let record = crate::companion::protocol::serialize_contact(ct);
+    let mut frame = heapless::Vec::<u8, 256>::new();
+    let _ = frame.push(crate::companion::protocol::PUSH_CODE_NEW_ADVERT);
+    let _ = frame.extend_from_slice(&record[1..]);
+    let _ = crate::companion::ble::COMPANION_PUSH_CHANNEL.try_send(frame);
+}
+
+fn push_advert(pub_key: &[u8; 32]) {
+    let mut frame = heapless::Vec::<u8, 256>::new();
+    let _ = frame.push(crate::companion::protocol::PUSH_CODE_ADVERT);
+    let _ = frame.extend_from_slice(pub_key);
+    let _ = crate::companion::ble::COMPANION_PUSH_CHANNEL.try_send(frame);
+}
+
+fn push_path_updated(pub_key: &[u8; 32]) {
+    let mut frame = heapless::Vec::<u8, 256>::new();
+    let _ = frame.push(crate::companion::protocol::PUSH_CODE_PATH_UPDATED);
+    let _ = frame.extend_from_slice(pub_key);
+    let _ = crate::companion::ble::COMPANION_PUSH_CHANNEL.try_send(frame);
+}
+
 fn track_pending_ack(crc: u32) {
     let now = embassy_time::Instant::now().as_millis();
     PENDING_MESSAGE_ACKS.lock(|a| {
@@ -487,86 +510,76 @@ async fn main(spawner: Spawner) {
                                 existing.snr = snr;
                                 existing.latitude = adv.latitude;
                                 existing.longitude = adv.longitude;
-                                existing.flags = adv.flags;
                                 existing.contact_type = contact_type;
-                            } else {
-                                // New contact - apply auto-add rules
-                                if !should_add {
-                                    // Contact type not enabled for auto-add, skip
-                                    return;
-                                }
+                                // Contact flags (favorite/telemetry permissions) are
+                                // independent of the advert flags; keep the stored ones.
+                                push_advert(&adv.pub_key);
+                                return;
+                            }
 
-                                // Try to add the contact
+                            // New contact. The app is told even when auto-add
+                            // declines it, matching the reference discovery flow.
+                            let mut cs = heapless::String::new();
+                            let _ = cs.push_str(adv.name.as_str());
+                            let discovered = crate::meshcore::mesh::DiscoveredContact {
+                                pub_key: adv.pub_key,
+                                callsign: cs,
+                                node_id,
+                                last_seen_epoch: node.epoch_time as u32,
+                                rssi,
+                                snr,
+                                latitude: adv.latitude,
+                                longitude: adv.longitude,
+                                // Contact flags start cleared; the advert flags
+                                // only classified `contact_type` above.
+                                flags: 0,
+                                contact_type,
+                                out_path: [0u8; 64],
+                                out_path_len: 0xFF,
+                                last_advert_ts: adv.timestamp,
+                            };
+
+                            let mut added = false;
+                            if should_add {
                                 if list.len() < list.capacity() {
-                                    // Space available
-                                    let mut cs = heapless::String::new();
-                                    let _ = cs.push_str(adv.name.as_str());
-                                    let _ = list.push(crate::meshcore::mesh::DiscoveredContact {
-                                        pub_key: adv.pub_key,
-                                        callsign: cs,
-                                        node_id,
-                                        last_seen_epoch: node.epoch_time as u32,
-                                        rssi,
-                                        snr,
-                                        latitude: adv.latitude,
-                                        longitude: adv.longitude,
-                                        flags: adv.flags,
-                                        contact_type,
-                                        out_path: [0u8; 64],
-                                        out_path_len: 0xFF,
-                                        last_advert_ts: adv.timestamp,
-                                    });
+                                    let _ = list.push(discovered.clone());
+                                    added = true;
                                 } else if node.should_overwrite_when_full() {
-                                    // List is full, find oldest non-favorite contact to overwrite
+                                    // Find the oldest non-favorite contact to overwrite.
                                     let mut oldest_idx = None;
                                     let mut oldest_lastmod = u32::MAX;
                                     for (idx, ct) in list.iter().enumerate() {
-                                        let is_favorite = (ct.flags & crate::companion::protocol::CONTACT_FLAG_FAVORITE) != 0;
+                                        let is_favorite = (ct.flags
+                                            & crate::companion::protocol::CONTACT_FLAG_FAVORITE)
+                                            != 0;
                                         if !is_favorite && ct.last_seen_epoch < oldest_lastmod {
                                             oldest_lastmod = ct.last_seen_epoch;
                                             oldest_idx = Some(idx);
                                         }
                                     }
                                     if let Some(idx) = oldest_idx {
-                                        // Send push notification that contact is being overwritten
-                                        let overwritten_key = list[idx].pub_key;
                                         let mut push = heapless::Vec::<u8, 256>::new();
-                                        let _ = push.push(crate::companion::protocol::PUSH_CODE_CONTACT_DELETED);
-                                        let _ = push.extend_from_slice(&overwritten_key);
-                                        let _ = crate::companion::ble::COMPANION_PUSH_CHANNEL.try_send(push);
-
-                                        // Replace with new contact
-                                        let mut cs = heapless::String::new();
-                                        let _ = cs.push_str(adv.name.as_str());
-                                        list[idx] = crate::meshcore::mesh::DiscoveredContact {
-                                            pub_key: adv.pub_key,
-                                            callsign: cs,
-                                            node_id,
-                                            last_seen_epoch: node.epoch_time as u32,
-                                            rssi,
-                                            snr,
-                                            latitude: adv.latitude,
-                                            longitude: adv.longitude,
-                                            flags: adv.flags,
-                                            contact_type,
-                                            out_path: [0u8; 64],
-                                            out_path_len: 0xFF,
-                                            last_advert_ts: adv.timestamp,
-                                        };
-                                    } else {
-                                        // All contacts are favorites, can't overwrite
-                                        // Send push notification that contacts list is full
-                                        let mut push = heapless::Vec::<u8, 256>::new();
-                                        let _ = push.push(crate::companion::protocol::PUSH_CODE_CONTACTS_FULL);
-                                        let _ = crate::companion::ble::COMPANION_PUSH_CHANNEL.try_send(push);
+                                        let _ = push.push(
+                                            crate::companion::protocol::PUSH_CODE_CONTACT_DELETED,
+                                        );
+                                        let _ = push.extend_from_slice(&list[idx].pub_key);
+                                        let _ =
+                                            crate::companion::ble::COMPANION_PUSH_CHANNEL.try_send(push);
+                                        list[idx] = discovered.clone();
+                                        added = true;
                                     }
-                                } else {
-                                    // List is full and overwrite is disabled
-                                    // Send push notification that contacts list is full
-                                    let mut push = heapless::Vec::<u8, 256>::new();
-                                    let _ = push.push(crate::companion::protocol::PUSH_CODE_CONTACTS_FULL);
-                                    let _ = crate::companion::ble::COMPANION_PUSH_CHANNEL.try_send(push);
                                 }
+                            }
+
+                            push_new_advert(&discovered);
+
+                            if !added && list.len() >= list.capacity() {
+                                let mut push = heapless::Vec::<u8, 256>::new();
+                                let _ = push.push(
+                                    crate::companion::protocol::PUSH_CODE_CONTACTS_FULL,
+                                );
+                                let _ =
+                                    crate::companion::ble::COMPANION_PUSH_CHANNEL.try_send(push);
                             }
                         });
                         crate::storage::request_contacts();
@@ -660,14 +673,21 @@ async fn main(spawner: Spawner) {
                             "MeshCore PATH from {:02x}{:02x}: {} hops, extra {}",
                             sender_pub[0], sender_pub[1], path.hop_count(), path.extra_type
                         );
-                        crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| {
-                            if let Some(ct) =
-                                c.borrow_mut().iter_mut().find(|ct| ct.pub_key == sender_pub)
-                            {
-                                ct.out_path = path.path;
-                                ct.out_path_len = path.path_len;
-                            }
-                        });
+                        let path_updated = crate::companion::usb::DISCOVERED_CONTACTS
+                            .lock(|c| {
+                                if let Some(ct) =
+                                    c.borrow_mut().iter_mut().find(|ct| ct.pub_key == sender_pub)
+                                {
+                                    ct.out_path = path.path;
+                                    ct.out_path_len = path.path_len;
+                                    true
+                                } else {
+                                    false
+                                }
+                            });
+                        if path_updated {
+                            push_path_updated(&sender_pub);
+                        }
                         crate::storage::request_contacts();
                         // A PATH return can carry an ACK as its extra.
                         if path.extra_type & 0x0F == 3 && path.extra.len() >= 4 {
