@@ -37,7 +37,7 @@ const LINE_H: i32 = 12;
 const SEPARATOR_Y: i32 = 28;
 /// Baseline of the first content row. Increase this to add space between the
 /// separator line and every page's content.
-const CONTENT_Y: i32 = 34;
+const CONTENT_Y: i32 = 40;
 
 type SmallStyle = MonoTextStyle<'static, BinaryColor>;
 type TitleStyle = MonoTextStyle<'static, BinaryColor>;
