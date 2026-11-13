@@ -23,7 +23,7 @@ fn make_queue() -> QueueStorage<Flash, Cache<Uncached, Uncached, Uncached>> {
 }
 
 fn record(n: u32) -> MessageRecord {
-    MessageRecord::new(
+    let mut rec = MessageRecord::new(
         (n % 4) as u8,
         1,
         n % 2 == 0,
@@ -33,7 +33,9 @@ fn record(n: u32) -> MessageRecord {
         1_700_000_000 + n,
         -(n as i16 % 100),
         (n % 20) as i8,
-    )
+    );
+    rec.txt_type = (n % 4) as u8;
+    rec
 }
 
 #[test]

@@ -1513,7 +1513,7 @@ impl CompanionNode {
                         let _ = resp.push(0);
                         let _ = resp.extend_from_slice(&msg.sender_pub[..6]);
                         let _ = resp.push(msg.path_len);
-                        let _ = resp.push(0); // TXT_TYPE_PLAIN
+                        let _ = resp.push(msg.txt_type);
                         let _ = resp.extend_from_slice(&msg.timestamp.to_le_bytes());
                         let _ = resp.extend_from_slice(msg.text.as_bytes());
                     } else {

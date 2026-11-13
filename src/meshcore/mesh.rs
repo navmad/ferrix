@@ -70,6 +70,8 @@ pub struct ReceivedMessage {
     pub rssi: i16,
     pub snr: i8,
     pub is_direct: bool,
+    /// MeshCore text type (`0` plain, `1` CLI data, `2` signed, `3` CLI command).
+    pub txt_type: u8,
 }
 
 /// Actions resulting from processing an inbound over-the-air packet

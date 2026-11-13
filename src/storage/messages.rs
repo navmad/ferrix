@@ -74,7 +74,7 @@ pub async fn queue_clear() {
 }
 
 fn message_to_record(m: &ReceivedMessage) -> MessageRecord {
-    MessageRecord::new(
+    let mut rec = MessageRecord::new(
         m.channel_idx,
         m.path_len,
         m.is_direct,
@@ -84,7 +84,9 @@ fn message_to_record(m: &ReceivedMessage) -> MessageRecord {
         m.timestamp,
         m.rssi,
         m.snr,
-    )
+    );
+    rec.txt_type = m.txt_type;
+    rec
 }
 
 fn record_to_message(r: &MessageRecord) -> ReceivedMessage {
@@ -102,6 +104,7 @@ fn record_to_message(r: &MessageRecord) -> ReceivedMessage {
         rssi: r.rssi,
         snr: r.snr,
         is_direct: r.is_direct,
+        txt_type: r.txt_type,
     }
 }
 

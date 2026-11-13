@@ -649,6 +649,7 @@ async fn main(spawner: Spawner) {
                             rssi,
                             snr,
                             is_direct: false,
+                            txt_type: grp.txt_type,
                         };
                         let dropped = crate::companion::usb::MESSAGE_LOG.lock(|m| {
                             let mut list = m.borrow_mut();
@@ -701,6 +702,7 @@ async fn main(spawner: Spawner) {
                             rssi,
                             snr,
                             is_direct: true,
+                            txt_type: msg.txt_type,
                         };
                         let dropped = crate::companion::usb::MESSAGE_LOG.lock(|m| {
                             let mut list = m.borrow_mut();

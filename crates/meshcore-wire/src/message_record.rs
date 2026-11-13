@@ -17,7 +17,7 @@
 //! 7..11  timestamp (u32)
 //! 11     sender length
 //! 12     text length
-//! 13     reserved (0)
+//! 13     text type (0 plain, 1 CLI data, 2 signed, 3 CLI command)
 //! 14..   sender public key (32 bytes, direct messages only)
 //!        sender display name
 //!        text
@@ -50,6 +50,8 @@ pub struct MessageRecord {
     pub timestamp: u32,
     pub rssi: i16,
     pub snr: i8,
+    /// MeshCore text type from the wire (0 = plain).
+    pub txt_type: u8,
 }
 
 impl Default for MessageRecord {
@@ -64,6 +66,7 @@ impl Default for MessageRecord {
             timestamp: 0,
             rssi: 0,
             snr: 0,
+            txt_type: 0,
         }
     }
 }
@@ -147,7 +150,7 @@ impl MessageRecord {
         out[7..11].copy_from_slice(&self.timestamp.to_le_bytes());
         out[11] = sender_len as u8;
         out[12] = text_len as u8;
-        out[13] = 0;
+        out[13] = self.txt_type & 0x3F;
         let mut pos = HEADER_SIZE;
         if self.is_direct {
             out[pos..pos + 32].copy_from_slice(&self.sender_pub);
@@ -181,6 +184,7 @@ impl MessageRecord {
         rec.rssi = i16::from_le_bytes(bytes[4..6].try_into().ok()?);
         rec.snr = bytes[6] as i8;
         rec.timestamp = u32::from_le_bytes(bytes[7..11].try_into().ok()?);
+        rec.txt_type = bytes[13] & 0x3F;
         let mut pos = HEADER_SIZE;
         if direct {
             rec.sender_pub.copy_from_slice(&bytes[pos..pos + 32]);
@@ -212,11 +216,14 @@ mod tests {
             -72,
             7,
         );
+        let mut record = record;
+        record.txt_type = 1; // CLI data
         let mut buf = [0u8; MESSAGE_RECORD_MAX];
         let n = record.encode(&mut buf).unwrap();
         assert_eq!(n, record.encoded_len());
         let decoded = MessageRecord::decode(&buf[..n]).unwrap();
         assert_eq!(decoded, record);
+        assert_eq!(decoded.txt_type, 1);
         assert_eq!(decoded.sender_str(), "alice");
         assert_eq!(decoded.text_str(), "hello world");
         assert_eq!(decoded.rssi, -72);
