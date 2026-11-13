@@ -492,7 +492,13 @@ async fn handle_text_cli(
             let _ = write!(s, "  -> {} (nRF52840, SX1262 LoRa)\r\n", CurrentBoard::NAME);
             let _ = write_all(sender, s.as_bytes()).await;
         }
-        "get radio" | "get freq" => {
+        "get freq" => {
+            let f = RADIO_SETTINGS.lock(|r| r.borrow().frequency_hz);
+            let mut s: heapless::String<48> = heapless::String::new();
+            let _ = write!(s, "  -> {:.3} MHz\r\n", f as f32 / 1_000_000.0);
+            let _ = write_all(sender, s.as_bytes()).await;
+        }
+        "get radio" | "radio" => {
             let (f, sf, bw, cr, tx, mode) = RADIO_SETTINGS.lock(|r| {
                 let cfg = r.borrow();
                 (cfg.frequency_hz, cfg.sf, cfg.bw_khz, cfg.cr, cfg.tx_power_dbm, cfg.path_hash_mode)
