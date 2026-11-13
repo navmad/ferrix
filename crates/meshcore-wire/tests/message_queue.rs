@@ -6,8 +6,8 @@
 //! capacity regressions without flashing a device.
 
 use futures::executor::block_on;
-use meshcore_wire::message_record::{MessageRecord, MESSAGE_RECORD_SIZE};
-use sequential_storage::cache::Cache;
+use meshcore_wire::message_record::{MessageRecord, MESSAGE_RECORD_MAX};
+use sequential_storage::cache::{Cache, Uncached};
 use sequential_storage::mock_flash::{MockFlashBase, WriteCountCheck};
 use sequential_storage::queue::{QueueConfig, QueueStorage};
 
@@ -17,7 +17,7 @@ const REGION: core::ops::Range<u32> = 0..(PAGES * PAGE_SIZE) as u32;
 
 type Flash = MockFlashBase<PAGES, 4, 1024>;
 
-fn make_queue() -> QueueStorage<Flash, Cache<sequential_storage::cache::Uncached, sequential_storage::cache::Uncached, sequential_storage::cache::Uncached, ()>> {
+fn make_queue() -> QueueStorage<Flash, Cache<Uncached, Uncached, Uncached>> {
     let flash = Flash::new(WriteCountCheck::Twice, None, false);
     QueueStorage::new(flash, QueueConfig::new(REGION), Cache::new_uncached())
 }
@@ -28,7 +28,7 @@ fn record(n: u32) -> MessageRecord {
         1,
         n % 2 == 0,
         "sender",
-        [n as u8; 32],
+        if n % 2 == 0 { [n as u8; 32] } else { [0; 32] },
         &format!("message {n}"),
         1_700_000_000 + n,
         -(n as i16 % 100),
@@ -40,16 +40,19 @@ fn record(n: u32) -> MessageRecord {
 fn fifo_roundtrip() {
     block_on(async {
         let mut queue = make_queue();
+        let mut buf = [0u8; MESSAGE_RECORD_MAX];
         for n in 0..20 {
-            queue.push(&record(n).to_bytes(), false).await.unwrap();
+            let rec = record(n);
+            let len = rec.encode(&mut buf).unwrap();
+            queue.push(&buf[..len], false).await.unwrap();
         }
-        let mut buf = [0u8; MESSAGE_RECORD_SIZE];
+        let mut out = [0u8; MESSAGE_RECORD_MAX];
         for n in 0..20 {
-            let data = queue.pop(&mut buf).await.unwrap().unwrap();
-            let decoded = MessageRecord::from_bytes(data).unwrap();
+            let data = queue.pop(&mut out).await.unwrap().unwrap();
+            let decoded = MessageRecord::decode(data).unwrap();
             assert_eq!(decoded, record(n));
         }
-        assert!(queue.pop(&mut buf).await.unwrap().is_none());
+        assert!(queue.pop(&mut out).await.unwrap().is_none());
     });
 }
 
@@ -57,16 +60,20 @@ fn fifo_roundtrip() {
 fn wraps_and_drops_oldest_when_full() {
     block_on(async {
         let mut queue = make_queue();
-        // Far more than the region can hold, so pages are erased and reused.
-        let total = 1200u32;
+        // Compact records mean the region holds thousands of messages; push
+        // well past one full ring so pages are erased and reused.
+        let total = 5000u32;
+        let mut buf = [0u8; MESSAGE_RECORD_MAX];
         for n in 0..total {
-            queue.push(&record(n).to_bytes(), true).await.unwrap();
+            let rec = record(n);
+            let len = rec.encode(&mut buf).unwrap();
+            queue.push(&buf[..len], true).await.unwrap();
         }
 
-        let mut buf = [0u8; MESSAGE_RECORD_SIZE];
+        let mut out = [0u8; MESSAGE_RECORD_MAX];
         let mut values = Vec::new();
-        while let Some(data) = queue.pop(&mut buf).await.unwrap() {
-            values.push(MessageRecord::from_bytes(data).unwrap().timestamp);
+        while let Some(data) = queue.pop(&mut out).await.unwrap() {
+            values.push(MessageRecord::decode(data).unwrap().timestamp);
         }
 
         // The newest record must still be the last one written.
@@ -74,10 +81,8 @@ fn wraps_and_drops_oldest_when_full() {
         // Dropped records must be a contiguous oldest prefix.
         let first = record(total - values.len() as u32);
         assert_eq!(values[0], first.timestamp);
-        // The queue must hold a useful number of records: roughly the region
-        // size divided by the per-item footprint.
         assert!(
-            values.len() > 400 && values.len() < 600,
+            values.len() > 1800 && values.len() < 2800,
             "unexpected capacity {}",
             values.len()
         );
@@ -88,15 +93,18 @@ fn wraps_and_drops_oldest_when_full() {
 fn iterates_without_consuming() {
     block_on(async {
         let mut queue = make_queue();
+        let mut buf = [0u8; MESSAGE_RECORD_MAX];
         for n in 0..10 {
-            queue.push(&record(n).to_bytes(), false).await.unwrap();
+            let rec = record(n);
+            let len = rec.encode(&mut buf).unwrap();
+            queue.push(&buf[..len], false).await.unwrap();
         }
-        let mut buf = [0u8; MESSAGE_RECORD_SIZE];
+        let mut out = [0u8; MESSAGE_RECORD_MAX];
         {
             let mut it = queue.iter().await.unwrap();
             let mut seen = 0u32;
-            while let Some(entry) = it.next(&mut buf).await.unwrap() {
-                let rec = MessageRecord::from_bytes(entry.into_buf()).unwrap();
+            while let Some(entry) = it.next(&mut out).await.unwrap() {
+                let rec = MessageRecord::decode(entry.into_buf()).unwrap();
                 assert_eq!(rec, record(seen));
                 seen += 1;
             }
@@ -104,6 +112,6 @@ fn iterates_without_consuming() {
         }
         // Iteration must not have removed anything.
         let mut it = queue.iter().await.unwrap();
-        assert!(it.next(&mut buf).await.unwrap().is_some());
+        assert!(it.next(&mut out).await.unwrap().is_some());
     });
 }

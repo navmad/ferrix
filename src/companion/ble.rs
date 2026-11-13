@@ -238,6 +238,7 @@ pub async fn contact_task() -> ! {
                             out_path,
                             out_path_len,
                             last_advert_ts,
+                            saved_hash: 0,
                         });
                     }
                 });
@@ -262,6 +263,7 @@ pub async fn contact_task() -> ! {
                 });
                 if removed {
                     crate::storage::adverts::forget(&pub_key);
+                    crate::storage::contacts::queue_remove(pub_key).await;
                 }
             }
         }

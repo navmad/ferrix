@@ -2187,6 +2187,7 @@ impl CompanionNode {
                                                     out_path,
                                                     out_path_len: pkt.path_len,
                                                     last_advert_ts: adv.timestamp,
+                                                    saved_hash: 0,
                                                 };
                                             let record = serialize_contact(&discovered);
                                             let _ = frame.push(PUSH_CODE_NEW_ADVERT);

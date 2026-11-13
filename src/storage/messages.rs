@@ -1,7 +1,7 @@
 //! Persistent message queue.
 //!
 //! Messages live in a wear-levelled FIFO (`sequential-storage`) over the
-//! 128 KB message region. Each message costs one fixed-size record write; a
+//! 128 KB message region. Each message costs one compact record write; a
 //! 4 KB page is erased only when the FIFO wraps into it. The previous design
 //! rewrote a ~60 KB snapshot (with a page erase) for every message.
 //!
@@ -14,15 +14,13 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use defmt::{error, info};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
-use embedded_storage_async::nor_flash::{
-    ErrorType, MultiwriteNorFlash, NorFlash, ReadNorFlash,
-};
 use heapless::String;
-use meshcore_wire::message_record::{MessageRecord, MESSAGE_RECORD_SIZE};
+use meshcore_wire::message_record::{MessageRecord, MESSAGE_RECORD_MAX};
 use nrf_softdevice::Flash;
 use sequential_storage::cache::{Cache, Uncached};
 use sequential_storage::queue::{QueueConfig, QueueStorage};
 
+use super::counted_flash::CountedFlash;
 use crate::companion::usb::{MESSAGE_LOG, MAX_MESSAGES};
 use crate::meshcore::mesh::ReceivedMessage;
 
@@ -33,55 +31,17 @@ const REGION: Range<u32> = 0x000C_C000..0x000E_C000;
 pub static RECORD_SAVES: AtomicU32 = AtomicU32::new(0);
 pub static PAGE_ERASES: AtomicU32 = AtomicU32::new(0);
 
-/// Flash wrapper that counts pages erased by the queue.
-struct CountingFlash<'a>(&'a mut Flash);
-
-impl ErrorType for CountingFlash<'_> {
-    type Error = <Flash as ErrorType>::Error;
-}
-
-impl ReadNorFlash for CountingFlash<'_> {
-    const READ_SIZE: usize = <Flash as ReadNorFlash>::READ_SIZE;
-
-    async fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
-        self.0.read(offset, bytes).await
-    }
-
-    fn capacity(&self) -> usize {
-        self.0.capacity()
-    }
-}
-
-impl NorFlash for CountingFlash<'_> {
-    const WRITE_SIZE: usize = <Flash as NorFlash>::WRITE_SIZE;
-    const ERASE_SIZE: usize = <Flash as NorFlash>::ERASE_SIZE;
-
-    async fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
-        let result = self.0.erase(from, to).await;
-        if result.is_ok() {
-            let pages = (to.saturating_sub(from) / Self::ERASE_SIZE as u32) as u32;
-            PAGE_ERASES.fetch_add(pages.max(1), Ordering::Relaxed);
-        }
-        result
-    }
-
-    async fn write(&mut self, offset: u32, bytes: &[u8]) -> Result<(), Self::Error> {
-        self.0.write(offset, bytes).await
-    }
-}
-
-impl MultiwriteNorFlash for CountingFlash<'_> {}
-
-type MessageCache = Cache<Uncached, Uncached, Uncached>;
-type MessageQueue<'a> = QueueStorage<CountingFlash<'a>, MessageCache>;
-
 fn open(flash: &mut Flash) -> MessageQueue<'_> {
     QueueStorage::new(
-        CountingFlash(flash),
+        CountedFlash::new(flash, &PAGE_ERASES),
         QueueConfig::new(REGION),
         Cache::new_uncached(),
     )
 }
+
+type MessageCache = Cache<Uncached, Uncached, Uncached>;
+type MessageQueue<'a> = QueueStorage<CountedFlash<'a>, MessageCache>;
+
 
 /// Work sent to the storage task. The storage task owns the flash, so message
 /// mutations are serialized through this channel.
@@ -163,13 +123,13 @@ pub async fn load(flash: &mut Flash) {
         }
     }
 
-    let mut buf = [0u8; MESSAGE_RECORD_SIZE];
+    let mut buf = [0u8; MESSAGE_RECORD_MAX];
     let mut count = 0usize;
     {
         match queue.iter().await {
             Ok(mut iter) => {
                 while let Ok(Some(entry)) = iter.next(&mut buf).await {
-                    let Some(rec) = MessageRecord::from_bytes(entry.into_buf()) else {
+                    let Some(rec) = MessageRecord::decode(entry.into_buf()) else {
                         continue;
                     };
                     let msg = record_to_message(&rec);
@@ -203,11 +163,16 @@ pub async fn load(flash: &mut Flash) {
 pub async fn append(flash: &mut Flash, msg: &ReceivedMessage) {
     // The SoftDevice flash driver requires a word-aligned write buffer.
     #[repr(C, align(4))]
-    struct Aligned([u8; MESSAGE_RECORD_SIZE]);
+    struct Aligned([u8; MESSAGE_RECORD_MAX]);
 
-    let aligned = Aligned(message_to_record(msg).to_bytes());
+    let encoded = message_to_record(msg);
+    let mut aligned = Aligned([0u8; MESSAGE_RECORD_MAX]);
+    let Some(len) = encoded.encode(&mut aligned.0) else {
+        error!("Persistence: message record too large");
+        return;
+    };
     let mut queue = open(flash);
-    match queue.push(&aligned.0, true).await {
+    match queue.push(&aligned.0[..len], true).await {
         Ok(()) => {
             RECORD_SAVES.fetch_add(1, Ordering::Relaxed);
         }
@@ -217,7 +182,7 @@ pub async fn append(flash: &mut Flash, msg: &ReceivedMessage) {
 
 /// Drop the oldest message (the app synced it).
 pub async fn consume(flash: &mut Flash) {
-    let mut buf = [0u8; MESSAGE_RECORD_SIZE];
+    let mut buf = [0u8; MESSAGE_RECORD_MAX];
     let mut queue = open(flash);
     if let Err(e) = queue.pop(&mut buf).await {
         error!("Persistence: message queue pop failed: {:?}", e);

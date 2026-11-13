@@ -53,6 +53,8 @@ pub struct DiscoveredContact {
     pub out_path_len: u8,
     /// Timestamp from the last accepted advert (anti-replay).
     pub last_advert_ts: u32,
+    /// Hash of the fields last written to flash (0 = never saved).
+    pub saved_hash: u32,
 }
 
 /// Recently received message entry for message history / inbox

@@ -514,6 +514,7 @@ async fn main(spawner: Spawner) {
                             && node.autoadd_allows_hops(advert_hops);
 
                         let mut store_blob = false;
+                        let mut overwritten_key: Option<[u8; 32]> = None;
                         crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| {
                             let mut list = c.borrow_mut();
                             if let Some(existing) = list.iter_mut().find(|ct| ct.pub_key == adv.pub_key) {
@@ -569,6 +570,7 @@ async fn main(spawner: Spawner) {
                                 out_path: [0u8; 64],
                                 out_path_len: 0xFF,
                                 last_advert_ts: adv.timestamp,
+                                saved_hash: 0,
                             };
 
                             let mut added = false;
@@ -599,6 +601,7 @@ async fn main(spawner: Spawner) {
                                         let _ =
                                             crate::companion::ble::COMPANION_PUSH_CHANNEL.try_send(push);
                                         crate::storage::adverts::forget(&overwritten);
+                                        overwritten_key = Some(overwritten);
                                         list[idx] = discovered.clone();
                                         added = true;
                                     }
@@ -623,6 +626,9 @@ async fn main(spawner: Spawner) {
                             if let Some(payload) = advert_payload.as_ref() {
                                 crate::storage::adverts::remember(&adv.pub_key, payload);
                             }
+                        }
+                        if let Some(key) = overwritten_key {
+                            crate::storage::contacts::queue_remove(key).await;
                         }
                         crate::storage::request_contacts();
                     }

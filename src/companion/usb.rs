@@ -1347,7 +1347,7 @@ async fn handle_text_cli(
             DISCOVERED_CONTACTS.lock(|c| {
                 c.borrow_mut().clear();
             });
-            crate::storage::request_contacts();
+            crate::storage::contacts::queue_clear().await;
             let _ = write_all(sender, b"  -> OK (Contacts cleared)\r\n").await;
         }
         "messages" | "inbox" | "get messages" => {
