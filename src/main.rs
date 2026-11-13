@@ -788,6 +788,30 @@ async fn main(spawner: Spawner) {
                     mesh.is_repeater = crate::companion::usb::forwarding_enabled();
                     let _ = crate::radio::lora_phy::request_radio_config();
                 }
+                UsbCommand::SetRadio {
+                    frequency_hz,
+                    bw_khz,
+                    sf,
+                    cr,
+                } => {
+                    info!(
+                        "Radio updated: {} Hz, BW {} kHz, SF{}, CR 4/{}",
+                        frequency_hz, bw_khz, sf, cr
+                    );
+                    crate::companion::usb::RADIO_SETTINGS.lock(|r| {
+                        let mut s = r.borrow_mut();
+                        s.frequency_hz = frequency_hz;
+                        s.bw_khz = bw_khz;
+                        s.sf = sf;
+                        s.cr = cr;
+                        s.offgrid_home_freq = 0;
+                        if !crate::companion::usb::is_offgrid_freq_hz(frequency_hz) {
+                            s.client_repeat = false;
+                        }
+                    });
+                    mesh.is_repeater = crate::companion::usb::forwarding_enabled();
+                    let _ = crate::radio::lora_phy::request_radio_config();
+                }
                 UsbCommand::SetTxPower(tx) => {
                     info!("TX power updated to: {} dBm", tx);
                     let _ = crate::radio::lora_phy::request_radio_config();

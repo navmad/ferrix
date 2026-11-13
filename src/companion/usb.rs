@@ -157,6 +157,17 @@ fn parse_bw_khz(val: &str) -> Option<u32> {
     matches!(bw, 7 | 10 | 15 | 20 | 31 | 41 | 62 | 125 | 250 | 500).then_some(bw)
 }
 
+/// Parse a coding rate denominator: `5`, `4/5`, `6`, `4/6`, ...
+fn parse_cr(val: &str) -> Option<u8> {
+    match val.trim() {
+        "5" | "4/5" => Some(5),
+        "6" | "4/6" => Some(6),
+        "7" | "4/7" => Some(7),
+        "8" | "4/8" => Some(8),
+        _ => None,
+    }
+}
+
 /// Render a bandwidth with trailing zeros stripped: 62.5, 125, 250, 500, 31.25...
 fn format_bw(bw_khz: u32) -> heapless::String<16> {
     let hz = bw_khz_to_hz(bw_khz);
@@ -382,6 +393,12 @@ pub enum UsbCommand {
         path: [u8; 64],
     },
     SetFrequency(u32),
+    SetRadio {
+        frequency_hz: u32,
+        bw_khz: u32,
+        sf: u8,
+        cr: u8,
+    },
     SetTxPower(i8),
     SetRepeat(bool),
     SetSpreadingFactor(u8),
@@ -631,6 +648,75 @@ async fn handle_text_cli(
             let _ = write!(s, "> {:.3},{},{},{}\r\n", f as f32 / 1_000_000.0, bw_str.as_str(), sf, cr);
             let _ = write_all(sender, s.as_bytes()).await;
         }
+        s if s == "set radio" || s.starts_with("set radio ") => {
+            let arg = s["set radio".len()..].trim();
+            let parsed = if arg.eq_ignore_ascii_case("default") {
+                Some((910_525_000u32, 62u32, 7u8, 5u8))
+            } else if arg.is_empty() {
+                None
+            } else {
+                let mut parts = arg
+                    .split(|c: char| c == ',' || c.is_whitespace())
+                    .filter(|p| !p.is_empty());
+                match (parts.next(), parts.next(), parts.next(), parts.next(), parts.next()) {
+                    (Some(f), Some(b), Some(sf), Some(cr), None) => {
+                        match (parse_freq_hz(f), parse_bw_khz(b), sf.parse::<u8>().ok(), parse_cr(cr)) {
+                            (Some(freq), Some(bw), Some(sf), Some(cr))
+                                if (5..=12).contains(&sf) =>
+                            {
+                                Some((freq, bw, sf, cr))
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
+                }
+            };
+
+            match parsed {
+                Some((freq, bw, sf, cr)) if (150_000_000..=960_000_000).contains(&freq) => {
+                    RADIO_SETTINGS.lock(|r| {
+                        let mut st = r.borrow_mut();
+                        st.frequency_hz = freq;
+                        st.bw_khz = bw;
+                        st.sf = sf;
+                        st.cr = cr;
+                        // The caller owns the new frequency, so the remembered
+                        // off-grid home is no longer valid. Leaving an allowed
+                        // band also clears the client-repeat flag.
+                        st.offgrid_home_freq = 0;
+                        if !is_offgrid_freq_hz(freq) {
+                            st.client_repeat = false;
+                        }
+                    });
+                    crate::storage::request_save_config();
+                    let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetRadio {
+                        frequency_hz: freq,
+                        bw_khz: bw,
+                        sf,
+                        cr,
+                    });
+                    let bw_str = format_bw(bw);
+                    let mut resp: heapless::String<64> = heapless::String::new();
+                    let _ = write!(
+                        resp,
+                        "OK - {:.3},{},{},{}\r\n",
+                        freq as f32 / 1_000_000.0,
+                        bw_str.as_str(),
+                        sf,
+                        cr
+                    );
+                    let _ = write_all(sender, resp.as_bytes()).await;
+                }
+                _ => {
+                    let _ = write_all(
+                        sender,
+                        b"Error: freq 150-960, bw 7-500, sf 5-12, cr 5-8, or default\r\n",
+                    )
+                    .await;
+                }
+            }
+        }
         s if s.starts_with("set freq ") => {
             let val = s[9..].trim();
             // Accepts "910.525" (MHz), "910525" (kHz), or "910525000" (Hz).
@@ -731,18 +817,7 @@ async fn handle_text_cli(
         }
         s if s.starts_with("set cr ") => {
             let val = s[7..].trim();
-            let cr_denom = if val == "5" || val == "4/5" {
-                Some(5)
-            } else if val == "6" || val == "4/6" {
-                Some(6)
-            } else if val == "7" || val == "4/7" {
-                Some(7)
-            } else if val == "8" || val == "4/8" {
-                Some(8)
-            } else {
-                None
-            };
-            if let Some(cr) = cr_denom {
+            if let Some(cr) = parse_cr(val) {
                 RADIO_SETTINGS.lock(|r| {
                     r.borrow_mut().cr = cr;
                 });
@@ -1152,7 +1227,7 @@ async fn handle_text_cli(
             let _ = write_all(sender, b"  -> OK (Config save queued to flash)\r\n").await;
         }
         "help" => {
-            let _ = write_all(sender, b"  -> Commands:\r\n  ->   Identity: get/set name, get/set prv.key, get public.key\r\n  ->   Radio:    get/set freq, get/set tx, get/set sf, get/set bw, get/set cr, get/set repeat, get/set hash-mode, stats-radio\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, advert, time, channels\r\n  ->   System:   save, ver, board, stats-core, stats-packets, clear stats/contacts/messages, reboot\r\n").await;
+            let _ = write_all(sender, b"  -> Commands:\r\n  ->   Identity: get/set name, get/set prv.key, get public.key\r\n  ->   Radio:    get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq/tx/sf/bw/cr, get/set repeat, get/set hash-mode, stats-radio\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, advert, time, channels\r\n  ->   System:   save, ver, board, stats-core, stats-packets, clear stats/contacts/messages, reboot\r\n").await;
         }
         _ => {
             let _ = write_all(sender, b"  -> Unknown command\r\n").await;
