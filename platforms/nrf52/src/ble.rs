@@ -19,7 +19,7 @@ use nrf_softdevice::ble::{Connection, EncryptionInfo, IdentityKey, MasterId, Pas
 use nrf_softdevice::Softdevice;
 
 use ferrix_core::companion::cli::CliHost;
-use ferrix_core::companion::protocol::CompanionNode;
+use ferrix_core::companion::session::{CompanionLink, CompanionSession};
 
 #[nrf_softdevice::gatt_service(uuid = "180a")]
 pub struct DeviceInformationService {
@@ -241,36 +241,6 @@ pub async fn contact_task() -> ! {
     }
 }
 
-/// Stream `GET_CONTACTS` responses with backpressure so a large contact list
-/// (up to `MAX_CONTACTS`) never overflows `COMPANION_PUSH_CHANNEL`.
-async fn stream_contacts() {
-    use ferrix_core::companion::protocol;
-
-    let count = protocol::contacts_count();
-
-    let mut start = Vec::<u8, 256>::new();
-    let _ = start.extend_from_slice(&protocol::encode_contacts_start(count));
-    let _ = COMPANION_PUSH_CHANNEL.send(start).await;
-
-    let mut max_lastmod = 0u32;
-    for idx in 0..count as usize {
-        let Some(c) = protocol::contact_at(idx) else {
-            continue;
-        };
-        if c.last_seen_epoch > max_lastmod {
-            max_lastmod = c.last_seen_epoch;
-        }
-        let resp = ferrix_core::companion::contacts::serialize_contact(&c);
-        let mut vec = Vec::<u8, 256>::new();
-        let _ = vec.extend_from_slice(&resp);
-        let _ = COMPANION_PUSH_CHANNEL.send(vec).await;
-    }
-
-    let mut end = Vec::<u8, 256>::new();
-    let _ = end.extend_from_slice(&protocol::encode_contacts_end(max_lastmod));
-    let _ = COMPANION_PUSH_CHANNEL.send(end).await;
-}
-
 pub struct MeshCoreSecurityHandler;
 
 impl SecurityHandler for MeshCoreSecurityHandler {
@@ -342,6 +312,23 @@ pub async fn softdevice_task(sd: &'static Softdevice) -> ! {
     sd.run().await
 }
 
+/// Companion link backed by the BLE notification queue.
+struct BleLink;
+
+impl CompanionLink for BleLink {
+    async fn write_frame(&mut self, frame: &[u8]) {
+        let mut vec = Vec::<u8, 256>::new();
+        let _ = vec.extend_from_slice(&frame[..frame.len().min(247)]);
+        let _ = COMPANION_PUSH_CHANNEL.send(vec).await;
+    }
+
+    async fn write_text(&mut self, text: &[u8]) {
+        let mut vec = Vec::<u8, 256>::new();
+        let _ = vec.extend_from_slice(&text[..text.len().min(247)]);
+        let _ = COMPANION_PUSH_CHANNEL.send(vec).await;
+    }
+}
+
 const FAST_ADV_SECS: u64 = 30;
 /// 1 second in 625 us advertising units.
 const ADVERTISING_SLOW_INTERVAL: u32 = 1600;
@@ -364,7 +351,7 @@ pub async fn ble_companion_task(
     info!("Starting MeshCore BLE companion advertising...");
 
     let callsign = ferrix_core::storage::get_callsign();
-    let mut node = CompanionNode::new(
+    let mut session = CompanionSession::new(
         callsign.as_str(),
         hw_model,
         capabilities,
@@ -459,6 +446,8 @@ pub async fn ble_companion_task(
             }
         };
 
+        session.reset();
+
         // Keep a second handle so slave latency can be restored while the
         // session futures still borrow `conn`.
         let mut latency_conn = conn.clone();
@@ -495,23 +484,7 @@ pub async fn ble_companion_task(
                     if drops != 0 {
                         debug!("BLE: dropped {} command(s) because the ring was full", drops);
                     }
-                    if cmd_buf[..len].first() == Some(&ferrix_core::companion::protocol::CMD_GET_CONTACTS) {
-                        stream_contacts().await;
-                    } else {
-                        ferrix_core::companion::protocol::handle_command(
-                            &mut node,
-                            &cmd_buf[..len],
-                            host,
-                            |resp| {
-                            let mut vec = Vec::<u8, 256>::new();
-                            let copy_len = resp.len().min(247);
-                            let _ = vec.extend_from_slice(&resp[..copy_len]);
-                            if COMPANION_PUSH_CHANNEL.try_send(vec).is_err() {
-                                debug!("BLE: response queue full, dropping response");
-                            }
-                        })
-                        .await;
-                    }
+                    session.handle_frame(&cmd_buf[..len], &mut BleLink).await;
                     embassy_futures::yield_now().await;
                 } else {
                     // Register before the emptiness check to avoid a lost wake.

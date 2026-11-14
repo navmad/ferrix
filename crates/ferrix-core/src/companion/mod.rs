@@ -5,4 +5,5 @@
 pub mod cli;
 pub mod contacts;
 pub mod protocol;
+pub mod session;
 pub mod framing;
