@@ -8,9 +8,10 @@
 //! External QSPI flash holds contacts and messages.
 
 use defmt::{error, info};
-use embassy_futures::select::{select, select5, Either, Either5};
-use embassy_time::Timer;
+use embassy_futures::select::{select, select3, select5, Either, Either3, Either5};
+use embassy_time::{Duration, Ticker, Timer};
 use embedded_storage_async::nor_flash::{MultiwriteNorFlash, NorFlash};
+use ferrix_core::state::bump_storage_heartbeat;
 use ferrix_core::storage::contacts::ContactOp;
 use ferrix_core::storage::{self, adverts, bonds, config, contacts, messages, StorageRegions};
 
@@ -35,8 +36,10 @@ where
 {
     contacts::load(external, &regions.contacts).await;
     messages::load(external, &regions.messages).await;
+    let mut heartbeat = Ticker::every(Duration::from_secs(5));
 
     loop {
+        bump_storage_heartbeat();
         // The advert lane handles both coalesced saves and synchronous
         // protocol fetches, which are served from the external flash.
         let advert_fut = select(
@@ -57,8 +60,8 @@ where
         let events_fut = select(select5_fut, storage::wait_factory_reset());
         let side_fut = select(op_fut, storage::wait_flush_request());
 
-        match select(events_fut, side_fut).await {
-            Either::First(inner) => match inner {
+        match select3(events_fut, side_fut, heartbeat.next()).await {
+            Either3::First(inner) => match inner {
                 Either::Second(_) => {
                     info!("Storage: factory reset - erasing data pages");
                     if internal
@@ -136,7 +139,7 @@ where
                     }
                 },
             },
-            Either::Second(side) => match side {
+            Either3::Second(side) => match side {
                 Either::First(op) => match op {
                     ContactOp::Remove(pub_key) => {
                         contacts::remove(external, &regions.contacts, pub_key).await
@@ -165,6 +168,7 @@ where
                     storage::complete_flush();
                 }
             },
+            Either3::Third(_) => bump_storage_heartbeat(),
         }
     }
 }

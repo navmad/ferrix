@@ -2,6 +2,7 @@
 //!
 //! Integrates with `embedded-graphics` for rendering off-grid dashboard metrics.
 
+use embassy_futures::select::{select, Either};
 use embassy_nrf::gpio::{Input, Output};
 use embassy_nrf::spim::Spim;
 use embassy_time::Timer;
@@ -116,7 +117,13 @@ impl<'a, T: embassy_nrf::spim::Instance> Ssd1681<'a, T> {
         self.wait_idle().await?;
         self.dc.set_low();
         self.cs.set_low();
-        let _ = self.spim.write(&[cmd]).await;
+        match select(self.spim.write(&[cmd]), Timer::after_millis(100)).await {
+            Either::First(_) => {}
+            Either::Second(_) => {
+                self.cs.set_high();
+                return Err(());
+            }
+        }
         self.cs.set_high();
         Ok(())
     }
@@ -126,7 +133,13 @@ impl<'a, T: embassy_nrf::spim::Instance> Ssd1681<'a, T> {
         self.wait_idle().await?;
         self.dc.set_high();
         self.cs.set_low();
-        let _ = self.spim.write(data).await;
+        match select(self.spim.write(data), Timer::after_millis(500)).await {
+            Either::First(_) => {}
+            Either::Second(_) => {
+                self.cs.set_high();
+                return Err(());
+            }
+        }
         self.cs.set_high();
         Ok(())
     }

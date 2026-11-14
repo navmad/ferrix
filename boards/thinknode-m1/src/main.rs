@@ -12,6 +12,7 @@ pub mod meshcore;
 pub mod radio;
 pub mod storage;
 pub mod telemetry;
+pub mod watchdog;
 
 use defmt::info;
 use defmt_rtt as _;
@@ -136,7 +137,12 @@ async fn delayed_push_task() -> ! {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
+    use core::sync::atomic::Ordering;
     use embassy_nrf::interrupt::{InterruptExt, Priority};
+
+    // Capture why the previous boot ended before anything can clear it.
+    let reset_reason = unsafe { core::ptr::read_volatile(0x4000_0400 as *const u32) };
+    ferrix_core::state::RESET_REASON.store(reset_reason, Ordering::Relaxed);
 
     // SoftDevice S140 reserves interrupt priorities P0, P1, and P4.
     // Configure all Embassy system and peripheral interrupts to P2 or P3.
@@ -154,6 +160,11 @@ async fn main(spawner: Spawner) {
 
     let mut board = crate::board::init(p);
     let qspi = board.qspi;
+
+    let wdt_handle = crate::watchdog::start(board.wdt);
+    spawner
+        .spawn(crate::watchdog::watchdog_task(wdt_handle))
+        .unwrap();
 
     // The GPS task owns the L76K UART and control pins; it holds the module
     // in reset/sleep until the dashboard enables it.
@@ -175,11 +186,20 @@ async fn main(spawner: Spawner) {
     // device never reports 0 mV (and therefore 0%) to the app.
     let mut battery_buf = [0i16; 1];
     if crate::board::HAS_BATTERY_ADC {
-        battery_adc.sample(&mut battery_buf).await;
-        let raw = battery_buf[0].max(0) as u16;
-        crate::telemetry::set_battery_millivolts(
-            crate::telemetry::adc_raw_to_battery_millivolts(raw),
-        );
+        match embassy_futures::select::select(
+            battery_adc.sample(&mut battery_buf),
+            Timer::after_millis(100),
+        )
+        .await
+        {
+            embassy_futures::select::Either::First(_) => {
+                let raw = battery_buf[0].max(0) as u16;
+                crate::telemetry::set_battery_millivolts(
+                    crate::telemetry::adc_raw_to_battery_millivolts(raw),
+                );
+            }
+            embassy_futures::select::Either::Second(_) => {}
+        }
     }
 
     // Initialize persistent configuration from flash

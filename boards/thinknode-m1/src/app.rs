@@ -1,6 +1,7 @@
 //! ThinkNode M1 implementation of the runtime application board interface.
 
 use defmt::info;
+use embassy_futures::select::{select, Either};
 use embassy_nrf::gpio::Output;
 use embassy_nrf::saadc;
 use embassy_nrf::peripherals::TWISPI1;
@@ -132,7 +133,15 @@ impl AppBoard for ThinkNodeApp {
         if !crate::board::HAS_BATTERY_ADC {
             return None;
         }
-        self.battery_adc.sample(&mut self.battery_buf).await;
+        match select(
+            self.battery_adc.sample(&mut self.battery_buf),
+            Timer::after_millis(100),
+        )
+        .await
+        {
+            Either::First(_) => {}
+            Either::Second(_) => return None,
+        }
         let raw = self.battery_buf[0].max(0) as u16;
         let mv = crate::telemetry::adc_raw_to_battery_millivolts(raw);
         if mv >= crate::telemetry::MIN_PLAUSIBLE_BATTERY_MV {

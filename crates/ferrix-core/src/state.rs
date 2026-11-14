@@ -507,6 +507,25 @@ pub fn clear_gps_state() {
     update_gps_state(GpsState::default());
 }
 
+/// Main application loop heartbeat, checked by the watchdog supervisor.
+pub static APP_HEARTBEAT: AtomicU32 = AtomicU32::new(0);
+/// Storage loop heartbeat, checked by the watchdog supervisor.
+pub static STORAGE_HEARTBEAT: AtomicU32 = AtomicU32::new(0);
+
+pub fn bump_app_heartbeat() {
+    APP_HEARTBEAT.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn bump_storage_heartbeat() {
+    STORAGE_HEARTBEAT.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Number of successful watchdog feeds since boot (diagnostic).
+pub static WDT_PETS: AtomicU32 = AtomicU32::new(0);
+
+/// POWER.RESETREAS captured at boot. Bit 1 is the watchdog (DOG) flag.
+pub static RESET_REASON: AtomicU32 = AtomicU32::new(0);
+
 #[cfg(test)]
 mod tests {
     use super::*;

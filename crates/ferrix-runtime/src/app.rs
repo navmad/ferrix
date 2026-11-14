@@ -258,6 +258,7 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
     let mut clicks_since_full: u32 = 0;
 
     loop {
+        bump_app_heartbeat();
         // Move packets queued by the previous iteration into the radio
         // scheduler before sleeping.
         flush_tx_queue(mesh, lora).await;

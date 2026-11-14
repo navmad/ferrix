@@ -1314,6 +1314,24 @@ pub async fn handle_text_cli<W: TextSink>(
             host.set_gps_enabled(false);
             let _ = sender.send( b"  -> GPS power off\r\n").await;
         }
+        "stats-wdt" | "watchdog" => {
+            use core::sync::atomic::Ordering;
+            let app = crate::state::APP_HEARTBEAT.load(Ordering::Relaxed);
+            let storage = crate::state::STORAGE_HEARTBEAT.load(Ordering::Relaxed);
+            let pets = crate::state::WDT_PETS.load(Ordering::Relaxed);
+            let reason = crate::state::RESET_REASON.load(Ordering::Relaxed);
+            let mut s: heapless::String<192> = heapless::String::new();
+            let _ = write!(
+                s,
+                "  -> WDT: app={} storage={} pets={} reset=0x{:08x} dog={}\r\n",
+                app,
+                storage,
+                pets,
+                reason,
+                (reason & 0x2) != 0
+            );
+            let _ = sender.send( s.as_bytes()).await;
+        }
         "stats-gps" | "gps" => {
             let g = crate::state::gps_state();
             let now = embassy_time::Instant::now().as_millis() as u64;
