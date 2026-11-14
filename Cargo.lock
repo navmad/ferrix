@@ -785,6 +785,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrix-role-companion"
+version = "0.1.0"
+dependencies = [
+ "defmt 0.3.101",
+ "embassy-executor",
+ "embassy-time",
+ "ferrix-core",
+ "ferrix-hal",
+ "ferrix-runtime",
+ "heapless",
+ "meshcore-wire",
+]
+
+[[package]]
 name = "ferrix-runtime"
 version = "0.1.0"
 dependencies = [
@@ -844,6 +858,7 @@ dependencies = [
  "ferrix-hal",
  "ferrix-l76k",
  "ferrix-nrf52",
+ "ferrix-role-companion",
  "ferrix-runtime",
  "ferrix-ssd1681",
  "ferrix-sx1262",
@@ -851,6 +866,19 @@ dependencies = [
  "meshcore-wire",
  "nrf-softdevice",
  "static_cell",
+]
+
+[[package]]
+name = "ferrix-thinknode-m1-companion"
+version = "0.1.0"
+dependencies = [
+ "cortex-m-rt",
+ "defmt 0.3.101",
+ "defmt-rtt",
+ "embassy-executor",
+ "ferrix-nrf52",
+ "ferrix-role-companion",
+ "ferrix-thinknode-m1",
 ]
 
 [[package]]

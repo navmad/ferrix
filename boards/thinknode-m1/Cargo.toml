@@ -4,14 +4,6 @@ version = "0.1.0"
 edition = "2021"
 build = "build.rs"
 
-[[bin]]
-name = "ferrix"
-path = "src/main.rs"
-
-[features]
-default = ["thinknode-m1"]
-thinknode-m1 = []
-
 [dependencies]
 cortex-m = { version = "0.7", features = ["inline-asm"] }
 cortex-m-rt = "0.7"
@@ -43,3 +35,4 @@ ferrix-runtime = { path = "../../crates/ferrix-runtime" }
 ferrix-sx1262 = { path = "../../drivers/radio/sx1262" }
 ferrix-ssd1681 = { path = "../../drivers/display/ssd1681" }
 ferrix-l76k = { path = "../../drivers/gnss/l76k" }
+ferrix-role-companion = { path = "../../roles/companion" }

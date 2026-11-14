@@ -1,0 +1,17 @@
+#![no_std]
+#![no_main]
+
+//! Ferrix companion firmware for the Elecrow ThinkNode M1.
+//!
+//! The board crate owns the hardware; the role crate owns the companion
+//! startup and application loop. This image only selects the pair.
+
+use defmt_rtt as _;
+use embassy_executor::Spawner;
+
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+    let peripherals = ferrix_nrf52::startup::init();
+    let board = ferrix_thinknode_m1::ThinkNodeBoard::new(peripherals);
+    ferrix_role_companion::run(board, spawner).await;
+}

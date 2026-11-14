@@ -14,6 +14,12 @@ use embassy_time::Timer;
 use ferrix_core::companion::protocol::{CAP_BLE, CAP_CLIENT, CAP_EPD, CAP_GPS};
 use crate::input::{InputDevice, InputEvent};
 
+embassy_nrf::bind_interrupts!(pub(crate) struct BoardIrqs {
+    TWISPI0 => embassy_nrf::spim::InterruptHandler<peripherals::TWISPI0>;
+    TWISPI1 => embassy_nrf::spim::InterruptHandler<peripherals::TWISPI1>;
+    SAADC => embassy_nrf::saadc::InterruptHandler;
+});
+
 /// Semtech SX1262 LoRa Radio Pin Configuration
 pub struct LoraPins {
     pub sck: peripherals::P0_19,

@@ -25,7 +25,7 @@ shift $(( $# >= 2 ? 2 : $# )) || true
 
 case "$board" in
     thinknode-m1)
-        pkg="ferrix-thinknode-m1"
+        pkg="ferrix-thinknode-m1-companion"
         target="thumbv7em-none-eabihf"
         ;;
     *)
