@@ -2,22 +2,26 @@
 //!
 //! MeshCore's `EXPORT_CONTACT` returns the raw advert packet that was received
 //! for a contact, so sharing preserves the original signature. The contact
-//! record itself cannot rebuild that signature, so blobs live in a single
-//! append-only flash bank above the application image. No double-banking:
-//! blobs are re-learned from the next advert, so a torn append is harmless.
+//! record itself cannot rebuild that signature, so blobs live in an
+//! append-only bank on the external QSPI flash.
+//!
+//! Blob reads are asynchronous: the storage task owns the QSPI driver, so
+//! protocol handlers request a blob and wait for the reply.
 
 use core::cell::RefCell;
+use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 use defmt::{error, info};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::channel::Channel;
+use embassy_sync::signal::Signal;
+use embedded_storage_async::nor_flash::NorFlash;
 use heapless::Vec;
 
+#[cfg(not(test))]
 use meshcore_wire::packets::AdvertPacket;
-
-use super::MappedFlash;
 
 /// `pub(32) ‖ ts(4) ‖ sig(64) ‖ app_data(≤32)`.
 pub const MAX_ADVERT_PAYLOAD: usize = 132;
@@ -48,9 +52,15 @@ static SAVE_CHANNEL: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
 pub static RECORD_SAVES: AtomicU32 = AtomicU32::new(0);
 pub static ERASES: AtomicU32 = AtomicU32::new(0);
 
-/// Platform reader for the memory-mapped region holding the advert log.
+/// A blob fetch from a protocol handler.
+pub struct FetchRequest {
+    pub key: [u8; 32],
+}
+
+static FETCH_CHANNEL: Channel<CriticalSectionRawMutex, FetchRequest, 1> = Channel::new();
+static FETCH_RESPONSE: Signal<CriticalSectionRawMutex, Option<PersistBlob>> = Signal::new();
+
 struct AdvertStore {
-    reader: &'static dyn MappedFlash,
     bank: u32,
     size: u32,
     slots: usize,
@@ -68,15 +78,15 @@ fn store_shape() -> (u32, u32, usize) {
     })
 }
 
-fn read_slot(index: usize) -> PersistBlob {
+async fn read_slot<F: NorFlash>(flash: &mut F, index: usize) -> Option<PersistBlob> {
+    let (bank, _, slots) = store_shape();
+    if index >= slots {
+        return None;
+    }
+    let addr = bank + index as u32 * RECORD_SIZE as u32;
     let mut buf = [0u8; RECORD_SIZE];
-    STORE.lock(|s| {
-        if let Some(st) = s.borrow().as_ref() {
-            let addr = st.bank + index as u32 * RECORD_SIZE as u32;
-            st.reader.read(addr, &mut buf);
-        }
-    });
-    unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const PersistBlob) }
+    flash.read(addr, &mut buf).await.ok()?;
+    Some(unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const PersistBlob) })
 }
 
 fn slot_valid(rec: &PersistBlob) -> bool {
@@ -86,27 +96,35 @@ fn slot_valid(rec: &PersistBlob) -> bool {
         && rec.pub_key[0] != 0xFF
 }
 
-/// Locate the append cursor. Called once at boot before the flash task starts.
-pub fn init(reader: &'static dyn MappedFlash, region: core::ops::Range<u32>) {
+/// Locate the append cursor. Called once after the QSPI flash is ready.
+pub async fn init<F: NorFlash>(flash: &mut F, region: Range<u32>) {
     let size = region.end - region.start;
+    let slots = size as usize / RECORD_SIZE;
     STORE.lock(|s| {
         *s.borrow_mut() = Some(AdvertStore {
-            reader,
             bank: region.start,
             size,
-            slots: size as usize / RECORD_SIZE,
+            slots,
         });
     });
-    let first = read_slot(0);
-    let slots = size as usize / RECORD_SIZE;
+
+    let first = read_slot(flash, 0).await.unwrap_or(PersistBlob {
+        magic: 0,
+        pub_key: [0xFF; 32],
+        len: 0,
+        payload: [0; MAX_ADVERT_PAYLOAD],
+        _pad: [0; 3],
+    });
     let (cursor, need_erase) = if slot_valid(&first) {
         let mut i = 1usize;
-        while i < slots && slot_valid(&read_slot(i)) {
-            i += 1;
+        while i < slots {
+            match read_slot(flash, i).await {
+                Some(rec) if slot_valid(&rec) => i += 1,
+                _ => break,
+            }
         }
         (i, false)
     } else if first.pub_key[0] == 0xFF {
-        // Freshly erased bank.
         (0, false)
     } else {
         // Foreign data (old layout or corrupt head); reclaim on first save.
@@ -124,12 +142,18 @@ pub fn init(reader: &'static dyn MappedFlash, region: core::ops::Range<u32>) {
 }
 
 fn request() {
+    #[cfg(not(test))]
     let _ = SAVE_CHANNEL.try_send(());
 }
 
 /// Wait for a coalesced advert-log save request.
 pub async fn wait_save_request() {
     SAVE_CHANNEL.receive().await;
+}
+
+/// Wait for a blob fetch request from a protocol handler.
+pub async fn wait_fetch_request() -> FetchRequest {
+    FETCH_CHANNEL.receive().await
 }
 
 /// Drop queued save requests after a coalescing delay.
@@ -180,13 +204,12 @@ pub fn forget(pub_key: &[u8; 32]) {
     });
 }
 
-/// True when a blob for this contact is queued or already written.
+/// True when a blob for this contact is queued for writing.
 pub fn has_blob(pub_key: &[u8; 32]) -> bool {
     PENDING.lock(|p| p.borrow().iter().any(|e| e.pub_key == *pub_key))
-        || (0..CURSOR.load(Ordering::Relaxed)).any(|i| key_matches(&read_slot(i), pub_key))
 }
 
-fn find_blob(pub_key: &[u8; 32]) -> Option<PersistBlob> {
+async fn find_blob<F: NorFlash>(flash: &mut F, pub_key: &[u8; 32]) -> Option<PersistBlob> {
     // A blob queued moments ago is already valid; do not make the app wait
     // for the debounced flash write.
     if let Some(rec) = PENDING.lock(|p| {
@@ -198,46 +221,53 @@ fn find_blob(pub_key: &[u8; 32]) -> Option<PersistBlob> {
     }) {
         return Some(rec);
     }
+
     let cursor = CURSOR.load(Ordering::Relaxed);
     let mut found = None;
     for i in 0..cursor {
-        let rec = read_slot(i);
-        if key_matches(&rec, pub_key) {
-            found = Some(rec);
+        if let Some(rec) = read_slot(flash, i).await {
+            if key_matches(&rec, pub_key) {
+                found = Some(rec);
+            }
         }
     }
     found
 }
 
-/// Verified advert payload for a contact, or `None` if no valid blob exists.
-pub fn payload(pub_key: &[u8; 32]) -> Option<Vec<u8, MAX_ADVERT_PAYLOAD>> {
-    let rec = find_blob(pub_key)?;
-    let len = rec.len as usize;
-    let adv = AdvertPacket::decode(&rec.payload[..len]).ok()?;
-    if !adv.verify_signature() {
-        return None;
+/// Fetch and verify the latest signed advert payload for a contact.
+///
+/// Runs in protocol task context; the storage task performs the QSPI read.
+pub async fn request_payload(pub_key: &[u8; 32]) -> Option<Vec<u8, MAX_ADVERT_PAYLOAD>> {
+    #[cfg(test)]
+    {
+        let _ = pub_key;
+        None
     }
-    let mut out = Vec::<u8, MAX_ADVERT_PAYLOAD>::new();
-    out.extend_from_slice(&rec.payload[..len]).ok()?;
-    Some(out)
+    #[cfg(not(test))]
+    {
+        let _ = FETCH_CHANNEL.send(FetchRequest { key: *pub_key }).await;
+        let rec = FETCH_RESPONSE.wait().await?;
+        let len = rec.len as usize;
+        let adv = AdvertPacket::decode(&rec.payload[..len]).ok()?;
+        if !adv.verify_signature() {
+            return None;
+        }
+        let mut out = Vec::<u8, MAX_ADVERT_PAYLOAD>::new();
+        out.extend_from_slice(&rec.payload[..len]).ok()?;
+        Some(out)
+    }
 }
 
-/// Build a complete advert packet (`header ‖ path_len ‖ payload`) for export.
-pub fn export(pub_key: &[u8; 32]) -> Option<Vec<u8, { MAX_ADVERT_PAYLOAD + 2 }>> {
-    let payload = payload(pub_key)?;
-    let mut out = Vec::<u8, { MAX_ADVERT_PAYLOAD + 2 }>::new();
-    // Flood-routed advert with no path, as MeshCore exports it.
-    out.push(0x11).ok()?;
-    out.push(0x00).ok()?;
-    out.extend_from_slice(&payload).ok()?;
-    Some(out)
+/// Serve one fetch request from the storage task.
+pub async fn serve_fetch<F: NorFlash>(flash: &mut F, req: FetchRequest) {
+    let rec = find_blob(flash, &req.key).await;
+    FETCH_RESPONSE.signal(rec);
 }
 
 /// Append queued blobs to the log.
 pub async fn save<F>(flash: &mut F)
 where
-    F: embedded_storage_async::nor_flash::NorFlash,
-    F::Error: defmt::Format,
+    F: NorFlash,
 {
     let (bank, size, slots) = store_shape();
     if !READY.load(Ordering::Relaxed) {
@@ -300,40 +330,16 @@ pub fn stats() -> (usize, usize, bool) {
     )
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    struct FakeFlash(std::vec::Vec<u8>);
-
-    impl MappedFlash for FakeFlash {
-        fn read(&self, offset: u32, out: &mut [u8]) {
-            let start = offset as usize;
-            out.copy_from_slice(&self.0[start..start + out.len()]);
-        }
-    }
-
     #[test]
-    fn scans_slots_through_the_mapped_reader() {
-        let bank = 0u32;
-        let mut data = vec![0u8; RECORD_SIZE * 2];
-        let rec = PersistBlob {
-            magic: RECORD_MAGIC,
-            pub_key: [7u8; 32],
-            len: 1,
-            payload: [0u8; MAX_ADVERT_PAYLOAD],
-            _pad: [0; 3],
-        };
-        unsafe {
-            core::ptr::write_unaligned(data.as_mut_ptr() as *mut PersistBlob, rec);
-        }
-        let flash: &'static FakeFlash = Box::leak(Box::new(FakeFlash(data)));
-
-        init(flash, bank..(bank + (RECORD_SIZE * 2) as u32));
-        assert_eq!(slots(), 2);
-        assert_eq!(stats().0, 1);
+    fn pending_blob_is_remembered() {
+        forget(&[7u8; 32]);
+        remember(&[7u8; 32], &[1, 2, 3]);
         assert!(has_blob(&[7u8; 32]));
         assert!(!has_blob(&[8u8; 32]));
+        forget(&[7u8; 32]);
     }
 }

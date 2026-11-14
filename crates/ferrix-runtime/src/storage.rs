@@ -37,11 +37,17 @@ where
     messages::load(external, &regions.messages).await;
 
     loop {
+        // The advert lane handles both coalesced saves and synchronous
+        // protocol fetches, which are served from the external flash.
+        let advert_fut = select(
+            adverts::wait_save_request(),
+            adverts::wait_fetch_request(),
+        );
         let select5_fut = select5(
             config::wait_save_request(),
             contacts::wait_save_request(),
             messages::next_command(),
-            adverts::wait_save_request(),
+            advert_fut,
             bonds::wait_save_request(),
         );
         // Contact removals are out-of-band: they must not wait for the
@@ -117,12 +123,15 @@ where
                             messages::clear(external, &regions.messages).await
                         }
                     },
-                    Either5::Fourth(_) => {
-                        // New contacts are rare; batch a discovery burst first.
-                        Timer::after_millis(1000).await;
-                        adverts::drain_save_requests();
-                        adverts::save(internal).await;
-                    }
+                    Either5::Fourth(event) => match event {
+                        Either::First(_) => {
+                            // New contacts are rare; batch a discovery burst first.
+                            Timer::after_millis(1000).await;
+                            adverts::drain_save_requests();
+                            adverts::save(external).await;
+                        }
+                        Either::Second(req) => adverts::serve_fetch(external, req).await,
+                    },
                     Either5::Fifth(_) => {
                         bonds::save(internal, &regions.bonds).await;
                     }

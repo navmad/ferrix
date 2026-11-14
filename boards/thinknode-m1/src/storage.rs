@@ -17,13 +17,12 @@ use heapless::String;
 ///
 /// The external QSPI regions are offsets into the 2 MB chip.
 pub static REGIONS: StorageRegions = StorageRegions {
-    // Internal: config and bonds stay here for now; the advert log is still
-    // internal until the async blob read path lands.
+    // Internal: config and bonds stay here for now.
     config: 0x000E_C000..0x000E_D000,
     bonds: 0x000A_F000..0x000B_0000,
-    adverts: 0x000A_0000..0x000A_F000,
     // External QSPI.
     contacts: 0x0000_0000..0x0002_C000,
+    adverts: 0x0002_C000..0x0004_0000,
     messages: 0x0004_0000..0x0014_0000,
     factory_reset: 0x000A_0000..0x000E_D000,
     factory_reset_external: 0x0000_0000..0x0014_0000,
@@ -39,7 +38,6 @@ pub fn init_config() -> (String<32>, Option<[u8; 64]>) {
 
 /// Load the advert log into RAM. Called once at boot, before the tasks start.
 pub fn load() {
-    adverts::init(&ferrix_nrf52::flash::MAPPED, REGIONS.adverts.clone());
     ferrix_core::storage::bonds::init(
         &ferrix_nrf52::flash::MAPPED,
         REGIONS.bonds.clone(),
@@ -72,6 +70,7 @@ pub async fn storage_task(
     embassy_time::Timer::after_millis(10).await;
     let qspi = QSPI.init(ferrix_nrf52::qspi::init(qspi_pins));
     ferrix_nrf52::qspi::self_test(qspi).await;
+    ferrix_core::storage::adverts::init(&mut *qspi, REGIONS.adverts.clone()).await;
 
     defmt::info!("Storage: Flash persistence task started");
     if storage_loop(&mut flash, qspi, &REGIONS).await == StorageExit::FactoryReset {
