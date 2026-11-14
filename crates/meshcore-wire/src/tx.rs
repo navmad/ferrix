@@ -14,12 +14,13 @@ pub enum TxLane {
 const FNV_INIT: u32 = 0x811C_9DC5;
 const FNV_PRIME: u32 = 0x0100_0193;
 
-/// Deterministic slot for a flood packet.
+/// Deterministic slot for a flood packet, in `0..slots`.
 ///
-/// Slot 0 means "the current opportunity" and is kept for control traffic, so
-/// floods start at slot 1. With `slots == 1` everything lands in slot 0.
+/// Slot 0 is the current opportunity; using it for floods keeps latency low
+/// when the calendar is idle. Control traffic is sent independently and does
+/// not occupy a slot.
 pub fn flood_slot(packet_hash: &[u8; 8], node_hash: &[u8], slots: usize) -> usize {
-    if slots <= 1 {
+    if slots == 0 {
         return 0;
     }
     let mut h = FNV_INIT;
@@ -27,7 +28,7 @@ pub fn flood_slot(packet_hash: &[u8; 8], node_hash: &[u8], slots: usize) -> usiz
         h ^= b as u32;
         h = h.wrapping_mul(FNV_PRIME);
     }
-    1 + (h as usize % (slots - 1))
+    h as usize % slots
 }
 
 #[cfg(test)]
@@ -38,12 +39,12 @@ mod tests {
     fn slot_is_deterministic_and_in_range() {
         let hash = [7u8; 8];
         let node = [3u8; 4];
-        for slots in 2..=8 {
+        for slots in 1..=8 {
             let slot = flood_slot(&hash, &node, slots);
             assert_eq!(slot, flood_slot(&hash, &node, slots));
-            assert!(slot >= 1 && slot < slots, "slot {slot} for {slots}");
+            assert!(slot < slots, "slot {slot} for {slots}");
         }
-        assert_eq!(flood_slot(&hash, &node, 1), 0);
+        assert_eq!(flood_slot(&hash, &node, 0), 0);
     }
 
     #[test]

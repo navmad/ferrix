@@ -1167,11 +1167,18 @@ async fn main(spawner: Spawner) {
                 UsbCommand::SetRepeat(rep) => {
                     info!("Setting repeater mode: {}", rep);
                     mesh.is_repeater = rep;
+                    if !rep {
+                        mesh.cancel_pending_forwards();
+                    }
                 }
                 UsbCommand::SetFrequency(f) => {
                     info!("Frequency updated to: {} Hz", f);
                     // Moving off an off-grid band can disable client repeat.
+                    let was_forwarding = mesh.is_repeater;
                     mesh.is_repeater = crate::companion::usb::forwarding_enabled();
+                    if was_forwarding && !mesh.is_repeater {
+                        mesh.cancel_pending_forwards();
+                    }
                     let _ = crate::radio::lora_phy::request_radio_config();
                 }
                 UsbCommand::SetRadio {

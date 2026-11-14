@@ -99,6 +99,26 @@ impl PacketQueue {
         self.push(pkt, now_ms, TxLane::Flood)
     }
 
+    /// Periodic adverts, sent when control and flood work is idle.
+    pub fn push_background(&mut self, pkt: Packet, now_ms: u64) -> Result<(), QueuedPacket> {
+        self.push(pkt, now_ms, TxLane::Background)
+    }
+
+    pub fn clear(&mut self) {
+        self.queue.clear();
+    }
+
+    /// Keep only the entries for which `keep` returns true.
+    pub fn retain(&mut self, mut keep: impl FnMut(&QueuedPacket) -> bool) {
+        let mut kept: Deque<QueuedPacket, OUTBOUND_QUEUE_SIZE> = Deque::new();
+        while let Some(item) = self.queue.pop_front() {
+            if keep(&item) {
+                let _ = kept.push_back(item);
+            }
+        }
+        self.queue = kept;
+    }
+
     pub fn pop(&mut self) -> Option<QueuedPacket> {
         self.queue.pop_front()
     }

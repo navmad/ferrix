@@ -22,6 +22,7 @@ use crate::meshcore::packets::{
 use core::sync::atomic::Ordering;
 
 use crate::meshcore::queue::{PacketQueue, SeenPacketFilter};
+use meshcore_wire::tx::TxLane;
 
 pub const DEFAULT_MAX_HOPS: u8 = 64;
 
@@ -274,6 +275,27 @@ impl MeshEngine {
             crate::radio::record_duplicate_delta(now.saturating_sub(entry.queued_at_ms));
             let _ = crate::radio::lora_phy::cancel_flood(entry.hash);
         }
+    }
+
+    /// Drop every queued flood and ask the radio task to clear scheduled ones.
+    /// Used when forwarding is turned off.
+    pub fn cancel_pending_forwards(&mut self) {
+        let mut hashes: heapless::Vec<[u8; 8], 8> = heapless::Vec::new();
+        self.tx_queue.retain(|queued| {
+            if queued.lane == TxLane::Flood {
+                let _ = hashes.push(queued.packet.calculate_packet_hash());
+                false
+            } else {
+                true
+            }
+        });
+        for hash in hashes.iter() {
+            crate::radio::lora_phy::cancel_flood(*hash);
+        }
+        for entry in self.pending_forwards.iter() {
+            crate::radio::lora_phy::cancel_flood(entry.hash);
+        }
+        self.pending_forwards.clear();
     }
 
     /// Process a packet received over the LoRa radio interface
@@ -725,7 +747,7 @@ impl MeshEngine {
             pkt.path_len = 0;
         }
         self.seen_filter.mark_seen(pkt.calculate_packet_hash());
-        let _ = self.tx_queue.push_control(pkt.clone(), now_ms());
+        let _ = self.tx_queue.push_background(pkt.clone(), now_ms());
         Ok(pkt)
     }
 
