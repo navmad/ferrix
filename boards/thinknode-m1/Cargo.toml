@@ -30,7 +30,6 @@ embedded-hal-async = "1.0"
 embedded-hal-bus = { version = "0.2", features = ["async"] }
 embedded-io-async = { version = "0.6", features = ["defmt-03"] }
 embedded-graphics = "0.8"
-lora-phy = "3.0.1"
 nrf-softdevice = { git = "https://github.com/embassy-rs/nrf-softdevice.git", rev = "5949a5b", features = ["nrf52840", "s140", "ble-peripheral", "ble-gatt-server", "ble-sec", "defmt", "critical-section-impl", "evt-max-size-512"] }
 
 heapless = { version = "0.8", features = ["defmt-03"] }
@@ -41,3 +40,4 @@ ferrix-core = { path = "../../crates/ferrix-core" }
 ferrix-hal = { path = "../../crates/ferrix-hal" }
 ferrix-nrf52 = { path = "../../platforms/nrf52" }
 ferrix-runtime = { path = "../../crates/ferrix-runtime" }
+ferrix-sx1262 = { path = "../../drivers/radio/sx1262" }

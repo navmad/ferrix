@@ -43,7 +43,7 @@ pub fn request_radio_config() -> bool {
             spreading_factor: s.sf,
             bandwidth_khz: s.bw_khz,
             coding_rate: s.cr,
-            preamble_length: 0,
+            preamble_length: preamble_for(s.sf),
             rx_duty_cycle: s.rx_duty_cycle,
         }
     });

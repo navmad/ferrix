@@ -6,6 +6,7 @@ members = [
     "crates/ferrix-core",
     "crates/ferrix-runtime",
     "platforms/nrf52",
+    "drivers/radio/sx1262",
     "boards/thinknode-m1",
 ]
 default-members = ["boards/thinknode-m1"]

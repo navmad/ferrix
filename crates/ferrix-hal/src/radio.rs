@@ -2,6 +2,23 @@
 
 use meshcore_wire::tx::TxLane;
 
+/// Convert the compact kHz setting to the exact bandwidth in Hz.
+///
+/// The narrow bandwidths are not exact kilohertz, so this table must be used
+/// for airtime and duty-cycle math instead of multiplying by 1000.
+pub fn bw_khz_to_hz(bw_khz: u32) -> u32 {
+    match bw_khz {
+        7 => 7_800,
+        10 => 10_400,
+        15 => 15_600,
+        20 => 20_800,
+        31 => 31_250,
+        41 => 41_670,
+        62 => 62_500,
+        other => other * 1000,
+    }
+}
+
 /// Standard LoRa modulation and RF configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LoraConfig {
@@ -23,7 +40,7 @@ impl Default for LoraConfig {
             spreading_factor: 7,
             bandwidth_khz: 62,
             coding_rate: 5,
-            preamble_length: 16,
+            preamble_length: 32,
             rx_duty_cycle: false,
         }
     }
