@@ -15,14 +15,14 @@ use defmt::{error, info};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use heapless::String;
-use meshcore_wire::message_record::{MessageRecord, MESSAGE_RECORD_MAX};
+use meshcore_wire::message_record::{ChannelDataRecord, MessageRecord, MESSAGE_RECORD_MAX};
 use nrf_softdevice::Flash;
 use sequential_storage::cache::{Cache, Uncached};
 use sequential_storage::queue::{QueueConfig, QueueStorage};
 
 use super::counted_flash::CountedFlash;
 use crate::companion::usb::{MESSAGE_LOG, MAX_MESSAGES};
-use crate::meshcore::mesh::ReceivedMessage;
+use crate::meshcore::mesh::{ReceivedChannelData, ReceivedMessage};
 
 /// 0xCC000..0xEC000: 32 pages of 4 KB.
 const REGION: Range<u32> = 0x000C_C000..0x000E_C000;
@@ -49,6 +49,7 @@ type MessageQueue<'a> = QueueStorage<CountedFlash<'a>, MessageCache>;
 /// mutations are serialized through this channel.
 pub enum MessageCommand {
     Append(ReceivedMessage),
+    AppendChannelData(ReceivedChannelData),
     Consume,
     Clear,
 }
@@ -58,6 +59,12 @@ pub static COMMAND_CHANNEL: Channel<CriticalSectionRawMutex, MessageCommand, 32>
 
 pub async fn queue_append(msg: ReceivedMessage) {
     let _ = COMMAND_CHANNEL.send(MessageCommand::Append(msg)).await;
+}
+
+pub async fn queue_append_channel_data(data: ReceivedChannelData) {
+    let _ = COMMAND_CHANNEL
+        .send(MessageCommand::AppendChannelData(data))
+        .await;
 }
 
 pub async fn queue_consume() {
@@ -86,6 +93,7 @@ fn message_to_record(m: &ReceivedMessage) -> MessageRecord {
         m.snr,
     );
     rec.txt_type = m.txt_type;
+    rec.signed_prefix = m.signed_prefix;
     rec
 }
 
@@ -105,6 +113,7 @@ fn record_to_message(r: &MessageRecord) -> ReceivedMessage {
         snr: r.snr,
         is_direct: r.is_direct,
         txt_type: r.txt_type,
+        signed_prefix: r.signed_prefix,
     }
 }
 
@@ -134,16 +143,33 @@ pub async fn load(flash: &mut Flash) {
         match queue.iter().await {
             Ok(mut iter) => {
                 while let Ok(Some(entry)) = iter.next(&mut buf).await {
-                    let Some(rec) = MessageRecord::decode(entry.into_buf()) else {
+                    let bytes = entry.into_buf();
+                    let version = bytes.first().copied().unwrap_or(0);
+                    let item = if version == 1 || version == 2 {
+                        MessageRecord::decode(bytes)
+                            .map(|rec| crate::companion::usb::InboxItem::Text(record_to_message(&rec)))
+                    } else if version == 3 {
+                        ChannelDataRecord::decode(bytes).map(|rec| {
+                            crate::companion::usb::InboxItem::ChannelData(ReceivedChannelData {
+                                channel_idx: rec.channel_idx,
+                                path_len: rec.path_len,
+                                snr: rec.snr,
+                                data_type: rec.data_type,
+                                data: rec.data,
+                            })
+                        })
+                    } else {
+                        None
+                    };
+                    let Some(item) = item else {
                         continue;
                     };
-                    let msg = record_to_message(&rec);
                     MESSAGE_LOG.lock(|m| {
                         let mut list = m.borrow_mut();
                         if list.len() >= MAX_MESSAGES {
                             list.remove(0);
                         }
-                        let _ = list.push(crate::companion::usb::InboxItem::Text(msg));
+                        let _ = list.push(item);
                     });
                     count += 1;
                 }
@@ -184,6 +210,36 @@ pub async fn append(flash: &mut Flash, msg: &ReceivedMessage) {
             QUEUED.fetch_add(1, Ordering::Relaxed);
         }
         Err(e) => error!("Persistence: message queue push failed: {:?}", e),
+    }
+}
+
+/// Append one channel datagram.
+pub async fn append_channel_data(flash: &mut Flash, data: &ReceivedChannelData) {
+    #[repr(C, align(4))]
+    struct Aligned([u8; MESSAGE_RECORD_MAX]);
+
+    let Some(rec) = ChannelDataRecord::new(
+        data.channel_idx,
+        data.path_len,
+        data.snr,
+        data.data_type,
+        &data.data,
+    ) else {
+        error!("Persistence: channel data too large");
+        return;
+    };
+    let mut aligned = Aligned([0u8; MESSAGE_RECORD_MAX]);
+    let Some(len) = rec.encode(&mut aligned.0) else {
+        error!("Persistence: channel data record too large");
+        return;
+    };
+    let mut queue = open(flash);
+    match queue.push(&aligned.0[..len], true).await {
+        Ok(()) => {
+            RECORD_SAVES.fetch_add(1, Ordering::Relaxed);
+            QUEUED.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(e) => error!("Persistence: channel data push failed: {:?}", e),
     }
 }
 

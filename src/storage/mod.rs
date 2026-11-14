@@ -93,6 +93,9 @@ pub async fn storage_task(sd: &'static nrf_softdevice::Softdevice) -> ! {
                         messages::MessageCommand::Append(msg) => {
                             messages::append(&mut flash, &msg).await
                         }
+                        messages::MessageCommand::AppendChannelData(data) => {
+                            messages::append_channel_data(&mut flash, &data).await
+                        }
                         messages::MessageCommand::Consume => {
                             messages::consume(&mut flash).await
                         }

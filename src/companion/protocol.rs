@@ -1520,6 +1520,13 @@ impl CompanionNode {
                                 let _ = resp.push(msg.path_len);
                                 let _ = resp.push(msg.txt_type);
                                 let _ = resp.extend_from_slice(&msg.timestamp.to_le_bytes());
+                                // Signed messages carry the signing-key prefix
+                                // between the timestamp and the text.
+                                if msg.txt_type
+                                    == crate::meshcore::packets::txtmsg::TXT_TYPE_SIGNED_PLAIN
+                                {
+                                    let _ = resp.extend_from_slice(&msg.signed_prefix);
+                                }
                                 let _ = resp.extend_from_slice(msg.text.as_bytes());
                             } else {
                                 // V3 Channel: [0x11, (snr*4), 0, 0, channel_idx, path_len, txt_type, 4B ts, text]
@@ -1537,6 +1544,9 @@ impl CompanionNode {
                             }
                         }
                         crate::companion::usb::InboxItem::ChannelData(data) => {
+                            // Datagrams are persisted too: pop the record once
+                            // the app has taken it.
+                            crate::storage::messages::queue_consume_now();
                             // [0x1B, (snr*4), 0, 0, channel_idx, path_len,
                             //  data_type u16 LE, data_len, data...]
                             let _ = resp.push(PACKET_CHANNEL_DATA_RECV);
@@ -2231,6 +2241,7 @@ impl CompanionNode {
                                                     out_path_len: pkt.path_len,
                                                     last_advert_ts: adv.timestamp,
                                                     saved_hash: 0,
+                            sync_since: 0,
                                                 };
                                             let record = serialize_contact(&discovered);
                                             let _ = frame.push(PUSH_CODE_NEW_ADVERT);
@@ -2542,9 +2553,9 @@ impl CompanionNode {
                         c.borrow()
                             .iter()
                             .find(|ct| ct.pub_key == dest_key)
-                            .map(|ct| (ct.out_path_len, ct.out_path, ct.contact_type))
+                            .map(|ct| (ct.out_path_len, ct.out_path, ct.contact_type, ct.sync_since))
                     });
-                    if let Some((out_path_len, out_path, contact_type)) = contact {
+                    if let Some((out_path_len, out_path, contact_type, sync_since)) = contact {
                         let identity = crate::meshcore::identity::LocalIdentity::from_private(
                             self.callsign.as_str(),
                             &self.private_key,
@@ -2558,7 +2569,8 @@ impl CompanionNode {
                                 let n = if contact_type
                                     == crate::meshcore::packets::advert::ADV_TYPE_ROOM
                                 {
-                                    // sync_since stays zero; password follows it.
+                                    // [tag][sync_since][password]
+                                    plain[4..8].copy_from_slice(&sync_since.to_le_bytes());
                                     plain[8..8 + pw.len()].copy_from_slice(pw);
                                     8 + pw.len()
                                 } else {

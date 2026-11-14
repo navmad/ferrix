@@ -56,6 +56,9 @@ pub struct DiscoveredContact {
     pub last_advert_ts: u32,
     /// Hash of the fields last written to flash (0 = never saved).
     pub saved_hash: u32,
+    /// Newest signed-message timestamp accepted from this contact (room
+    /// servers use it to decide which posts to replay).
+    pub sync_since: u32,
 }
 
 /// Recently received message entry for message history / inbox
@@ -73,6 +76,8 @@ pub struct ReceivedMessage {
     pub is_direct: bool,
     /// MeshCore text type (`0` plain, `1` CLI data, `2` signed, `3` CLI command).
     pub txt_type: u8,
+    /// Signing-key prefix for signed messages; zero otherwise.
+    pub signed_prefix: [u8; 4],
 }
 
 /// A received channel datagram (GRP_DATA), delivered to the companion as
@@ -449,12 +454,22 @@ impl MeshEngine {
                         None => continue,
                     };
                     if let Ok(msg) = TxtMsgPacket::decode(payload, &secret, peer) {
-                        if msg.txt_type == crate::meshcore::packets::txtmsg::TXT_TYPE_PLAIN {
-                            let ack = AckPacket::with_extended(
-                                msg.ack_crc,
-                                msg.extended_attempt,
-                                0,
-                            );
+                        let plain = msg.txt_type
+                            == crate::meshcore::packets::txtmsg::TXT_TYPE_PLAIN;
+                        let signed = msg.txt_type
+                            == crate::meshcore::packets::txtmsg::TXT_TYPE_SIGNED_PLAIN;
+                        if plain || signed {
+                            // Signed messages carry a 4-byte ACK; companions
+                            // use the extended 6-byte form.
+                            let ack = if signed {
+                                AckPacket::new(msg.ack_crc)
+                            } else {
+                                AckPacket::with_extended(
+                                    msg.ack_crc,
+                                    msg.extended_attempt,
+                                    0,
+                                )
+                            };
                             if pkt.is_flood() {
                                 // Flooded DM: return the arrival path with the ACK
                                 // as extra, so the sender learns a direct route.

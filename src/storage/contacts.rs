@@ -23,9 +23,11 @@ use crate::meshcore::mesh::DiscoveredContact;
 
 /// 0xB0000..0xCC000: 28 pages of 4 KB.
 const REGION: Range<u32> = 0x000B_0000..0x000C_C000;
-const CONTACT_RECORD_SIZE: usize = 156;
+const CONTACT_RECORD_SIZE: usize = 164;
+/// Size of records written before `sync_since` was added.
+const LEGACY_CONTACT_RECORD_SIZE: usize = 156;
 /// Key (32) + serialized contact, rounded up to a whole flash word.
-const SCRATCH_SIZE: usize = 192;
+const SCRATCH_SIZE: usize = 200;
 
 /// Completed contact record writes and page erases since boot.
 pub static SAVES: AtomicU32 = AtomicU32::new(0);
@@ -47,6 +49,7 @@ struct PersistContact {
     flags: u8,
     contact_type: u8,
     out_path_len: u8,
+    sync_since: u32,
     _pad: [u8; 2],
 }
 
@@ -103,6 +106,7 @@ fn contact_to_record(c: &DiscoveredContact) -> PersistContact {
         flags: c.flags,
         contact_type: c.contact_type,
         out_path_len: c.out_path_len,
+        sync_since: c.sync_since,
         _pad: [0; 2],
     }
 }
@@ -125,6 +129,7 @@ fn record_to_contact(r: &PersistContact) -> DiscoveredContact {
         out_path_len: r.out_path_len,
         last_advert_ts: r.last_advert_ts,
         saved_hash: 0,
+        sync_since: r.sync_since,
     }
 }
 
@@ -138,6 +143,7 @@ fn structural_hash_of(ct: &DiscoveredContact) -> u32 {
     fnv_bytes(&mut h, &ct.out_path);
     fnv_bytes(&mut h, &ct.latitude.to_le_bytes());
     fnv_bytes(&mut h, &ct.longitude.to_le_bytes());
+    fnv_bytes(&mut h, &ct.sync_since.to_le_bytes());
     fnv_bytes(&mut h, &[ct.flags, ct.contact_type, ct.out_path_len]);
     h
 }
@@ -166,12 +172,20 @@ pub async fn load(flash: &mut Flash) {
     match map.fetch_all_items(&mut buf.0).await {
         Ok(mut iter) => {
             while let Ok(Some((key, value))) = iter.next::<&[u8]>(&mut buf.0).await {
-                if value.len() < CONTACT_RECORD_SIZE {
+                if value.len() < LEGACY_CONTACT_RECORD_SIZE {
                     continue;
                 }
-                let rec = unsafe {
-                    core::ptr::read_unaligned(value.as_ptr() as *const PersistContact)
-                };
+                // Older records are shorter (no sync_since); copy only what is
+                // present into a zeroed struct.
+                let mut rec: PersistContact = unsafe { core::mem::zeroed() };
+                let n = value.len().min(CONTACT_RECORD_SIZE);
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        value.as_ptr(),
+                        &mut rec as *mut PersistContact as *mut u8,
+                        n,
+                    );
+                }
                 let mut ct = record_to_contact(&rec);
                 ct.saved_hash = structural_hash_of(&ct);
                 DISCOVERED_CONTACTS.lock(|c| {

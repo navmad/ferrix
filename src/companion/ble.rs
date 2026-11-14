@@ -239,6 +239,7 @@ pub async fn contact_task() -> ! {
                             out_path_len,
                             last_advert_ts,
                             saved_hash: 0,
+                            sync_since: 0,
                         });
                     }
                 });

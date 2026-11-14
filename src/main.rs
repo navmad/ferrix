@@ -571,6 +571,7 @@ async fn main(spawner: Spawner) {
                                 out_path_len: 0xFF,
                                 last_advert_ts: adv.timestamp,
                                 saved_hash: 0,
+                            sync_since: 0,
                             };
 
                             let mut added = false;
@@ -650,23 +651,20 @@ async fn main(spawner: Spawner) {
                             snr,
                             is_direct: false,
                             txt_type: grp.txt_type,
+                            signed_prefix: [0u8; 4],
                         };
-                        let dropped_text = crate::companion::usb::MESSAGE_LOG.lock(|m| {
+                        let dropped = crate::companion::usb::MESSAGE_LOG.lock(|m| {
                             let mut list = m.borrow_mut();
-                            let dropped_text = if list.is_full() {
-                                matches!(
-                                    list.remove(0),
-                                    crate::companion::usb::InboxItem::Text(_)
-                                )
-                            } else {
-                                false
-                            };
+                            let dropped = list.is_full();
+                            if dropped {
+                                list.remove(0);
+                            }
                             let _ = list.push(crate::companion::usb::InboxItem::Text(
                                 message.clone(),
                             ));
-                            dropped_text
+                            dropped
                         });
-                        if dropped_text {
+                        if dropped {
                             crate::storage::messages::queue_consume().await;
                         }
                         crate::storage::messages::queue_append(message).await;
@@ -688,24 +686,21 @@ async fn main(spawner: Spawner) {
                             data_type: packet.data_type,
                             data: packet.data.clone(),
                         };
-                        let dropped_text = crate::companion::usb::MESSAGE_LOG.lock(|m| {
+                        let dropped = crate::companion::usb::MESSAGE_LOG.lock(|m| {
                             let mut list = m.borrow_mut();
-                            let dropped_text = if list.is_full() {
-                                matches!(
-                                    list.remove(0),
-                                    crate::companion::usb::InboxItem::Text(_)
-                                )
-                            } else {
-                                false
-                            };
+                            let dropped = list.is_full();
+                            if dropped {
+                                list.remove(0);
+                            }
                             let _ = list.push(crate::companion::usb::InboxItem::ChannelData(
-                                item,
+                                item.clone(),
                             ));
-                            dropped_text
+                            dropped
                         });
-                        if dropped_text {
+                        if dropped {
                             crate::storage::messages::queue_consume().await;
                         }
+                        crate::storage::messages::queue_append_channel_data(item).await;
 
                         let mut msg_wait = heapless::Vec::<u8, 256>::new();
                         let _ = msg_wait.push(crate::companion::protocol::PUSH_CODE_MSG_WAITING);
@@ -719,6 +714,32 @@ async fn main(spawner: Spawner) {
                             msg.text.as_str()
                         );
                         node.unread_messages = node.unread_messages.saturating_add(1);
+                        // Signed room posts advance the room-sync watermark so a
+                        // later login does not replay the whole backlog.
+                        if msg.txt_type
+                            == crate::meshcore::packets::txtmsg::TXT_TYPE_SIGNED_PLAIN
+                        {
+                            let changed =
+                                crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| {
+                                    if let Some(ct) = c
+                                        .borrow_mut()
+                                        .iter_mut()
+                                        .find(|ct| ct.pub_key == sender_pub)
+                                    {
+                                        if msg.timestamp > ct.sync_since {
+                                            ct.sync_since = msg.timestamp;
+                                            true
+                                        } else {
+                                            false
+                                        }
+                                    } else {
+                                        false
+                                    }
+                                });
+                            if changed {
+                                crate::storage::request_contacts();
+                            }
+                        }
                         let mut s_sender = heapless::String::new();
                         use core::fmt::Write;
                         let _ = write!(
@@ -744,23 +765,20 @@ async fn main(spawner: Spawner) {
                             snr,
                             is_direct: true,
                             txt_type: msg.txt_type,
+                            signed_prefix: msg.signed_prefix,
                         };
-                        let dropped_text = crate::companion::usb::MESSAGE_LOG.lock(|m| {
+                        let dropped = crate::companion::usb::MESSAGE_LOG.lock(|m| {
                             let mut list = m.borrow_mut();
-                            let dropped_text = if list.is_full() {
-                                matches!(
-                                    list.remove(0),
-                                    crate::companion::usb::InboxItem::Text(_)
-                                )
-                            } else {
-                                false
-                            };
+                            let dropped = list.is_full();
+                            if dropped {
+                                list.remove(0);
+                            }
                             let _ = list.push(crate::companion::usb::InboxItem::Text(
                                 message.clone(),
                             ));
-                            dropped_text
+                            dropped
                         });
-                        if dropped_text {
+                        if dropped {
                             crate::storage::messages::queue_consume().await;
                         }
                         crate::storage::messages::queue_append(message).await;

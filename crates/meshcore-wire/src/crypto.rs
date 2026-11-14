@@ -183,6 +183,25 @@ pub fn ack_crc(ts: u32, flags: u8, text: &[u8], sender_pub: &[u8; 32]) -> u32 {
     u32::from_le_bytes([full[0], full[1], full[2], full[3]])
 }
 
+/// ACK CRC for a signed message: the signing-key prefix is part of the
+/// authenticated plaintext, between the flags and the text.
+pub fn ack_crc_signed(
+    ts: u32,
+    flags: u8,
+    prefix: &[u8; 4],
+    text: &[u8],
+    sender_pub: &[u8; 32],
+) -> u32 {
+    let mut hasher = Sha256::new();
+    hasher.update(ts.to_le_bytes());
+    hasher.update([flags]);
+    hasher.update(prefix);
+    hasher.update(text);
+    hasher.update(sender_pub);
+    let full: [u8; 32] = hasher.finalize().into();
+    u32::from_le_bytes([full[0], full[1], full[2], full[3]])
+}
+
 /// Region key: `SHA256("#" ‖ name)[0..16]`. "fr" and "#fr" are equivalent.
 pub fn region_key(name: &str) -> [u8; 16] {
     let name = name.strip_prefix('#').unwrap_or(name);

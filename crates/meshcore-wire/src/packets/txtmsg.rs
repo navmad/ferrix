@@ -6,7 +6,9 @@
 
 use heapless::String;
 
-use crate::crypto::{ack_crc, meshcore_encrypt_then_mac, meshcore_mac_then_decrypt};
+use crate::crypto::{
+    ack_crc, ack_crc_signed, meshcore_encrypt_then_mac, meshcore_mac_then_decrypt,
+};
 use crate::packet::{Packet, PAYLOAD_TYPE_TXT_MSG};
 
 pub const MAX_TEXT_LEN: usize = 160;
@@ -30,6 +32,8 @@ pub struct TxtMsgPacket {
     pub ack_crc: u32,
     /// Byte after the terminating NUL: the extended attempt, or padding.
     pub extended_attempt: u8,
+    /// Signing-key prefix for `TXT_TYPE_SIGNED_PLAIN`; zero otherwise.
+    pub signed_prefix: [u8; 4],
 }
 
 impl TxtMsgPacket {
@@ -62,6 +66,7 @@ impl TxtMsgPacket {
             text: t,
             ack_crc: ack_crc(timestamp, flags, text.as_bytes(), sender_pub),
             extended_attempt: if attempt > 3 { attempt } else { 0 },
+            signed_prefix: [0; 4],
         })
     }
 
@@ -103,16 +108,38 @@ impl TxtMsgPacket {
         let txt_type = flags >> 2;
 
         let rest = &plain[5..plain_len];
-        let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());
-        let text_str = core::str::from_utf8(&rest[..end]).map_err(|_| ())?;
+        let signed = txt_type == TXT_TYPE_SIGNED_PLAIN && rest.len() >= 4;
+        let mut signed_prefix = [0u8; 4];
+        let text_rest = if signed {
+            // Signed plaintext: [prefix 4][text...]
+            signed_prefix.copy_from_slice(&rest[..4]);
+            &rest[4..]
+        } else {
+            rest
+        };
+        let end = text_rest
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(text_rest.len());
+        let text_str = core::str::from_utf8(&text_rest[..end]).map_err(|_| ())?;
         let mut text = String::new();
         text.push_str(text_str)?;
 
-        let extended_attempt = rest.get(end + 1).copied().unwrap_or(0);
+        let extended_attempt = if signed {
+            0
+        } else {
+            text_rest.get(end + 1).copied().unwrap_or(0)
+        };
         let attempt = if extended_attempt > 3 {
             extended_attempt
         } else {
             flags & 0x03
+        };
+
+        let crc = if signed {
+            ack_crc_signed(timestamp, flags, &signed_prefix, text.as_bytes(), sender_pub)
+        } else {
+            ack_crc(timestamp, flags, text.as_bytes(), sender_pub)
         };
 
         Ok(Self {
@@ -121,9 +148,10 @@ impl TxtMsgPacket {
             timestamp,
             txt_type,
             attempt,
-            ack_crc: ack_crc(timestamp, flags, text.as_bytes(), sender_pub),
+            ack_crc: crc,
             text,
             extended_attempt,
+            signed_prefix,
         })
     }
 
@@ -141,12 +169,19 @@ impl TxtMsgPacket {
         let flags = flags_of(self.txt_type, self.attempt);
         let mut n = 0;
 
-        if out.len() < 5 + text.len() + if self.attempt > 3 { 2 } else { 0 } {
+        let signed = self.txt_type == TXT_TYPE_SIGNED_PLAIN;
+        if out.len()
+            < 5 + if signed { 4 } else { 0 } + text.len() + if self.attempt > 3 { 2 } else { 0 }
+        {
             return Err(());
         }
         out[0..4].copy_from_slice(&self.timestamp.to_le_bytes());
         out[4] = flags;
         n += 5;
+        if signed {
+            out[n..n + 4].copy_from_slice(&self.signed_prefix);
+            n += 4;
+        }
         out[n..n + text.len()].copy_from_slice(text);
         n += text.len();
         if self.attempt > 3 {
