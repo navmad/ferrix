@@ -5,8 +5,9 @@
 //! services it needs and keeps the local CLI dispatched by the USB task.
 
 pub use ferrix_core::companion::cli::{CliHost, RadioStats, StorageStats};
-pub use ferrix_core::companion::protocol::{CompanionHost, CompanionNode};
 use heapless::Vec;
+
+pub use ferrix_core::companion::protocol::CompanionHost;
 
 pub use ferrix_core::companion::protocol::*;
 pub(crate) use ferrix_core::companion::contacts::serialize_contact;
@@ -67,14 +68,6 @@ impl CompanionHost for BoardCompanionHost {
 }
 
 impl CliHost for BoardCompanionHost {
-    async fn clear_contacts(&self) {
-        crate::storage::contacts::queue_clear().await;
-    }
-
-    async fn clear_messages(&self) {
-        crate::storage::messages::queue_clear().await;
-    }
-
     fn leds_disabled(&self) -> bool {
         crate::companion::usb::leds_disabled()
     }
@@ -131,7 +124,9 @@ impl CliHost for BoardCompanionHost {
     }
 
     fn reboot_to_bootloader(&self) -> ! {
-        crate::companion::usb::reboot_to_bootloader()
+        let sd_active =
+            ferrix_core::state::BLE_STATUS.load(core::sync::atomic::Ordering::Relaxed) >= 3;
+        ferrix_nrf52::reset::reboot_to_bootloader(sd_active)
     }
 
     fn board_line(&self) -> &'static str {
@@ -148,29 +143,3 @@ pub async fn delayed_push_task() -> ! {
     }
 }
 
-/// Dispatch a companion frame, keeping the local CLI on the board side.
-///
-/// `CMD_RUN_CLI_COMMAND` needs the full text CLI (display, GPS, DFU and radio
-/// diagnostics), so the transport intercepts it here before the core parser.
-pub async fn handle_command<F: FnMut(&[u8])>(
-    node: &mut CompanionNode<'_>,
-    payload: &[u8],
-    mut emit: F,
-) {
-    if payload.first() == Some(&CMD_RUN_CLI_COMMAND) {
-        let line = core::str::from_utf8(&payload[1..])
-            .unwrap_or("")
-            .trim_end_matches('\0');
-        let mut out = heapless::String::<512>::new();
-        crate::companion::usb::cli_reply(line, node, &mut out).await;
-        let mut resp =
-            Vec::<u8, { ferrix_core::companion::framing::MAX_FRAME_PAYLOAD_SIZE }>::new();
-        let _ = resp.push(PACKET_CLI_REPLY);
-        let bytes = out.as_bytes();
-        let max = ferrix_core::companion::framing::MAX_FRAME_PAYLOAD_SIZE - 1;
-        let _ = resp.extend_from_slice(&bytes[..bytes.len().min(max)]);
-        emit(&resp);
-    } else {
-        node.handle_command(payload, emit).await;
-    }
-}

@@ -55,10 +55,7 @@ pub struct RadioStats {
 }
 
 /// Board services used by the text CLI.
-#[allow(async_fn_in_trait)]
 pub trait CliHost: CompanionHost {
-    async fn clear_contacts(&self);
-    async fn clear_messages(&self);
     fn leds_disabled(&self) -> bool;
     fn set_leds_disabled(&self, disabled: bool);
     fn storage_stats(&self) -> StorageStats;
@@ -73,10 +70,10 @@ pub trait CliHost: CompanionHost {
 }
 
 /// Run one local CLI line and collect its reply for `PACKET_CLI_REPLY`.
-pub async fn reply<H: CliHost>(
+pub async fn reply(
     line: &str,
     node: &mut CompanionNode<'_>,
-    host: &H,
+    host: &dyn CliHost,
     out: &mut String<512>,
 ) {
     let mut sink = TextBuffer(out);
@@ -210,11 +207,11 @@ fn hex_to_nibble_opt(b: u8) -> Option<u8> {
 }
 
 
-pub async fn handle_text_cli<W: TextSink, H: CliHost>(
+pub async fn handle_text_cli<W: TextSink>(
     sender: &mut W,
     cmd_line: &str,
     node: &mut CompanionNode<'_>,
-    host: &H,
+    host: &dyn CliHost,
     echo: bool,
 ) {
     let storage = host.storage_stats();
@@ -965,7 +962,7 @@ pub async fn handle_text_cli<W: TextSink, H: CliHost>(
             DISCOVERED_CONTACTS.lock(|c| {
                 c.borrow_mut().clear();
             });
-            host.clear_contacts().await;
+            crate::storage::contacts::queue_clear().await;
             let _ = sender.send( b"  -> OK (Contacts cleared)\r\n").await;
         }
         "messages" | "inbox" | "get messages" => {
@@ -1029,7 +1026,7 @@ pub async fn handle_text_cli<W: TextSink, H: CliHost>(
             MESSAGE_LOG.lock(|m| {
                 m.borrow_mut().clear();
             });
-            host.clear_messages().await;
+            crate::storage::messages::queue_clear().await;
             let _ = sender.send( b"  -> OK (Messages cleared)\r\n").await;
         }
         "get tx.slot" => {

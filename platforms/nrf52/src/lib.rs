@@ -8,3 +8,4 @@
 pub mod flash;
 pub mod reset;
 pub mod seed;
+pub mod usb;

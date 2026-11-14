@@ -779,9 +779,16 @@ version = "0.1.0"
 dependencies = [
  "cortex-m",
  "defmt 0.3.101",
+ "embassy-executor",
+ "embassy-futures",
+ "embassy-nrf",
+ "embassy-time",
+ "embassy-usb",
  "ferrix-core",
+ "heapless 0.8.0",
  "meshcore-wire",
  "nrf-softdevice",
+ "static_cell",
 ]
 
 [[package]]

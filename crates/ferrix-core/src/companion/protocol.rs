@@ -3216,3 +3216,31 @@ mod tests {
         assert_eq!(node.battery_percentage, 77);
     }
 }
+
+/// Dispatch a companion frame, including the local-CLI command.
+///
+/// Transports call this instead of [`CompanionNode::handle_command`] so the
+/// text CLI and binary protocol share one entry point.
+pub async fn handle_command<F: FnMut(&[u8])>(
+    node: &mut CompanionNode<'_>,
+    payload: &[u8],
+    host: &dyn crate::companion::cli::CliHost,
+    mut emit: F,
+) {
+    if payload.first() == Some(&CMD_RUN_CLI_COMMAND) {
+        let line = core::str::from_utf8(&payload[1..])
+            .unwrap_or("")
+            .trim_end_matches('\0');
+        let mut out = String::<512>::new();
+        crate::companion::cli::reply(line, node, host, &mut out).await;
+        let mut resp =
+            Vec::<u8, { crate::companion::framing::MAX_FRAME_PAYLOAD_SIZE }>::new();
+        let _ = resp.push(PACKET_CLI_REPLY);
+        let bytes = out.as_bytes();
+        let max = crate::companion::framing::MAX_FRAME_PAYLOAD_SIZE - 1;
+        let _ = resp.extend_from_slice(&bytes[..bytes.len().min(max)]);
+        emit(&resp);
+    } else {
+        node.handle_command(payload, emit).await;
+    }
+}

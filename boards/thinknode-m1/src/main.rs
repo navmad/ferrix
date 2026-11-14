@@ -331,9 +331,24 @@ async fn main(spawner: Spawner) {
     let vbus: &'static embassy_nrf::usb::vbus_detect::SoftwareVbusDetect =
         &*VBUS_DETECT.init(embassy_nrf::usb::vbus_detect::SoftwareVbusDetect::new(true, true));
     let usb_driver = usb::Driver::new(board.usbd, Irqs, vbus);
-    let (usb_dev, cdc_class) = crate::companion::usb::init_usb(usb_driver);
+    let (usb_dev, cdc_class) = crate::companion::usb::init_usb(
+        usb_driver,
+        0x239A,
+        0x8029,
+        "MeshCore",
+        "ThinkNode M1 Companion",
+    );
     spawner.spawn(crate::companion::usb::usb_task(usb_dev)).unwrap();
-    spawner.spawn(crate::companion::usb::cdc_acm_task(cdc_class, pub_key, priv_key)).unwrap();
+    spawner
+        .spawn(crate::companion::usb::cdc_acm_task(
+            cdc_class,
+            pub_key,
+            priv_key,
+            CurrentBoard::NAME,
+            CurrentBoard::CAPABILITIES,
+            &crate::companion::protocol::BOARD_HOST,
+        ))
+        .unwrap();
     spawner.spawn(crate::companion::ble::contact_task()).unwrap();
     spawner.spawn(crate::companion::protocol::delayed_push_task()).unwrap();
     spawner

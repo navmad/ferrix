@@ -478,7 +478,11 @@ pub async fn ble_companion_task(
                     if cmd_buf[..len].first() == Some(&crate::companion::protocol::CMD_GET_CONTACTS) {
                         stream_contacts().await;
                     } else {
-                        crate::companion::protocol::handle_command(&mut node, &cmd_buf[..len], |resp| {
+                        crate::companion::protocol::handle_command(
+                            &mut node,
+                            &cmd_buf[..len],
+                            &crate::companion::protocol::BOARD_HOST,
+                            |resp| {
                             let mut vec = Vec::<u8, 256>::new();
                             let copy_len = resp.len().min(247);
                             let _ = vec.extend_from_slice(&resp[..copy_len]);
