@@ -1,0 +1,11 @@
+[package]
+name = "ferrix-nrf52"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+cortex-m = { version = "0.7", features = ["inline-asm"] }
+defmt = "0.3"
+ferrix-core = { path = "../../crates/ferrix-core" }
+meshcore-wire = { path = "../../crates/meshcore-wire" }
+nrf-softdevice = { git = "https://github.com/embassy-rs/nrf-softdevice.git", rev = "5949a5b", features = ["nrf52840", "s140", "ble-peripheral", "ble-gatt-server", "ble-sec", "defmt", "critical-section-impl", "evt-max-size-512"] }

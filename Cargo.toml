@@ -5,6 +5,7 @@ members = [
     "crates/ferrix-hal",
     "crates/ferrix-core",
     "crates/ferrix-runtime",
+    "platforms/nrf52",
     "boards/thinknode-m1",
 ]
 default-members = ["boards/thinknode-m1"]

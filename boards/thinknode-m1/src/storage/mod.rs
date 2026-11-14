@@ -23,21 +23,6 @@ pub static REGIONS: StorageRegions = StorageRegions {
     factory_reset: 0x000A_0000..0x000E_D000,
 };
 
-/// Memory-mapped flash reader for the advert log.
-struct NrfMappedFlash;
-
-impl MappedFlash for NrfMappedFlash {
-    fn read(&self, offset: u32, out: &mut [u8]) {
-        // SAFETY: offsets come from `REGIONS`, which is inside the reserved,
-        // memory-mapped flash region above the application image.
-        unsafe {
-            core::ptr::copy_nonoverlapping(offset as *const u8, out.as_mut_ptr(), out.len());
-        }
-    }
-}
-
-static MAPPED_FLASH: NrfMappedFlash = NrfMappedFlash;
-
 /// Initialize configuration from the reserved page, or defaults.
 pub fn init_config() -> (String<32>, Option<[u8; 64]>) {
     let len = (REGIONS.config.end - REGIONS.config.start) as usize;
@@ -48,16 +33,16 @@ pub fn init_config() -> (String<32>, Option<[u8; 64]>) {
 
 /// Load the advert log into RAM. Called once at boot, before the tasks start.
 pub fn load() {
-    adverts::init(&MAPPED_FLASH, REGIONS.adverts.clone());
+    adverts::init(&ferrix_nrf52::flash::MAPPED, REGIONS.adverts.clone());
 }
 
 /// Background storage task that serializes all flash writes.
 #[embassy_executor::task]
 pub async fn storage_task(sd: &'static nrf_softdevice::Softdevice) -> ! {
-    let mut flash = nrf_softdevice::Flash::take(sd);
+    let mut flash = ferrix_nrf52::flash::take(sd);
     defmt::info!("Storage: Flash persistence task started");
     if storage_loop(&mut flash, &REGIONS).await == StorageExit::FactoryReset {
-        cortex_m::peripheral::SCB::sys_reset();
+        ferrix_nrf52::reset::system_reset();
     }
     core::future::pending().await
 }

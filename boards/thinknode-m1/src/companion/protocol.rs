@@ -62,7 +62,7 @@ impl CompanionHost for BoardCompanionHost {
     }
 
     fn reboot(&self) -> ! {
-        cortex_m::peripheral::SCB::sys_reset()
+        ferrix_nrf52::reset::system_reset()
     }
 }
 

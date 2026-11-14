@@ -771,6 +771,17 @@ name = "ferrix-hal"
 version = "0.1.0"
 
 [[package]]
+name = "ferrix-nrf52"
+version = "0.1.0"
+dependencies = [
+ "cortex-m",
+ "defmt 0.3.101",
+ "ferrix-core",
+ "meshcore-wire",
+ "nrf-softdevice",
+]
+
+[[package]]
 name = "ferrix-runtime"
 version = "0.1.0"
 dependencies = [
@@ -801,6 +812,7 @@ dependencies = [
  "embedded-hal-bus",
  "embedded-io-async",
  "ferrix-core",
+ "ferrix-nrf52",
  "ferrix-runtime",
  "heapless 0.8.0",
  "lora-phy",

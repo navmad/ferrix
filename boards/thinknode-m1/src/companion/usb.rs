@@ -64,22 +64,11 @@ static MSOS_DESC: StaticCell<[u8; 256]> = StaticCell::new();
 static CONTROL_BUF: StaticCell<[u8; 64]> = StaticCell::new();
 static CDC_STATE: StaticCell<State> = StaticCell::new();
 
-/// Reboot the nRF52840 directly into the DFU Bootloader
+/// Reboot the nRF52840 directly into the DFU Bootloader.
 pub fn reboot_to_bootloader() -> ! {
-    info!("Rebooting into Adafruit DFU Bootloader (GPREGRET=0x57)...");
-    let sd_active = crate::companion::ble::BLE_STATUS.load(core::sync::atomic::Ordering::Relaxed) >= 3;
-    if sd_active {
-        unsafe {
-            let _ = nrf_softdevice::raw::sd_power_gpregret_clr(0, 0xFF);
-            let _ = nrf_softdevice::raw::sd_power_gpregret_set(0, 0x57);
-        }
-    } else {
-        unsafe {
-            let gpregret = (0x4000_0000 + 0x51C) as *mut u32;
-            gpregret.write_volatile(0x57);
-        }
-    }
-    cortex_m::peripheral::SCB::sys_reset();
+    let sd_active =
+        crate::companion::ble::BLE_STATUS.load(core::sync::atomic::Ordering::Relaxed) >= 3;
+    ferrix_nrf52::reset::reboot_to_bootloader(sd_active)
 }
 
 /// Helper: Write an entire byte slice across USB CDC-ACM packet boundaries
