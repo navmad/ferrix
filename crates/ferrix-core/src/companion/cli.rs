@@ -1154,6 +1154,31 @@ pub async fn handle_text_cli<W: TextSink>(
             );
             let _ = sender.send( s.as_bytes()).await;
         }
+        "qspi" | "stats-qspi" => {
+            use core::sync::atomic::Ordering;
+            let status = crate::state::QSPI_STATUS.load(Ordering::Relaxed);
+            let id = crate::state::QSPI_ID.load(Ordering::Relaxed);
+            let test = crate::state::QSPI_SELFTEST.load(Ordering::Relaxed);
+            let status_s = match status {
+                0 => "not initialized",
+                1 => "ready",
+                2 => "id mismatch",
+                _ => "io error",
+            };
+            let test_s = match test {
+                0 => "not run",
+                1 => "pass",
+                2 => "fail",
+                _ => "?",
+            };
+            let mut s: heapless::String<160> = heapless::String::new();
+            let _ = write!(
+                s,
+                "  -> QSPI: {} id={:06x} selftest={}\r\n",
+                status_s, id, test_s
+            );
+            let _ = sender.send( s.as_bytes()).await;
+        }
         "stats-disc" => {
             let mut s: heapless::String<160> = heapless::String::new();
             let _ = write!(
@@ -1260,13 +1285,12 @@ pub async fn handle_text_cli<W: TextSink>(
             let _ = sender.send( s.as_bytes()).await;
         }
         "stats-adverts" => {
-            let (cursor, pending, erase_pending) = host.advert_stats();
+            let (saved, pending, erase_pending) = host.advert_stats();
             let mut s: heapless::String<96> = heapless::String::new();
             let _ = write!(
                 s,
-                "  -> slot {}/{} pending {}{}\r\n",
-                cursor,
-                host.advert_slots(),
+                "  -> blobs {} saved, pending {}{}\r\n",
+                saved,
                 pending,
                 if erase_pending { " erase-pending" } else { "" }
             );
@@ -1282,7 +1306,7 @@ pub async fn handle_text_cli<W: TextSink>(
         }
         "stats-ble" | "get ble" => {
             let st = crate::state::BLE_STATUS.load(core::sync::atomic::Ordering::Relaxed);
-            let mut s: heapless::String<128> = heapless::String::new();
+            let mut s: heapless::String<224> = heapless::String::new();
             match st {
                 0 => { let _ = write!(s, "  -> BLE: Not started\r\n"); }
                 1 => { let _ = write!(s, "  -> BLE: Probing SoftDevice...\r\n"); }
@@ -1293,10 +1317,13 @@ pub async fn handle_text_cli<W: TextSink>(
                     let callsign = crate::storage::get_callsign();
                     let _ = write!(
                         s,
-                        "  -> BLE: Active (MeshCore-{} NUS), connected: {}, bonds: {}\r\n",
+                        "  -> BLE: Active (MeshCore-{} NUS), connected: {}, bonds: {} (loaded {}, saved {}, errors {})\r\n",
                         callsign.as_str(),
                         connected,
-                        crate::storage::bonds::count()
+                        crate::storage::bonds::count(),
+                        crate::storage::bonds::BOND_LOADED.load(core::sync::atomic::Ordering::Relaxed),
+                        crate::storage::bonds::BOND_SAVES.load(core::sync::atomic::Ordering::Relaxed),
+                        crate::storage::bonds::BOND_SAVE_ERRORS.load(core::sync::atomic::Ordering::Relaxed)
                     );
                 }
                 code if code >= 0x1000 => {
@@ -1404,18 +1431,21 @@ pub async fn handle_text_cli<W: TextSink>(
             let _ = sender.send( b"  -> OK\r\n").await;
         }
         "dfu" | "bootloader" => {
+            let _ = crate::storage::flush_pending().await;
             let _ = sender.send( b"  -> Entering DFU bootloader...\r\n").await;
             embassy_time::Timer::after_millis(50).await;
             host.reboot_to_bootloader();
         }
         "reboot" => {
+            let _ = crate::storage::flush_pending().await;
             let _ = sender.send( b"  -> Rebooting device...\r\n").await;
             embassy_time::Timer::after_millis(50).await;
             host.reboot();
         }
         "save" => {
             host.request_save_config();
-            let _ = sender.send( b"  -> OK (Config save queued to flash)\r\n").await;
+            let _ = crate::storage::flush_pending().await;
+            let _ = sender.send( b"  -> OK (Config saved to flash)\r\n").await;
         }
         "help" => {
             let _ = sender.send( b"  -> Commands:\r\n  ->   Identity: get/set name, get/set prv.key, get public.key\r\n  ->   Radio:    get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq/tx/sf/bw/cr, get/set repeat, get/set rxduty, get/set af, get/set dutycycle, get/set hash-mode, stats-radio\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, get/set autoadd, advert, time, channels\r\n  ->   System:   save, ver, board, get/set leds, stats-core, stats-packets, clear stats/contacts/messages, reboot\r\n").await;

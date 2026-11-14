@@ -2,7 +2,7 @@
 //!
 //! The SoftDevice leaves bond persistence to the application. This module keeps
 //! a small RAM table for synchronous lookups from the BLE event context and
-//! writes the table to one reserved flash page whenever it changes.
+//! persists bonds as a `sequential-storage` map in a 16 KB internal journal.
 
 use core::cell::RefCell;
 use core::ops::Range;
@@ -12,8 +12,12 @@ use defmt::{error, info};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::channel::Channel;
-use embedded_storage_async::nor_flash::NorFlash;
+use embedded_storage_async::nor_flash::{MultiwriteNorFlash, NorFlash};
+use sequential_storage::cache::{Cache, Uncached};
+use sequential_storage::map::{MapConfig, MapStorage};
 
+use super::counted_flash::CountedFlash;
+use super::util::{self, MappedAsyncFlash};
 use super::MappedFlash;
 
 pub const MAX_BONDS: usize = 4;
@@ -23,6 +27,7 @@ const MAGIC: u32 = 0x424F_4E44; // "BOND"
 const VERSION: u16 = 1;
 const RECORD_SIZE: usize = 128;
 const RECORD_PAYLOAD: usize = RECORD_SIZE - 4;
+const SCRATCH_SIZE: usize = 192;
 
 /// One bonded peer.
 #[derive(Clone, Copy, Debug)]
@@ -59,25 +64,54 @@ struct PersistBond {
 
 const _: () = assert!(core::mem::size_of::<PersistBond>() == RECORD_SIZE);
 
+pub static BOND_ERASES: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+pub static BOND_SAVES: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+pub static BOND_SAVE_ERRORS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+pub static BOND_LOADED: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
 struct Store {
     bonds: [Option<Bond>; MAX_BONDS],
     dirty: [bool; MAX_BONDS],
+    removed: [Option<[u8; 10]>; MAX_BONDS],
     seq: [u32; MAX_BONDS],
-    reader: Option<&'static dyn MappedFlash>,
-    region: Range<u32>,
     sequence: u32,
 }
 
 static STORE: Mutex<CriticalSectionRawMutex, RefCell<Store>> = Mutex::new(RefCell::new(Store {
     bonds: [None; MAX_BONDS],
     dirty: [false; MAX_BONDS],
+    removed: [None; MAX_BONDS],
     seq: [0; MAX_BONDS],
-    reader: None,
-    region: 0..0,
     sequence: 0,
 }));
 
 static SAVE_CHANNEL: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
+
+type BondCache = Cache<Uncached, Uncached, Uncached, [u8; 10]>;
+type BondMap<'a, F> = MapStorage<[u8; 10], CountedFlash<'a, F>, BondCache>;
+
+fn open<'a, F>(flash: &'a mut F, region: &Range<u32>) -> BondMap<'a, F>
+where
+    F: NorFlash + MultiwriteNorFlash,
+    F::Error: defmt::Format,
+{
+    MapStorage::new(
+        CountedFlash::new(flash, &BOND_ERASES),
+        MapConfig::new(region.clone()),
+        Cache::new_uncached(),
+    )
+}
+
+fn bond_key(bond: &Bond) -> [u8; 10] {
+    let mut key = [0u8; 10];
+    key[..2].copy_from_slice(&bond.master_ediv.to_le_bytes());
+    key[2..].copy_from_slice(&bond.master_rand);
+    key
+}
 
 fn checksum(bytes: &[u8]) -> u32 {
     let mut h = 0x811C_9DC5u32;
@@ -147,34 +181,43 @@ fn same_address(a: &Bond, flags: u8, addr: [u8; 6]) -> bool {
     a.peer_addr_flags == flags && a.peer_addr == addr
 }
 
-/// Load the bond page into RAM. Called once at boot before BLE starts.
+/// Load the bond map into RAM. Called once at boot before BLE starts.
 pub fn init(reader: &'static dyn MappedFlash, region: Range<u32>) {
-    let mut bytes = [0u8; RECORD_SIZE];
-    let mut bonds: [Option<Bond>; MAX_BONDS] = [None; MAX_BONDS];
-    let mut count = 0usize;
+    let mut flash = MappedAsyncFlash::new(reader, region.clone());
+    let mut buf = [0u8; SCRATCH_SIZE];
 
-    for slot in 0..MAX_BONDS {
-        let addr = region.start + (slot * RECORD_SIZE) as u32;
-        reader.read(addr, &mut bytes);
-        let Some(bond) = decode(&bytes) else {
-            break;
-        };
-        if let Some(existing) = bonds
-            .iter_mut()
-            .flatten()
-            .find(|b| same_peer(b, &bond))
-        {
-            *existing = bond;
-        } else if count < MAX_BONDS {
-            bonds[count] = Some(bond);
-            count += 1;
+    let (bonds, count) = util::block_on(async {
+        let mut map = open(&mut flash, &region);
+        let mut bonds: [Option<Bond>; MAX_BONDS] = [None; MAX_BONDS];
+        let mut count = 0usize;
+        match map.fetch_all_items(&mut buf).await {
+            Ok(mut iter) => {
+                while let Ok(Some((_key, value))) = iter.next::<&[u8]>(&mut buf).await {
+                    let Some(bond) = decode(value) else {
+                        continue;
+                    };
+                    if let Some(existing) = bonds
+                        .iter_mut()
+                        .flatten()
+                        .find(|b| same_peer(b, &bond))
+                    {
+                        *existing = bond;
+                    } else if count < MAX_BONDS {
+                        bonds[count] = Some(bond);
+                        count += 1;
+                    }
+                }
+            }
+            Err(_) => {}
         }
-    }
+        (bonds, count)
+    });
 
     STORE.lock(|s| {
         let mut store = s.borrow_mut();
         store.bonds = bonds;
         store.dirty = [false; MAX_BONDS];
+        store.removed = [None; MAX_BONDS];
         let mut seq = [0u32; MAX_BONDS];
         let mut next = 0u32;
         for (i, bond) in store.bonds.iter().enumerate() {
@@ -185,10 +228,8 @@ pub fn init(reader: &'static dyn MappedFlash, region: Range<u32>) {
         }
         store.seq = seq;
         store.sequence = next;
-        store.reader = Some(reader);
-        store.region = region;
-        store.sequence = count as u32;
     });
+    BOND_LOADED.store(count as u32, core::sync::atomic::Ordering::Relaxed);
     #[cfg(not(test))]
     info!("BLE: loaded {} bond(s)", count);
 }
@@ -241,6 +282,8 @@ pub fn upsert(bond: Bond) {
                     new_bond.sys_len = existing.sys_len;
                     new_bond.sys_attrs = existing.sys_attrs;
                 }
+            } else {
+                store.removed[slot] = Some(bond_key(&existing));
             }
         }
         store.bonds[slot] = Some(new_bond);
@@ -322,55 +365,74 @@ pub fn sys_attrs(flags: u8, addr: [u8; 6]) -> Option<([u8; MAX_SYS_ATTRS], usize
     })
 }
 
-/// Forget all bonds. The next save rewrites the page as empty.
+/// Forget all bonds. The next save removes every persisted record.
 pub fn clear() {
     STORE.lock(|s| {
         let mut store = s.borrow_mut();
-        store.bonds = [None; MAX_BONDS];
-        store.dirty = [true; MAX_BONDS];
+        for i in 0..MAX_BONDS {
+            if let Some(bond) = store.bonds[i] {
+                store.removed[i] = Some(bond_key(&bond));
+            }
+            store.bonds[i] = None;
+            store.dirty[i] = false;
+        }
         store.seq = [0; MAX_BONDS];
     });
     request_save();
 }
 
-/// Write the current bond table to its reserved page.
+/// Persist dirty/removed bonds to the map.
 pub async fn save<F>(flash: &mut F, region: &Range<u32>) -> bool
 where
-    F: NorFlash,
+    F: NorFlash + MultiwriteNorFlash,
     F::Error: defmt::Format,
 {
-    let (bonds, dirty) = STORE.lock(|s| {
+    let (bonds, dirty, removed) = STORE.lock(|s| {
         let store = s.borrow();
-        (store.bonds, store.dirty)
+        (store.bonds, store.dirty, store.removed)
     });
-    if !dirty.iter().any(|d| *d) {
+    if !dirty.iter().any(|d| *d) && !removed.iter().any(Option::is_some) {
         return true;
     }
 
-    if let Err(e) = flash.erase(region.start, region.end).await {
-        #[cfg(not(test))]
-        error!("BLE: bond page erase failed: {:?}", e);
-        return false;
+    let mut buf = [0u8; SCRATCH_SIZE];
+    let mut map = open(flash, region);
+
+    for key in removed.iter().flatten() {
+        if let Err(_e) = map.remove_item(&mut buf, key).await {
+            BOND_SAVE_ERRORS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            #[cfg(not(test))]
+            error!("BLE: bond remove failed: {:?}", _e);
+            return false;
+        }
     }
 
-    let mut slot = 0u32;
-    for bond in bonds.iter().flatten() {
+    for (i, bond) in bonds.iter().enumerate() {
+        if !dirty[i] {
+            continue;
+        }
+        let Some(bond) = bond else {
+            continue;
+        };
         let rec = encode(bond);
         let bytes = unsafe {
             core::slice::from_raw_parts(&rec as *const PersistBond as *const u8, RECORD_SIZE)
         };
-        if let Err(e) = flash
-            .write(region.start + slot * RECORD_SIZE as u32, bytes)
-            .await
-        {
+        let key = bond_key(bond);
+        if let Err(_e) = map.store_item(&mut buf, &key, &bytes).await {
+            BOND_SAVE_ERRORS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             #[cfg(not(test))]
-            error!("BLE: bond write failed: {:?}", e);
+            error!("BLE: bond write failed: {:?}", _e);
             return false;
         }
-        slot += 1;
     }
 
-    STORE.lock(|s| s.borrow_mut().dirty = [false; MAX_BONDS]);
+    STORE.lock(|s| {
+        let mut store = s.borrow_mut();
+        store.dirty = [false; MAX_BONDS];
+        store.removed = [None; MAX_BONDS];
+    });
+    BOND_SAVES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     true
 }
 

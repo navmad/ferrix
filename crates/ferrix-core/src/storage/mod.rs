@@ -6,12 +6,14 @@
 pub mod adverts;
 pub mod bonds;
 pub mod config;
+pub mod contact_map;
 pub mod contacts;
 pub mod counted_flash;
 pub mod messages;
 pub mod util;
 
 use core::ops::Range;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
@@ -28,16 +30,16 @@ pub use messages::MessageCommand;
 pub struct StorageRegions {
     /// Configuration page (one erase sector).
     pub config: Range<u32>,
-    /// Contact key-value map.
+    /// Contact key-value map (external flash).
     pub contacts: Range<u32>,
-    /// Message FIFO.
+    /// Message FIFO (external flash).
     pub messages: Range<u32>,
-    /// Advert blob log.
-    pub adverts: Range<u32>,
     /// BLE bond table.
     pub bonds: Range<u32>,
-    /// Everything erased by a factory reset.
+    /// Internal data regions erased by a factory reset.
     pub factory_reset: Range<u32>,
+    /// External flash regions erased by a factory reset.
+    pub factory_reset_external: Range<u32>,
 }
 
 /// Synchronous reader over a memory-mapped flash region.
@@ -58,4 +60,42 @@ pub fn request_factory_reset() {
 /// Wait for a factory-reset request.
 pub async fn wait_factory_reset() {
     RESET_CHANNEL.receive().await;
+}
+
+/// Request an immediate flush of pending contact/blob/config/bond writes.
+static FLUSH_REQUEST: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
+static FLUSH_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Wait for a flush request from a reboot/DFU path.
+pub async fn wait_flush_request() {
+    FLUSH_REQUEST.receive().await;
+}
+
+/// Mark a flush request as complete.
+pub fn complete_flush() {
+    FLUSH_DONE.store(true, Ordering::Release);
+}
+
+/// Flush pending writes and wait for the storage task to finish.
+///
+/// Used before reboot/DFU so a just-changed contact or advert is not lost.
+pub async fn flush_pending() -> bool {
+    #[cfg(test)]
+    {
+        true
+    }
+    #[cfg(not(test))]
+    {
+        FLUSH_DONE.store(false, Ordering::Release);
+        // A request may already be queued; that request will complete and
+        // set FLUSH_DONE, so a full channel is not an error.
+        let _ = FLUSH_REQUEST.try_send(());
+        for _ in 0..600 {
+            if FLUSH_DONE.load(Ordering::Acquire) {
+                return true;
+            }
+            embassy_time::Timer::after_millis(5).await;
+        }
+        false
+    }
 }

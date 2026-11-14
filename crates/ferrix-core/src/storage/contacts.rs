@@ -12,21 +12,16 @@ use defmt::{error, info};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use heapless::String;
-use embedded_storage_async::nor_flash::NorFlash;
-use sequential_storage::cache::{Cache, Uncached};
-use sequential_storage::map::{MapConfig, MapStorage};
+use embedded_storage_async::nor_flash::{MultiwriteNorFlash, NorFlash};
 
-use super::counted_flash::CountedFlash;
+use super::contact_map::{self, SCRATCH_SIZE};
 use super::util::{fixed_str, fnv_bytes, str_from_fixed, FNV_INIT};
-use super::StorageRegions;
 use crate::state::DISCOVERED_CONTACTS;
 use crate::types::DiscoveredContact;
 
 const CONTACT_RECORD_SIZE: usize = 164;
 /// Size of records written before `sync_since` was added.
 const LEGACY_CONTACT_RECORD_SIZE: usize = 156;
-/// Key (32) + serialized contact, rounded up to a whole flash word.
-const SCRATCH_SIZE: usize = 200;
 
 /// Completed contact record writes and page erases since boot.
 pub static SAVES: AtomicU32 = AtomicU32::new(0);
@@ -57,19 +52,12 @@ const _: () = assert!(core::mem::size_of::<PersistContact>() == CONTACT_RECORD_S
 #[repr(C, align(4))]
 struct Scratch([u8; SCRATCH_SIZE]);
 
-type ContactCache = Cache<Uncached, Uncached, Uncached, [u8; 32]>;
-type ContactMap<'a, F> = MapStorage<[u8; 32], CountedFlash<'a, F>, ContactCache>;
-
-fn open<'a, F>(flash: &'a mut F, region: &Range<u32>) -> ContactMap<'a, F>
+fn open<'a, F>(flash: &'a mut F, region: &Range<u32>) -> contact_map::Map<'a, F>
 where
-    F: NorFlash + embedded_storage_async::nor_flash::MultiwriteNorFlash,
+    F: NorFlash + MultiwriteNorFlash,
     F::Error: defmt::Format,
 {
-    MapStorage::new(
-        CountedFlash::new(flash, &ERASES),
-        MapConfig::new(region.clone()),
-        Cache::new_uncached(),
-    )
+    contact_map::open(flash, region, &ERASES)
 }
 
 static SAVE_CHANNEL: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
@@ -176,7 +164,7 @@ where
     flash.read(addr, &mut buf).await.is_ok() && u32::from_le_bytes(buf) == magic
 }
 
-pub async fn load<F>(flash: &mut F, regions: &StorageRegions)
+pub async fn load<F>(flash: &mut F, region: &Range<u32>)
 where
     F: NorFlash + embedded_storage_async::nor_flash::MultiwriteNorFlash,
     F::Error: defmt::Format,
@@ -186,10 +174,10 @@ where
     // The previous firmware kept two whole-table snapshots in this region.
     // Their layout is not a valid map, so clear them once.
     const LEGACY_MAGIC: u32 = 0x434E_5443;
-    let legacy = has_magic(flash, regions.contacts.start, LEGACY_MAGIC).await
-        || has_magic(flash, regions.contacts.start + 14 * 4096, LEGACY_MAGIC).await;
+    let legacy = has_magic(flash, region.start, LEGACY_MAGIC).await
+        || has_magic(flash, region.start + 14 * 4096, LEGACY_MAGIC).await;
 
-    let mut map = open(flash, &regions.contacts);
+    let mut map = open(flash, region);
     if legacy {
         info!("Persistence: clearing legacy contact snapshot banks");
         if let Err(e) = map.erase_all().await {
@@ -202,9 +190,13 @@ where
     match map.fetch_all_items(&mut buf.0).await {
         Ok(mut iter) => {
             while let Ok(Some((key, value))) = iter.next::<&[u8]>(&mut buf.0).await {
+                if contact_map::key_tag(&key) != contact_map::CONTACT_TAG {
+                    continue;
+                }
                 if value.len() < LEGACY_CONTACT_RECORD_SIZE {
                     continue;
                 }
+                let pub_key = contact_map::key_pub_key(&key);
                 // Older records are shorter (no sync_since); copy only what is
                 // present into a zeroed struct.
                 let mut rec: PersistContact = unsafe { core::mem::zeroed() };
@@ -220,7 +212,7 @@ where
                 ct.saved_hash = structural_hash_of(&ct);
                 DISCOVERED_CONTACTS.lock(|c| {
                     let mut list = c.borrow_mut();
-                    if let Some(existing) = list.iter().position(|x| x.pub_key == key) {
+                    if let Some(existing) = list.iter().position(|x| x.pub_key == pub_key) {
                         list[existing] = ct;
                     } else if list.len() < list.capacity() {
                         let _ = list.push(ct);
@@ -235,13 +227,13 @@ where
 }
 
 /// Write contacts whose persisted fields changed since the last save.
-pub async fn save<F>(flash: &mut F, regions: &StorageRegions)
+pub async fn save<F>(flash: &mut F, region: &Range<u32>)
 where
     F: NorFlash + embedded_storage_async::nor_flash::MultiwriteNorFlash,
     F::Error: defmt::Format,
 {
     let total = DISCOVERED_CONTACTS.lock(|c| c.borrow().len());
-    let mut map = open(flash, &regions.contacts);
+    let mut map = open(flash, region);
     let mut buf = Scratch([0u8; SCRATCH_SIZE]);
     let mut written = 0u32;
 
@@ -265,7 +257,10 @@ where
             )
         };
         let value: &[u8] = bytes;
-        match map.store_item(&mut buf.0, &ct.pub_key, &value).await {
+        match map
+            .store_item(&mut buf.0, &contact_map::contact_key(&ct.pub_key), &value)
+            .await
+        {
             Ok(()) => {
                 written += 1;
                 DISCOVERED_CONTACTS.lock(|c| {
@@ -291,25 +286,31 @@ where
 }
 
 /// Remove one contact record (overwrite or explicit delete).
-pub async fn remove<F>(flash: &mut F, regions: &StorageRegions, pub_key: [u8; 32])
+pub async fn remove<F>(flash: &mut F, region: &Range<u32>, pub_key: [u8; 32])
 where
     F: NorFlash + embedded_storage_async::nor_flash::MultiwriteNorFlash,
     F::Error: defmt::Format,
 {
-    let mut map = open(flash, &regions.contacts);
+    let mut map = open(flash, region);
     let mut buf = Scratch([0u8; SCRATCH_SIZE]);
-    if let Err(e) = map.remove_item(&mut buf.0, &pub_key).await {
+    let contact_key = contact_map::contact_key(&pub_key);
+    if let Err(e) = map.remove_item(&mut buf.0, &contact_key).await {
         error!("Persistence: contact map remove failed: {:?}", e);
+    }
+    // The advert blob shares this map, so remove it with the contact.
+    let blob_key = contact_map::blob_key(&pub_key);
+    if let Err(e) = map.remove_item(&mut buf.0, &blob_key).await {
+        error!("Persistence: blob map remove failed: {:?}", e);
     }
 }
 
 /// Erase every stored contact.
-pub async fn clear<F>(flash: &mut F, regions: &StorageRegions)
+pub async fn clear<F>(flash: &mut F, region: &Range<u32>)
 where
     F: NorFlash + embedded_storage_async::nor_flash::MultiwriteNorFlash,
     F::Error: defmt::Format,
 {
-    let mut map = open(flash, &regions.contacts);
+    let mut map = open(flash, region);
     if let Err(e) = map.erase_all().await {
         error!("Persistence: contact map clear failed: {:?}", e);
     }

@@ -674,8 +674,6 @@ pub trait CompanionHost: Send + Sync {
     fn request_factory_reset(&self);
     fn queue_consume_now(&self);
     fn advert_remember(&self, pub_key: &[u8; 32], payload: &[u8]);
-    fn advert_payload(&self, pub_key: &[u8; 32]) -> Option<Vec<u8, 132>>;
-    fn advert_export(&self, pub_key: &[u8; 32]) -> Option<Vec<u8, 134>>;
     /// Reset the node. Does not return.
     fn reboot(&self) -> !;
 }
@@ -1291,6 +1289,9 @@ impl<'a> CompanionNode<'a> {
 
             CMD_REBOOT => {
                 if payload.len() >= 7 && &payload[1..7] == b"reboot" {
+                    // The app reconnects after a reboot; make sure pending
+                    // contacts/blobs/config are durable before resetting.
+                    let _ = crate::storage::flush_pending().await;
                     let mut resp = Vec::<u8, 4>::new();
                     let _ = resp.push(RESP_CODE_OK);
                     emit(&resp);
@@ -1380,6 +1381,7 @@ impl<'a> CompanionNode<'a> {
                             changed
                         });
                         if changed {
+                            crate::storage::config::mark_channel_dirty(channel_idx);
                             self.host.request_save_config();
                         }
                     }
@@ -1940,7 +1942,9 @@ impl<'a> CompanionNode<'a> {
                     if !known {
                         let _ = resp.push(RESP_CODE_ERR);
                         let _ = resp.push(ERR_NOT_FOUND);
-                    } else if let Some(advert) = self.host.advert_payload(&key) {
+                    } else if let Some(advert) =
+                        crate::storage::adverts::request_payload(&key).await
+                    {
                         let mut pkt = Packet::new(
                             meshcore_wire::packet::ROUTE_TYPE_TRANSPORT_DIRECT,
                             PAYLOAD_TYPE_ADVERT,
@@ -2107,9 +2111,15 @@ impl<'a> CompanionNode<'a> {
                     if !known {
                         let _ = resp.push(RESP_CODE_ERR);
                         let _ = resp.push(ERR_NOT_FOUND);
-                    } else if let Some(packet) = self.host.advert_export(&key) {
+                    } else if let Some(advert) =
+                        crate::storage::adverts::request_payload(&key).await
+                    {
+                        // [0x11, 0x00, signed advert payload]: a flood-routed
+                        // advert with no path, matching MeshCore's export.
                         let _ = resp.push(RESP_CODE_EXPORT_CONTACT);
-                        let _ = resp.extend_from_slice(&packet);
+                        let _ = resp.push(0x11);
+                        let _ = resp.push(0x00);
+                        let _ = resp.extend_from_slice(&advert);
                     } else {
                         let _ = resp.push(RESP_CODE_ERR);
                         let _ = resp.push(ERR_BAD_STATE);
@@ -3198,12 +3208,6 @@ mod tests {
         fn request_factory_reset(&self) {}
         fn queue_consume_now(&self) {}
         fn advert_remember(&self, _pub_key: &[u8; 32], _payload: &[u8]) {}
-        fn advert_payload(&self, _pub_key: &[u8; 32]) -> Option<Vec<u8, 132>> {
-            None
-        }
-        fn advert_export(&self, _pub_key: &[u8; 32]) -> Option<Vec<u8, 134>> {
-            None
-        }
         fn reboot(&self) -> ! {
             panic!("reboot in host test")
         }

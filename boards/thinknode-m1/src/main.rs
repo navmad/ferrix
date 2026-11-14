@@ -149,8 +149,10 @@ async fn main(spawner: Spawner) {
     embassy_nrf::interrupt::TWISPI0.set_priority(Priority::P3);
     embassy_nrf::interrupt::TWISPI1.set_priority(Priority::P3);
     embassy_nrf::interrupt::SAADC.set_priority(Priority::P3);
+    embassy_nrf::interrupt::QSPI.set_priority(Priority::P3);
 
     let mut board = crate::board::init(p);
+    let qspi = board.qspi;
 
     // Keep the GPS module held in reset until the user enables it from the
     // dashboard. P1.02 is GPS_EN, P1.05 is the active-low reset.
@@ -258,6 +260,7 @@ async fn main(spawner: Spawner) {
         crate::board::CAPABILITIES,
         "ThinkNode M1",
         &BOARD_HOST,
+        qspi,
         crate::fatal_blink_forever,
         crate::storage::spawn_storage,
     );

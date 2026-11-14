@@ -5,7 +5,6 @@
 
 use ferrix_core::companion::cli::{CliHost, RadioStats, StorageStats};
 use ferrix_core::companion::protocol::CompanionHost;
-use heapless::Vec;
 
 /// Board implementation of the protocol's persistence/telemetry interface.
 pub struct BoardCompanionHost;
@@ -47,14 +46,6 @@ impl CompanionHost for BoardCompanionHost {
 
     fn advert_remember(&self, pub_key: &[u8; 32], payload: &[u8]) {
         crate::storage::adverts::remember(pub_key, payload);
-    }
-
-    fn advert_payload(&self, pub_key: &[u8; 32]) -> Option<Vec<u8, 132>> {
-        crate::storage::adverts::payload(pub_key)
-    }
-
-    fn advert_export(&self, pub_key: &[u8; 32]) -> Option<Vec<u8, 134>> {
-        crate::storage::adverts::export(pub_key)
     }
 
     fn reboot(&self) -> ! {
