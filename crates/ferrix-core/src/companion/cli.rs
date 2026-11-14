@@ -1292,8 +1292,9 @@ pub async fn handle_text_cli<W: TextSink>(
                         .load(core::sync::atomic::Ordering::Relaxed);
                     let _ = write!(
                         s,
-                        "  -> BLE: Active (MeshCore-M1 NUS), connected: {}\r\n",
-                        connected
+                        "  -> BLE: Active (MeshCore-M1 NUS), connected: {}, bonds: {}\r\n",
+                        connected,
+                        crate::storage::bonds::count()
                     );
                 }
                 code if code >= 0x1000 => {

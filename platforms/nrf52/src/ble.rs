@@ -3,12 +3,14 @@
 //! Exposes Nordic UART Service (NUS) over BLE GATT, enabling official MeshCore
 //! mobile apps (iOS & Android) to discover, pair, and communicate with ThinkNode M1.
 
-use core::cell::UnsafeCell;
+use core::cell::{RefCell, UnsafeCell};
 use core::future::poll_fn;
 use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 use core::task::Poll;
 
 use defmt::{debug, error, info};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::waitqueue::AtomicWaker;
 
 use heapless::Vec;
@@ -19,6 +21,7 @@ use nrf_softdevice::ble::{Connection, EncryptionInfo, IdentityKey, MasterId, Pas
 use nrf_softdevice::Softdevice;
 
 use ferrix_core::companion::cli::CliHost;
+use ferrix_core::storage::bonds::{self, Bond};
 use ferrix_core::companion::session::{CompanionLink, CompanionSession};
 
 #[nrf_softdevice::gatt_service(uuid = "180a")]
@@ -33,10 +36,10 @@ pub struct DeviceInformationService {
 
 #[nrf_softdevice::gatt_service(uuid = "6e400001-b5a3-f393-e0a9-e50e24dcca9e")]
 pub struct NordicUartService {
-    #[characteristic(uuid = "6e400002-b5a3-f393-e0a9-e50e24dcca9e", write, write_without_response)]
+    #[characteristic(uuid = "6e400002-b5a3-f393-e0a9-e50e24dcca9e", write, write_without_response, security = "mitm")]
     pub rx: Vec<u8, 256>,
 
-    #[characteristic(uuid = "6e400003-b5a3-f393-e0a9-e50e24dcca9e", notify)]
+    #[characteristic(uuid = "6e400003-b5a3-f393-e0a9-e50e24dcca9e", notify, security = "mitm")]
     pub tx: Vec<u8, 256>,
 }
 
@@ -241,6 +244,38 @@ pub async fn contact_task() -> ! {
     }
 }
 
+/// Stable storage for the SoftDevice's static passkey.
+static PASSKEY_BUF: Mutex<CriticalSectionRawMutex, RefCell<[u8; 6]>> =
+    Mutex::new(RefCell::new([b'0'; 6]));
+
+/// Program the SoftDevice's fixed 6-digit pairing passkey.
+fn set_static_passkey(pin: u32) {
+    PASSKEY_BUF.lock(|cell| {
+        let mut buf = cell.borrow_mut();
+        let mut value = pin % 1_000_000;
+        for i in (0..6).rev() {
+            buf[i] = b'0' + (value % 10) as u8;
+            value /= 10;
+        }
+        let opt = nrf_softdevice::raw::ble_opt_t {
+            gap_opt: nrf_softdevice::raw::ble_gap_opt_t {
+                passkey: nrf_softdevice::raw::ble_gap_opt_passkey_t {
+                    p_passkey: buf.as_ptr(),
+                },
+            },
+        };
+        let ret = unsafe {
+            nrf_softdevice::raw::sd_ble_opt_set(
+                nrf_softdevice::raw::BLE_GAP_OPTS_BLE_GAP_OPT_PASSKEY,
+                &opt,
+            )
+        };
+        if ret != 0 {
+            error!("BLE: static passkey set failed {=u32:#x}", ret);
+        }
+    });
+}
+
 pub struct MeshCoreSecurityHandler;
 
 impl SecurityHandler for MeshCoreSecurityHandler {
@@ -249,25 +284,52 @@ impl SecurityHandler for MeshCoreSecurityHandler {
     }
 
     fn can_bond(&self, _conn: &Connection) -> bool {
-        // Bond storage is not implemented: nrf-softdevice has no built-in bond
-        // store, so `on_bonded` would have to persist the keys itself.
-        //
-        // Enabling bonding without implementing `on_bonded` is fatal: when the
-        // SoftDevice reports a completed bond (BLE_GAP_EVT_AUTH_STATUS with
-        // bonded=1), the trait's default `on_bonded` panics, taking down USB,
-        // BLE and the whole executor. That was the contact-add freeze.
-        false
+        true
     }
 
     fn on_bonded(
         &self,
         _conn: &Connection,
-        _master_id: MasterId,
-        _key: EncryptionInfo,
-        _peer_id: IdentityKey,
+        master_id: MasterId,
+        key: EncryptionInfo,
+        peer_id: IdentityKey,
     ) {
-        // Defensive: never let a bonding event panic. If bonding is enabled in
-        // the future, persist the key here instead.
+        bonds::upsert(Bond {
+            master_ediv: master_id.ediv,
+            master_rand: master_id.rand,
+            ltk: key.ltk,
+            ltk_flags: key.flags,
+            peer_addr_flags: peer_id.addr.flags,
+            peer_addr: peer_id.addr.bytes,
+            peer_irk: peer_id.irk.as_raw().irk,
+            sys_len: 0,
+            sys_attrs: [0u8; 64],
+        });
+    }
+
+    fn get_key(&self, _conn: &Connection, master_id: MasterId) -> Option<EncryptionInfo> {
+        let bond = bonds::get_key(master_id.ediv, &master_id.rand)?;
+        Some(EncryptionInfo {
+            ltk: bond.ltk,
+            flags: bond.ltk_flags,
+        })
+    }
+
+    fn save_sys_attrs(&self, conn: &Connection) {
+        let mut buf = [0u8; 64];
+        if let Ok(len) = gatt_server::get_sys_attrs(conn, &mut buf) {
+            let addr = conn.peer_address();
+            bonds::set_sys_attrs(addr.flags, addr.bytes, &buf[..len]);
+        }
+    }
+
+    fn load_sys_attrs(&self, conn: &Connection) {
+        let addr = conn.peer_address();
+        let attrs = bonds::sys_attrs(addr.flags, addr.bytes);
+        let slice = attrs.as_ref().map(|(buf, len)| &buf[..*len]);
+        if gatt_server::set_sys_attrs(conn, slice).is_err() {
+            debug!("BLE: set sys attrs failed");
+        }
     }
 
     fn request_mitm_protection(&self, _conn: &Connection) -> bool {
@@ -411,7 +473,9 @@ pub async fn ble_companion_task(
     let _ = server.dis.manufacturer_name_set(&mfg);
 
     loop {
-        info!("BLE: Waiting for pairable connection from MeshCore companion app (PIN 123456)...");
+        info!("BLE: Waiting for pairable connection from MeshCore companion app...");
+        // Pick up a PIN changed by the companion app before advertising again.
+        set_static_passkey(BLE_PIN.load(Ordering::Relaxed));
 
         let advertise_fut =
             peripheral::advertise_pairable(sd, adv, &adv_config, &SECURITY_HANDLER);
@@ -430,6 +494,9 @@ pub async fn ble_companion_task(
                 let _ = c.data_length_update(None);
                 // Disable slave latency during sync so the device wakes at every connection event.
                 let _ = c.ignore_slave_latency(true);
+                if let Err(e) = c.request_security() {
+                    debug!("BLE: security request failed: {:?}", e);
+                }
                 c
             }
             embassy_futures::select::Either::First(Err(e)) => {
@@ -644,6 +711,7 @@ pub async fn ble_companion_supervisor_task(
     unsafe { nrf_softdevice::raw::sd_softdevice_disable() };
 
     let sd = Softdevice::enable(&sd_config);
+    set_static_passkey(BLE_PIN.load(Ordering::Relaxed));
     if let Ok(server) = MeshCoreGattServer::new(sd) {
         if spawner.spawn(softdevice_task(sd)).is_ok()
             && spawner

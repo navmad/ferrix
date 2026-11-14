@@ -2271,11 +2271,17 @@ impl<'a> CompanionNode<'a> {
             CMD_SET_DEVICE_PIN => {
                 let mut ok = false;
                 if payload.len() >= 5 {
-                    let pin = u32::from_le_bytes([
+                    let raw = u32::from_le_bytes([
                         payload[1], payload[2], payload[3], payload[4],
                     ]);
-                    if pin == 0 || (100_000..=999_999).contains(&pin) {
-                        crate::state::BLE_PIN.store(pin, Ordering::Relaxed);
+                    // Zero keeps the static default rather than programming
+                    // an unusable all-zero passkey.
+                    let pin = if raw == 0 { 123_456 } else { raw };
+                    if (100_000..=999_999).contains(&pin) {
+                        let changed = crate::state::BLE_PIN.swap(pin, Ordering::Relaxed) != pin;
+                        if changed {
+                            self.host.request_save_config();
+                        }
                         ok = true;
                     }
                 }

@@ -18,6 +18,21 @@ use crate::types::{ChannelData, MAX_CHANNELS};
 pub const CONFIG_MAGIC: u32 = 0x4D434647; // 'MCFG' (MeshCore Config)
 pub const CONFIG_VERSION: u32 = 1;
 
+/// BLE PIN record lives after the config struct in the same 4 KB page.
+const PIN_OFFSET: usize = 3072;
+const PIN_MAGIC: u32 = 0x5049_4E42; // "BINP"
+const DEFAULT_BLE_PIN: u32 = 123_456;
+
+#[repr(C, align(4))]
+#[derive(Clone, Copy)]
+struct PinRecord {
+    magic: u32,
+    pin: u32,
+    checksum: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<PersistentConfig>() <= PIN_OFFSET);
+
 /// Completed config-page writes and erases since boot.
 pub static CONFIG_SAVES: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
@@ -61,7 +76,7 @@ pub struct PersistentConfig {
     pub checksum: u32,
 }
 
-pub use crate::state::{CUSTOM_PRIV_KEY, NODE_CALLSIGN};
+pub use crate::state::{BLE_PIN, CUSTOM_PRIV_KEY, NODE_CALLSIGN};
 
 static SAVE_REQUEST_CHANNEL: Channel<SharedRawMutex, (), 2> = Channel::new();
 
@@ -95,6 +110,23 @@ pub fn read_config(page: &[u8]) -> Option<PersistentConfig> {
         && compute_checksum(&cfg) == cfg.checksum
     {
         Some(cfg)
+    } else {
+        None
+    }
+}
+
+fn read_ble_pin(page: &[u8]) -> Option<u32> {
+    if page.len() < PIN_OFFSET + core::mem::size_of::<PinRecord>() {
+        return None;
+    }
+    let rec = unsafe {
+        core::ptr::read_unaligned(page.as_ptr().add(PIN_OFFSET) as *const PinRecord)
+    };
+    if rec.magic == PIN_MAGIC
+        && rec.checksum == rec.pin ^ PIN_MAGIC
+        && (100_000..=999_999).contains(&rec.pin)
+    {
+        Some(rec.pin)
     } else {
         None
     }
@@ -166,6 +198,11 @@ pub fn request_save_config() {
 
 /// Initialize configuration from flash (or defaults if flash is uninitialized)
 pub fn init_config(page: &[u8], default_name: &str) -> (String<32>, Option<[u8; 64]>) {
+    BLE_PIN.store(
+        read_ble_pin(page).unwrap_or(DEFAULT_BLE_PIN),
+        core::sync::atomic::Ordering::Relaxed,
+    );
+
     if let Some(cfg) = read_config(page) {
         info!("Storage: Found valid persistent config page");
 
@@ -346,6 +383,25 @@ where
     CONFIG_ERASES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if let Err(e) = flash.write(region.start, config_bytes).await {
         error!("Storage: Flash write error: {:?}", e);
+        return;
+    }
+    let pin = BLE_PIN.load(core::sync::atomic::Ordering::Relaxed);
+    let rec = PinRecord {
+        magic: PIN_MAGIC,
+        pin,
+        checksum: pin ^ PIN_MAGIC,
+    };
+    let rec_bytes = unsafe {
+        core::slice::from_raw_parts(
+            &rec as *const PinRecord as *const u8,
+            core::mem::size_of::<PinRecord>(),
+        )
+    };
+    if let Err(e) = flash
+        .write(region.start + PIN_OFFSET as u32, rec_bytes)
+        .await
+    {
+        error!("Storage: BLE PIN write error: {:?}", e);
         return;
     }
     CONFIG_SAVES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
