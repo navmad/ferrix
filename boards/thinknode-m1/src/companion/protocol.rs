@@ -4,6 +4,7 @@
 //! [`ferrix_core::companion::protocol`]. This module supplies the board
 //! services it needs and keeps the local CLI dispatched by the USB task.
 
+pub use ferrix_core::companion::cli::{CliHost, RadioStats, StorageStats};
 pub use ferrix_core::companion::protocol::{CompanionHost, CompanionNode};
 use heapless::Vec;
 
@@ -62,6 +63,79 @@ impl CompanionHost for BoardCompanionHost {
 
     fn reboot(&self) -> ! {
         cortex_m::peripheral::SCB::sys_reset()
+    }
+}
+
+impl CliHost for BoardCompanionHost {
+    async fn clear_contacts(&self) {
+        crate::storage::contacts::queue_clear().await;
+    }
+
+    async fn clear_messages(&self) {
+        crate::storage::messages::queue_clear().await;
+    }
+
+    fn leds_disabled(&self) -> bool {
+        crate::companion::usb::leds_disabled()
+    }
+
+    fn set_leds_disabled(&self, disabled: bool) {
+        crate::companion::usb::set_leds_disabled(disabled);
+    }
+
+    fn storage_stats(&self) -> StorageStats {
+        use core::sync::atomic::Ordering::Relaxed;
+        StorageStats {
+            contact_saves: crate::storage::contacts::SAVES.load(Relaxed),
+            contact_erases: crate::storage::contacts::ERASES.load(Relaxed),
+            message_records: crate::storage::messages::RECORD_SAVES.load(Relaxed),
+            message_page_erases: crate::storage::messages::PAGE_ERASES.load(Relaxed),
+            message_queued: crate::storage::messages::QUEUED.load(Relaxed),
+            advert_records: crate::storage::adverts::RECORD_SAVES.load(Relaxed),
+            advert_erases: crate::storage::adverts::ERASES.load(Relaxed),
+            config_saves: crate::storage::config::CONFIG_SAVES.load(Relaxed),
+            config_erases: crate::storage::config::CONFIG_ERASES.load(Relaxed),
+        }
+    }
+
+    fn radio_stats(&self) -> RadioStats {
+        use core::sync::atomic::Ordering::Relaxed;
+        RadioStats {
+            override_ms: crate::radio::TX_SLOT_MS_OVERRIDE.load(Relaxed),
+            slot_ms: crate::radio::TX_SLOT_MS_LAST.load(Relaxed),
+            used: crate::radio::TX_SLOT_USED.load(Relaxed),
+            forward_scheduled: crate::radio::FORWARD_SCHEDULED.load(Relaxed),
+            forward_sent: crate::radio::FORWARD_SENT.load(Relaxed),
+            duplicate_deltas: crate::radio::duplicate_deltas(),
+        }
+    }
+
+    fn set_tx_slot_override(&self, ms: u32) {
+        crate::radio::TX_SLOT_MS_OVERRIDE
+            .store(ms, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn clear_radio_stats(&self) {
+        use core::sync::atomic::Ordering::Relaxed;
+        crate::radio::FORWARD_SCHEDULED.store(0, Relaxed);
+        crate::radio::FORWARD_SENT.store(0, Relaxed);
+        crate::radio::clear_duplicate_deltas();
+    }
+
+    fn advert_stats(&self) -> (usize, usize, bool) {
+        crate::storage::adverts::stats()
+    }
+
+    fn advert_slots(&self) -> usize {
+        crate::storage::adverts::SLOTS
+    }
+
+    fn reboot_to_bootloader(&self) -> ! {
+        crate::companion::usb::reboot_to_bootloader()
+    }
+
+    fn board_line(&self) -> &'static str {
+        "ThinkNode M1 (nRF52840, SX1262 LoRa)"
     }
 }
 
