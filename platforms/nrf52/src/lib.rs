@@ -5,6 +5,7 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod ble;
 pub mod flash;
 pub mod reset;
 pub mod seed;

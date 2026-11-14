@@ -366,7 +366,18 @@ async fn main(spawner: Spawner) {
     );
 
     // Initialize BLE Companion peripheral (Nordic UART Service)
-    crate::companion::ble::init_ble_companion(spawner, pub_key, priv_key);
+    crate::companion::ble::init_ble_companion(
+        spawner,
+        pub_key,
+        priv_key,
+        CurrentBoard::NAME,
+        CurrentBoard::CAPABILITIES,
+        "MeshCore-M1",
+        "ThinkNode M1",
+        &crate::companion::protocol::BOARD_HOST,
+        crate::fatal_blink_forever,
+        crate::storage::spawn_storage,
+    );
 
     info!("====================================================");
     info!(" Ferrix Companion Firmware (ferrix) ");

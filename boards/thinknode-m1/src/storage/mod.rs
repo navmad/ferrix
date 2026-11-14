@@ -36,6 +36,14 @@ pub fn load() {
     adverts::init(&ferrix_nrf52::flash::MAPPED, REGIONS.adverts.clone());
 }
 
+/// Spawn the storage task once the SoftDevice has been enabled.
+pub fn spawn_storage(
+    spawner: embassy_executor::Spawner,
+    sd: &'static nrf_softdevice::Softdevice,
+) {
+    let _ = spawner.spawn(storage_task(sd));
+}
+
 /// Background storage task that serializes all flash writes.
 #[embassy_executor::task]
 pub async fn storage_task(sd: &'static nrf_softdevice::Softdevice) -> ! {
