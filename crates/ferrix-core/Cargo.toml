@@ -1,0 +1,18 @@
+[package]
+name = "ferrix-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+meshcore-wire = { path = "../meshcore-wire" }
+heapless = { version = "0.8", features = ["defmt-03"] }
+defmt = "0.3"
+embassy-sync = { version = "0.6", features = ["defmt"] }
+embedded-storage-async = "0.4"
+sequential-storage = { version = "8", features = ["defmt"] }
+embassy-time = { version = "0.4", features = ["defmt"] }
+
+[dev-dependencies]
+# Host tests lock the shared state through embassy-sync; the embedded build
+# gets its critical-section implementation from the nRF SoftDevice.
+critical-section = { version = "1", features = ["std"] }

@@ -91,7 +91,7 @@ if [ "${PROFILE}" = "release" ]; then
     CARGO_FLAGS+=("--release")
 fi
 
-cargo build "${CARGO_FLAGS[@]}"
+cargo build -p ferrix-thinknode-m1 "${CARGO_FLAGS[@]}"
 
 ELF="${ROOT_DIR}/target/${TARGET}/${PROFILE}/ferrix"
 HEX="${ROOT_DIR}/target/${TARGET}/${PROFILE}/ferrix-${BOARD}.hex"

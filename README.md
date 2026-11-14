@@ -23,25 +23,39 @@ See [FEATURES.md](FEATURES.md) for the full feature set and current limitations.
 The firmware decouples application logic from board-specific pinouts and radio hardware:
 
 ```text
-src/
-├── main.rs                  <-- Generic application loop & state machine
-├── radio/
-│   ├── mod.rs               <-- LoraRadio async trait & LoraConfig
-│   ├── sx1262.rs            <-- Semtech SX1262 transceiver driver
-│   └── commands.rs          <-- Semtech SX126x opcode definitions
-├── boards/                  <-- BOARD SUPPORT LAYER
-│   ├── mod.rs               <-- Board trait, capability flags, & feature gating
-│   ├── thinknode_m1.rs      <-- ThinkNode M1 hardware pinout & peripherals
-│   └── rak4631.rs           <-- RAKwireless WisBlock Core pinout
-├── companion/               <-- MeshCore USB CDC-ACM & BLE packet framing & protocol
-├── display/                 <-- 1.54" SSD1681 driver & dashboard UI (conditional)
-├── gps/                     <-- Quectel L76K NMEA driver (conditional)
-└── telemetry/               <-- Battery voltage ADC monitoring & health
+boards/thinknode-m1/          <-- BOARD CRATE
+├── Cargo.toml                 <-- binary: ferrix
+├── memory.x                   <-- flash/RAM layout
+└── src/
+    ├── main.rs                <-- hardware init & startup
+    ├── board.rs               <-- pins, board metadata & init
+    ├── app.rs                 <-- AppBoard: LED, display, GPS, battery
+    ├── meshcore.rs            <-- engine context & wire re-exports
+    ├── radio/sx1262.rs        <-- SX1262 driver & startup
+    ├── host.rs               <-- protocol/CLI host binding
+    ├── companion.rs          <-- transport re-exports
+    ├── display/               <-- SSD1681 e-paper & dashboard
+    ├── storage.rs             <-- flash layout adapter
+    ├── gps.rs                 <-- GPS power state
+    ├── input.rs               <-- button-to-event mapper
+    └── telemetry.rs           <-- battery ADC
+
+crates/
+├── meshcore-wire/             <-- pure MeshCore codecs
+├── ferrix-hal/                <-- hardware traits
+├── ferrix-core/               <-- application, protocol and storage formats
+└── ferrix-runtime/            <-- application, radio and storage loops
+
+platforms/
+└── nrf52/                     <-- USB, BLE, reset, seed and flash access
 ```
 
-### Adding a New Radio or Board
-1. **New Radio**: Implement the `LoraRadio` async trait in [`src/radio/`](file:///Users/navmad/Projects/embedded-projects/ferrix/src/radio).
-2. **New Board**: Add a board module to [`src/boards/`](file:///Users/navmad/Projects/embedded-projects/ferrix/src/boards) and define its pinout, radio type, and capability flags (`HAS_DISPLAY`, `HAS_GPS`).
+### Adding a New Board
+1. Add a crate under `boards/<name>` with its `memory.x`, pinout and devices.
+2. Implement the `ferrix-hal` traits and pass the devices to `ferrix-runtime`.
+3. Add the board to the workspace and to the build/test tooling.
+4. The application crates (`ferrix-core`, `ferrix-runtime`) must not need
+   board-specific changes.
 
 ---
 
