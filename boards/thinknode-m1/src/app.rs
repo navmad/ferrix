@@ -1,6 +1,7 @@
 //! ThinkNode M1 implementation of the runtime application board interface.
 
 use defmt::info;
+use embassy_futures::select::{select, Either};
 use embassy_nrf::gpio::Output;
 use embassy_nrf::saadc;
 use embassy_nrf::peripherals::TWISPI1;
@@ -8,7 +9,6 @@ use embassy_time::{Duration, Instant, Timer};
 use ferrix_core::companion::protocol::CompanionNode;
 use ferrix_runtime::app::{AppBoard, UiState};
 
-use crate::board::GpsPins;
 use crate::display::{NodeDisplay, ThinkNodeDisplay};
 use crate::gps;
 
@@ -19,7 +19,6 @@ const BACKLIGHT_IDLE_SECS: u64 = 15;
 pub struct ThinkNodeApp {
     led: Output<'static>,
     display: Option<ThinkNodeDisplay<'static, TWISPI1>>,
-    gps: Option<GpsPins>,
     battery_adc: saadc::Saadc<'static, 1>,
     battery_buf: [i16; 1],
     backlight_on: bool,
@@ -31,13 +30,11 @@ impl ThinkNodeApp {
     pub fn new(
         led: Output<'static>,
         display: Option<ThinkNodeDisplay<'static, TWISPI1>>,
-        gps: Option<GpsPins>,
         battery_adc: saadc::Saadc<'static, 1>,
     ) -> Self {
         Self {
             led,
             display,
-            gps,
             battery_adc,
             battery_buf: [0i16; 1],
             backlight_on: true,
@@ -85,15 +82,6 @@ impl AppBoard for ThinkNodeApp {
     }
 
     fn set_gps_enabled(&mut self, on: bool) {
-        if let Some(g) = self.gps.as_mut() {
-            if on {
-                g.standby.set_high();
-                g.reinit.set_high();
-            } else {
-                g.standby.set_low();
-                g.reinit.set_low();
-            }
-        }
         gps::set_gps_enabled(on);
         info!("Input: GPS power {}", if on { "on" } else { "off" });
     }
@@ -145,7 +133,15 @@ impl AppBoard for ThinkNodeApp {
         if !crate::board::HAS_BATTERY_ADC {
             return None;
         }
-        self.battery_adc.sample(&mut self.battery_buf).await;
+        match select(
+            self.battery_adc.sample(&mut self.battery_buf),
+            Timer::after_millis(100),
+        )
+        .await
+        {
+            Either::First(_) => {}
+            Either::Second(_) => return None,
+        }
         let raw = self.battery_buf[0].max(0) as u16;
         let mv = crate::telemetry::adc_raw_to_battery_millivolts(raw);
         if mv >= crate::telemetry::MIN_PLAUSIBLE_BATTERY_MV {

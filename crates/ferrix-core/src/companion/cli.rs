@@ -64,6 +64,8 @@ pub trait CliHost: CompanionHost {
     fn clear_radio_stats(&self);
     fn advert_stats(&self) -> (usize, usize, bool);
     fn advert_slots(&self) -> usize;
+    fn gps_enabled(&self) -> bool;
+    fn set_gps_enabled(&self, on: bool);
     fn reboot_to_bootloader(&self) -> !;
     /// One-line board description for the `board` command.
     fn board_line(&self) -> &'static str;
@@ -1301,6 +1303,45 @@ pub async fn handle_text_cli<W: TextSink>(
                 crate::companion::protocol::ADVERT_LAST_KEY.load(core::sync::atomic::Ordering::Relaxed),
                 crate::companion::protocol::ADVERT_LAST_TS.load(core::sync::atomic::Ordering::Relaxed),
                 if crate::companion::protocol::ADVERT_LAST_HAD_BLOB.load(core::sync::atomic::Ordering::Relaxed) { "yes" } else { "no" }
+            );
+            let _ = sender.send( s.as_bytes()).await;
+        }
+        "gps on" => {
+            host.set_gps_enabled(true);
+            let _ = sender.send( b"  -> GPS power on\r\n").await;
+        }
+        "gps off" => {
+            host.set_gps_enabled(false);
+            let _ = sender.send( b"  -> GPS power off\r\n").await;
+        }
+        "stats-wdt" | "watchdog" => {
+            use core::sync::atomic::Ordering;
+            let app = crate::state::APP_HEARTBEAT.load(Ordering::Relaxed);
+            let storage = crate::state::STORAGE_HEARTBEAT.load(Ordering::Relaxed);
+            let pets = crate::state::WDT_PETS.load(Ordering::Relaxed);
+            let reason = crate::state::RESET_REASON.load(Ordering::Relaxed);
+            let mut s: heapless::String<192> = heapless::String::new();
+            let _ = write!(
+                s,
+                "  -> WDT: app={} storage={} pets={} reset=0x{:08x} dog={}\r\n",
+                app,
+                storage,
+                pets,
+                reason,
+                (reason & 0x2) != 0
+            );
+            let _ = sender.send( s.as_bytes()).await;
+        }
+        "stats-gps" | "gps" => {
+            let g = crate::state::gps_state();
+            let now = embassy_time::Instant::now().as_millis() as u64;
+            let age = now.saturating_sub(g.last_update_ms);
+            let mut s: heapless::String<192> = heapless::String::new();
+            let _ = write!(
+                s,
+                "  -> GPS: power={} fix={} sats={} lat={:.6} lon={:.6} alt={:.1}m hdop={:.1} age={}ms\r\n",
+                if host.gps_enabled() { "on" } else { "off" },
+                g.fix, g.satellites, g.latitude, g.longitude, g.altitude_m, g.hdop, age
             );
             let _ = sender.send( s.as_bytes()).await;
         }

@@ -175,6 +175,7 @@ pub struct BoardPins {
     pub bat_adc_pin: peripherals::P0_04,
     pub usbd: peripherals::USBD,
     pub qspi: ferrix_nrf52::qspi::QspiPins,
+    pub wdt: peripherals::WDT,
 }
 
 /// Initialize the ThinkNode M1 pinout and peripherals.
@@ -274,6 +275,7 @@ pub fn init(p: embassy_nrf::Peripherals) -> BoardPins {
             bat_adc_pin: p.P0_04,
             usbd: p.USBD,
             qspi,
+            wdt: p.WDT,
         }
 }
 

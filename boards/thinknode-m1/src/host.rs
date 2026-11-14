@@ -109,6 +109,14 @@ impl CliHost for BoardCompanionHost {
         crate::storage::adverts::slots()
     }
 
+    fn gps_enabled(&self) -> bool {
+        crate::gps::gps_enabled()
+    }
+
+    fn set_gps_enabled(&self, on: bool) {
+        crate::gps::set_gps_enabled(on);
+    }
+
     fn reboot_to_bootloader(&self) -> ! {
         let sd_active =
             ferrix_core::state::BLE_STATUS.load(core::sync::atomic::Ordering::Relaxed) >= 3;
