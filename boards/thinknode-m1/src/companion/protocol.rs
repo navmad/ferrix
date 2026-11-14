@@ -61,24 +61,11 @@ fn note_status(tag: u32, pub_key: [u8; 32]) {
     PENDING_STATUS.lock(|p| *p.borrow_mut() = Some((tag, pub_key)));
 }
 
-const MAX_CONNECTIONS: usize = 4;
+use ferrix_core::state::{Connection, CONNECTIONS, MAX_CONNECTIONS, PENDING_LOGIN};
+
 const RESP_SERVER_LOGIN_OK: u8 = 0;
 const REQ_TYPE_KEEP_ALIVE: u8 = 0x02;
 const CONNECTION_GRACE_MS: u64 = 5000;
-
-#[derive(Clone, Copy)]
-struct Connection {
-    pub_key: [u8; 32],
-    last_activity_ms: u64,
-    next_keepalive_ms: u64,
-    expected_ack: u32,
-    keep_alive_secs: u16,
-}
-
-static CONNECTIONS: Mutex<CriticalSectionRawMutex, RefCell<Vec<Connection, MAX_CONNECTIONS>>> =
-    Mutex::new(RefCell::new(Vec::new()));
-static PENDING_LOGIN: Mutex<CriticalSectionRawMutex, RefCell<Option<([u8; 32], u64)>>> =
-    Mutex::new(RefCell::new(None));
 
 // Login diagnostics.
 pub static LOGIN_TX_COUNT: AtomicU32 = AtomicU32::new(0);

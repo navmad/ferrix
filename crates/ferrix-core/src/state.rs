@@ -5,7 +5,7 @@
 //! board/application coupling without changing behavior.
 
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
@@ -97,6 +97,14 @@ pub fn set_device_time(epoch: u32) {
     });
 }
 
+/// BLE companion transport status (0 = off, 1..=5 = init stages, high bit set
+/// on SoftDevice init failure).
+pub static BLE_STATUS: AtomicU32 = AtomicU32::new(0);
+/// True while a companion app is connected over BLE (for the dashboard).
+pub static BLE_CONNECTED: AtomicBool = AtomicBool::new(false);
+/// Pairing PIN reported to the app and used by the security handler.
+pub static BLE_PIN: AtomicU32 = AtomicU32::new(123456);
+
 /// Blue status LED disabled by the user (persisted in the config page).
 pub static LEDS_DISABLED: AtomicBool = AtomicBool::new(false);
 
@@ -129,6 +137,26 @@ pub const fn default_channels() -> [ChannelData; MAX_CHANNELS] {
 
 pub static CHANNELS: Mutex<SharedRawMutex, RefCell<[ChannelData; MAX_CHANNELS]>> =
     Mutex::new(RefCell::new(default_channels()));
+
+/// Maximum concurrent companion logins tracked by the node.
+pub const MAX_CONNECTIONS: usize = 4;
+
+/// One authenticated companion connection (identified by its public key).
+#[derive(Clone, Copy, Debug)]
+pub struct Connection {
+    pub pub_key: [u8; 32],
+    pub last_activity_ms: u64,
+    pub next_keepalive_ms: u64,
+    pub expected_ack: u32,
+    pub keep_alive_secs: u16,
+}
+
+pub static CONNECTIONS: Mutex<SharedRawMutex, RefCell<Vec<Connection, MAX_CONNECTIONS>>> =
+    Mutex::new(RefCell::new(Vec::new()));
+
+/// Login currently awaiting its room/server response, with an expiry instant.
+pub static PENDING_LOGIN: Mutex<SharedRawMutex, RefCell<Option<([u8; 32], u64)>>> =
+    Mutex::new(RefCell::new(None));
 
 /// Active node callsign, mirrored from the persisted config.
 pub static NODE_CALLSIGN: Mutex<SharedRawMutex, RefCell<heapless::String<32>>> =

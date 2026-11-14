@@ -5,7 +5,7 @@
 
 use core::cell::UnsafeCell;
 use core::future::poll_fn;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use core::task::Poll;
 
 use defmt::{debug, error, info};
@@ -599,13 +599,10 @@ pub async fn ble_companion_task(
     }
 }
 
-pub static BLE_STATUS: AtomicU32 = AtomicU32::new(0);
-/// True while a companion app is connected over BLE (for the dashboard).
-pub static BLE_CONNECTED: AtomicBool = AtomicBool::new(false);
+pub use ferrix_core::state::{BLE_CONNECTED, BLE_PIN, BLE_STATUS};
+
 /// Counts commands dropped because the GATT command ring was full.
 static BLE_CMD_DROPS: AtomicU32 = AtomicU32::new(0);
-/// Pairing PIN reported to the app and used by the security handler.
-pub static BLE_PIN: AtomicU32 = AtomicU32::new(123456);
 
 unsafe extern "C" fn sd_fault_handler(id: u32, pc: u32, info: u32) {
     defmt::error!("Softdevice fault: id={=u32:#x} pc={=u32:#x} info={=u32:#x}", id, pc, info);
