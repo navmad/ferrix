@@ -37,7 +37,7 @@ esac
 
 if [[ "$action" == "test" ]]; then
     host="$(rustc -vV | sed -n 's/host: //p')"
-    exec cargo test -p meshcore-wire -p ferrix-hal -p ferrix-core -p ferrix-runtime -p ferrix-sx1262 --target "$host" "$@"
+    exec cargo test -p meshcore-wire -p ferrix-hal -p ferrix-core -p ferrix-runtime -p ferrix-sx1262 -p ferrix-ssd1681 --target "$host" "$@"
 fi
 
 exec cargo "$action" -p "$pkg" --target "$target" "$@"

@@ -18,7 +18,7 @@ use ferrix_core::companion::protocol::CompanionNode;
 use ferrix_core::types::InboxItem;
 use ferrix_runtime::app::{RadarSort, UiState};
 
-use crate::display::epd::{EpdFrameBuffer, EPD_WIDTH};
+use crate::display::framebuffer::{EpdFrameBuffer, EPD_WIDTH};
 
 pub const PAGE_COUNT: u8 = 8;
 pub const FIRMWARE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-ferrix");

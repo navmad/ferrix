@@ -23,7 +23,7 @@ use embassy_nrf::peripherals;
 use embassy_nrf::saadc;
 use embassy_nrf::spim::{self, Spim};
 use embassy_nrf::usb;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Delay, Duration, Timer};
 #[cfg(feature = "thinknode-m1")]
 use static_cell::StaticCell;
 
@@ -31,7 +31,7 @@ use crate::app::{set_blue_led, ThinkNodeApp};
 use ferrix_core::companion::protocol::CompanionNode;
 use crate::host::BOARD_HOST;
 #[cfg(feature = "thinknode-m1")]
-use crate::display::{EpdFrameBuffer, NodeDisplay, Ssd1681, ThinkNodeDisplay};
+use crate::display::{EpdFrameBuffer, NodeDisplay, PanelConfig, Ssd1681, ThinkNodeDisplay};
 use crate::meshcore::{LocalIdentity, MeshEngine};
 use crate::radio::{sx1262_task, LoraConfig, ChannelRadio, LoraRadio};
 
@@ -342,13 +342,16 @@ async fn main(spawner: Spawner) {
                 spim1_config,
             );
 
+            let spi_device = embedded_hal_bus::spi::ExclusiveDevice::new(spim1, disp.cs, Delay)
+                .unwrap();
             let epd = Ssd1681::new(
-                spim1,
-                disp.cs,
+                spi_device,
                 disp.dc,
                 disp.reset,
                 disp.busy,
-                disp.backlight,
+                Some(disp.backlight),
+                Delay,
+                PanelConfig::THINKNODE_M1,
             );
 
             let fb = EPD_FRAMEBUFFER.init(EpdFrameBuffer::new());

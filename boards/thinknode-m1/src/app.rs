@@ -4,7 +4,6 @@ use defmt::info;
 use embassy_futures::select::{select, Either};
 use embassy_nrf::gpio::Output;
 use embassy_nrf::saadc;
-use embassy_nrf::peripherals::TWISPI1;
 use embassy_time::{Duration, Instant, Timer};
 use ferrix_core::companion::protocol::CompanionNode;
 use ferrix_runtime::app::{AppBoard, UiState};
@@ -18,7 +17,7 @@ const BACKLIGHT_IDLE_SECS: u64 = 15;
 /// Board-side devices used by the application loop.
 pub struct ThinkNodeApp {
     led: Output<'static>,
-    display: Option<ThinkNodeDisplay<'static, TWISPI1>>,
+    display: Option<ThinkNodeDisplay>,
     battery_adc: saadc::Saadc<'static, 1>,
     battery_buf: [i16; 1],
     backlight_on: bool,
@@ -29,7 +28,7 @@ pub struct ThinkNodeApp {
 impl ThinkNodeApp {
     pub fn new(
         led: Output<'static>,
-        display: Option<ThinkNodeDisplay<'static, TWISPI1>>,
+        display: Option<ThinkNodeDisplay>,
         battery_adc: saadc::Saadc<'static, 1>,
     ) -> Self {
         Self {
