@@ -1,0 +1,5 @@
+[package]
+name = "ferrix-role-repeater"
+version = "0.1.0"
+edition = "2021"
+description = "MeshCore repeater role for Ferrix boards (placeholder)"

@@ -10,6 +10,7 @@ members = [
     "drivers/display/ssd1681",
     "drivers/gnss/l76k",
     "roles/companion",
+    "roles/repeater",
     "firmware/thinknode-m1-companion",
     "boards/thinknode-m1",
 ]

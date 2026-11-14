@@ -799,6 +799,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrix-role-repeater"
+version = "0.1.0"
+
+[[package]]
 name = "ferrix-runtime"
 version = "0.1.0"
 dependencies = [
