@@ -10,7 +10,6 @@ use heapless::Vec;
 pub use ferrix_core::companion::protocol::CompanionHost;
 
 pub use ferrix_core::companion::protocol::*;
-pub(crate) use ferrix_core::companion::contacts::serialize_contact;
 
 /// Board implementation of the protocol's persistence/telemetry interface.
 pub struct BoardCompanionHost;
