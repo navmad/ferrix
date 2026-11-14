@@ -297,6 +297,14 @@ where
 
     let mut cursor = CURSOR.load(Ordering::Relaxed);
     for rec in pending.iter() {
+        // Keep blobs only for contacts that are still in the saved/discovered
+        // list. This drops orphans from contacts removed before the debounced
+        // write, and from adverts that were never accepted.
+        let known = crate::state::DISCOVERED_CONTACTS
+            .lock(|c| c.borrow().iter().any(|ct| ct.pub_key == rec.pub_key));
+        if !known {
+            continue;
+        }
         if cursor >= slots {
             error!("Persistence: advert log full");
             break;

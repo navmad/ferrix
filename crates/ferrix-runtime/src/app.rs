@@ -335,17 +335,16 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                         DISCOVERED_CONTACTS.lock(|c| {
                             let mut list = c.borrow_mut();
                             if let Some(existing) = list.iter_mut().find(|ct| ct.pub_key == adv.pub_key) {
-                                // Backfill a missing blob even from a replayed
-                                // advert: the payload is still correctly signed.
-                                if !storage::adverts::has_blob(&adv.pub_key) {
-                                    store_blob = true;
-                                }
                                 // Anti-replay: ignore an advert no newer than the last accepted one.
                                 if existing.last_advert_ts != 0 && adv.timestamp <= existing.last_advert_ts {
                                     return;
                                 }
                                 // Only rewrite the shared advert blob when the
                                 // contact's advertised identity actually changed.
+                                // A missing blob is not backfilled on every
+                                // advert: that would append a record per advert
+                                // and wear the log. The next real change (or a
+                                // re-add) stores it.
                                 if existing.callsign != adv.name
                                     || existing.contact_type != contact_type
                                     || existing.latitude != adv.latitude
