@@ -192,3 +192,25 @@ pub static RADIO_TELEMETRY: Mutex<SharedRawMutex, RefCell<RadioTelemetry>> =
         tx_retries: 0,
         tx_dropped: 0,
     }));
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_channel_zero_is_public() {
+        let channels = default_channels();
+        assert_eq!(&channels[0].name[..6], b"Public");
+        assert_eq!(channels[0].secret, DEFAULT_PUBLIC_SECRET);
+        assert!(channels[1..].iter().all(|ch| ch.name == [0u8; 32]));
+        assert!(channels[1..].iter().all(|ch| ch.secret == [0u8; 16]));
+    }
+
+    #[test]
+    fn companion_limits_match_protocol() {
+        assert_eq!(MAX_MESSAGES, 256);
+        assert_eq!(MAX_CHANNELS, 40);
+        assert_eq!(MAX_CONTACTS, 350);
+        assert_eq!(MAX_CONNECTIONS, 4);
+    }
+}
