@@ -1,10 +1,22 @@
-//! Board host implementation for the companion protocol and text CLI.
+//! Board bindings for the companion protocol, text CLI and routing engine.
 //!
 //! The protocol and CLI live in `ferrix-core`; this module maps their host
 //! operations onto ThinkNode storage, radio, telemetry and reset.
 
+use core::sync::atomic::Ordering;
+
 use ferrix_core::companion::cli::{CliHost, RadioStats, StorageStats};
 use ferrix_core::companion::protocol::CompanionHost;
+use ferrix_core::engine::EngineContext;
+use ferrix_core::types::{ChannelData, MAX_CHANNELS};
+use meshcore_wire::Packet;
+
+/// Persist the user's LED preference.
+pub fn set_leds_disabled(disabled: bool) {
+    if ferrix_core::state::LEDS_DISABLED.swap(disabled, Ordering::Relaxed) != disabled {
+        crate::storage::request_save_config();
+    }
+}
 
 /// Board implementation of the protocol's persistence/telemetry interface.
 pub struct BoardCompanionHost;
@@ -13,7 +25,7 @@ pub static BOARD_HOST: BoardCompanionHost = BoardCompanionHost;
 
 impl CompanionHost for BoardCompanionHost {
     fn battery_millivolts(&self) -> u16 {
-        crate::telemetry::battery_millivolts()
+        crate::battery_millivolts()
     }
 
     fn set_callsign(&self, name: &str) {
@@ -33,7 +45,7 @@ impl CompanionHost for BoardCompanionHost {
     }
 
     fn request_radio_config(&self) {
-        crate::radio::sx1262::request_radio_config();
+        crate::radio::request_radio_config();
     }
 
     fn request_factory_reset(&self) {
@@ -55,50 +67,46 @@ impl CompanionHost for BoardCompanionHost {
 
 impl CliHost for BoardCompanionHost {
     fn leds_disabled(&self) -> bool {
-        crate::companion::usb::leds_disabled()
+        ferrix_core::state::leds_disabled()
     }
 
     fn set_leds_disabled(&self, disabled: bool) {
-        crate::companion::usb::set_leds_disabled(disabled);
+        set_leds_disabled(disabled);
     }
 
     fn storage_stats(&self) -> StorageStats {
-        use core::sync::atomic::Ordering::Relaxed;
         StorageStats {
-            contact_saves: crate::storage::contacts::SAVES.load(Relaxed),
-            contact_erases: crate::storage::contacts::ERASES.load(Relaxed),
-            message_records: crate::storage::messages::RECORD_SAVES.load(Relaxed),
-            message_page_erases: crate::storage::messages::PAGE_ERASES.load(Relaxed),
-            message_queued: crate::storage::messages::QUEUED.load(Relaxed),
-            advert_records: crate::storage::adverts::RECORD_SAVES.load(Relaxed),
-            advert_erases: crate::storage::adverts::ERASES.load(Relaxed),
-            config_saves: crate::storage::config::CONFIG_SAVES.load(Relaxed),
-            config_erases: crate::storage::config::CONFIG_ERASES.load(Relaxed),
+            contact_saves: crate::storage::contacts::SAVES.load(Ordering::Relaxed),
+            contact_erases: crate::storage::contacts::ERASES.load(Ordering::Relaxed),
+            message_records: crate::storage::messages::RECORD_SAVES.load(Ordering::Relaxed),
+            message_page_erases: crate::storage::messages::PAGE_ERASES.load(Ordering::Relaxed),
+            message_queued: crate::storage::messages::QUEUED.load(Ordering::Relaxed),
+            advert_records: crate::storage::adverts::RECORD_SAVES.load(Ordering::Relaxed),
+            advert_erases: crate::storage::adverts::ERASES.load(Ordering::Relaxed),
+            config_saves: crate::storage::config::CONFIG_SAVES.load(Ordering::Relaxed),
+            config_erases: crate::storage::config::CONFIG_ERASES.load(Ordering::Relaxed),
         }
     }
 
     fn radio_stats(&self) -> RadioStats {
-        use core::sync::atomic::Ordering::Relaxed;
         RadioStats {
-            override_ms: crate::radio::TX_SLOT_MS_OVERRIDE.load(Relaxed),
-            slot_ms: crate::radio::TX_SLOT_MS_LAST.load(Relaxed),
-            used: crate::radio::TX_SLOT_USED.load(Relaxed),
-            forward_scheduled: crate::radio::FORWARD_SCHEDULED.load(Relaxed),
-            forward_sent: crate::radio::FORWARD_SENT.load(Relaxed),
-            duplicate_deltas: crate::radio::duplicate_deltas(),
+            override_ms: ferrix_core::state::TX_SLOT_MS_OVERRIDE.load(Ordering::Relaxed),
+            slot_ms: ferrix_core::state::TX_SLOT_MS_LAST.load(Ordering::Relaxed),
+            used: ferrix_core::state::TX_SLOT_USED.load(Ordering::Relaxed),
+            forward_scheduled: ferrix_core::state::FORWARD_SCHEDULED.load(Ordering::Relaxed),
+            forward_sent: ferrix_core::state::FORWARD_SENT.load(Ordering::Relaxed),
+            duplicate_deltas: ferrix_core::state::duplicate_deltas(),
         }
     }
 
     fn set_tx_slot_override(&self, ms: u32) {
-        crate::radio::TX_SLOT_MS_OVERRIDE
-            .store(ms, core::sync::atomic::Ordering::Relaxed);
+        ferrix_core::state::TX_SLOT_MS_OVERRIDE.store(ms, Ordering::Relaxed);
     }
 
     fn clear_radio_stats(&self) {
-        use core::sync::atomic::Ordering::Relaxed;
-        crate::radio::FORWARD_SCHEDULED.store(0, Relaxed);
-        crate::radio::FORWARD_SENT.store(0, Relaxed);
-        crate::radio::clear_duplicate_deltas();
+        ferrix_core::state::FORWARD_SCHEDULED.store(0, Ordering::Relaxed);
+        ferrix_core::state::FORWARD_SENT.store(0, Ordering::Relaxed);
+        ferrix_core::state::clear_duplicate_deltas();
     }
 
     fn advert_stats(&self) -> (usize, usize, bool) {
@@ -118,12 +126,68 @@ impl CliHost for BoardCompanionHost {
     }
 
     fn reboot_to_bootloader(&self) -> ! {
-        let sd_active =
-            ferrix_core::state::BLE_STATUS.load(core::sync::atomic::Ordering::Relaxed) >= 3;
+        let sd_active = ferrix_core::state::BLE_STATUS.load(Ordering::Relaxed) >= 3;
         ferrix_nrf52::reset::reboot_to_bootloader(sd_active)
     }
 
     fn board_line(&self) -> &'static str {
         "ThinkNode M1 (nRF52840, SX1262 LoRa)"
+    }
+}
+
+/// Routing engine host implementation backed by the board's shared state.
+pub struct BoardEngineContext;
+
+pub static BOARD_ENGINE_CONTEXT: BoardEngineContext = BoardEngineContext;
+
+impl EngineContext for BoardEngineContext {
+    fn path_hash_mode(&self) -> u8 {
+        crate::storage::get_path_hash_mode()
+    }
+
+    fn peers_by_hash(&self, hash: u8) -> heapless::Vec<[u8; 32], 32> {
+        let mut peers = heapless::Vec::new();
+        ferrix_core::state::DISCOVERED_CONTACTS.lock(|c| {
+            for ct in c.borrow().iter() {
+                if ct.pub_key[0] == hash {
+                    let _ = peers.push(ct.pub_key);
+                }
+            }
+        });
+        peers
+    }
+
+    fn channels(&self) -> [ChannelData; MAX_CHANNELS] {
+        ferrix_core::state::CHANNELS.lock(|chs| *chs.borrow())
+    }
+
+    fn peer_path(&self, pub_key: &[u8; 32]) -> (u8, [u8; 64]) {
+        ferrix_core::state::DISCOVERED_CONTACTS.lock(|c| {
+            if let Some(ct) = c.borrow().iter().find(|ct| ct.pub_key == *pub_key) {
+                (ct.out_path_len, ct.out_path)
+            } else {
+                (0xFF, [0u8; 64])
+            }
+        })
+    }
+
+    fn apply_flood_scope(&self, pkt: &mut Packet) {
+        ferrix_core::state::apply_flood_scope(pkt);
+    }
+
+    fn apply_flood_scope_default(&self, pkt: &mut Packet) {
+        ferrix_core::state::apply_flood_scope_default(pkt);
+    }
+
+    fn note_forward_scheduled(&self) {
+        ferrix_core::state::FORWARD_SCHEDULED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn note_duplicate_delta(&self, ms: u64) {
+        ferrix_core::state::record_duplicate_delta(ms);
+    }
+
+    fn cancel_flood(&self, hash: [u8; 8]) {
+        crate::radio::cancel_flood(hash);
     }
 }

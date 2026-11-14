@@ -1336,12 +1336,14 @@ pub async fn handle_text_cli<W: TextSink>(
             let g = crate::state::gps_state();
             let now = embassy_time::Instant::now().as_millis() as u64;
             let age = now.saturating_sub(g.last_update_ms);
-            let mut s: heapless::String<192> = heapless::String::new();
+            let bytes = crate::state::GPS_BYTES.load(core::sync::atomic::Ordering::Relaxed);
+            let sentences = crate::state::GPS_SENTENCES.load(core::sync::atomic::Ordering::Relaxed);
+            let mut s: heapless::String<224> = heapless::String::new();
             let _ = write!(
                 s,
-                "  -> GPS: power={} fix={} sats={} lat={:.6} lon={:.6} alt={:.1}m hdop={:.1} age={}ms\r\n",
+                "  -> GPS: power={} fix={} sats={} lat={:.6} lon={:.6} alt={:.1}m hdop={:.1} age={}ms bytes={} lines={}\r\n",
                 if host.gps_enabled() { "on" } else { "off" },
-                g.fix, g.satellites, g.latitude, g.longitude, g.altitude_m, g.hdop, age
+                g.fix, g.satellites, g.latitude, g.longitude, g.altitude_m, g.hdop, age, bytes, sentences
             );
             let _ = sender.send( s.as_bytes()).await;
         }

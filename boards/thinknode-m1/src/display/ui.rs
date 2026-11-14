@@ -18,7 +18,7 @@ use ferrix_core::companion::protocol::CompanionNode;
 use ferrix_core::types::InboxItem;
 use ferrix_runtime::app::{RadarSort, UiState};
 
-use crate::display::epd::{EpdFrameBuffer, EPD_WIDTH};
+use crate::display::{EpdFrameBuffer, EPD_WIDTH};
 
 pub const PAGE_COUNT: u8 = 8;
 pub const FIRMWARE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-ferrix");
@@ -89,7 +89,7 @@ fn draw_top_bar(
         let _ = name.push(c);
     }
     if name.is_empty() {
-        let _ = name.push_str(crate::board::NAME);
+        let _ = name.push_str(crate::NAME);
     }
     draw_text(fb, name.as_str(), 2, 14, title);
 }
@@ -137,7 +137,7 @@ fn page_mesh(
     title: TitleStyle,
 ) {
     draw_text(fb, "MESH", 2, 50, title);
-    let role = if crate::companion::usb::forwarding_enabled() {
+    let role = if ferrix_core::state::forwarding_enabled() {
         "repeater / forwarding"
     } else {
         "client"
@@ -150,7 +150,7 @@ fn page_mesh(
     let mut row: String<32> = String::new();
     let _ = write!(row, "unread {}", node.unread_messages);
     draw_text(fb, row.as_str(), 2, 142, small);
-    let ble = if crate::companion::ble::BLE_CONNECTED.load(core::sync::atomic::Ordering::Relaxed) {
+    let ble = if ferrix_core::state::BLE_CONNECTED.load(core::sync::atomic::Ordering::Relaxed) {
         "BLE <ok>"
     } else {
         "BLE --"
@@ -341,7 +341,7 @@ fn page_radar(
 }
 
 fn page_radio(fb: &mut EpdFrameBuffer, small: SmallStyle, title: TitleStyle) {
-    let (freq, bw, sf, cr, tx, duty) = crate::companion::usb::RADIO_SETTINGS.lock(|r| {
+    let (freq, bw, sf, cr, tx, duty) = ferrix_core::state::RADIO_SETTINGS.lock(|r| {
         let s = r.borrow();
         (s.frequency_hz, s.bw_khz, s.sf, s.cr, s.tx_power_dbm, s.rx_duty_cycle)
     });
@@ -364,7 +364,7 @@ fn page_radio(fb: &mut EpdFrameBuffer, small: SmallStyle, title: TitleStyle) {
     let _ = write!(row, "TX {} dBm   RX {}", tx, if duty { "DUTY" } else { "CONT" });
     draw_text(fb, row.as_str(), 2, 114, small);
     row.clear();
-    let af = crate::companion::usb::RADIO_SETTINGS
+    let af = ferrix_core::state::RADIO_SETTINGS
         .lock(|r| r.borrow().airtime_factor_tenths);
     let duty_x10 = 10_000 / (af as u32 + 10);
     let _ = write!(row, "airtime {}.{}%", duty_x10 / 10, duty_x10 % 10);
@@ -419,7 +419,7 @@ fn page_signal(
     }
     draw_separator(fb, 124);
 
-    let (rx, tx) = crate::companion::usb::RADIO_TELEMETRY.lock(|t| {
+    let (rx, tx) = ferrix_core::state::RADIO_TELEMETRY.lock(|t| {
         let t = t.borrow();
         (t.rx_packets, t.tx_beacons)
     });
@@ -427,7 +427,7 @@ fn page_signal(
     let _ = write!(row, "rx {}   tx {}", rx, tx);
     draw_text(fb, row.as_str(), 2, 138, small);
     row.clear();
-    let _ = write!(row, "air {} ms", crate::companion::usb::RADIO_TELEMETRY.lock(|t| t.borrow().rx_air_ms));
+    let _ = write!(row, "air {} ms", ferrix_core::state::RADIO_TELEMETRY.lock(|t| t.borrow().rx_air_ms));
     draw_text(fb, row.as_str(), 2, 150, small);
 }
 
@@ -472,7 +472,7 @@ fn page_position(
 }
 
 fn page_offgrid(fb: &mut EpdFrameBuffer, small: SmallStyle, title: TitleStyle) {
-    let (active, client, repeater, freq) = crate::companion::usb::RADIO_SETTINGS
+    let (active, client, repeater, freq) = ferrix_core::state::RADIO_SETTINGS
         .lock(|r| {
             let s = r.borrow();
             (
@@ -523,7 +523,7 @@ fn page_system(
 
     draw_text(fb, uptime_label().as_str(), 2, 86, small);
 
-    let (duty, path) = crate::companion::usb::RADIO_SETTINGS.lock(|r| {
+    let (duty, path) = ferrix_core::state::RADIO_SETTINGS.lock(|r| {
         let s = r.borrow();
         (s.rx_duty_cycle, s.path_hash_mode)
     });
@@ -531,7 +531,7 @@ fn page_system(
     let _ = write!(
         row,
         "LEDs {}   RX duty {}",
-        if crate::companion::usb::leds_disabled() { "OFF" } else { "ON" },
+        if ferrix_core::state::leds_disabled() { "OFF" } else { "ON" },
         if duty { "ON" } else { "OFF" }
     );
     draw_text(fb, row.as_str(), 2, 100, small);
@@ -542,7 +542,7 @@ fn page_system(
     let _ = write!(row, "FW {}", FIRMWARE_VERSION);
     draw_text(fb, row.as_str(), 2, 134, small);
     row.clear();
-    let _ = write!(row, "BOARD {}", crate::board::NAME);
+    let _ = write!(row, "BOARD {}", crate::NAME);
     draw_text(fb, row.as_str(), 2, 146, small);
 }
 
@@ -720,7 +720,7 @@ pub fn render_boot(node: &CompanionNode<'_>, fb: &mut EpdFrameBuffer) {
     draw_text(fb, "FW", 2, 86, small);
     draw_text(fb, FIRMWARE_VERSION, 66, 86, small);
     draw_text(fb, "BOARD", 2, 100, small);
-    draw_text(fb, crate::board::NAME, 66, 100, small);
+    draw_text(fb, crate::NAME, 66, 100, small);
     draw_text(fb, "DEVICE", 2, 114, small);
     let mut name: String<32> = String::new();
     let _ = name.push_str(node.callsign.as_str());

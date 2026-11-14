@@ -4,12 +4,11 @@ use defmt::info;
 use embassy_futures::select::{select, Either};
 use embassy_nrf::gpio::Output;
 use embassy_nrf::saadc;
-use embassy_nrf::peripherals::TWISPI1;
 use embassy_time::{Duration, Instant, Timer};
 use ferrix_core::companion::protocol::CompanionNode;
 use ferrix_runtime::app::{AppBoard, UiState};
 
-use crate::display::{NodeDisplay, ThinkNodeDisplay};
+use crate::display::ThinkNodeDisplay;
 use crate::gps;
 
 /// Seconds the display frontlight stays on after the last button press.
@@ -18,7 +17,7 @@ const BACKLIGHT_IDLE_SECS: u64 = 15;
 /// Board-side devices used by the application loop.
 pub struct ThinkNodeApp {
     led: Output<'static>,
-    display: Option<ThinkNodeDisplay<'static, TWISPI1>>,
+    display: Option<ThinkNodeDisplay>,
     battery_adc: saadc::Saadc<'static, 1>,
     battery_buf: [i16; 1],
     backlight_on: bool,
@@ -29,7 +28,7 @@ pub struct ThinkNodeApp {
 impl ThinkNodeApp {
     pub fn new(
         led: Output<'static>,
-        display: Option<ThinkNodeDisplay<'static, TWISPI1>>,
+        display: Option<ThinkNodeDisplay>,
         battery_adc: saadc::Saadc<'static, 1>,
     ) -> Self {
         Self {
@@ -74,7 +73,7 @@ impl AppBoard for ThinkNodeApp {
     }
 
     fn has_battery_adc(&self) -> bool {
-        crate::board::HAS_BATTERY_ADC
+        crate::HAS_BATTERY_ADC
     }
 
     fn gps_enabled(&self) -> bool {
@@ -130,7 +129,7 @@ impl AppBoard for ThinkNodeApp {
     }
 
     async fn sample_battery(&mut self) -> Option<u16> {
-        if !crate::board::HAS_BATTERY_ADC {
+        if !crate::HAS_BATTERY_ADC {
             return None;
         }
         match select(
@@ -143,9 +142,9 @@ impl AppBoard for ThinkNodeApp {
             Either::Second(_) => return None,
         }
         let raw = self.battery_buf[0].max(0) as u16;
-        let mv = crate::telemetry::adc_raw_to_battery_millivolts(raw);
-        if mv >= crate::telemetry::MIN_PLAUSIBLE_BATTERY_MV {
-            crate::telemetry::set_battery_millivolts(mv);
+        let mv = crate::adc_raw_to_battery_millivolts(raw);
+        if mv >= crate::MIN_PLAUSIBLE_BATTERY_MV {
+            crate::set_battery_millivolts(mv);
             Some(mv)
         } else {
             None
@@ -153,6 +152,6 @@ impl AppBoard for ThinkNodeApp {
     }
 
     fn set_leds_disabled(&mut self, disabled: bool) {
-        crate::companion::usb::set_leds_disabled(disabled);
+        crate::host::set_leds_disabled(disabled);
     }
 }

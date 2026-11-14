@@ -6,9 +6,15 @@ members = [
     "crates/ferrix-core",
     "crates/ferrix-runtime",
     "platforms/nrf52",
+    "drivers/radio/sx1262",
+    "drivers/display/ssd1681",
+    "drivers/gnss/l76k",
+    "roles/companion",
+    "roles/repeater",
+    "firmware/thinknode-m1-companion",
     "boards/thinknode-m1",
 ]
-default-members = ["boards/thinknode-m1"]
+default-members = ["firmware/thinknode-m1-companion"]
 
 # Local patch: nrf-softdevice panics when a GAP/GATTS event arrives after the
 # peer disconnected (e.g. a late CONN_PARAM_UPDATE). See the patch notes in

@@ -1,0 +1,17 @@
+[package]
+name = "ferrix-thinknode-m1-companion"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[[bin]]
+name = "ferrix"
+path = "src/main.rs"
+
+[dependencies]
+cortex-m-rt = "0.7"
+defmt-rtt = "0.4"
+embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread", "executor-interrupt", "defmt", "task-arena-size-40960"] }
+ferrix-nrf52 = { path = "../../platforms/nrf52" }
+ferrix-role-companion = { path = "../../roles/companion" }
+ferrix-thinknode-m1 = { path = "../../boards/thinknode-m1" }

@@ -25,7 +25,7 @@ shift $(( $# >= 2 ? 2 : $# )) || true
 
 case "$board" in
     thinknode-m1)
-        pkg="ferrix-thinknode-m1"
+        pkg="ferrix-thinknode-m1-companion"
         target="thumbv7em-none-eabihf"
         ;;
     *)
@@ -37,7 +37,7 @@ esac
 
 if [[ "$action" == "test" ]]; then
     host="$(rustc -vV | sed -n 's/host: //p')"
-    exec cargo test -p meshcore-wire -p ferrix-hal -p ferrix-core -p ferrix-runtime --target "$host" "$@"
+    exec cargo test -p meshcore-wire -p ferrix-hal -p ferrix-core -p ferrix-runtime -p ferrix-sx1262 -p ferrix-ssd1681 -p ferrix-l76k --target "$host" "$@"
 fi
 
 exec cargo "$action" -p "$pkg" --target "$target" "$@"

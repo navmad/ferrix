@@ -3,18 +3,11 @@
 //! These helpers are platform independent and allocation free.
 
 /// Convert the compact kHz setting to the exact bandwidth in Hz.
-pub fn bw_khz_to_hz(bw_khz: u32) -> u32 {
-    match bw_khz {
-        7 => 7_800,
-        10 => 10_400,
-        15 => 15_600,
-        20 => 20_800,
-        31 => 31_250,
-        41 => 41_670,
-        62 => 62_500,
-        other => other * 1000,
-    }
-}
+///
+/// Kept as a re-export so existing `ferrix_core::airtime::bw_khz_to_hz` users
+/// continue to work; the implementation lives in `ferrix-hal` because radio
+/// drivers need it without depending on the protocol crate.
+pub use ferrix_hal::radio::bw_khz_to_hz;
 
 /// Estimate LoRa airtime in milliseconds (preamble + header + payload + CRC).
 pub fn estimate_airtime_ms(len: usize, sf: u8, bw_khz: u32, cr: u8, preamble: u16) -> u32 {

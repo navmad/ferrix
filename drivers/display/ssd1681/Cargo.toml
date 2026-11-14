@@ -1,0 +1,11 @@
+[package]
+name = "ferrix-ssd1681"
+version = "0.1.0"
+edition = "2021"
+description = "Reusable SSD1681 e-paper controller driver for Ferrix boards"
+
+[dependencies]
+defmt = "0.3"
+embassy-time = { version = "0.4", features = ["defmt"] }
+embedded-hal = "1.0"
+embedded-hal-async = "1.0"

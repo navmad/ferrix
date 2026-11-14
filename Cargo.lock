@@ -743,6 +743,7 @@ dependencies = [
  "embassy-sync 0.6.2",
  "embassy-time",
  "embedded-storage-async",
+ "ferrix-hal",
  "heapless",
  "meshcore-wire",
  "sequential-storage",
@@ -753,6 +754,15 @@ name = "ferrix-hal"
 version = "0.1.0"
 dependencies = [
  "meshcore-wire",
+]
+
+[[package]]
+name = "ferrix-l76k"
+version = "0.1.0"
+dependencies = [
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+ "embedded-io-async",
 ]
 
 [[package]]
@@ -775,6 +785,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrix-role-companion"
+version = "0.1.0"
+dependencies = [
+ "defmt 0.3.101",
+ "embassy-executor",
+ "ferrix-core",
+ "ferrix-hal",
+ "ferrix-runtime",
+ "heapless",
+ "meshcore-wire",
+]
+
+[[package]]
+name = "ferrix-role-repeater"
+version = "0.1.0"
+
+[[package]]
 name = "ferrix-runtime"
 version = "0.1.0"
 dependencies = [
@@ -790,6 +817,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrix-ssd1681"
+version = "0.1.0"
+dependencies = [
+ "defmt 0.3.101",
+ "embassy-time",
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+]
+
+[[package]]
+name = "ferrix-sx1262"
+version = "0.1.0"
+dependencies = [
+ "defmt 0.3.101",
+ "embassy-time",
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+ "ferrix-hal",
+ "lora-phy",
+]
+
+[[package]]
 name = "ferrix-thinknode-m1"
 version = "0.1.0"
 dependencies = [
@@ -800,23 +849,34 @@ dependencies = [
  "embassy-executor",
  "embassy-futures",
  "embassy-nrf",
- "embassy-sync 0.6.2",
  "embassy-time",
- "embassy-usb",
  "embedded-graphics",
- "embedded-hal 1.0.0",
- "embedded-hal-async",
  "embedded-hal-bus",
  "embedded-io-async",
  "ferrix-core",
  "ferrix-hal",
+ "ferrix-l76k",
  "ferrix-nrf52",
+ "ferrix-role-companion",
  "ferrix-runtime",
+ "ferrix-ssd1681",
+ "ferrix-sx1262",
  "heapless",
- "lora-phy",
  "meshcore-wire",
  "nrf-softdevice",
  "static_cell",
+]
+
+[[package]]
+name = "ferrix-thinknode-m1-companion"
+version = "0.1.0"
+dependencies = [
+ "cortex-m-rt",
+ "defmt-rtt",
+ "embassy-executor",
+ "ferrix-nrf52",
+ "ferrix-role-companion",
+ "ferrix-thinknode-m1",
 ]
 
 [[package]]

@@ -17,7 +17,7 @@ use ferrix_core::state::{
     current_public_key, RADIO_SETTINGS, RADIO_TELEMETRY, TX_SLOT_MS_LAST, TX_SLOT_MS_OVERRIDE,
     TX_SLOT_USED, FORWARD_SENT,
 };
-use ferrix_hal::radio::{LoraConfig, RadioDevice, RxOutcome, TxOutcome};
+use ferrix_hal::radio::{LoraConfig, LoraRadio, RadioDevice, RxOutcome, TxOutcome};
 use heapless::{Deque, Vec};
 use meshcore_wire::tx::TxLane;
 
@@ -43,11 +43,78 @@ pub fn request_radio_config() -> bool {
             spreading_factor: s.sf,
             bandwidth_khz: s.bw_khz,
             coding_rate: s.cr,
-            preamble_length: 0,
+            preamble_length: preamble_for(s.sf),
             rx_duty_cycle: s.rx_duty_cycle,
         }
     });
     LORA_CFG_CHANNEL.try_send(cfg).is_ok()
+}
+
+/// LoRa radio adapter implementing `LoraRadio` through the runtime channels.
+///
+/// This is transport plumbing, not board code: it only turns a synchronous
+/// radio handle into the channel-driven interface used by the mesh engine.
+pub struct ChannelRadio;
+
+impl ChannelRadio {
+    pub const fn new() -> Self {
+        Self
+    }
+}
+
+impl LoraRadio for ChannelRadio {
+    type Error = ();
+
+    async fn init(&mut self, _config: &LoraConfig) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    async fn transmit(&mut self, payload: &[u8]) -> Result<(), Self::Error> {
+        let now = Instant::now().as_millis() as u64;
+        self.transmit_lane(payload, TxLane::Control, now, [0; 8])
+            .await
+    }
+
+    async fn transmit_lane(
+        &mut self,
+        payload: &[u8],
+        lane: TxLane,
+        queued_at_ms: u64,
+        hash: [u8; 8],
+    ) -> Result<(), Self::Error> {
+        if payload.is_empty() || payload.len() > 256 {
+            return Ok(());
+        }
+        let mut pkt = TxPacket {
+            len: payload.len(),
+            data: [0u8; 256],
+            lane,
+            queued_at_ms,
+            hash,
+            attempts: 0,
+        };
+        pkt.data[..payload.len()].copy_from_slice(payload);
+        LORA_TX_CHANNEL.try_send(pkt).map_err(|_| ())
+    }
+
+    async fn start_receive(&mut self) {}
+
+    async fn poll_receive(&mut self, buf: &mut [u8]) -> Option<(usize, i16, i8)> {
+        if let Ok((len, rssi, snr, data)) = LORA_RX_CHANNEL.try_receive() {
+            let copy_len = len.min(buf.len());
+            buf[..copy_len].copy_from_slice(&data[..copy_len]);
+            Some((copy_len, rssi, snr))
+        } else {
+            None
+        }
+    }
+
+    async fn receive(&mut self, buf: &mut [u8]) -> (usize, i16, i8) {
+        let (len, rssi, snr, data) = LORA_RX_CHANNEL.receive().await;
+        let copy_len = len.min(buf.len());
+        buf[..copy_len].copy_from_slice(&data[..copy_len]);
+        (copy_len, rssi, snr)
+    }
 }
 
 fn airtime_factor() -> u8 {
