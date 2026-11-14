@@ -256,7 +256,6 @@ async fn main(spawner: Spawner) {
         priv_key,
         crate::board::NAME,
         crate::board::CAPABILITIES,
-        "MeshCore-M1",
         "ThinkNode M1",
         &BOARD_HOST,
         crate::fatal_blink_forever,

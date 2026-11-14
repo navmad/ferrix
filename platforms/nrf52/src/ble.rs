@@ -406,7 +406,6 @@ pub async fn ble_companion_task(
     private_key: [u8; 64],
     hw_model: &'static str,
     capabilities: u32,
-    adv_name: &'static str,
     model_name: &'static str,
     host: &'static dyn CliHost,
 ) {
@@ -449,8 +448,18 @@ pub async fn ble_companion_task(
     adv_data[4] = 0x07; // Complete list of 128-bit Service UUIDs
     adv_data[5..21].copy_from_slice(&nus_uuid_128);
 
-    // Scan response data: Complete Local Name (MeshCore-ThinkNode)
-    let name = adv_name.as_bytes();
+    // Scan response data: Complete Local Name `MeshCore-<callsign>`, truncated
+    // to the 29-byte budget of a 31-byte BLE advertisement payload.
+    const NAME_PREFIX: &[u8] = b"MeshCore-";
+    const BLE_NAME_MAX: usize = 29;
+    let mut name_buf = [0u8; BLE_NAME_MAX];
+    let callsign_bytes = callsign.as_bytes();
+    let copy_len = callsign_bytes.len().min(BLE_NAME_MAX - NAME_PREFIX.len());
+    name_buf[..NAME_PREFIX.len()].copy_from_slice(NAME_PREFIX);
+    name_buf[NAME_PREFIX.len()..NAME_PREFIX.len() + copy_len]
+        .copy_from_slice(&callsign_bytes[..copy_len]);
+    let name = &name_buf[..NAME_PREFIX.len() + copy_len];
+
     scan_data[0] = (name.len() + 1) as u8;
     scan_data[1] = 0x09; // Complete Local Name
     scan_data[2..2 + name.len()].copy_from_slice(name);
@@ -650,7 +659,6 @@ pub async fn ble_companion_supervisor_task(
     private_key: [u8; 64],
     hw_model: &'static str,
     capabilities: u32,
-    adv_name: &'static str,
     model_name: &'static str,
     host: &'static dyn CliHost,
     fault_handler: fn(u32) -> !,
@@ -722,7 +730,6 @@ pub async fn ble_companion_supervisor_task(
                     private_key,
                     hw_model,
                     capabilities,
-                    adv_name,
                     model_name,
                     host,
                 ))
@@ -745,7 +752,6 @@ pub fn init_ble_companion(
     private_key: [u8; 64],
     hw_model: &'static str,
     capabilities: u32,
-    adv_name: &'static str,
     model_name: &'static str,
     host: &'static dyn CliHost,
     fault_handler: fn(u32) -> !,
@@ -758,7 +764,6 @@ pub fn init_ble_companion(
             private_key,
             hw_model,
             capabilities,
-            adv_name,
             model_name,
             host,
             fault_handler,
