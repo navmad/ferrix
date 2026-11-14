@@ -226,7 +226,7 @@ async fn advert_feedback(led: &mut embassy_nrf::gpio::Output<'static>) {
 /// Hand queued packets to the radio task. The task schedules them by
 /// eligibility, applies the duty-cycle budget and retries failures, so this
 /// only needs to stop when its queue is full.
-async fn flush_tx_queue(mesh: &mut MeshEngine, lora: &mut LoraPhyChannelRadio) {
+async fn flush_tx_queue(mesh: &mut MeshEngine<'_>, lora: &mut LoraPhyChannelRadio) {
     while let Some(queued) = mesh.tx_queue.front() {
         let mut buf = [0u8; 256];
         let Ok(len) = queued.packet.write_to(&mut buf) else {
@@ -318,7 +318,11 @@ async fn main(spawner: Spawner) {
     let priv_key = local_id.private_key_bytes();
     // Publish the identity so every transport (USB, BLE) reads the same keys.
     crate::companion::usb::set_identity(pub_key, priv_key);
-    let mut mesh = MeshEngine::new(local_id, false);
+    let mut mesh = MeshEngine::new(
+        local_id,
+        false,
+        &crate::meshcore::BOARD_ENGINE_CONTEXT,
+    );
     // Forwarding is enabled for a dedicated repeater role or off-grid mode.
     mesh.is_repeater = crate::companion::usb::forwarding_enabled();
 

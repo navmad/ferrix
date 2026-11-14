@@ -15,6 +15,8 @@ pub use meshcore_wire::{
     ROUTE_TYPE_TRANSPORT_FLOOD,
 };
 
+pub mod context;
 pub mod mesh;
 
+pub use context::{BoardEngineContext, BOARD_ENGINE_CONTEXT};
 pub use mesh::{InboundAction, MeshEngine};
