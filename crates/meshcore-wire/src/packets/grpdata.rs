@@ -80,3 +80,29 @@ impl GrpDataPacket {
         Ok(pkt)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encrypted_roundtrip() {
+        let secret = [0x42u8; 16];
+        let payload: Vec<u8, MAX_GROUP_DATA> = Vec::from_slice(&[1, 2, 3, 4, 5]).unwrap();
+        let original = GrpDataPacket::new(0x7A, 0x1234, &payload).unwrap();
+
+        let mut buf = [0u8; 184];
+        let len = original.encode_encrypted(&secret, &mut buf).unwrap();
+        let decoded = GrpDataPacket::decode_encrypted(&buf[..len], &secret).unwrap();
+
+        assert_eq!(decoded.channel_hash, 0x7A);
+        assert_eq!(decoded.data_type, 0x1234);
+        assert_eq!(decoded.data, payload);
+    }
+
+    #[test]
+    fn rejects_oversized_payload() {
+        let data = [0u8; MAX_GROUP_DATA + 1];
+        assert!(GrpDataPacket::new(0, 1, &data).is_err());
+    }
+}

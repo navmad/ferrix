@@ -756,6 +756,8 @@ pub const PUSH_CODE_TELEMETRY_RESPONSE: u8 = 0x8B;
 pub const PUSH_CODE_BINARY_RESPONSE: u8 = 0x8C;
 pub const PUSH_CODE_PATH_DISCOVERY_RESP: u8 = 0x8D;
 pub const PUSH_CODE_CONTROL_DATA: u8 = 0x8E;
+/// Inbound channel datagram frame (same value as the reference packet code).
+pub const PACKET_CHANNEL_DATA_RECV: u8 = 0x1B;
 pub const PUSH_CODE_CONTACT_DELETED: u8 = 0x8F;
 pub const PUSH_CODE_CONTACTS_FULL: u8 = 0x90;
 
@@ -1489,7 +1491,7 @@ impl CompanionNode {
             }
 
             CMD_SYNC_NEXT_MESSAGE => {
-                let next_msg = crate::companion::usb::MESSAGE_LOG.lock(|m| {
+                let next_item = crate::companion::usb::MESSAGE_LOG.lock(|m| {
                     let mut list = m.borrow_mut();
                     if !list.is_empty() {
                         Some(list.remove(0))
@@ -1497,38 +1499,53 @@ impl CompanionNode {
                         None
                     }
                 });
-                if next_msg.is_some() {
-                    // Pop the record from flash too, so a reboot does not
-                    // resurrect a message the app already received.
-                    crate::storage::messages::queue_consume_now();
-                }
 
-                if let Some(msg) = next_msg {
+                if let Some(item) = next_item {
                     let mut resp = Vec::<u8, 256>::new();
-                    if msg.is_direct {
-                        // V3 DM: [0x10, (snr*4), 0, 0, 6B pubkey, path_len, txt_type, 4B ts, text]
-                        let _ = resp.push(RESP_CODE_CONTACT_MSG_V3);
-                        let _ = resp.push((msg.snr * 4) as u8);
-                        let _ = resp.push(0);
-                        let _ = resp.push(0);
-                        let _ = resp.extend_from_slice(&msg.sender_pub[..6]);
-                        let _ = resp.push(msg.path_len);
-                        let _ = resp.push(msg.txt_type);
-                        let _ = resp.extend_from_slice(&msg.timestamp.to_le_bytes());
-                        let _ = resp.extend_from_slice(msg.text.as_bytes());
-                    } else {
-                        // V3 Channel: [0x11, (snr*4), 0, 0, channel_idx, path_len, txt_type, 4B ts, text]
-                        let _ = resp.push(RESP_CODE_CHANNEL_MSG_V3);
-                        let _ = resp.push((msg.snr * 4) as u8);
-                        let _ = resp.push(0);
-                        let _ = resp.push(0);
-                        let _ = resp.push(msg.channel_idx);
-                        let _ = resp.push(msg.path_len);
-                        let _ = resp.push(0); // TXT_TYPE_PLAIN
-                        let _ = resp.extend_from_slice(&msg.timestamp.to_le_bytes());
-                        let _ = resp.extend_from_slice(msg.sender.as_bytes());
-                        let _ = resp.extend_from_slice(b": ");
-                        let _ = resp.extend_from_slice(msg.text.as_bytes());
+                    match item {
+                        crate::companion::usb::InboxItem::Text(msg) => {
+                            // Pop the record from flash too, so a reboot does
+                            // not resurrect a message the app already received.
+                            crate::storage::messages::queue_consume_now();
+                            if msg.is_direct {
+                                // V3 DM: [0x10, (snr*4), 0, 0, 6B pubkey, path_len, txt_type, 4B ts, text]
+                                let _ = resp.push(RESP_CODE_CONTACT_MSG_V3);
+                                let _ = resp.push((msg.snr * 4) as u8);
+                                let _ = resp.push(0);
+                                let _ = resp.push(0);
+                                let _ = resp.extend_from_slice(&msg.sender_pub[..6]);
+                                let _ = resp.push(msg.path_len);
+                                let _ = resp.push(msg.txt_type);
+                                let _ = resp.extend_from_slice(&msg.timestamp.to_le_bytes());
+                                let _ = resp.extend_from_slice(msg.text.as_bytes());
+                            } else {
+                                // V3 Channel: [0x11, (snr*4), 0, 0, channel_idx, path_len, txt_type, 4B ts, text]
+                                let _ = resp.push(RESP_CODE_CHANNEL_MSG_V3);
+                                let _ = resp.push((msg.snr * 4) as u8);
+                                let _ = resp.push(0);
+                                let _ = resp.push(0);
+                                let _ = resp.push(msg.channel_idx);
+                                let _ = resp.push(msg.path_len);
+                                let _ = resp.push(0); // TXT_TYPE_PLAIN
+                                let _ = resp.extend_from_slice(&msg.timestamp.to_le_bytes());
+                                let _ = resp.extend_from_slice(msg.sender.as_bytes());
+                                let _ = resp.extend_from_slice(b": ");
+                                let _ = resp.extend_from_slice(msg.text.as_bytes());
+                            }
+                        }
+                        crate::companion::usb::InboxItem::ChannelData(data) => {
+                            // [0x1B, (snr*4), 0, 0, channel_idx, path_len,
+                            //  data_type u16 LE, data_len, data...]
+                            let _ = resp.push(PACKET_CHANNEL_DATA_RECV);
+                            let _ = resp.push((data.snr * 4) as u8);
+                            let _ = resp.push(0);
+                            let _ = resp.push(0);
+                            let _ = resp.push(data.channel_idx);
+                            let _ = resp.push(data.path_len);
+                            let _ = resp.extend_from_slice(&data.data_type.to_le_bytes());
+                            let _ = resp.push(data.data.len() as u8);
+                            let _ = resp.extend_from_slice(&data.data);
+                        }
                     }
                     emit(&resp);
                 } else {
@@ -1676,33 +1693,56 @@ impl CompanionNode {
             }
 
             CMD_SEND_CHANNEL_DATA => {
-                // Inbound channel datagram layout:
-                // [CMD(0x3E), channel_idx(1), path_len(1), path..., data_type(2), payload...]
+                // [CMD(0x3E), channel_idx, path_len, path..., data_type u16 LE, data...]
+                let mut ok = false;
                 if payload.len() >= 5 {
                     let channel_idx = payload[1];
                     let path_len = payload[2];
-                    let hash_count = (path_len & 63) as usize;
-                    let hash_size = ((path_len >> 6) as usize) + 1;
-                    let path_bytes = if path_len == 0xFF { 0 } else { hash_count * hash_size };
-                    let data_offset = 3 + path_bytes;
-                    if payload.len() >= data_offset + 2 {
-                        let _data_type = u16::from_le_bytes([payload[data_offset], payload[data_offset + 1]]);
-                        let text_bytes = &payload[data_offset + 2..];
-                        if let Ok(msg_str) = core::str::from_utf8(text_bytes) {
-                            let msg_str = msg_str.trim_end_matches('\0');
-                            let mut s = String::<160>::new();
-                            let _ = s.push_str(msg_str);
-                            let now = crate::companion::usb::get_device_time();
-                            let _ = crate::companion::usb::USB_COMMAND_CHANNEL.try_send(crate::companion::usb::UsbCommand::SendGroupText {
-                                channel_idx,
-                                timestamp: now,
-                                text: s,
-                            });
+                    let path_bytes = if path_len == 0xFF {
+                        0
+                    } else if Packet::is_valid_path_len(path_len) {
+                        (path_len & 63) as usize * (((path_len >> 6) as usize) + 1)
+                    } else {
+                        usize::MAX
+                    };
+                    if path_bytes != usize::MAX && payload.len() >= 3 + path_bytes + 2 {
+                        let mut path = [0u8; 64];
+                        if path_bytes > 0 {
+                            path[..path_bytes]
+                                .copy_from_slice(&payload[3..3 + path_bytes]);
+                        }
+                        let type_offset = 3 + path_bytes;
+                        let data_type = u16::from_le_bytes([
+                            payload[type_offset],
+                            payload[type_offset + 1],
+                        ]);
+                        let raw = &payload[type_offset + 2..];
+                        let channel_ok = crate::companion::usb::CHANNELS.lock(|c| {
+                            c.borrow()
+                                .get(channel_idx as usize)
+                                .map_or(false, |ch| ch.secret != [0u8; 16])
+                        });
+                        // Data type 0 is reserved; the radio limit is 165 bytes.
+                        if channel_ok && data_type != 0 && raw.len() <= 165 {
+                            let mut data = Vec::<u8, 165>::new();
+                            if data.extend_from_slice(raw).is_ok() {
+                                ok = crate::companion::usb::USB_COMMAND_CHANNEL
+                                    .try_send(
+                                        crate::companion::usb::UsbCommand::SendChannelData {
+                                            channel_idx,
+                                            path_len,
+                                            path,
+                                            data_type,
+                                            data,
+                                        },
+                                    )
+                                    .is_ok();
+                            }
                         }
                     }
                 }
                 let mut resp = Vec::<u8, 4>::new();
-                let _ = resp.push(RESP_CODE_OK);
+                let _ = resp.push(if ok { RESP_CODE_OK } else { RESP_CODE_ERR });
                 emit(&resp);
             }
 

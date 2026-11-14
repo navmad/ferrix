@@ -651,21 +651,62 @@ async fn main(spawner: Spawner) {
                             is_direct: false,
                             txt_type: grp.txt_type,
                         };
-                        let dropped = crate::companion::usb::MESSAGE_LOG.lock(|m| {
+                        let dropped_text = crate::companion::usb::MESSAGE_LOG.lock(|m| {
                             let mut list = m.borrow_mut();
-                            let dropped = list.is_full();
-                            if dropped {
-                                list.remove(0);
-                            }
-                            let _ = list.push(message.clone());
-                            dropped
+                            let dropped_text = if list.is_full() {
+                                matches!(
+                                    list.remove(0),
+                                    crate::companion::usb::InboxItem::Text(_)
+                                )
+                            } else {
+                                false
+                            };
+                            let _ = list.push(crate::companion::usb::InboxItem::Text(
+                                message.clone(),
+                            ));
+                            dropped_text
                         });
-                        if dropped {
+                        if dropped_text {
                             crate::storage::messages::queue_consume().await;
                         }
                         crate::storage::messages::queue_append(message).await;
 
                         // Prompt companion app with PUSH_CODE_MSG_WAITING (0x83)
+                        let mut msg_wait = heapless::Vec::<u8, 256>::new();
+                        let _ = msg_wait.push(crate::companion::protocol::PUSH_CODE_MSG_WAITING);
+                        let _ = crate::companion::ble::COMPANION_PUSH_CHANNEL.try_send(msg_wait);
+                    }
+                    InboundAction::ReceivedGroupData {
+                        channel_idx,
+                        path_len,
+                        packet,
+                    } => {
+                        let item = crate::meshcore::mesh::ReceivedChannelData {
+                            channel_idx,
+                            path_len,
+                            snr,
+                            data_type: packet.data_type,
+                            data: packet.data.clone(),
+                        };
+                        let dropped_text = crate::companion::usb::MESSAGE_LOG.lock(|m| {
+                            let mut list = m.borrow_mut();
+                            let dropped_text = if list.is_full() {
+                                matches!(
+                                    list.remove(0),
+                                    crate::companion::usb::InboxItem::Text(_)
+                                )
+                            } else {
+                                false
+                            };
+                            let _ = list.push(crate::companion::usb::InboxItem::ChannelData(
+                                item,
+                            ));
+                            dropped_text
+                        });
+                        if dropped_text {
+                            crate::storage::messages::queue_consume().await;
+                        }
+
                         let mut msg_wait = heapless::Vec::<u8, 256>::new();
                         let _ = msg_wait.push(crate::companion::protocol::PUSH_CODE_MSG_WAITING);
                         let _ = crate::companion::ble::COMPANION_PUSH_CHANNEL.try_send(msg_wait);
@@ -704,16 +745,22 @@ async fn main(spawner: Spawner) {
                             is_direct: true,
                             txt_type: msg.txt_type,
                         };
-                        let dropped = crate::companion::usb::MESSAGE_LOG.lock(|m| {
+                        let dropped_text = crate::companion::usb::MESSAGE_LOG.lock(|m| {
                             let mut list = m.borrow_mut();
-                            let dropped = list.is_full();
-                            if dropped {
-                                list.remove(0);
-                            }
-                            let _ = list.push(message.clone());
-                            dropped
+                            let dropped_text = if list.is_full() {
+                                matches!(
+                                    list.remove(0),
+                                    crate::companion::usb::InboxItem::Text(_)
+                                )
+                            } else {
+                                false
+                            };
+                            let _ = list.push(crate::companion::usb::InboxItem::Text(
+                                message.clone(),
+                            ));
+                            dropped_text
                         });
-                        if dropped {
+                        if dropped_text {
                             crate::storage::messages::queue_consume().await;
                         }
                         crate::storage::messages::queue_append(message).await;
@@ -938,6 +985,38 @@ async fn main(spawner: Spawner) {
                     let ch_hash = crate::meshcore::crypto::channel_hash(&secret);
                     node.tx_beacons = node.tx_beacons.saturating_add(1);
                     let _ = mesh.queue_group_text(ch_hash, &secret, text.as_str(), timestamp);
+                }
+                UsbCommand::SendChannelData {
+                    channel_idx,
+                    path_len,
+                    path,
+                    data_type,
+                    data,
+                } => {
+                    info!(
+                        "Queuing channel datagram on ch {} type {} ({} bytes)",
+                        channel_idx,
+                        data_type,
+                        data.len()
+                    );
+                    let secret = crate::companion::usb::CHANNELS.lock(|chs| {
+                        let list = chs.borrow();
+                        if (channel_idx as usize) < list.len() {
+                            list[channel_idx as usize].secret
+                        } else {
+                            [0u8; 16]
+                        }
+                    });
+                    let ch_hash = crate::meshcore::crypto::channel_hash(&secret);
+                    node.tx_beacons = node.tx_beacons.saturating_add(1);
+                    let _ = mesh.queue_group_data(
+                        ch_hash,
+                        &secret,
+                        data_type,
+                        data.as_slice(),
+                        path_len,
+                        &path,
+                    );
                 }
                 UsbCommand::SendDirectText {
                     dest_prefix,

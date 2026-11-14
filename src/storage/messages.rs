@@ -143,7 +143,7 @@ pub async fn load(flash: &mut Flash) {
                         if list.len() >= MAX_MESSAGES {
                             list.remove(0);
                         }
-                        let _ = list.push(msg);
+                        let _ = list.push(crate::companion::usb::InboxItem::Text(msg));
                     });
                     count += 1;
                 }

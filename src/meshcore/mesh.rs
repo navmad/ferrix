@@ -74,6 +74,18 @@ pub struct ReceivedMessage {
     pub txt_type: u8,
 }
 
+/// A received channel datagram (GRP_DATA), delivered to the companion as
+/// `PACKET_CHANNEL_DATA_RECV`.
+#[derive(Clone, Debug)]
+pub struct ReceivedChannelData {
+    pub channel_idx: u8,
+    /// `0xFF` when the packet did not arrive over a flood route.
+    pub path_len: u8,
+    pub snr: i8,
+    pub data_type: u16,
+    pub data: heapless::Vec<u8, { crate::meshcore::packets::grpdata::MAX_GROUP_DATA }>,
+}
+
 /// Actions resulting from processing an inbound over-the-air packet
 pub enum InboundAction {
     /// Dropped because it has already been processed recently
@@ -111,6 +123,7 @@ pub enum InboundAction {
     /// Received channel datagram
     ReceivedGroupData {
         channel_idx: u8,
+        path_len: u8,
         packet: GrpDataPacket,
     },
     /// Received anonymous request
@@ -512,6 +525,7 @@ impl MeshEngine {
                         {
                             return InboundAction::ReceivedGroupData {
                                 channel_idx: idx as u8,
+                                path_len: if pkt.is_flood() { pkt.path_len } else { 0xFF },
                                 packet: grp,
                             };
                         }
@@ -641,6 +655,36 @@ impl MeshEngine {
         self.seen_filter.mark_seen(pkt.calculate_packet_hash());
         let _ = self.tx_queue.push(pkt.clone());
         Ok(pkt)
+    }
+
+    /// Construct and queue a channel datagram. `path_len == 0xFF` floods the
+    /// packet; any other value sends it direct over the supplied path.
+    pub fn queue_group_data(
+        &mut self,
+        channel_hash: u8,
+        channel_secret: &[u8],
+        data_type: u16,
+        data: &[u8],
+        path_len: u8,
+        path: &[u8; 64],
+    ) -> Result<Packet, ()> {
+        let grp = GrpDataPacket::new(channel_hash, data_type, data)?;
+        if path_len == 0xFF {
+            let mut pkt = grp.to_packet(channel_secret, ROUTE_TYPE_FLOOD)?;
+            pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
+            crate::companion::protocol::apply_flood_scope(&mut pkt);
+            self.seen_filter.mark_seen(pkt.calculate_packet_hash());
+            let _ = self.tx_queue.push(pkt.clone());
+            Ok(pkt)
+        } else {
+            let mut pkt = grp.to_packet(channel_secret, ROUTE_TYPE_DIRECT)?;
+            pkt.path_len = path_len;
+            let n = pkt.path_byte_len();
+            pkt.path[..n].copy_from_slice(&path[..n]);
+            self.seen_filter.mark_seen(pkt.calculate_packet_hash());
+            let _ = self.tx_queue.push(pkt.clone());
+            Ok(pkt)
+        }
     }
 
     /// Construct and queue a direct text message. Returns the ACK CRC the

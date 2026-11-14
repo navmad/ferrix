@@ -138,10 +138,18 @@ pub const MAX_CHANNELS: usize = 40;
 pub static DISCOVERED_CONTACTS: Mutex<SharedRawMutex, RefCell<heapless::Vec<DiscoveredContact, MAX_CONTACTS>>> =
     Mutex::new(RefCell::new(heapless::Vec::new()));
 
-/// Number of retained messages (matched by the persistent snapshot size).
+/// Number of retained inbox entries (text messages and channel datagrams).
 pub const MAX_MESSAGES: usize = 256;
 
-pub static MESSAGE_LOG: Mutex<SharedRawMutex, RefCell<heapless::Vec<ReceivedMessage, MAX_MESSAGES>>> =
+/// One entry in the companion inbox. Text messages and channel datagrams are
+/// kept in a single FIFO so `CMD_SYNC_NEXT_MESSAGE` preserves receive order.
+#[derive(Clone, Debug)]
+pub enum InboxItem {
+    Text(ReceivedMessage),
+    ChannelData(crate::meshcore::mesh::ReceivedChannelData),
+}
+
+pub static MESSAGE_LOG: Mutex<SharedRawMutex, RefCell<heapless::Vec<InboxItem, MAX_MESSAGES>>> =
     Mutex::new(RefCell::new(heapless::Vec::new()));
 
 #[derive(Clone, Copy, Debug)]
@@ -466,6 +474,13 @@ pub enum UsbCommand {
         txt_type: u8,
         attempt: u8,
         text: heapless::String<160>,
+    },
+    SendChannelData {
+        channel_idx: u8,
+        path_len: u8,
+        path: [u8; 64],
+        data_type: u16,
+        data: heapless::Vec<u8, 165>,
     },
     SendControlData {
         data: heapless::Vec<u8, 183>,
@@ -1360,7 +1375,7 @@ async fn handle_text_cli(
                 // CLI task stack.
                 let mut start = 0usize;
                 while start < total {
-                    let mut chunk: heapless::Vec<ReceivedMessage, 16> = heapless::Vec::new();
+                    let mut chunk: heapless::Vec<InboxItem, 16> = heapless::Vec::new();
                     MESSAGE_LOG.lock(|m| {
                         let list = m.borrow();
                         if start >= list.len() {
@@ -1374,19 +1389,33 @@ async fn handle_text_cli(
                     if chunk.is_empty() {
                         break;
                     }
-                    for msg in chunk.iter() {
+                    for item in chunk.iter() {
                         let mut s = heapless::String::<320>::new();
-                        let mode = if msg.is_direct { "[DM]" } else { "[GRP]" };
-                        let _ = write!(
-                            s,
-                            "  -> {} <{}> {}: {} (RSSI: {}dBm, SNR: {}dB)\r\n",
-                            mode,
-                            msg.sender.as_str(),
-                            msg.timestamp,
-                            msg.text.as_str(),
-                            msg.rssi,
-                            msg.snr
-                        );
+                        match item {
+                            InboxItem::Text(msg) => {
+                                let mode = if msg.is_direct { "[DM]" } else { "[GRP]" };
+                                let _ = write!(
+                                    s,
+                                    "  -> {} <{}> {}: {} (RSSI: {}dBm, SNR: {}dB)\r\n",
+                                    mode,
+                                    msg.sender.as_str(),
+                                    msg.timestamp,
+                                    msg.text.as_str(),
+                                    msg.rssi,
+                                    msg.snr
+                                );
+                            }
+                            InboxItem::ChannelData(data) => {
+                                let _ = write!(
+                                    s,
+                                    "  -> [DATA] ch {} type {} ({} bytes, SNR: {}dB)\r\n",
+                                    data.channel_idx,
+                                    data.data_type,
+                                    data.data.len(),
+                                    data.snr
+                                );
+                            }
+                        }
                         let _ = write_all(sender, s.as_bytes()).await;
                     }
                     start += chunk.len();
