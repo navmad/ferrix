@@ -753,6 +753,47 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
 
 [[package]]
+name = "ferrix-core"
+version = "0.1.0"
+
+[[package]]
+name = "ferrix-hal"
+version = "0.1.0"
+
+[[package]]
+name = "ferrix-runtime"
+version = "0.1.0"
+
+[[package]]
+name = "ferrix-thinknode-m1"
+version = "0.1.0"
+dependencies = [
+ "cortex-m",
+ "cortex-m-rt",
+ "defmt 0.3.101",
+ "defmt-rtt",
+ "embassy-executor",
+ "embassy-futures",
+ "embassy-nrf",
+ "embassy-sync 0.6.2",
+ "embassy-time",
+ "embassy-usb",
+ "embedded-graphics",
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+ "embedded-hal-bus",
+ "embedded-io-async",
+ "embedded-storage-async",
+ "heapless 0.8.0",
+ "lora-phy",
+ "meshcore-wire",
+ "nmea",
+ "nrf-softdevice",
+ "sequential-storage",
+ "static_cell",
+]
+
+[[package]]
 name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1048,35 +1089,6 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
-
-[[package]]
-name = "ferrix"
-version = "0.1.0"
-dependencies = [
- "cortex-m",
- "cortex-m-rt",
- "defmt 0.3.101",
- "defmt-rtt",
- "embassy-executor",
- "embassy-futures",
- "embassy-nrf",
- "embassy-sync 0.6.2",
- "embassy-time",
- "embassy-usb",
- "embedded-graphics",
- "embedded-hal 1.0.0",
- "embedded-hal-async",
- "embedded-hal-bus",
- "embedded-io-async",
- "embedded-storage-async",
- "heapless 0.8.0",
- "lora-phy",
- "meshcore-wire",
- "nmea",
- "nrf-softdevice",
- "sequential-storage",
- "static_cell",
-]
 
 [[package]]
 name = "meshcore-wire"

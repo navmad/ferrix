@@ -23,25 +23,31 @@ See [FEATURES.md](FEATURES.md) for the full feature set and current limitations.
 The firmware decouples application logic from board-specific pinouts and radio hardware:
 
 ```text
-src/
-├── main.rs                  <-- Generic application loop & state machine
-├── radio/
-│   ├── mod.rs               <-- LoraRadio async trait & LoraConfig
-│   ├── sx1262.rs            <-- Semtech SX1262 transceiver driver
-│   └── commands.rs          <-- Semtech SX126x opcode definitions
-├── boards/                  <-- BOARD SUPPORT LAYER
-│   ├── mod.rs               <-- Board trait, capability flags, & feature gating
-│   ├── thinknode_m1.rs      <-- ThinkNode M1 hardware pinout & peripherals
-│   └── rak4631.rs           <-- RAKwireless WisBlock Core pinout
-├── companion/               <-- MeshCore USB CDC-ACM & BLE packet framing & protocol
-├── display/                 <-- 1.54" SSD1681 driver & dashboard UI (conditional)
-├── gps/                     <-- Quectel L76K NMEA driver (conditional)
-└── telemetry/               <-- Battery voltage ADC monitoring & health
+boards/thinknode-m1/          <-- BOARD CRATE
+├── Cargo.toml                 <-- binary: ferrix
+├── memory.x                   <-- flash/RAM layout
+└── src/
+    ├── main.rs                <-- board entry & task wiring
+    ├── boards/                <-- pinout, capabilities, peripherals
+    ├── radio/                 <-- SX1262 driver & LoRa task
+    ├── companion/             <-- USB CDC / BLE framing & protocol
+    ├── display/               <-- SSD1681 e-paper & dashboard
+    ├── gps/                   <-- L76K NMEA driver
+    └── telemetry/             <-- battery ADC
+
+crates/
+├── meshcore-wire/             <-- pure MeshCore codecs
+├── ferrix-hal/                <-- hardware traits (extracted)
+├── ferrix-core/               <-- platform-independent application (extracted)
+└── ferrix-runtime/            <-- generic task wiring (extracted)
 ```
 
-### Adding a New Radio or Board
-1. **New Radio**: Implement the `LoraRadio` async trait in [`src/radio/`](file:///Users/navmad/Projects/embedded-projects/ferrix/src/radio).
-2. **New Board**: Add a board module to [`src/boards/`](file:///Users/navmad/Projects/embedded-projects/ferrix/src/boards) and define its pinout, radio type, and capability flags (`HAS_DISPLAY`, `HAS_GPS`).
+### Adding a New Board
+1. Add a crate under `boards/<name>` with its `memory.x`, pinout and devices.
+2. Implement the `ferrix-hal` traits and pass the devices to `ferrix-runtime`.
+3. Add the board to the workspace and to the build/test tooling.
+4. The application crates (`ferrix-core`, `ferrix-runtime`) must not need
+   board-specific changes.
 
 ---
 
