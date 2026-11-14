@@ -5,9 +5,7 @@
 //!
 //! Preserved across firmware updates, serial DFU flashing, and power cycles.
 
-use core::cell::RefCell;
 use defmt::{error, info};
-use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::channel::Channel;
 
 /// Shared raw mutex type — see usb.rs for documentation.
@@ -67,11 +65,7 @@ pub struct PersistentConfig {
     pub checksum: u32,
 }
 
-pub static NODE_CALLSIGN: Mutex<SharedRawMutex, RefCell<String<32>>> =
-    Mutex::new(RefCell::new(String::new()));
-
-pub static CUSTOM_PRIV_KEY: Mutex<SharedRawMutex, RefCell<Option<[u8; 64]>>> =
-    Mutex::new(RefCell::new(None));
+pub use ferrix_core::state::{CUSTOM_PRIV_KEY, NODE_CALLSIGN};
 
 pub(crate) static SAVE_REQUEST_CHANNEL: Channel<SharedRawMutex, (), 2> = Channel::new();
 

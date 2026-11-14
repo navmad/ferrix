@@ -59,6 +59,44 @@ pub fn current_private_key() -> [u8; 64] {
     NODE_PRIVATE_KEY.lock(|k| *k.borrow())
 }
 
+/// Wall-clock base for companion timestamps: the epoch at the moment the
+/// instant counter was sampled.
+#[derive(Clone, Copy, Debug)]
+pub struct DeviceClock {
+    pub base_epoch: u32,
+    pub base_instant_secs: u64,
+}
+
+pub static DEVICE_CLOCK: Mutex<SharedRawMutex, RefCell<DeviceClock>> =
+    Mutex::new(RefCell::new(DeviceClock {
+        base_epoch: 0,
+        base_instant_secs: 0,
+    }));
+
+/// Current device epoch, or `0` when the clock has never been set.
+pub fn get_device_time() -> u32 {
+    DEVICE_CLOCK.lock(|c| {
+        let clock = c.borrow();
+        if clock.base_epoch == 0 {
+            0
+        } else {
+            let elapsed = embassy_time::Instant::now()
+                .as_secs()
+                .saturating_sub(clock.base_instant_secs);
+            clock.base_epoch.saturating_add(elapsed as u32)
+        }
+    })
+}
+
+pub fn set_device_time(epoch: u32) {
+    DEVICE_CLOCK.lock(|c| {
+        *c.borrow_mut() = DeviceClock {
+            base_epoch: epoch,
+            base_instant_secs: embassy_time::Instant::now().as_secs(),
+        };
+    });
+}
+
 /// Blue status LED disabled by the user (persisted in the config page).
 pub static LEDS_DISABLED: AtomicBool = AtomicBool::new(false);
 
@@ -91,6 +129,14 @@ pub const fn default_channels() -> [ChannelData; MAX_CHANNELS] {
 
 pub static CHANNELS: Mutex<SharedRawMutex, RefCell<[ChannelData; MAX_CHANNELS]>> =
     Mutex::new(RefCell::new(default_channels()));
+
+/// Active node callsign, mirrored from the persisted config.
+pub static NODE_CALLSIGN: Mutex<SharedRawMutex, RefCell<heapless::String<32>>> =
+    Mutex::new(RefCell::new(heapless::String::new()));
+
+/// Imported 64-byte expanded private key, or `None` to derive from the seed.
+pub static CUSTOM_PRIV_KEY: Mutex<SharedRawMutex, RefCell<Option<[u8; 64]>>> =
+    Mutex::new(RefCell::new(None));
 
 pub static DISCOVERED_CONTACTS: Mutex<
     SharedRawMutex,
