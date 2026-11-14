@@ -6,6 +6,8 @@ A generic, native `no_std` embedded Rust companion firmware for **MeshCore** LoR
 
 Built on the **Embassy** asynchronous runtime for the Nordic **nRF52840** ARM Cortex-M4F microcontroller, with a modular board abstraction layer and extensible Semtech transceiver support (`LoraRadio`).
 
+See [FEATURES.md](FEATURES.md) for the full feature set and current limitations.
+
 ---
 
 ## Supported Boards
