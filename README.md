@@ -31,7 +31,7 @@ boards/thinknode-m1/          <-- BOARD CRATE
     ├── board.rs               <-- pins, board metadata & init
     ├── app.rs                 <-- AppBoard: LED, display, GPS, battery
     ├── meshcore.rs            <-- engine context & wire re-exports
-    ├── radio/                 <-- SX1262/lora-phy driver
+    ├── radio/sx1262.rs        <-- SX1262 driver & startup
     ├── host.rs               <-- protocol/CLI host binding
     ├── companion.rs          <-- transport re-exports
     ├── display/               <-- SSD1681 e-paper & dashboard

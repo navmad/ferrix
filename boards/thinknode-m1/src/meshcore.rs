@@ -77,6 +77,6 @@ impl EngineContext for BoardEngineContext {
     }
 
     fn cancel_flood(&self, hash: [u8; 8]) {
-        crate::radio::lora_phy::cancel_flood(hash);
+        crate::radio::sx1262::cancel_flood(hash);
     }
 }

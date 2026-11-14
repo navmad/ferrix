@@ -34,7 +34,7 @@ impl CompanionHost for BoardCompanionHost {
     }
 
     fn request_radio_config(&self) {
-        crate::radio::lora_phy::request_radio_config();
+        crate::radio::sx1262::request_radio_config();
     }
 
     fn request_factory_reset(&self) {
