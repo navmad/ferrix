@@ -5,26 +5,25 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use embedded_storage_async::nor_flash::{
     ErrorType, MultiwriteNorFlash, NorFlash, ReadNorFlash,
 };
-use nrf_softdevice::Flash;
 
-/// Borrows the SoftDevice flash and counts erases into `erases`.
-pub struct CountedFlash<'a> {
-    flash: &'a mut Flash,
+/// Borrows a flash and counts erases into `erases`.
+pub struct CountedFlash<'a, F> {
+    flash: &'a mut F,
     erases: &'static AtomicU32,
 }
 
-impl<'a> CountedFlash<'a> {
-    pub fn new(flash: &'a mut Flash, erases: &'static AtomicU32) -> Self {
+impl<'a, F> CountedFlash<'a, F> {
+    pub fn new(flash: &'a mut F, erases: &'static AtomicU32) -> Self {
         Self { flash, erases }
     }
 }
 
-impl ErrorType for CountedFlash<'_> {
-    type Error = <Flash as ErrorType>::Error;
+impl<F: ErrorType> ErrorType for CountedFlash<'_, F> {
+    type Error = F::Error;
 }
 
-impl ReadNorFlash for CountedFlash<'_> {
-    const READ_SIZE: usize = <Flash as ReadNorFlash>::READ_SIZE;
+impl<F: ReadNorFlash> ReadNorFlash for CountedFlash<'_, F> {
+    const READ_SIZE: usize = F::READ_SIZE;
 
     async fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
         self.flash.read(offset, bytes).await
@@ -35,9 +34,9 @@ impl ReadNorFlash for CountedFlash<'_> {
     }
 }
 
-impl NorFlash for CountedFlash<'_> {
-    const WRITE_SIZE: usize = <Flash as NorFlash>::WRITE_SIZE;
-    const ERASE_SIZE: usize = <Flash as NorFlash>::ERASE_SIZE;
+impl<F: NorFlash> NorFlash for CountedFlash<'_, F> {
+    const WRITE_SIZE: usize = F::WRITE_SIZE;
+    const ERASE_SIZE: usize = F::ERASE_SIZE;
 
     async fn erase(&mut self, from: u32, to: u32) -> Result<(), Self::Error> {
         let result = self.flash.erase(from, to).await;
@@ -53,4 +52,4 @@ impl NorFlash for CountedFlash<'_> {
     }
 }
 
-impl MultiwriteNorFlash for CountedFlash<'_> {}
+impl<F: MultiwriteNorFlash> MultiwriteNorFlash for CountedFlash<'_, F> {}

@@ -38,8 +38,8 @@ boards/thinknode-m1/          <-- BOARD CRATE
 crates/
 ├── meshcore-wire/             <-- pure MeshCore codecs
 ├── ferrix-hal/                <-- hardware traits (extracted)
-├── ferrix-core/               <-- platform-independent application (extracted)
-└── ferrix-runtime/            <-- generic task wiring (extracted)
+├── ferrix-core/               <-- application, protocol and storage formats
+└── ferrix-runtime/            <-- task wiring, scheduler and storage loop
 ```
 
 ### Adding a New Board

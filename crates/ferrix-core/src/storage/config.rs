@@ -13,12 +13,8 @@ type SharedRawMutex = embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex
 use embedded_storage_async::nor_flash::NorFlash;
 use heapless::String;
 
-use crate::boards::Board;
-use crate::companion::usb::ChannelData;
+use crate::types::{ChannelData, MAX_CHANNELS};
 
-/// Address of the reserved 4 KB flash configuration page
-/// (Top page of application flash, immediately preceding bootloader at 0x000ED000)
-pub const CONFIG_FLASH_ADDR: u32 = 0x000EC000;
 pub const CONFIG_MAGIC: u32 = 0x4D434647; // 'MCFG' (MeshCore Config)
 pub const CONFIG_VERSION: u32 = 1;
 
@@ -61,13 +57,13 @@ pub struct PersistentConfig {
     pub multi_acks: u8,
     pub radio_freq_hz: u32,
     pub radio_bw_khz: u32,
-    pub channels: [ChannelData; crate::companion::usb::MAX_CHANNELS],
+    pub channels: [ChannelData; MAX_CHANNELS],
     pub checksum: u32,
 }
 
-pub use ferrix_core::state::{CUSTOM_PRIV_KEY, NODE_CALLSIGN};
+pub use crate::state::{CUSTOM_PRIV_KEY, NODE_CALLSIGN};
 
-pub(crate) static SAVE_REQUEST_CHANNEL: Channel<SharedRawMutex, (), 2> = Channel::new();
+static SAVE_REQUEST_CHANNEL: Channel<SharedRawMutex, (), 2> = Channel::new();
 
 /// Compute a 32-bit checksum covering a configuration structure up to its
 /// checksum field.
@@ -89,8 +85,11 @@ fn compute_checksum<T>(cfg: &T) -> u32 {
 ///
 /// The layout starts fresh at version 1: a page written by any older firmware
 /// (or with a different layout) is ignored and defaults are used.
-pub fn read_config() -> Option<PersistentConfig> {
-    let cfg = unsafe { (CONFIG_FLASH_ADDR as *const PersistentConfig).read_volatile() };
+pub fn read_config(page: &[u8]) -> Option<PersistentConfig> {
+    if page.len() < core::mem::size_of::<PersistentConfig>() {
+        return None;
+    }
+    let cfg = unsafe { core::ptr::read_unaligned(page.as_ptr() as *const PersistentConfig) };
     if cfg.magic == CONFIG_MAGIC
         && cfg.version == CONFIG_VERSION
         && compute_checksum(&cfg) == cfg.checksum
@@ -108,13 +107,13 @@ pub fn get_callsign() -> String<32> {
 
 /// Retrieve the active path hash mode (0: 1B, 1: 2B, 2: 3B)
 pub fn get_path_hash_mode() -> u8 {
-    crate::companion::usb::RADIO_SETTINGS.lock(|r| r.borrow().path_hash_mode)
+    crate::state::RADIO_SETTINGS.lock(|r| r.borrow().path_hash_mode)
 }
 
 /// Set a new path hash mode and queue a persistent flash save
 pub fn set_path_hash_mode(mode: u8) {
     if mode <= 2 {
-        let changed = crate::companion::usb::RADIO_SETTINGS.lock(|r| {
+        let changed = crate::state::RADIO_SETTINGS.lock(|r| {
             let mut s = r.borrow_mut();
             let changed = s.path_hash_mode != mode;
             s.path_hash_mode = mode;
@@ -150,15 +149,25 @@ pub fn set_custom_priv_key(key: [u8; 64]) {
     request_save_config();
 }
 
+/// Wait for a coalesced configuration save request.
+pub async fn wait_save_request() {
+    SAVE_REQUEST_CHANNEL.receive().await;
+}
+
+/// Drop queued save requests after a coalescing delay.
+pub fn drain_save_requests() {
+    while SAVE_REQUEST_CHANNEL.try_receive().is_ok() {}
+}
+
 /// Signal the storage task to write the current settings to flash
 pub fn request_save_config() {
     let _ = SAVE_REQUEST_CHANNEL.try_send(());
 }
 
 /// Initialize configuration from flash (or defaults if flash is uninitialized)
-pub fn init_config() -> (String<32>, Option<[u8; 64]>) {
-    if let Some(cfg) = read_config() {
-        info!("Storage: Found valid persistent config in flash at 0x{:08x}!", CONFIG_FLASH_ADDR);
+pub fn init_config(page: &[u8], default_name: &str) -> (String<32>, Option<[u8; 64]>) {
+    if let Some(cfg) = read_config(page) {
+        info!("Storage: Found valid persistent config page");
 
         // Load callsign
         let name_len = cfg.callsign.iter().position(|&b| b == 0).unwrap_or(32);
@@ -169,17 +178,17 @@ pub fn init_config() -> (String<32>, Option<[u8; 64]>) {
             }
         }
         if name.is_empty() {
-            let _ = name.push_str(crate::boards::CurrentBoard::NAME);
+            let _ = name.push_str(default_name);
         }
         NODE_CALLSIGN.lock(|c| *c.borrow_mut() = name.clone());
 
         // Load channels
-        crate::companion::usb::CHANNELS.lock(|c| {
+        crate::state::CHANNELS.lock(|c| {
             *c.borrow_mut() = cfg.channels;
         });
 
         // Load radio settings
-        crate::companion::usb::RADIO_SETTINGS.lock(|r| {
+        crate::state::RADIO_SETTINGS.lock(|r| {
             let mut s = r.borrow_mut();
             s.frequency_hz = cfg.radio_freq_hz;
             s.tx_power_dbm = cfg.radio_tx_power;
@@ -195,17 +204,17 @@ pub fn init_config() -> (String<32>, Option<[u8; 64]>) {
         });
 
         // Load the contact auto-add policy.
-        crate::companion::usb::AUTOADD_SETTINGS.lock(|a| {
-            *a.borrow_mut() = crate::companion::usb::AutoAddSettings {
+        crate::state::AUTOADD_SETTINGS.lock(|a| {
+            *a.borrow_mut() = crate::types::AutoAddSettings {
                 manual_add_contacts: if cfg.manual_add_contacts != 0 { 1 } else { 0 },
                 config: cfg.autoadd_config,
                 max_hops: cfg.autoadd_max_hops.min(64),
             };
         });
 
-        crate::companion::usb::init_leds_disabled(cfg.leds_disabled != 0);
+        crate::state::init_leds_disabled(cfg.leds_disabled != 0);
 
-        crate::companion::protocol::update_prefs(|p| {
+        crate::state::update_prefs(|p| {
             p.scope_name = cfg.flood_scope_name;
             p.scope_key = cfg.flood_scope_key;
             p.advert_loc_policy = if cfg.advert_loc_policy <= 2 {
@@ -231,7 +240,7 @@ pub fn init_config() -> (String<32>, Option<[u8; 64]>) {
     } else {
         info!("Storage: No persistent config found (first boot or unformatted). Initializing defaults.");
         let mut name = String::<32>::new();
-        let _ = name.push_str(crate::boards::CurrentBoard::NAME);
+        let _ = name.push_str(default_name);
         NODE_CALLSIGN.lock(|c| *c.borrow_mut() = name.clone());
         (name, None)
     }
@@ -247,7 +256,7 @@ pub fn assemble_current_config() -> PersistentConfig {
     });
 
     let (freq, tx, sf, bw, cr, is_rep, client_repeat, offgrid_home_freq, path_mode, rx_duty, af) =
-        crate::companion::usb::RADIO_SETTINGS.lock(|r| {
+        crate::state::RADIO_SETTINGS.lock(|r| {
             let s = r.borrow();
             (
                 s.frequency_hz,
@@ -264,7 +273,7 @@ pub fn assemble_current_config() -> PersistentConfig {
             )
         });
 
-    let channels = crate::companion::usb::CHANNELS.lock(|c| *c.borrow());
+    let channels = crate::state::CHANNELS.lock(|c| *c.borrow());
 
     let (has_custom_key, custom_priv_key) = CUSTOM_PRIV_KEY.lock(|k| {
         if let Some(key) = *k.borrow() {
@@ -274,8 +283,8 @@ pub fn assemble_current_config() -> PersistentConfig {
         }
     });
 
-    let auto = crate::companion::usb::AUTOADD_SETTINGS.lock(|a| *a.borrow());
-    let prefs = crate::companion::protocol::prefs();
+    let auto = crate::state::AUTOADD_SETTINGS.lock(|a| *a.borrow());
+    let prefs = crate::state::prefs();
 
     let mut cfg = PersistentConfig {
         magic: CONFIG_MAGIC,
@@ -293,7 +302,7 @@ pub fn assemble_current_config() -> PersistentConfig {
         autoadd_config: auto.config,
         autoadd_max_hops: auto.max_hops,
         manual_add_contacts: auto.manual_add_contacts,
-        leds_disabled: if crate::companion::usb::leds_disabled() { 1 } else { 0 },
+        leds_disabled: if crate::state::leds_disabled() { 1 } else { 0 },
         rx_duty_cycle: if rx_duty { 1 } else { 0 },
         airtime_factor_tenths: af,
         flood_scope_name: prefs.scope_name,
@@ -313,7 +322,11 @@ pub fn assemble_current_config() -> PersistentConfig {
 }
 
 /// Commit the current configuration snapshot to the config page.
-pub(crate) async fn save_config(flash: &mut nrf_softdevice::Flash) {
+pub async fn save_config<F>(flash: &mut F, region: &core::ops::Range<u32>)
+where
+    F: NorFlash,
+    F::Error: defmt::Format,
+{
     let config = assemble_current_config();
     let config_bytes = unsafe {
         core::slice::from_raw_parts(
@@ -324,17 +337,87 @@ pub(crate) async fn save_config(flash: &mut nrf_softdevice::Flash) {
 
     info!(
         "Storage: Committing persistent configuration to flash at 0x{:08x}...",
-        CONFIG_FLASH_ADDR
+        region.start
     );
-    if let Err(e) = flash.erase(CONFIG_FLASH_ADDR, CONFIG_FLASH_ADDR + 4096).await {
+    if let Err(e) = flash.erase(region.start, region.end).await {
         error!("Storage: Flash page erase error: {:?}", e);
         return;
     }
     CONFIG_ERASES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    if let Err(e) = flash.write(CONFIG_FLASH_ADDR, config_bytes).await {
+    if let Err(e) = flash.write(region.start, config_bytes).await {
         error!("Storage: Flash write error: {:?}", e);
         return;
     }
     CONFIG_SAVES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     info!("Storage: Configuration successfully saved to flash!");
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_bytes() -> [u8; core::mem::size_of::<PersistentConfig>()] {
+        let cfg = PersistentConfig {
+            magic: CONFIG_MAGIC,
+            version: CONFIG_VERSION,
+            callsign: [0u8; 32],
+            custom_priv_key: [3u8; 64],
+            has_custom_key: 1,
+            is_repeater: 0,
+            client_repeat: 0,
+            offgrid_home_freq: 0,
+            radio_tx_power: 22,
+            radio_sf: 7,
+            radio_cr: 5,
+            path_hash_mode: 1,
+            autoadd_config: 0,
+            autoadd_max_hops: 0,
+            manual_add_contacts: 0,
+            leds_disabled: 0,
+            rx_duty_cycle: 0,
+            airtime_factor_tenths: 90,
+            flood_scope_name: [0u8; 31],
+            flood_scope_key: [0u8; 16],
+            advert_loc_policy: 0,
+            telemetry_mode_base: 0,
+            telemetry_mode_loc: 0,
+            telemetry_mode_env: 0,
+            multi_acks: 0,
+            radio_freq_hz: 910_525_000,
+            radio_bw_khz: 62,
+            channels: [ChannelData {
+                name: [0u8; 32],
+                secret: [0u8; 16],
+            }; MAX_CHANNELS],
+            checksum: 0,
+        };
+        let mut cfg = cfg;
+        cfg.checksum = compute_checksum(&cfg);
+        let mut bytes = [0u8; core::mem::size_of::<PersistentConfig>()];
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                &cfg as *const PersistentConfig as *const u8,
+                bytes.as_mut_ptr(),
+                bytes.len(),
+            );
+        }
+        bytes
+    }
+
+    #[test]
+    fn parses_a_valid_page() {
+        let bytes = config_bytes();
+        let cfg = read_config(&bytes).expect("valid config");
+        assert_eq!(cfg.magic, CONFIG_MAGIC);
+        assert_eq!(cfg.radio_freq_hz, 910_525_000);
+        assert_eq!(cfg.custom_priv_key, [3u8; 64]);
+    }
+
+    #[test]
+    fn rejects_a_corrupt_page() {
+        let mut bytes = config_bytes();
+        bytes[12] ^= 0xFF;
+        assert!(read_config(&bytes).is_none());
+    }
 }

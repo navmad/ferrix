@@ -127,7 +127,7 @@ impl CliHost for BoardCompanionHost {
     }
 
     fn advert_slots(&self) -> usize {
-        crate::storage::adverts::SLOTS
+        crate::storage::adverts::slots()
     }
 
     fn reboot_to_bootloader(&self) -> ! {

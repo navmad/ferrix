@@ -16,16 +16,14 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use heapless::String;
 use meshcore_wire::message_record::{ChannelDataRecord, MessageRecord, MESSAGE_RECORD_MAX};
-use nrf_softdevice::Flash;
 use sequential_storage::cache::{Cache, Uncached};
+use embedded_storage_async::nor_flash::{MultiwriteNorFlash, NorFlash};
 use sequential_storage::queue::{QueueConfig, QueueStorage};
 
 use super::counted_flash::CountedFlash;
-use crate::companion::usb::{MESSAGE_LOG, MAX_MESSAGES};
-use crate::meshcore::mesh::{ReceivedChannelData, ReceivedMessage};
-
-/// 0xCC000..0xEC000: 32 pages of 4 KB.
-const REGION: Range<u32> = 0x000C_C000..0x000E_C000;
+use super::StorageRegions;
+use crate::state::MESSAGE_LOG;
+use crate::types::{InboxItem, ReceivedChannelData, ReceivedMessage, MAX_MESSAGES};
 
 /// Completed record writes and page erases since boot.
 pub static RECORD_SAVES: AtomicU32 = AtomicU32::new(0);
@@ -33,16 +31,20 @@ pub static PAGE_ERASES: AtomicU32 = AtomicU32::new(0);
 /// Records currently held by the flash queue.
 pub static QUEUED: AtomicU32 = AtomicU32::new(0);
 
-fn open(flash: &mut Flash) -> MessageQueue<'_> {
+fn open<'a, F>(flash: &'a mut F, region: &Range<u32>) -> MessageQueue<'a, F>
+where
+    F: NorFlash + MultiwriteNorFlash,
+    F::Error: defmt::Format,
+{
     QueueStorage::new(
         CountedFlash::new(flash, &PAGE_ERASES),
-        QueueConfig::new(REGION),
+        QueueConfig::new(region.clone()),
         Cache::new_uncached(),
     )
 }
 
 type MessageCache = Cache<Uncached, Uncached, Uncached>;
-type MessageQueue<'a> = QueueStorage<CountedFlash<'a>, MessageCache>;
+type MessageQueue<'a, F> = QueueStorage<CountedFlash<'a, F>, MessageCache>;
 
 
 /// Work sent to the storage task. The storage task owns the flash, so message
@@ -56,6 +58,11 @@ pub enum MessageCommand {
 
 pub static COMMAND_CHANNEL: Channel<CriticalSectionRawMutex, MessageCommand, 32> =
     Channel::new();
+
+/// Wait for the next message mutation.
+pub async fn next_command() -> MessageCommand {
+    COMMAND_CHANNEL.receive().await
+}
 
 pub async fn queue_append(msg: ReceivedMessage) {
     let _ = COMMAND_CHANNEL.send(MessageCommand::Append(msg)).await;
@@ -117,20 +124,32 @@ fn record_to_message(r: &MessageRecord) -> ReceivedMessage {
     }
 }
 
-/// Replace `MESSAGE_LOG` with the unconsumed messages from flash.
-pub async fn load(flash: &mut Flash) {
-    MESSAGE_LOG.lock(|m| m.borrow_mut().clear());
+async fn has_magic<F>(flash: &mut F, addr: u32, magic: u32) -> bool
+where
+    F: NorFlash + MultiwriteNorFlash,
+    F::Error: defmt::Format,
+{
+    let mut buf = [0u8; 4];
+    flash.read(addr, &mut buf).await.is_ok() && u32::from_le_bytes(buf) == magic
+}
 
-    let mut queue = open(flash);
+/// Replace `MESSAGE_LOG` with the unconsumed messages from flash.
+pub async fn load<F>(flash: &mut F, regions: &StorageRegions)
+where
+    F: NorFlash + MultiwriteNorFlash,
+    F::Error: defmt::Format,
+{
+    MESSAGE_LOG.lock(|m| m.borrow_mut().clear());
 
     // The previous firmware stored two whole-log snapshots in this region.
     // Their record format is not compatible with the FIFO, so clear the legacy
     // banks once instead of making the queue repair arbitrary data.
     const LEGACY_SNAPSHOT_MAGIC: u32 = 0x4D53_474D;
-    let legacy = |addr: u32| unsafe {
-        (addr as *const u32).read_unaligned() == LEGACY_SNAPSHOT_MAGIC
-    };
-    if legacy(REGION.start) || legacy(REGION.start + 0x1_0000) {
+    let legacy = has_magic(flash, regions.messages.start, LEGACY_SNAPSHOT_MAGIC).await
+        || has_magic(flash, regions.messages.start + 0x1_0000, LEGACY_SNAPSHOT_MAGIC).await;
+
+    let mut queue = open(flash, &regions.messages);
+    if legacy {
         info!("Persistence: clearing legacy message snapshot banks");
         if let Err(e) = queue.erase_all().await {
             error!("Persistence: legacy message erase failed: {:?}", e);
@@ -147,10 +166,10 @@ pub async fn load(flash: &mut Flash) {
                     let version = bytes.first().copied().unwrap_or(0);
                     let item = if version == 1 || version == 2 {
                         MessageRecord::decode(bytes)
-                            .map(|rec| crate::companion::usb::InboxItem::Text(record_to_message(&rec)))
+                            .map(|rec| InboxItem::Text(record_to_message(&rec)))
                     } else if version == 3 {
                         ChannelDataRecord::decode(bytes).map(|rec| {
-                            crate::companion::usb::InboxItem::ChannelData(ReceivedChannelData {
+                            InboxItem::ChannelData(ReceivedChannelData {
                                 channel_idx: rec.channel_idx,
                                 path_len: rec.path_len,
                                 snr: rec.snr,
@@ -192,7 +211,11 @@ pub async fn load(flash: &mut Flash) {
 }
 
 /// Append one message, dropping the oldest record when the region is full.
-pub async fn append(flash: &mut Flash, msg: &ReceivedMessage) {
+pub async fn append<F>(flash: &mut F, regions: &StorageRegions, msg: &ReceivedMessage)
+where
+    F: NorFlash + MultiwriteNorFlash,
+    F::Error: defmt::Format,
+{
     // The SoftDevice flash driver requires a word-aligned write buffer.
     #[repr(C, align(4))]
     struct Aligned([u8; MESSAGE_RECORD_MAX]);
@@ -203,7 +226,7 @@ pub async fn append(flash: &mut Flash, msg: &ReceivedMessage) {
         error!("Persistence: message record too large");
         return;
     };
-    let mut queue = open(flash);
+    let mut queue = open(flash, &regions.messages);
     match queue.push(&aligned.0[..len], true).await {
         Ok(()) => {
             RECORD_SAVES.fetch_add(1, Ordering::Relaxed);
@@ -214,7 +237,11 @@ pub async fn append(flash: &mut Flash, msg: &ReceivedMessage) {
 }
 
 /// Append one channel datagram.
-pub async fn append_channel_data(flash: &mut Flash, data: &ReceivedChannelData) {
+pub async fn append_channel_data<F>(flash: &mut F, regions: &StorageRegions, data: &ReceivedChannelData)
+where
+    F: NorFlash + MultiwriteNorFlash,
+    F::Error: defmt::Format,
+{
     #[repr(C, align(4))]
     struct Aligned([u8; MESSAGE_RECORD_MAX]);
 
@@ -233,7 +260,7 @@ pub async fn append_channel_data(flash: &mut Flash, data: &ReceivedChannelData) 
         error!("Persistence: channel data record too large");
         return;
     };
-    let mut queue = open(flash);
+    let mut queue = open(flash, &regions.messages);
     match queue.push(&aligned.0[..len], true).await {
         Ok(()) => {
             RECORD_SAVES.fetch_add(1, Ordering::Relaxed);
@@ -244,9 +271,13 @@ pub async fn append_channel_data(flash: &mut Flash, data: &ReceivedChannelData) 
 }
 
 /// Drop the oldest message (the app synced it).
-pub async fn consume(flash: &mut Flash) {
+pub async fn consume<F>(flash: &mut F, regions: &StorageRegions)
+where
+    F: NorFlash + MultiwriteNorFlash,
+    F::Error: defmt::Format,
+{
     let mut buf = [0u8; MESSAGE_RECORD_MAX];
-    let mut queue = open(flash);
+    let mut queue = open(flash, &regions.messages);
     match queue.pop(&mut buf).await {
         Ok(Some(_)) => {
             let _ = QUEUED.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
@@ -259,8 +290,12 @@ pub async fn consume(flash: &mut Flash) {
 }
 
 /// Erase every stored message.
-pub async fn clear(flash: &mut Flash) {
-    let mut queue = open(flash);
+pub async fn clear<F>(flash: &mut F, regions: &StorageRegions)
+where
+    F: NorFlash + MultiwriteNorFlash,
+    F::Error: defmt::Format,
+{
+    let mut queue = open(flash, &regions.messages);
     if let Err(e) = queue.erase_all().await {
         error!("Persistence: message queue clear failed: {:?}", e);
     } else {

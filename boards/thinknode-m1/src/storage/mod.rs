@@ -1,116 +1,63 @@
-//! Persistent storage for the companion.
+//! Board binding for the storage formats owned by `ferrix-core`.
 //!
-//! - `config`   — identity, radio settings, channels (one 4 KB page).
-//! - `contacts` — key-value map keyed by public key.
-//! - `messages` — wear-levelled persistent message queue.
+//! The ThinkNode layout reserves the region above the application image:
+//! adverts, contacts, messages and one configuration page. The storage loop
+//! itself lives in `ferrix-runtime`.
 
-pub mod adverts;
-pub mod config;
-pub mod counted_flash;
-pub mod contacts;
-pub mod messages;
-pub mod util;
-
-use defmt::{error, info};
-use embedded_storage_async::nor_flash::NorFlash;
-use embassy_futures::select::{select, select4, Either, Either4};
-use embassy_time::Timer;
-
-pub use config::{
-    get_callsign, get_path_hash_mode, init_config, request_save_config, set_callsign,
-    set_custom_priv_key, set_path_hash_mode,
+pub use ferrix_core::storage::{
+    adverts, config, contacts, counted_flash, get_callsign, get_path_hash_mode, messages,
+    request_contacts, request_factory_reset, request_save_config, set_callsign,
+    set_custom_priv_key, set_path_hash_mode, util, MappedFlash, MessageCommand, StorageRegions,
 };
-pub use contacts::request as request_contacts;
-pub use messages::MessageCommand;
 
-/// Request a factory reset: erase all data pages, then reboot.
-static RESET_CHANNEL: embassy_sync::channel::Channel<
-    embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
-    (),
-    1,
-> = embassy_sync::channel::Channel::new();
+use crate::boards::{Board, CurrentBoard};
+use ferrix_runtime::storage::{storage_loop, StorageExit};
+use heapless::String;
 
-pub fn request_factory_reset() {
-    let _ = RESET_CHANNEL.try_send(());
+/// Flash layout for ThinkNode M1 (nRF52840, 1 MB).
+pub static REGIONS: StorageRegions = StorageRegions {
+    config: 0x000E_C000..0x000E_D000,
+    contacts: 0x000B_0000..0x000C_C000,
+    messages: 0x000C_C000..0x000E_C000,
+    adverts: 0x000A_0000..0x000B_0000,
+    factory_reset: 0x000A_0000..0x000E_D000,
+};
+
+/// Memory-mapped flash reader for the advert log.
+struct NrfMappedFlash;
+
+impl MappedFlash for NrfMappedFlash {
+    fn read(&self, offset: u32, out: &mut [u8]) {
+        // SAFETY: offsets come from `REGIONS`, which is inside the reserved,
+        // memory-mapped flash region above the application image.
+        unsafe {
+            core::ptr::copy_nonoverlapping(offset as *const u8, out.as_mut_ptr(), out.len());
+        }
+    }
+}
+
+static MAPPED_FLASH: NrfMappedFlash = NrfMappedFlash;
+
+/// Initialize configuration from the reserved page, or defaults.
+pub fn init_config() -> (String<32>, Option<[u8; 64]>) {
+    let len = (REGIONS.config.end - REGIONS.config.start) as usize;
+    // SAFETY: the config page is memory-mapped flash.
+    let page = unsafe { core::slice::from_raw_parts(REGIONS.config.start as *const u8, len) };
+    ferrix_core::storage::config::init_config(page, CurrentBoard::NAME)
 }
 
 /// Load the advert log into RAM. Called once at boot, before the tasks start.
-/// Contacts and messages are loaded by the storage task itself because their
-/// stores own the flash instance.
 pub fn load() {
-    adverts::init();
+    adverts::init(&MAPPED_FLASH, REGIONS.adverts.clone());
 }
 
 /// Background storage task that serializes all flash writes.
 #[embassy_executor::task]
 pub async fn storage_task(sd: &'static nrf_softdevice::Softdevice) -> ! {
     let mut flash = nrf_softdevice::Flash::take(sd);
-    info!("Storage: Flash persistence task started");
-    contacts::load(&mut flash).await;
-    messages::load(&mut flash).await;
-
-    loop {
-        let select4_fut = select4(
-            config::SAVE_REQUEST_CHANNEL.receive(),
-            contacts::SAVE_CHANNEL.receive(),
-            messages::COMMAND_CHANNEL.receive(),
-            adverts::SAVE_CHANNEL.receive(),
-        );
-        // Contact removals are out-of-band: they must not wait for the
-        // coalescing delay of a save request.
-        let op_fut = contacts::OP_CHANNEL.receive();
-        match select(select(select4_fut, RESET_CHANNEL.receive()), op_fut).await {
-            Either::Second(op) => match op {
-                contacts::ContactOp::Remove(pub_key) => {
-                    contacts::remove(&mut flash, pub_key).await
-                }
-                contacts::ContactOp::Clear => contacts::clear(&mut flash).await,
-            },
-            Either::First(inner) => match inner {
-                Either::Second(_) => {
-                    info!("Storage: factory reset - erasing data pages");
-                    if flash.erase(0x000A_0000, 0x000E_D000).await.is_err() {
-                        error!("Storage: factory reset erase failed");
-                    }
-                    cortex_m::peripheral::SCB::sys_reset();
-                }
-                Either::First(selected) => match selected {
-                    Either4::First(_) => {
-                        // Debounce in case several settings are saved together.
-                        Timer::after_millis(200).await;
-                        while config::SAVE_REQUEST_CHANNEL.try_receive().is_ok() {}
-                        config::save_config(&mut flash).await;
-                    }
-                    Either4::Second(_) => {
-                        // Advert/app bursts arrive together; coalesce them.
-                        Timer::after_millis(1000).await;
-                        while contacts::SAVE_CHANNEL.try_receive().is_ok() {}
-                        contacts::save(&mut flash).await;
-                    }
-                    Either4::Third(command) => match command {
-                        // One record per message; the FIFO erases a page only
-                        // when it wraps, so no batching is needed or wanted.
-                        messages::MessageCommand::Append(msg) => {
-                            messages::append(&mut flash, &msg).await
-                        }
-                        messages::MessageCommand::AppendChannelData(data) => {
-                            messages::append_channel_data(&mut flash, &data).await
-                        }
-                        messages::MessageCommand::Consume => {
-                            messages::consume(&mut flash).await
-                        }
-                        messages::MessageCommand::Clear => {
-                            messages::clear(&mut flash).await
-                        }
-                    },
-                    Either4::Fourth(_) => {
-                        // New contacts are rare; batch a discovery burst first.
-                        Timer::after_millis(1000).await;
-                        while adverts::SAVE_CHANNEL.try_receive().is_ok() {}
-                        adverts::save(&mut flash).await;
-                    }
-                },
-            },
-        }
+    defmt::info!("Storage: Flash persistence task started");
+    if storage_loop(&mut flash, &REGIONS).await == StorageExit::FactoryReset {
+        cortex_m::peripheral::SCB::sys_reset();
     }
+    core::future::pending().await
 }

@@ -10,4 +10,5 @@ pub mod command;
 pub mod companion;
 pub mod engine;
 pub mod state;
+pub mod storage;
 pub mod types;

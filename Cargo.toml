@@ -20,6 +20,10 @@ nrf-softdevice = { path = "vendor/nrf-softdevice/nrf-softdevice" }
 # SF10-12 at 62.5 kHz did not interoperate. See vendor/lora-phy/PATCHES.md.
 [patch.crates-io]
 lora-phy = { path = "vendor/lora-phy" }
+# Local patch: sequential-storage 8.0.2's defmt derive covers the `_test`
+# backtrace fields, which do not implement defmt::Format. See
+# vendor/sequential-storage/PATCHES.md.
+sequential-storage = { path = "vendor/sequential-storage" }
 
 [profile.dev]
 codegen-units = 1
