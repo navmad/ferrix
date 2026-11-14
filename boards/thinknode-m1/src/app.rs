@@ -6,7 +6,7 @@ use embassy_nrf::saadc;
 use embassy_nrf::peripherals::TWISPI1;
 use embassy_time::{Duration, Instant, Timer};
 use ferrix_core::companion::protocol::CompanionNode;
-use ferrix_runtime::app::AppBoard;
+use ferrix_runtime::app::{AppBoard, UiState};
 
 use crate::board::GpsPins;
 use crate::display::{NodeDisplay, ThinkNodeDisplay};
@@ -106,12 +106,12 @@ impl AppBoard for ThinkNodeApp {
         advert_feedback(&mut self.led).await;
     }
 
-    async fn render(&mut self, node: &CompanionNode<'_>, full: bool) {
+    async fn render(&mut self, node: &CompanionNode<'_>, ui: &UiState, full: bool) {
         if let Some(d) = &mut self.display {
             if full {
-                d.render_dashboard_full(node).await.ok();
+                d.render_dashboard_full(node, ui).await.ok();
             } else {
-                d.render_dashboard(node).await.ok();
+                d.render_dashboard(node, ui).await.ok();
             }
         }
     }
@@ -127,7 +127,7 @@ impl AppBoard for ThinkNodeApp {
         }
     }
 
-    async fn tick(&mut self, node: &CompanionNode<'_>, tick: u32) {
+    async fn tick(&mut self, node: &CompanionNode<'_>, ui: &UiState, tick: u32) {
         if self.backlight_on && Instant::now() >= self.backlight_deadline {
             if let Some(d) = &mut self.display {
                 d.set_backlight(false);
@@ -137,7 +137,7 @@ impl AppBoard for ThinkNodeApp {
         }
 
         if tick % 30 == 0 && self.epd_active {
-            self.render(node, false).await;
+            self.render(node, ui, false).await;
         }
     }
 

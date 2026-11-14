@@ -10,6 +10,7 @@ pub use epd::{EpdFrameBuffer, Ssd1681};
 pub use ui::render_dashboard;
 
 use ferrix_core::companion::protocol::CompanionNode;
+use ferrix_runtime::app::UiState;
 
 /// Common Display Interface for MeshCore Nodes
 #[allow(async_fn_in_trait)]
@@ -20,10 +21,13 @@ pub trait NodeDisplay {
     async fn init(&mut self) -> Result<(), Self::Error>;
 
     /// Render and flush the dashboard to the screen (fast differential refresh)
-    async fn render_dashboard(&mut self, node: &CompanionNode<'_>) -> Result<(), Self::Error>;
+    async fn render_dashboard(&mut self, node: &CompanionNode<'_>, ui: &UiState) -> Result<(), Self::Error>;
 
     /// Render full dashboard with full OTP clearing refresh (for boot / calibration)
-    async fn render_dashboard_full(&mut self, node: &CompanionNode<'_>) -> Result<(), Self::Error>;
+    async fn render_dashboard_full(&mut self, node: &CompanionNode<'_>, ui: &UiState) -> Result<(), Self::Error>;
+
+    /// Render the boot splash.
+    async fn render_boot(&mut self, node: &CompanionNode<'_>) -> Result<(), Self::Error>;
 
     /// Put the display into ultra-low-power sleep
     async fn sleep(&mut self) -> Result<(), Self::Error>;
@@ -53,13 +57,18 @@ impl<'a, T: embassy_nrf::spim::Instance> NodeDisplay for ThinkNodeDisplay<'a, T>
         self.epd.init().await
     }
 
-    async fn render_dashboard(&mut self, node: &CompanionNode<'_>) -> Result<(), Self::Error> {
-        ui::render_dashboard(node, self.fb);
+    async fn render_dashboard(&mut self, node: &CompanionNode<'_>, ui: &UiState) -> Result<(), Self::Error> {
+        ui::render_dashboard(node, ui, self.fb);
         self.epd.display_frame_fast(self.fb).await
     }
 
-    async fn render_dashboard_full(&mut self, node: &CompanionNode<'_>) -> Result<(), Self::Error> {
-        ui::render_dashboard(node, self.fb);
+    async fn render_dashboard_full(&mut self, node: &CompanionNode<'_>, ui: &UiState) -> Result<(), Self::Error> {
+        ui::render_dashboard(node, ui, self.fb);
+        self.epd.display_frame_full(self.fb).await
+    }
+
+    async fn render_boot(&mut self, node: &CompanionNode<'_>) -> Result<(), Self::Error> {
+        ui::render_boot(node, self.fb);
         self.epd.display_frame_full(self.fb).await
     }
 

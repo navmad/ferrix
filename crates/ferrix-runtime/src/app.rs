@@ -22,7 +22,7 @@ use heapless::Vec;
 use meshcore_wire::packet::Packet;
 
 /// E-ink pages between full refreshes.
-const FULL_REFRESH_INTERVAL: u32 = 9;
+const CLICKS_PER_FULL_REFRESH: u32 = 10;
 
 /// Semantic events from the input task.
 pub static INPUT_EVENT_CHANNEL: Channel<CriticalSectionRawMutex, InputEvent, 4> = Channel::new();
@@ -39,6 +39,79 @@ pub enum InputEvent {
     PowerToggle,
 }
 
+/// Sort metric for the radar page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RadarSort {
+    #[default]
+    Age,
+    Signal,
+}
+
+/// Small rolling RSSI/SNR history for the signal page.
+pub struct SignalHistory {
+    rssi: [i8; 24],
+    snr: [i8; 24],
+    len: usize,
+    next: usize,
+}
+
+impl Default for SignalHistory {
+    fn default() -> Self {
+        Self {
+            rssi: [0; 24],
+            snr: [0; 24],
+            len: 0,
+            next: 0,
+        }
+    }
+}
+
+impl SignalHistory {
+    pub fn push(&mut self, rssi: i16, snr: i8) {
+        let rssi = rssi.clamp(i8::MIN as i16, i8::MAX as i16) as i8;
+        self.rssi[self.next] = rssi;
+        self.snr[self.next] = snr;
+        self.next = (self.next + 1) % 24;
+        if self.len < 24 {
+            self.len += 1;
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.len = 0;
+        self.next = 0;
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn at(&self, index: usize) -> Option<(i8, i8)> {
+        if index >= self.len {
+            return None;
+        }
+        let start = (self.next + 24 - self.len) % 24;
+        let i = (start + index) % 24;
+        Some((self.rssi[i], self.snr[i]))
+    }
+
+    pub fn last(&self) -> Option<(i8, i8)> {
+        if self.len == 0 {
+            None
+        } else {
+            Some((self.rssi[(self.next + 23) % 24], self.snr[(self.next + 23) % 24]))
+        }
+    }
+}
+
+/// UI-only state shared by the application and the board renderer.
+#[derive(Default)]
+pub struct UiState {
+    pub inbox_cursor: usize,
+    pub radar_sort: RadarSort,
+    pub signal: SignalHistory,
+}
+
 /// Board services used by the application loop.
 #[allow(async_fn_in_trait)]
 pub trait AppBoard {
@@ -49,9 +122,9 @@ pub trait AppBoard {
     fn set_gps_enabled(&mut self, on: bool);
     fn set_led(&mut self, on: bool);
     async fn advert_feedback(&mut self);
-    async fn render(&mut self, node: &CompanionNode<'_>, full: bool);
+    async fn render(&mut self, node: &CompanionNode<'_>, ui: &UiState, full: bool);
     async fn input_wake(&mut self);
-    async fn tick(&mut self, node: &CompanionNode<'_>, tick: u32);
+    async fn tick(&mut self, node: &CompanionNode<'_>, ui: &UiState, tick: u32);
     async fn sample_battery(&mut self) -> Option<u16>;
     fn set_leds_disabled(&mut self, disabled: bool);
 }
@@ -151,6 +224,18 @@ pub async fn flush_tx_queue<R: LoraRadio>(mesh: &mut MeshEngine<'_>, radio: &mut
     }
 }
 
+async fn send_advert<B: AppBoard>(
+    board: &mut B,
+    mesh: &mut MeshEngine<'_>,
+    node: &mut CompanionNode<'_>,
+    flood: bool,
+) {
+    node.tx_beacons = node.tx_beacons.saturating_add(1);
+    board.advert_feedback().await;
+    let (lat, lon) = protocol::advert_location(node.latitude, node.longitude);
+    let _ = mesh.queue_advert(node.epoch_time as u32, lat, lon, flood);
+}
+
 /// Run the application loop until the executor stops.
 pub async fn run<B: AppBoard, R: LoraRadio>(
     board: &mut B,
@@ -161,7 +246,8 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
     let mut rx_buf = [0u8; 256];
     let mut ticker = Ticker::every(Duration::from_secs(2));
     let mut tick: u32 = 0;
-    let mut page_turns: u32 = 0;
+    let mut ui = UiState::default();
+    let mut clicks_since_full: u32 = 0;
 
     loop {
         // Move packets queued by the previous iteration into the radio
@@ -183,6 +269,7 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
             node.rx_packets = node.rx_packets.saturating_add(1);
             node.last_rssi = rssi;
             node.last_snr = snr;
+            ui.signal.push(rssi, snr);
 
             // Stream raw packet to companion app via PUSH_CODE_LOG_RX_DATA (0x88)
             // Layout: [0x88, (snr * 4) as i8, rssi as i8, raw_lora_packet_bytes...]
@@ -677,7 +764,7 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                     info!("Updating node callsign to: {}", new_name.as_str());
                     mesh.set_callsign(new_name.as_str());
                     node.callsign = new_name;
-                    board.render(node, false).await;
+                    board.render(node, &ui, false).await;
                 }
                 UsbCommand::SetPrivateKey(priv_key) => {
                     info!("Updating node private & public keys");
@@ -942,48 +1029,85 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
             // Any interaction wakes the frontlight and restarts its idle timer.
             board.input_wake().await;
 
+            let clicks = match event {
+                InputEvent::NextPage | InputEvent::ActionPrimary => 1,
+                InputEvent::PrevPage | InputEvent::ActionSecondary => 2,
+                _ => 0,
+            };
+            clicks_since_full += clicks;
+            let full = if clicks_since_full >= CLICKS_PER_FULL_REFRESH {
+                clicks_since_full -= CLICKS_PER_FULL_REFRESH;
+                true
+            } else {
+                false
+            };
+
             match event {
                 InputEvent::NextPage => {
-                    info!("Input: Next Page requested");
-                    // Cycle through pages: 0 -> 1 -> 2 -> 0
                     node.current_page = (node.current_page + 1) % board.page_count();
-                    page_turns = page_turns.wrapping_add(1);
-
-                    board.render(node, page_turns % FULL_REFRESH_INTERVAL == 0).await;
+                    board.render(node, &ui, full).await;
                 }
-                InputEvent::ActionPrimary => {
-                    match node.current_page {
-                        0 => {
-                            info!("Input: flood advert");
-                            node.tx_beacons = node.tx_beacons.saturating_add(1);
-                            board.advert_feedback().await;
-                            let (lat, lon) = protocol::advert_location(
-                                node.latitude,
-                                node.longitude,
-                            );
-                            let _ = mesh.queue_advert(
-                                node.epoch_time as u32,
-                                lat,
-                                lon,
-                                true,
-                            );
-                        }
-                        1 => {
+                InputEvent::PrevPage => {
+                    let count = board.page_count().max(1);
+                    node.current_page = if node.current_page == 0 {
+                        count - 1
+                    } else {
+                        node.current_page - 1
+                    };
+                    board.render(node, &ui, full).await;
+                }
+                InputEvent::ActionPrimary | InputEvent::ActionSecondary => {
+                    let action = if matches!(event, InputEvent::ActionPrimary) {
+                        1
+                    } else {
+                        2
+                    };
+
+                    match (node.current_page, action) {
+                        (0, 1) => {
                             info!("Input: zero-hop advert");
-                            node.tx_beacons = node.tx_beacons.saturating_add(1);
-                            board.advert_feedback().await;
-                            let (lat, lon) = protocol::advert_location(
-                                node.latitude,
-                                node.longitude,
-                            );
-                            let _ = mesh.queue_advert(
-                                node.epoch_time as u32,
-                                lat,
-                                lon,
-                                false,
+                            send_advert(board, mesh, node, false).await;
+                        }
+                        (0, _) => {
+                            info!("Input: flood advert");
+                            send_advert(board, mesh, node, true).await;
+                        }
+                        (1, 1) => {
+                            let count = MESSAGE_LOG.lock(|m| m.borrow().len());
+                            if count > 0 {
+                                ui.inbox_cursor = (ui.inbox_cursor + 1) % count;
+                            } else {
+                                ui.inbox_cursor = 0;
+                            }
+                            info!("Input: inbox next {}", ui.inbox_cursor);
+                        }
+                        (1, _) => {
+                            let count = MESSAGE_LOG.lock(|m| m.borrow().len());
+                            if count > 0 {
+                                ui.inbox_cursor = (ui.inbox_cursor + count - 1) % count;
+                            } else {
+                                ui.inbox_cursor = 0;
+                            }
+                            info!("Input: inbox previous {}", ui.inbox_cursor);
+                        }
+                        (2, 1) => {
+                            info!("Input: radar ping (zero-hop advert)");
+                            send_advert(board, mesh, node, false).await;
+                        }
+                        (2, _) => {
+                            ui.radar_sort = match ui.radar_sort {
+                                RadarSort::Age => RadarSort::Signal,
+                                RadarSort::Signal => RadarSort::Age,
+                            };
+                            info!(
+                                "Input: radar sort {}",
+                                match ui.radar_sort {
+                                    RadarSort::Age => "age",
+                                    RadarSort::Signal => "signal",
+                                }
                             );
                         }
-                        2 => {
+                        (3, 1) => {
                             let next = RADIO_SETTINGS.lock(|r| {
                                 let mut s = r.borrow_mut();
                                 s.tx_power_dbm = match s.tx_power_dbm {
@@ -998,7 +1122,17 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                             let _ = crate::radio::request_radio_config();
                             info!("Input: TX power -> {} dBm", next);
                         }
-                        3 => {
+                        (3, _) => {
+                            let on = RADIO_SETTINGS.lock(|r| {
+                                let mut s = r.borrow_mut();
+                                s.rx_duty_cycle = !s.rx_duty_cycle;
+                                s.rx_duty_cycle
+                            });
+                            storage::request_save_config();
+                            let _ = crate::radio::request_radio_config();
+                            info!("Input: RX duty cycle {}", if on { "on" } else { "off" });
+                        }
+                        (4, 1) => {
                             RADIO_TELEMETRY.lock(|t| {
                                 let mut t = t.borrow_mut();
                                 t.tx_beacons = 0;
@@ -1008,12 +1142,26 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                             node.rx_packets = 0;
                             info!("Input: counters reset");
                         }
-                        4 => {
+                        (4, _) => {
+                            ui.signal.reset();
+                            info!("Input: signal history reset");
+                        }
+                        (5, 1) => {
                             let on = !board.gps_enabled();
                             board.set_gps_enabled(on);
                             info!("Input: GPS power {}", if on { "on" } else { "off" });
                         }
-                        5 => {
+                        (5, _) => {
+                            let mut on = 0u8;
+                            update_prefs(|p| {
+                                p.advert_loc_policy =
+                                    if p.advert_loc_policy == 0 { 1 } else { 0 };
+                                on = p.advert_loc_policy;
+                            });
+                            storage::request_save_config();
+                            info!("Input: advert location {}", if on != 0 { "on" } else { "off" });
+                        }
+                        (6, 1) => {
                             let active = offgrid_active();
                             let change = offgrid_set(!active);
                             if change.no_band {
@@ -1029,7 +1177,20 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                                 info!("Input: offgrid {}", if active { "off" } else { "on" });
                             }
                         }
-                        6 => {
+                        (6, _) => {
+                            let on = RADIO_SETTINGS.lock(|r| {
+                                let mut s = r.borrow_mut();
+                                s.is_repeater = !s.is_repeater;
+                                s.is_repeater
+                            });
+                            mesh.is_repeater = forwarding_enabled();
+                            if !mesh.is_repeater {
+                                mesh.cancel_pending_forwards();
+                            }
+                            storage::request_save_config();
+                            info!("Input: repeater role {}", if on { "on" } else { "off" });
+                        }
+                        (7, 1) => {
                             let disabled = !leds_disabled();
                             board.set_leds_disabled(disabled);
                             board.set_led(!disabled);
@@ -1038,19 +1199,19 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                                 if disabled { "disabled" } else { "enabled" }
                             );
                         }
-                        _ => {
-                            let on = RADIO_SETTINGS.lock(|r| {
-                                let mut s = r.borrow_mut();
-                                s.rx_duty_cycle = !s.rx_duty_cycle;
-                                s.rx_duty_cycle
-                            });
-                            storage::request_save_config();
-                            let _ = crate::radio::request_radio_config();
-                            info!("Input: RX duty cycle {}", if on { "on" } else { "off" });
+                        (_, _) => {
+                            let next = (storage::get_path_hash_mode() + 1) % 3;
+                            storage::set_path_hash_mode(next);
+                            mesh.set_path_hash_mode(next);
+                            node.path_hash_mode = next;
+                            info!(
+                                "Input: path hash {} byte(s)/hop",
+                                next + 1
+                            );
                         }
                     }
 
-                    board.render(node, false).await;
+                    board.render(node, &ui, full).await;
                 }
                 _ => {}
             }
@@ -1059,7 +1220,7 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
             tick = tick.wrapping_add(1);
             protocol::keepalive_tick();
 
-            board.tick(node, tick).await;
+            board.tick(node, &ui, tick).await;
 
             // Sample the battery every 10 s (5 ticks).
             if tick % 5 == 0 {

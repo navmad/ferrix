@@ -22,7 +22,7 @@ use embassy_nrf::peripherals;
 use embassy_nrf::saadc;
 use embassy_nrf::spim::{self, Spim};
 use embassy_nrf::usb;
-use embassy_time::Timer;
+use embassy_time::{Duration, Timer};
 #[cfg(feature = "thinknode-m1")]
 use static_cell::StaticCell;
 
@@ -333,9 +333,20 @@ async fn main(spawner: Spawner) {
             let fb = EPD_FRAMEBUFFER.init(EpdFrameBuffer::new());
             let mut d = ThinkNodeDisplay::new(epd, fb);
 
-            info!("Initializing display and drawing MeshCore Dashboard (Full calibration refresh)...");
+            info!("Initializing display and drawing Ferrix boot splash...");
             d.init().await.ok();
-            d.render_dashboard_full(&node).await.ok();
+            d.render_boot(&node).await.ok();
+            Timer::after(Duration::from_secs(2)).await;
+            // Presses during the splash are intentionally ignored.
+            while ferrix_runtime::app::INPUT_EVENT_CHANNEL.try_receive().is_ok() {}
+            // The splash was a full refresh; the first page only needs a
+            // differential update.
+            d.render_dashboard(
+                &node,
+                &ferrix_runtime::app::UiState::default(),
+            )
+            .await
+            .ok();
             info!("Dashboard rendered successfully!");
             Some(d)
         } else {

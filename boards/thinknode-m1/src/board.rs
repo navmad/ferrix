@@ -66,17 +66,48 @@ impl ThinkNodeInputs {
 
 impl InputDevice for ThinkNodeInputs {
     async fn wait_event(&mut self) -> Option<InputEvent> {
-        let event = embassy_futures::select::select(
+        use embassy_futures::select::{select, Either};
+
+        let first = select(
             self.function_btn.wait_for_falling_edge(),
             self.page_btn.wait_for_falling_edge(),
         )
         .await;
+        let is_function = matches!(first, Either::First(_));
 
-        Timer::after_millis(80).await; // debounce
+        // Let contact bounce settle, then look for a second click of the
+        // same button within the double-click window.
+        Timer::after_millis(40).await;
+        let double = if is_function {
+            matches!(
+                select(
+                    self.function_btn.wait_for_falling_edge(),
+                    Timer::after_millis(280)
+                )
+                .await,
+                Either::First(_)
+            )
+        } else {
+            matches!(
+                select(
+                    self.page_btn.wait_for_falling_edge(),
+                    Timer::after_millis(280)
+                )
+                .await,
+                Either::First(_)
+            )
+        };
 
-        Some(match event {
-            embassy_futures::select::Either::First(_) => InputEvent::ActionPrimary,
-            embassy_futures::select::Either::Second(_) => InputEvent::NextPage,
+        Some(if is_function {
+            if double {
+                InputEvent::ActionSecondary
+            } else {
+                InputEvent::ActionPrimary
+            }
+        } else if double {
+            InputEvent::PrevPage
+        } else {
+            InputEvent::NextPage
         })
     }
 
