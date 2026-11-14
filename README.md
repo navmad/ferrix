@@ -32,7 +32,8 @@ boards/thinknode-m1/          <-- BOARD CRATE
     ├── app.rs                 <-- AppBoard: LED, display, GPS, battery
     ├── meshcore.rs            <-- engine context & wire re-exports
     ├── radio/                 <-- SX1262/lora-phy driver
-    ├── companion/             <-- companion host binding
+    ├── host.rs               <-- protocol/CLI host binding
+    ├── companion.rs          <-- transport re-exports
     ├── display/               <-- SSD1681 e-paper & dashboard
     ├── storage.rs             <-- flash layout adapter
     ├── gps.rs                 <-- GPS power state

@@ -6,6 +6,7 @@ pub mod board;
 pub mod companion;
 pub mod display;
 pub mod gps;
+pub mod host;
 pub mod input;
 pub mod meshcore;
 pub mod radio;
@@ -26,7 +27,8 @@ use embassy_time::Timer;
 use static_cell::StaticCell;
 
 use crate::app::{set_blue_led, ThinkNodeApp};
-use crate::companion::protocol::CompanionNode;
+use ferrix_core::companion::protocol::CompanionNode;
+use crate::host::BOARD_HOST;
 #[cfg(feature = "thinknode-m1")]
 use crate::display::{EpdFrameBuffer, NodeDisplay, Ssd1681, ThinkNodeDisplay};
 use crate::meshcore::{LocalIdentity, MeshEngine};
@@ -121,6 +123,15 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 #[cortex_m_rt::exception]
 unsafe fn HardFault(_frame: &cortex_m_rt::ExceptionFrame) -> ! {
     fatal_blink_forever(6)
+}
+
+/// Forward deferred protocol pushes to the connected companion transport.
+#[embassy_executor::task]
+async fn delayed_push_task() -> ! {
+    loop {
+        let frame = ferrix_core::companion::protocol::next_delayed_push().await;
+        let _ = ferrix_core::command::COMPANION_PUSH_CHANNEL.try_send(frame);
+    }
 }
 
 #[embassy_executor::main]
@@ -219,11 +230,11 @@ async fn main(spawner: Spawner) {
             priv_key,
             crate::board::NAME,
             crate::board::CAPABILITIES,
-            &crate::companion::protocol::BOARD_HOST,
+            &BOARD_HOST,
         ))
         .unwrap();
     spawner.spawn(crate::companion::ble::contact_task()).unwrap();
-    spawner.spawn(crate::companion::protocol::delayed_push_task()).unwrap();
+    spawner.spawn(delayed_push_task()).unwrap();
     spawner
         .spawn(crate::board::thinknode_input_task(board.inputs))
         .unwrap();
@@ -235,7 +246,7 @@ async fn main(spawner: Spawner) {
         crate::board::CAPABILITIES,
         pub_key,
         priv_key,
-        &crate::companion::protocol::BOARD_HOST,
+        &BOARD_HOST,
     );
 
     // Initialize BLE Companion peripheral (Nordic UART Service)
@@ -247,7 +258,7 @@ async fn main(spawner: Spawner) {
         crate::board::CAPABILITIES,
         "MeshCore-M1",
         "ThinkNode M1",
-        &crate::companion::protocol::BOARD_HOST,
+        &BOARD_HOST,
         crate::fatal_blink_forever,
         crate::storage::spawn_storage,
     );

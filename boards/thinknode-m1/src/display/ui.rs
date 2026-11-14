@@ -23,7 +23,7 @@ use embedded_graphics::primitives::{Line, PrimitiveStyle, Rectangle};
 use embedded_graphics::text::Text;
 use heapless::String;
 
-use crate::companion::protocol::CompanionNode;
+use ferrix_core::companion::protocol::CompanionNode;
 use crate::display::epd::{EpdFrameBuffer, EPD_WIDTH};
 
 /// Number of dashboard pages. Keep in sync with `main`'s page-turn modulo.

@@ -1,15 +1,11 @@
-//! Board binding for the companion protocol now owned by `ferrix-core`.
+//! Board host implementation for the companion protocol and text CLI.
 //!
-//! The command parser and response encoders live in
-//! [`ferrix_core::companion::protocol`]. This module supplies the board
-//! services it needs and keeps the local CLI dispatched by the USB task.
+//! The protocol and CLI live in `ferrix-core`; this module maps their host
+//! operations onto ThinkNode storage, radio, telemetry and reset.
 
-pub use ferrix_core::companion::cli::{CliHost, RadioStats, StorageStats};
+use ferrix_core::companion::cli::{CliHost, RadioStats, StorageStats};
+use ferrix_core::companion::protocol::CompanionHost;
 use heapless::Vec;
-
-pub use ferrix_core::companion::protocol::CompanionHost;
-
-pub use ferrix_core::companion::protocol::*;
 
 /// Board implementation of the protocol's persistence/telemetry interface.
 pub struct BoardCompanionHost;
@@ -132,13 +128,3 @@ impl CliHost for BoardCompanionHost {
         "ThinkNode M1 (nRF52840, SX1262 LoRa)"
     }
 }
-
-/// Forward deferred protocol pushes to the connected companion transport.
-#[embassy_executor::task]
-pub async fn delayed_push_task() -> ! {
-    loop {
-        let frame = ferrix_core::companion::protocol::next_delayed_push().await;
-        let _ = ferrix_core::command::COMPANION_PUSH_CHANNEL.try_send(frame);
-    }
-}
-

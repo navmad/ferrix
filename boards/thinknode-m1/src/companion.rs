@@ -3,8 +3,6 @@
 //! The transports live in `platforms/nrf52`; these inline modules keep the
 //! board-facing state and configuration re-exports in one place.
 
-pub mod protocol;
-
 pub mod usb {
 //! Board-facing re-exports for the platform USB transport.
 //!
