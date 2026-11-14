@@ -18,6 +18,21 @@ use crate::types::{ChannelData, MAX_CHANNELS};
 pub const CONFIG_MAGIC: u32 = 0x4D434647; // 'MCFG' (MeshCore Config)
 pub const CONFIG_VERSION: u32 = 1;
 
+/// BLE PIN record lives after the config struct in the same 4 KB page.
+const PIN_OFFSET: usize = 3072;
+const PIN_MAGIC: u32 = 0x5049_4E42; // "BINP"
+const DEFAULT_BLE_PIN: u32 = 123_456;
+
+#[repr(C, align(4))]
+#[derive(Clone, Copy)]
+struct PinRecord {
+    magic: u32,
+    pin: u32,
+    checksum: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<PersistentConfig>() <= PIN_OFFSET);
+
 /// Completed config-page writes and erases since boot.
 pub static CONFIG_SAVES: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
@@ -61,9 +76,15 @@ pub struct PersistentConfig {
     pub checksum: u32,
 }
 
-pub use crate::state::{CUSTOM_PRIV_KEY, NODE_CALLSIGN};
+pub use crate::state::{BLE_PIN, CUSTOM_PRIV_KEY, NODE_CALLSIGN};
 
-static SAVE_REQUEST_CHANNEL: Channel<SharedRawMutex, (), 2> = Channel::new();
+static SAVE_REQUEST_CHANNEL: Channel<SharedRawMutex, u32, 2> = Channel::new();
+/// Highest configuration-save sequence number that has reached flash.
+static SAVE_ACKED_SEQ: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+/// Next sequence number for a synchronous save request.
+static NEXT_SAVE_SEQ: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(1);
 
 /// Compute a 32-bit checksum covering a configuration structure up to its
 /// checksum field.
@@ -95,6 +116,23 @@ pub fn read_config(page: &[u8]) -> Option<PersistentConfig> {
         && compute_checksum(&cfg) == cfg.checksum
     {
         Some(cfg)
+    } else {
+        None
+    }
+}
+
+fn read_ble_pin(page: &[u8]) -> Option<u32> {
+    if page.len() < PIN_OFFSET + core::mem::size_of::<PinRecord>() {
+        return None;
+    }
+    let rec = unsafe {
+        core::ptr::read_unaligned(page.as_ptr().add(PIN_OFFSET) as *const PinRecord)
+    };
+    if rec.magic == PIN_MAGIC
+        && rec.checksum == rec.pin ^ PIN_MAGIC
+        && (100_000..=999_999).contains(&rec.pin)
+    {
+        Some(rec.pin)
     } else {
         None
     }
@@ -150,22 +188,90 @@ pub fn set_custom_priv_key(key: [u8; 64]) {
 }
 
 /// Wait for a coalesced configuration save request.
-pub async fn wait_save_request() {
-    SAVE_REQUEST_CHANNEL.receive().await;
+///
+/// Returns the request's sequence number: zero for a fire-and-forget save, or
+/// a non-zero value that must be acknowledged after the write completes.
+pub async fn wait_save_request() -> u32 {
+    SAVE_REQUEST_CHANNEL.receive().await
 }
 
-/// Drop queued save requests after a coalescing delay.
-pub fn drain_save_requests() {
-    while SAVE_REQUEST_CHANNEL.try_receive().is_ok() {}
+/// Drop queued save requests after a coalescing delay and return the highest
+/// sequence number among them.
+pub fn drain_save_requests() -> u32 {
+    let mut highest = 0;
+    while let Ok(seq) = SAVE_REQUEST_CHANNEL.try_receive() {
+        highest = highest.max(seq);
+    }
+    highest
 }
 
-/// Signal the storage task to write the current settings to flash
+/// Signal the storage task to write the current settings to flash.
 pub fn request_save_config() {
-    let _ = SAVE_REQUEST_CHANNEL.try_send(());
+    let _ = SAVE_REQUEST_CHANNEL.try_send(0);
+}
+
+fn next_save_seq() -> u32 {
+    loop {
+        let seq = NEXT_SAVE_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        if seq != 0 {
+            return seq;
+        }
+    }
+}
+
+/// Request a configuration save and wait until it has reached flash.
+///
+/// Used when the caller cannot tolerate a later reboot losing the write, such
+/// as a BLE PIN change that the app applies by restarting the node.
+pub async fn request_save_config_and_wait() -> bool {
+    #[cfg(test)]
+    {
+        true
+    }
+    #[cfg(not(test))]
+    {
+        use core::sync::atomic::Ordering;
+
+        let seq = next_save_seq();
+        let mut queued = false;
+        for _ in 0..40 {
+            if SAVE_REQUEST_CHANNEL.try_send(seq).is_ok() {
+                queued = true;
+                break;
+            }
+            embassy_time::Timer::after_millis(5).await;
+        }
+        if !queued {
+            return false;
+        }
+
+        // Requests are FIFO and the storage loop acknowledges the highest
+        // sequence it drained, so any acknowledgement at or above `seq`
+        // proves this request has been written.
+        for _ in 0..300 {
+            if SAVE_ACKED_SEQ.load(Ordering::Acquire) >= seq {
+                return true;
+            }
+            embassy_time::Timer::after_millis(5).await;
+        }
+        false
+    }
+}
+
+/// Record that saves up to `seq` have completed.
+pub fn notify_save_complete(seq: u32) {
+    if seq != 0 {
+        SAVE_ACKED_SEQ.fetch_max(seq, core::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 /// Initialize configuration from flash (or defaults if flash is uninitialized)
 pub fn init_config(page: &[u8], default_name: &str) -> (String<32>, Option<[u8; 64]>) {
+    BLE_PIN.store(
+        read_ble_pin(page).unwrap_or(DEFAULT_BLE_PIN),
+        core::sync::atomic::Ordering::Relaxed,
+    );
+
     if let Some(cfg) = read_config(page) {
         info!("Storage: Found valid persistent config page");
 
@@ -346,6 +452,25 @@ where
     CONFIG_ERASES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     if let Err(e) = flash.write(region.start, config_bytes).await {
         error!("Storage: Flash write error: {:?}", e);
+        return;
+    }
+    let pin = BLE_PIN.load(core::sync::atomic::Ordering::Relaxed);
+    let rec = PinRecord {
+        magic: PIN_MAGIC,
+        pin,
+        checksum: pin ^ PIN_MAGIC,
+    };
+    let rec_bytes = unsafe {
+        core::slice::from_raw_parts(
+            &rec as *const PinRecord as *const u8,
+            core::mem::size_of::<PinRecord>(),
+        )
+    };
+    if let Err(e) = flash
+        .write(region.start + PIN_OFFSET as u32, rec_bytes)
+        .await
+    {
+        error!("Storage: BLE PIN write error: {:?}", e);
         return;
     }
     CONFIG_SAVES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);

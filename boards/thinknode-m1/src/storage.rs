@@ -18,7 +18,8 @@ pub static REGIONS: StorageRegions = StorageRegions {
     config: 0x000E_C000..0x000E_D000,
     contacts: 0x000B_0000..0x000C_C000,
     messages: 0x000C_C000..0x000E_C000,
-    adverts: 0x000A_0000..0x000B_0000,
+    adverts: 0x000A_0000..0x000A_F000,
+    bonds: 0x000A_F000..0x000B_0000,
     factory_reset: 0x000A_0000..0x000E_D000,
 };
 
@@ -33,6 +34,10 @@ pub fn init_config() -> (String<32>, Option<[u8; 64]>) {
 /// Load the advert log into RAM. Called once at boot, before the tasks start.
 pub fn load() {
     adverts::init(&ferrix_nrf52::flash::MAPPED, REGIONS.adverts.clone());
+    ferrix_core::storage::bonds::init(
+        &ferrix_nrf52::flash::MAPPED,
+        REGIONS.bonds.clone(),
+    );
 }
 
 /// Spawn the storage task once the SoftDevice has been enabled.

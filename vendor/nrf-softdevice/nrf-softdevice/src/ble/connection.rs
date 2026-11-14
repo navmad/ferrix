@@ -738,16 +738,14 @@ impl Connection {
 
             #[cfg(not(feature = "ble-sec"))]
             let sec_params = unsafe { core::mem::zeroed() };
+            // Local patch: use the full security parameters, including IO
+            // capabilities and key distribution. The reduced parameters
+            // forced Just Works and ignored the handler's passkey setup.
             #[cfg(feature = "ble-sec")]
             let sec_params = state
                 .security
                 .handler
-                .map(|h| {
-                    let mut p: raw::ble_gap_sec_params_t = unsafe { core::mem::zeroed() };
-                    p.set_bond(h.can_bond(self) as u8);
-                    p.set_mitm(h.request_mitm_protection(self) as u8);
-                    p
-                })
+                .map(|h| h.security_params(self))
                 .unwrap_or_else(|| unsafe { core::mem::zeroed() });
 
             Ok::<_, AuthenticateError>((conn_handle, sec_params))

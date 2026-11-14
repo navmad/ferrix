@@ -4,6 +4,7 @@
 //! `ferrix-runtime`. All handlers are `no_std` and allocation free.
 
 pub mod adverts;
+pub mod bonds;
 pub mod config;
 pub mod contacts;
 pub mod counted_flash;
@@ -33,6 +34,8 @@ pub struct StorageRegions {
     pub messages: Range<u32>,
     /// Advert blob log.
     pub adverts: Range<u32>,
+    /// BLE bond table.
+    pub bonds: Range<u32>,
     /// Everything erased by a factory reset.
     pub factory_reset: Range<u32>,
 }
