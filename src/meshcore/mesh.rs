@@ -263,7 +263,7 @@ impl MeshEngine {
     fn note_duplicate_of_pending(&mut self, pkt: &Packet) {
         let now = now_ms();
         self.pending_forwards
-            .retain(|entry| entry.queued_at_ms.saturating_add(5000) >= now);
+            .retain(|entry| entry.queued_at_ms.saturating_add(8000) >= now);
         let hash = pkt.calculate_packet_hash();
         if let Some(index) = self
             .pending_forwards
@@ -272,6 +272,7 @@ impl MeshEngine {
         {
             let entry = self.pending_forwards.remove(index);
             crate::radio::record_duplicate_delta(now.saturating_sub(entry.queued_at_ms));
+            let _ = crate::radio::lora_phy::cancel_flood(entry.hash);
         }
     }
 

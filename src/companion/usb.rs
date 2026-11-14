@@ -450,6 +450,8 @@ pub struct RadioTelemetry {
     pub tx_flood: u32,
     /// Floods dropped because their slot was missed.
     pub tx_stale: u32,
+    /// Floods cancelled after another repeater was heard first.
+    pub tx_cancelled: u32,
     /// Radio-level retries after a failed transmission.
     pub tx_retries: u32,
     /// Requests dropped after exhausting retries or because a queue was full.
@@ -468,6 +470,7 @@ pub static RADIO_TELEMETRY: Mutex<SharedRawMutex, RefCell<RadioTelemetry>> = Mut
     tx_control: 0,
     tx_flood: 0,
     tx_stale: 0,
+    tx_cancelled: 0,
     tx_retries: 0,
     tx_dropped: 0,
 }));
@@ -1511,21 +1514,27 @@ async fn handle_text_cli<W: CliSink>(
             let used = crate::radio::TX_SLOT_USED.load(Relaxed);
             let scheduled = crate::radio::FORWARD_SCHEDULED.load(Relaxed);
             let sent = crate::radio::FORWARD_SENT.load(Relaxed);
-            let (control, flood, stale) = RADIO_TELEMETRY.lock(|t| {
+            let (control, flood, stale, cancelled) = RADIO_TELEMETRY.lock(|t| {
                 let tel = t.borrow();
-                (tel.tx_control, tel.tx_flood, tel.tx_stale)
+                (
+                    tel.tx_control,
+                    tel.tx_flood,
+                    tel.tx_stale,
+                    tel.tx_cancelled,
+                )
             });
             let d = crate::radio::duplicate_deltas();
             let mut s: heapless::String<256> = heapless::String::new();
             let _ = write!(
                 s,
-                "  -> slot {} ms (auto={}), used {}/4, control {} / flood {} sent, stale {}\r\n  -> forwards {} scheduled / {} sent, duplicate deltas <20:{} 20-40:{} 40-80:{} 80-160:{} 160-320:{} >320:{}\r\n",
+                "  -> slot {} ms (auto={}), used {}/4, control {} / flood {} sent, stale {}, cancelled {}\r\n  -> forwards {} scheduled / {} sent, duplicate deltas <20:{} 20-40:{} 40-80:{} 80-160:{} 160-320:{} >320:{}\r\n",
                 slot_ms,
                 if override_ms == 0 { 1 } else { 0 },
                 used,
                 control,
                 flood,
                 stale,
+                cancelled,
                 scheduled,
                 sent,
                 d[0], d[1], d[2], d[3], d[4], d[5]
@@ -1791,6 +1800,7 @@ async fn handle_text_cli<W: CliSink>(
                 tel.tx_control = 0;
                 tel.tx_flood = 0;
                 tel.tx_stale = 0;
+                tel.tx_cancelled = 0;
                 tel.tx_retries = 0;
                 tel.tx_dropped = 0;
             });

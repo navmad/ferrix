@@ -6,7 +6,7 @@
 use core::sync::atomic::Ordering;
 
 use defmt::{debug, error, info};
-use embassy_futures::select::{select4, Either4};
+use embassy_futures::select::{select, select4, Either, Either4};
 use embassy_nrf::gpio::{Input, Output};
 use embassy_nrf::peripherals::TWISPI0;
 use embassy_nrf::spim::Spim;
@@ -37,6 +37,13 @@ pub struct TxPacket {
 pub static LORA_RX_CHANNEL: Channel<SharedRawMutex, (usize, i16, i8, [u8; 256]), 4> = Channel::new();
 pub static LORA_TX_CHANNEL: Channel<SharedRawMutex, TxPacket, 8> = Channel::new();
 pub static LORA_CFG_CHANNEL: Channel<SharedRawMutex, LoraConfig, 4> = Channel::new();
+/// Hashes of scheduled floods that another repeater was heard for.
+pub static LORA_CANCEL_CHANNEL: Channel<SharedRawMutex, [u8; 8], 8> = Channel::new();
+
+/// Ask the radio task to drop a scheduled flood with this hash.
+pub fn cancel_flood(hash: [u8; 8]) {
+    let _ = LORA_CANCEL_CHANNEL.try_send(hash);
+}
 
 /// Ask the radio task to apply the current `RADIO_SETTINGS`.
 pub fn request_radio_config() -> bool {
@@ -190,6 +197,19 @@ fn assign_flood(
         }
     }
     Err(req)
+}
+
+fn cancel_slot(
+    floods: &mut [Option<FloodSlot>; FLOOD_SLOTS],
+    hash: [u8; 8],
+) -> bool {
+    for slot in floods.iter_mut() {
+        if slot.as_ref().is_some_and(|s| s.req.hash == hash) {
+            *slot = None;
+            return true;
+        }
+    }
+    false
 }
 
 fn due_flood(
@@ -388,7 +408,10 @@ pub async fn lora_phy_task(
     let mut rx_backoff_ms = 50u64;
     let mut control: heapless::Deque<TxPacket, CONTROL_QUEUE> = heapless::Deque::new();
     let mut floods: [Option<FloodSlot>; FLOOD_SLOTS] = [None, None, None, None];
-    let mut tx_budget_ms = crate::radio::tx_budget_max(airtime_factor());
+    let af0 = airtime_factor();
+    let total0 = crate::radio::tx_budget_max(af0);
+    let mut control_budget_ms = total0 * 25 / 100;
+    let mut flood_budget_ms = total0 - control_budget_ms;
     let mut tx_budget_last = Instant::now();
     let mut next_tx_allowed_ms: u64 = 0;
     let mut base_ms = Instant::now().as_millis() as u64;
@@ -398,6 +421,16 @@ pub async fn lora_phy_task(
 
     loop {
         let now = Instant::now().as_millis() as u64;
+
+        // Apply cancellations before choosing a slot to transmit.
+        while let Ok(hash) = LORA_CANCEL_CHANNEL.try_receive() {
+            if cancel_slot(&mut floods, hash) {
+                crate::companion::usb::RADIO_TELEMETRY.lock(|t| {
+                    let mut tel = t.borrow_mut();
+                    tel.tx_cancelled = tel.tx_cancelled.saturating_add(1);
+                });
+            }
+        }
 
         // Runtime slot-width override.
         let override_ms = crate::radio::TX_SLOT_MS_OVERRIDE.load(Ordering::Relaxed) as u64;
@@ -421,13 +454,20 @@ pub async fn lora_phy_task(
         // Refill the duty-cycle budget.
         let af = airtime_factor();
         let duty_pct = crate::radio::tx_duty_pct(af);
-        let max_budget = crate::radio::tx_budget_max(af);
+        let total_max = crate::radio::tx_budget_max(af);
+        let control_max = total_max * 25 / 100;
+        let flood_max = total_max - control_max;
         let elapsed_ms = now.saturating_sub(tx_budget_last.as_millis() as u64) as i64;
         if elapsed_ms > 0 {
-            tx_budget_ms = (tx_budget_ms + elapsed_ms * duty_pct / 100).min(max_budget);
+            let total_refill = elapsed_ms * duty_pct / 100;
+            let control_refill = total_refill * 25 / 100;
+            control_budget_ms = (control_budget_ms + control_refill).min(control_max);
+            flood_budget_ms =
+                (flood_budget_ms + total_refill - control_refill).min(flood_max);
             tx_budget_last = Instant::now();
         }
-        tx_budget_ms = tx_budget_ms.min(max_budget);
+        control_budget_ms = control_budget_ms.min(control_max);
+        flood_budget_ms = flood_budget_ms.min(flood_max);
 
         let mut wake_at = u64::MAX;
         let mut budget_wait_ms = 0u64;
@@ -443,12 +483,12 @@ pub async fn lora_phy_task(
                     current_cfg.4,
                     preamble,
                 );
-                if duty_pct >= 100 || tx_budget_ms >= airtime as i64 {
+                if duty_pct >= 100 || control_budget_ms >= airtime as i64 {
                     let req = control.pop_front().unwrap();
                     pick = Some((req, false, airtime));
                 } else if duty_pct > 0 {
-                    let deficit = airtime as i64 - tx_budget_ms;
-                    budget_wait_ms = (deficit * 100 / duty_pct).max(1) as u64;
+                    let deficit = airtime as i64 - control_budget_ms;
+                    budget_wait_ms = (deficit * 10_000 / (duty_pct * 25)).max(1) as u64;
                 }
             }
 
@@ -463,7 +503,7 @@ pub async fn lora_phy_task(
                         current_cfg.4,
                         preamble,
                     );
-                    if duty_pct >= 100 || tx_budget_ms >= airtime as i64 {
+                    if duty_pct >= 100 || flood_budget_ms >= airtime as i64 {
                         let slot = floods[index].take().unwrap();
                         if now
                             > due.saturating_add(
@@ -478,8 +518,8 @@ pub async fn lora_phy_task(
                         }
                         pick = Some((slot.req, true, airtime));
                     } else if duty_pct > 0 {
-                        let deficit = airtime as i64 - tx_budget_ms;
-                        let wait = (deficit * 100 / duty_pct).max(1) as u64;
+                        let deficit = airtime as i64 - flood_budget_ms;
+                        let wait = (deficit * 10_000 / (duty_pct * 75)).max(1) as u64;
                         budget_wait_ms = budget_wait_ms.max(wait);
                     }
                 }
@@ -529,7 +569,11 @@ pub async fn lora_phy_task(
             if success {
                 next_tx_allowed_ms = Instant::now().as_millis() as u64 + TX_GAP_MS;
                 if duty_pct < 100 {
-                    tx_budget_ms = (tx_budget_ms - airtime as i64).max(0);
+                    if is_flood {
+                        flood_budget_ms = (flood_budget_ms - airtime as i64).max(0);
+                    } else {
+                        control_budget_ms = (control_budget_ms - airtime as i64).max(0);
+                    }
                 }
                 if is_flood {
                     crate::radio::FORWARD_SENT.fetch_add(1, Ordering::Relaxed);
@@ -597,15 +641,26 @@ pub async fn lora_phy_task(
             lora.rx(&rx_pkt_params, &mut rx_buf),
         );
 
-        match select4(
-            rx_fut,
-            LORA_TX_CHANNEL.receive(),
-            LORA_CFG_CHANNEL.receive(),
-            Timer::after(Duration::from_millis(wait_ms as u64)),
+        match select(
+            select4(
+                rx_fut,
+                LORA_TX_CHANNEL.receive(),
+                LORA_CFG_CHANNEL.receive(),
+                Timer::after(Duration::from_millis(wait_ms as u64)),
+            ),
+            LORA_CANCEL_CHANNEL.receive(),
         )
         .await
         {
-            Either4::First(rx_result) => match rx_result {
+            Either::Second(hash) => {
+                if cancel_slot(&mut floods, hash) {
+                    crate::companion::usb::RADIO_TELEMETRY.lock(|t| {
+                        let mut tel = t.borrow_mut();
+                        tel.tx_cancelled = tel.tx_cancelled.saturating_add(1);
+                    });
+                }
+            }
+            Either::First(Either4::First(rx_result)) => match rx_result {
                 Ok(Ok((len, status))) => {
                     rx_backoff_ms = 50;
                     info!("lora-phy: RX {} bytes, RSSI: {} dBm, SNR: {} dB", len, status.rssi, status.snr);
@@ -666,7 +721,7 @@ pub async fn lora_phy_task(
                     }
                 }
             },
-            Either4::Second(req) => {
+            Either::First(Either4::Second(req)) => {
                 let received_at = Instant::now().as_millis() as u64;
                 match req.lane {
                     TxLane::Flood => {
@@ -696,7 +751,7 @@ pub async fn lora_phy_task(
                     }
                 }
             }
-            Either4::Third(cfg) => {
+            Either::First(Either4::Third(cfg)) => {
                 let requested = (
                     cfg.frequency_hz,
                     cfg.tx_power_dbm,
@@ -801,7 +856,7 @@ pub async fn lora_phy_task(
                     }
                 }
             }
-            Either4::Fourth(_) => {
+            Either::First(Either4::Fourth(_)) => {
                 // Timer fired: loop around and re-evaluate eligibility and the
                 // duty-cycle budget. RX remains armed.
             }
