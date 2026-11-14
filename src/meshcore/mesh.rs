@@ -23,6 +23,12 @@ use crate::meshcore::queue::{PacketQueue, SeenPacketFilter};
 
 pub const DEFAULT_MAX_HOPS: u8 = 64;
 
+/// Monotonic milliseconds for transmit eligibility.
+fn now_ms() -> u64 {
+    embassy_time::Instant::now().as_millis() as u64
+}
+
+
 /// Direct when the contact has a valid encoded path; flood otherwise.
 fn route_for(out_path_len: u8) -> (u8, u8) {
     if out_path_len != 0xFF && Packet::is_valid_path_len(out_path_len) {
@@ -292,7 +298,7 @@ impl MeshEngine {
                 if relay.path_len < 64 {
                     relay.path[relay.path_len as usize] = (snr.saturating_mul(4)) as u8;
                     relay.path_len += 1;
-                    let _ = self.tx_queue.push(relay);
+                    let _ = self.tx_queue.push(relay, now_ms());
                 }
                 return InboundAction::Forwarded;
             }
@@ -320,7 +326,10 @@ impl MeshEngine {
                             } else {
                                 None
                             };
-                            let _ = self.tx_queue.push(fwd);
+                            let node = *self.identity.pub_key();
+                            let _ = self
+                                .tx_queue
+                                .push_forward(fwd, now_ms(), &node[..4]);
                             if let Some(ack) = ack {
                                 return InboundAction::ReceivedAck(ack);
                             }
@@ -349,7 +358,10 @@ impl MeshEngine {
                     if self.is_repeater && pkt.is_flood() && !already_in_path && adv.pub_key != *self.identity.pub_key() {
                         let mut repeat_pkt = pkt.clone();
                         repeat_pkt.append_hop_bytes(self.identity.pub_key());
-                        let _ = self.tx_queue.push(repeat_pkt);
+                        let node = *self.identity.pub_key();
+                        let _ = self
+                            .tx_queue
+                            .push_forward(repeat_pkt, now_ms(), &node[..4]);
                     }
                     InboundAction::ReceivedAdvert(adv)
                 } else {
@@ -367,7 +379,10 @@ impl MeshEngine {
                     if self.is_repeater && pkt.is_flood() && !is_dupe && !already_in_path {
                         let mut repeat_pkt = pkt.clone();
                         repeat_pkt.append_hop_bytes(self.identity.pub_key());
-                        let _ = self.tx_queue.push(repeat_pkt);
+                        let node = *self.identity.pub_key();
+                        let _ = self
+                            .tx_queue
+                            .push_forward(repeat_pkt, now_ms(), &node[..4]);
                     }
 
                     // Copy the channel array out of the lock before doing any crypto.
@@ -436,7 +451,10 @@ impl MeshEngine {
                 {
                     let mut repeat_pkt = pkt.clone();
                     repeat_pkt.append_hop_bytes(self.identity.pub_key());
-                    let _ = self.tx_queue.push(repeat_pkt);
+                    let node = *self.identity.pub_key();
+                    let _ = self
+                        .tx_queue
+                        .push_forward(repeat_pkt, now_ms(), &node[..4]);
                 }
                 if is_dupe {
                     return InboundAction::DropDuplicate;
@@ -579,7 +597,10 @@ impl MeshEngine {
                 {
                     let mut repeat_pkt = pkt.clone();
                     repeat_pkt.append_hop_bytes(self.identity.pub_key());
-                    let _ = self.tx_queue.push(repeat_pkt);
+                    let node = *self.identity.pub_key();
+                    let _ = self
+                        .tx_queue
+                        .push_forward(repeat_pkt, now_ms(), &node[..4]);
                 }
                 if is_dupe {
                     return InboundAction::DropDuplicate;
@@ -672,7 +693,7 @@ impl MeshEngine {
             pkt.path_len = 0;
         }
         self.seen_filter.mark_seen(pkt.calculate_packet_hash());
-        let _ = self.tx_queue.push(pkt.clone());
+        let _ = self.tx_queue.push(pkt.clone(), now_ms());
         Ok(pkt)
     }
 
@@ -683,7 +704,7 @@ impl MeshEngine {
         pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
         crate::companion::protocol::apply_flood_scope(&mut pkt);
         self.seen_filter.mark_seen(pkt.calculate_packet_hash());
-        let _ = self.tx_queue.push(pkt.clone());
+        let _ = self.tx_queue.push(pkt.clone(), now_ms());
         Ok(pkt)
     }
 
@@ -704,7 +725,7 @@ impl MeshEngine {
             pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
             crate::companion::protocol::apply_flood_scope(&mut pkt);
             self.seen_filter.mark_seen(pkt.calculate_packet_hash());
-            let _ = self.tx_queue.push(pkt.clone());
+            let _ = self.tx_queue.push(pkt.clone(), now_ms());
             Ok(pkt)
         } else {
             let mut pkt = grp.to_packet(channel_secret, ROUTE_TYPE_DIRECT)?;
@@ -712,7 +733,7 @@ impl MeshEngine {
             let n = pkt.path_byte_len();
             pkt.path[..n].copy_from_slice(&path[..n]);
             self.seen_filter.mark_seen(pkt.calculate_packet_hash());
-            let _ = self.tx_queue.push(pkt.clone());
+            let _ = self.tx_queue.push(pkt.clone(), now_ms());
             Ok(pkt)
         }
     }
@@ -815,7 +836,7 @@ impl MeshEngine {
             pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
         }
         self.seen_filter.mark_seen(pkt.calculate_packet_hash());
-        let _ = self.tx_queue.push(pkt.clone());
+        let _ = self.tx_queue.push(pkt.clone(), now_ms());
         pkt
     }
 }

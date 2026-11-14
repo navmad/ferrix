@@ -14,6 +14,7 @@ pub mod message_record;
 pub mod packet;
 pub mod packets;
 pub mod queue;
+pub mod tx;
 
 pub use identity::{Identity, LocalIdentity};
 pub use packet::{
@@ -25,7 +26,8 @@ pub use packets::{
     AckPacket, AddressedPacket, AdvertPacket, AnonReqPacket, ControlPacket, GrpDataPacket,
     GrpTextPacket, MultipartPacket, PathPacket, RawPacket, TracePacket, TxtMsgPacket,
 };
-pub use queue::{PacketQueue, SeenPacketFilter};
+pub use queue::{PacketQueue, QueuedPacket, SeenPacketFilter};
+pub use tx::{TxItem, TxScheduler};
 
 #[cfg(test)]
 mod tests {

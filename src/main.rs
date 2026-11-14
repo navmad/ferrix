@@ -223,13 +223,31 @@ async fn advert_feedback(led: &mut embassy_nrf::gpio::Output<'static>) {
     }
 }
 
-fn tx_duty_pct(af_tenths: u8) -> i64 {
-    1000 / (af_tenths as i64 + 10)
-}
-
-fn tx_budget_max(af_tenths: u8) -> i64 {
-    // One-hour duty-cycle window.
-    3_600_000 * tx_duty_pct(af_tenths) / 100
+/// Hand queued packets to the radio task. The task schedules them by
+/// eligibility, applies the duty-cycle budget and retries failures, so this
+/// only needs to stop when its queue is full.
+async fn flush_tx_queue(mesh: &mut MeshEngine, lora: &mut LoraPhyChannelRadio) {
+    while let Some(queued) = mesh.tx_queue.front() {
+        let mut buf = [0u8; 256];
+        let Ok(len) = queued.packet.write_to(&mut buf) else {
+            let _ = mesh.tx_queue.pop();
+            continue;
+        };
+        if lora
+            .transmit_at(
+                &buf[..len],
+                queued.eligible_at_ms,
+                queued.enqueued_at_ms,
+                queued.is_forward,
+            )
+            .await
+            .is_err()
+        {
+            // Radio scheduler full: leave it for the next wakeup.
+            break;
+        }
+        let _ = mesh.tx_queue.pop();
+    }
 }
 
 #[embassy_executor::main]
@@ -432,12 +450,11 @@ async fn main(spawner: Spawner) {
     let mut ticker = Ticker::every(Duration::from_secs(2));
     let mut tick: u32 = 0;
 
-    let af0 = crate::companion::usb::RADIO_SETTINGS
-        .lock(|r| r.borrow().airtime_factor_tenths);
-    let mut tx_budget_ms = tx_budget_max(af0);
-    let mut tx_budget_last = embassy_time::Instant::now();
-
     loop {
+        // Move packets queued by the previous iteration into the radio
+        // scheduler before sleeping.
+        flush_tx_queue(&mut mesh, &mut lora).await;
+
         let wake = select4(
             lora.receive(&mut rx_buf),
             USB_COMMAND_CHANNEL.receive(),
@@ -1084,7 +1101,9 @@ async fn main(spawner: Spawner) {
                                 crate::meshcore::packet::ROUTE_TYPE_DIRECT,
                             ) {
                                 mesh.seen_filter.mark_seen(pkt.calculate_packet_hash());
-                                let _ = mesh.tx_queue.push(pkt);
+                                let _ = mesh
+                                    .tx_queue
+                                    .push(pkt, embassy_time::Instant::now().as_millis() as u64);
                             }
                         }
                     }
@@ -1104,14 +1123,18 @@ async fn main(spawner: Spawner) {
                             let n = pkt.path_byte_len();
                             pkt.path[..n].copy_from_slice(&path[..n]);
                             mesh.seen_filter.mark_seen(pkt.calculate_packet_hash());
-                            let _ = mesh.tx_queue.push(pkt);
+                            let _ = mesh
+                                    .tx_queue
+                                    .push(pkt, embassy_time::Instant::now().as_millis() as u64);
                         }
                     }
                 }
                 UsbCommand::SendRawPacket { raw } => {
                     if let Ok(pkt) = Packet::read_from(raw.as_slice()) {
                         mesh.seen_filter.mark_seen(pkt.calculate_packet_hash());
-                        let _ = mesh.tx_queue.push(pkt);
+                        let _ = mesh
+                                    .tx_queue
+                                    .push(pkt, embassy_time::Instant::now().as_millis() as u64);
                     }
                 }
                 UsbCommand::SendTracePath {
@@ -1134,7 +1157,9 @@ async fn main(spawner: Spawner) {
                                 crate::meshcore::packet::ROUTE_TYPE_DIRECT,
                             ) {
                                 mesh.seen_filter.mark_seen(pkt.calculate_packet_hash());
-                                let _ = mesh.tx_queue.push(pkt);
+                                let _ = mesh
+                                    .tx_queue
+                                    .push(pkt, embassy_time::Instant::now().as_millis() as u64);
                             }
                         }
                     }
@@ -1390,61 +1415,5 @@ async fn main(spawner: Spawner) {
         }
         }
 
-        // Transmit pending packets, subject to the airtime duty-cycle budget.
-        let (af_tenths, sf, bw_khz, cr) = crate::companion::usb::RADIO_SETTINGS.lock(|r| {
-            let s = r.borrow();
-            (s.airtime_factor_tenths, s.sf, s.bw_khz, s.cr)
-        });
-        let duty_pct = tx_duty_pct(af_tenths);
-        let max_budget = tx_budget_max(af_tenths);
-        let now = embassy_time::Instant::now();
-        let elapsed_ms = (now - tx_budget_last).as_millis() as i64;
-        if elapsed_ms > 0 {
-            tx_budget_ms = (tx_budget_ms + elapsed_ms * duty_pct / 100).min(max_budget);
-            tx_budget_last = now;
-        }
-        tx_budget_ms = tx_budget_ms.min(max_budget);
-        let preamble = if sf <= 8 { 32 } else { 16 };
-
-        loop {
-            let airtime = match mesh.tx_queue.front() {
-                Some(pkt) => {
-                    let mut probe = [0u8; 256];
-                    match pkt.write_to(&mut probe) {
-                        Ok(len) => crate::radio::estimate_airtime_ms(
-                            len, sf, bw_khz, cr, preamble,
-                        ),
-                        Err(_) => 0,
-                    }
-                }
-                None => break,
-            };
-
-            if duty_pct < 100 && airtime > 0 && tx_budget_ms < airtime as i64 {
-                break;
-            }
-
-            let Some(out_pkt) = mesh.tx_queue.pop() else {
-                break;
-            };
-            let mut wire_buf = [0u8; 256];
-            if let Ok(wire_len) = out_pkt.write_to(&mut wire_buf) {
-                info!(
-                    "Transmitting MeshCore packet: {} bytes (type: {})",
-                    wire_len,
-                    out_pkt.payload_type()
-                );
-                let _ = lora.transmit(&wire_buf[..wire_len]).await;
-                lora.start_receive().await;
-                crate::companion::usb::RADIO_TELEMETRY.lock(|t| {
-                    let mut tel = t.borrow_mut();
-                    tel.tx_beacons = tel.tx_beacons.saturating_add(1);
-                    tel.tx_air_ms = tel.tx_air_ms.saturating_add(airtime);
-                });
-            }
-            if duty_pct < 100 && airtime > 0 {
-                tx_budget_ms = (tx_budget_ms - airtime as i64).max(0);
-            }
-        }
     }
 }

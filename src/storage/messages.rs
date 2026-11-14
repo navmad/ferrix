@@ -249,7 +249,7 @@ pub async fn consume(flash: &mut Flash) {
     let mut queue = open(flash);
     match queue.pop(&mut buf).await {
         Ok(Some(_)) => {
-            let _ = QUEUED.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            let _ = QUEUED.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 Some(n.saturating_sub(1))
             });
         }

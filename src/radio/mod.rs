@@ -57,6 +57,16 @@ impl Default for LoraConfig {
     }
 }
 
+/// Duty-cycle percentage implied by the airtime factor setting.
+pub fn tx_duty_pct(af_tenths: u8) -> i64 {
+    1000 / (af_tenths as i64 + 10)
+}
+
+/// Airtime budget for a one-hour duty-cycle window.
+pub fn tx_budget_max(af_tenths: u8) -> i64 {
+    3_600_000 * tx_duty_pct(af_tenths) / 100
+}
+
 /// Generic Asynchronous LoRa Radio Trait
 ///
 /// Implemented by Semtech transceiver drivers (SX1262, LR1110, LR1121, SX1276, etc.)
@@ -69,6 +79,16 @@ pub trait LoraRadio {
 
     /// Transmit a packet asynchronously
     async fn transmit(&mut self, payload: &[u8]) -> Result<(), Self::Error>;
+
+    /// Queue a packet for the radio task to transmit no earlier than
+    /// `eligible_at_ms` (monotonic milliseconds).
+    async fn transmit_at(
+        &mut self,
+        payload: &[u8],
+        eligible_at_ms: u64,
+        enqueued_at_ms: u64,
+        is_forward: bool,
+    ) -> Result<(), Self::Error>;
 
     /// Enter continuous reception mode
     async fn start_receive(&mut self);

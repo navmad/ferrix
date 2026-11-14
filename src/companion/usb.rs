@@ -442,6 +442,14 @@ pub struct RadioTelemetry {
     pub tx_air_ms: u32,
     /// Estimated cumulative receive airtime in milliseconds.
     pub rx_air_ms: u32,
+    /// Longest wait from enqueue to transmission in milliseconds.
+    pub tx_wait_max_ms: u32,
+    /// Requests queued with a future eligibility time (jittered forwards).
+    pub tx_deferred: u32,
+    /// Radio-level retries after a failed transmission.
+    pub tx_retries: u32,
+    /// Requests dropped after exhausting retries or because a queue was full.
+    pub tx_dropped: u32,
 }
 
 pub static RADIO_TELEMETRY: Mutex<SharedRawMutex, RefCell<RadioTelemetry>> = Mutex::new(RefCell::new(RadioTelemetry {
@@ -452,6 +460,10 @@ pub static RADIO_TELEMETRY: Mutex<SharedRawMutex, RefCell<RadioTelemetry>> = Mut
     has_rx: false,
     tx_air_ms: 0,
     rx_air_ms: 0,
+    tx_wait_max_ms: 0,
+    tx_deferred: 0,
+    tx_retries: 0,
+    tx_dropped: 0,
 }));
 
 #[derive(Clone, Debug)]
@@ -1461,18 +1473,34 @@ async fn handle_text_cli<W: CliSink>(
             let _ = sender.send( b"  -> OK (Messages cleared)\r\n").await;
         }
         "stats-radio" => {
-            let (tx_ms, rx_ms, rssi, snr) = RADIO_TELEMETRY.lock(|t| {
-                let tel = t.borrow();
-                (tel.tx_air_ms, tel.rx_air_ms, tel.last_rssi, tel.last_snr)
-            });
-            let mut s: heapless::String<128> = heapless::String::new();
+            let (tx_ms, rx_ms, rssi, snr, wait_ms, deferred, retries, dropped, sent) =
+                RADIO_TELEMETRY.lock(|t| {
+                    let tel = t.borrow();
+                    (
+                        tel.tx_air_ms,
+                        tel.rx_air_ms,
+                        tel.last_rssi,
+                        tel.last_snr,
+                        tel.tx_wait_max_ms,
+                        tel.tx_deferred,
+                        tel.tx_retries,
+                        tel.tx_dropped,
+                        tel.tx_beacons,
+                    )
+                });
+            let mut s: heapless::String<256> = heapless::String::new();
             let _ = write!(
                 s,
-                "  -> {{\"noise_floor\":-118,\"last_rssi\":{},\"last_snr\":{:.2},\"tx_air_secs\":{},\"rx_air_secs\":{}}}\r\n",
+                "  -> {{\"noise_floor\":-118,\"last_rssi\":{},\"last_snr\":{:.2},\"tx_air_secs\":{},\"rx_air_secs\":{},\"tx_sent\":{},\"tx_wait_max_ms\":{},\"tx_deferred\":{},\"tx_retries\":{},\"tx_dropped\":{}}}\r\n",
                 rssi,
                 snr as f32,
                 tx_ms / 1000,
-                rx_ms / 1000
+                rx_ms / 1000,
+                sent,
+                wait_ms,
+                deferred,
+                retries,
+                dropped
             );
             let _ = sender.send( s.as_bytes()).await;
         }

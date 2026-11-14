@@ -4,7 +4,7 @@
 //! using an asynchronous Embassy radio task and bounded IPC channels.
 
 use defmt::{debug, error, info};
-use embassy_futures::select::{select3, Either3};
+use embassy_futures::select::{select4, Either4};
 use embassy_nrf::gpio::{Input, Output};
 use embassy_nrf::peripherals::TWISPI0;
 use embassy_nrf::spim::Spim;
@@ -12,12 +12,13 @@ use embassy_sync::channel::Channel;
 
 /// Shared raw mutex type — see usb.rs for documentation.
 type SharedRawMutex = embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_time::Delay;
+use embassy_time::{Delay, Duration, Instant, Timer};
 use embedded_hal_bus::spi::ExclusiveDevice;
 use lora_phy::iv::GenericSx126xInterfaceVariant;
 use lora_phy::mod_params::{Bandwidth, CodingRate, DutyCycleParams, RadioError, RxMode, SpreadingFactor};
 use lora_phy::sx126x::{Config as Sx126xConfig, Sx1262, Sx126x, TcxoCtrlVoltage};
 use lora_phy::LoRa;
+use meshcore_wire::tx::{TxItem, TxScheduler};
 
 use crate::radio::{LoraConfig, LoraRadio};
 
@@ -28,7 +29,7 @@ pub struct TxPacket {
 }
 
 pub static LORA_RX_CHANNEL: Channel<SharedRawMutex, (usize, i16, i8, [u8; 256]), 4> = Channel::new();
-pub static LORA_TX_CHANNEL: Channel<SharedRawMutex, TxPacket, 4> = Channel::new();
+pub static LORA_TX_CHANNEL: Channel<SharedRawMutex, TxItem<TxPacket>, 8> = Channel::new();
 pub static LORA_CFG_CHANNEL: Channel<SharedRawMutex, LoraConfig, 4> = Channel::new();
 
 /// Ask the radio task to apply the current `RADIO_SETTINGS`.
@@ -138,6 +139,11 @@ fn make_rx_mode(sf: u8, bw_khz: u32, duty_cycle: bool) -> RxMode {
     RxMode::Continuous
 }
 
+fn airtime_factor() -> u8 {
+    crate::companion::usb::RADIO_SETTINGS
+        .lock(|r| r.borrow().airtime_factor_tenths)
+}
+
 /// ThinkNode M1 LoRa Radio Adapter implementing `LoraRadio` via channels
 pub struct LoraPhyChannelRadio;
 
@@ -148,13 +154,24 @@ impl LoraPhyChannelRadio {
 }
 
 impl LoraRadio for LoraPhyChannelRadio {
-    type Error = core::convert::Infallible;
+    type Error = ();
 
     async fn init(&mut self, _config: &LoraConfig) -> Result<(), Self::Error> {
         Ok(())
     }
 
     async fn transmit(&mut self, payload: &[u8]) -> Result<(), Self::Error> {
+        let now = Instant::now().as_millis() as u64;
+        self.transmit_at(payload, now, now, false).await
+    }
+
+    async fn transmit_at(
+        &mut self,
+        payload: &[u8],
+        eligible_at_ms: u64,
+        enqueued_at_ms: u64,
+        is_forward: bool,
+    ) -> Result<(), Self::Error> {
         if payload.is_empty() || payload.len() > 256 {
             return Ok(());
         }
@@ -163,10 +180,15 @@ impl LoraRadio for LoraPhyChannelRadio {
             data: [0u8; 256],
         };
         pkt.data[..payload.len()].copy_from_slice(payload);
-        // Never block the main loop if the radio task is stalled or
-        // reconfiguring; dropping is preferable to a frozen UI.
-        let _ = LORA_TX_CHANNEL.try_send(pkt);
-        Ok(())
+        let item = TxItem {
+            payload: pkt,
+            eligible_at_ms,
+            enqueued_at_ms,
+            is_forward,
+            attempts: 0,
+        };
+        // The caller keeps the packet queued and retries when this fails.
+        LORA_TX_CHANNEL.try_send(item).map_err(|_| ())
     }
 
     async fn start_receive(&mut self) {
@@ -279,24 +301,166 @@ pub async fn lora_phy_task(
         freq_hz, sf, bw_khz, cr, rx_mode
     );
 
+    const TX_GAP_MS: u64 = 30;
+    const TX_MAX_ATTEMPTS: u8 = 4;
+
     let mut rx_buf = [0u8; 256];
     // If the radio starts returning immediate RX errors, never spin without
     // yielding: the executor is cooperative, and a tight loop here starves the
     // main loop, USB and BLE tasks.
     let mut rx_backoff_ms = 50u64;
+    let mut schedule: TxScheduler<TxPacket, 8> = TxScheduler::new();
+    let mut next_tx_allowed_ms: u64 = 0;
+    let mut tx_budget_ms = crate::radio::tx_budget_max(airtime_factor());
+    let mut tx_budget_last = Instant::now();
 
     loop {
+        let now = Instant::now().as_millis() as u64;
+
+        // Refill the duty-cycle budget.
+        let af = airtime_factor();
+        let duty_pct = crate::radio::tx_duty_pct(af);
+        let max_budget = crate::radio::tx_budget_max(af);
+        let elapsed_ms = now.saturating_sub(tx_budget_last.as_millis() as u64) as i64;
+        if elapsed_ms > 0 {
+            tx_budget_ms = (tx_budget_ms + elapsed_ms * duty_pct / 100).min(max_budget);
+            tx_budget_last = Instant::now();
+        }
+        tx_budget_ms = tx_budget_ms.min(max_budget);
+
+        // Work out the earliest thing that needs attention.
+        let mut wake_at = u64::MAX;
+        if now < next_tx_allowed_ms {
+            wake_at = next_tx_allowed_ms;
+        }
+
+        // Transmit the earliest eligible request when the gap and budget allow.
+        if now >= next_tx_allowed_ms {
+            if let Some(index) = schedule.next_due_index(now) {
+                let (len, enqueued_at_ms, attempts) = schedule
+                    .get(index)
+                    .map(|item| {
+                        (
+                            item.payload.len,
+                            item.enqueued_at_ms,
+                            item.attempts,
+                        )
+                    })
+                    .unwrap_or((0, now, 0));
+                let airtime = crate::radio::estimate_airtime_ms(
+                    len,
+                    current_cfg.2,
+                    current_cfg.3,
+                    current_cfg.4,
+                    preamble,
+                );
+                if duty_pct >= 100 || tx_budget_ms >= airtime as i64 {
+                    let item = schedule.remove(index);
+                    info!(
+                        "lora-phy: Transmitting {} bytes (queued {} ms ago)...",
+                        item.payload.len,
+                        now.saturating_sub(item.enqueued_at_ms)
+                    );
+                    // A TX that never sees DIO1 would otherwise wedge this task
+                    // forever, leaving the node alive but unable to receive.
+                    let tx_result = embassy_time::with_timeout(
+                        Duration::from_secs(20),
+                        async {
+                            let mut tx_pkt_params = lora.create_tx_packet_params(
+                                preamble,
+                                false,
+                                true,
+                                false,
+                                &mdltn_params,
+                            )?;
+                            lora.prepare_for_tx(
+                                &mdltn_params,
+                                &mut tx_pkt_params,
+                                tx_power_dbm as i32,
+                                &item.payload.data[..item.payload.len],
+                            )
+                            .await?;
+                            lora.tx().await
+                        },
+                    )
+                    .await;
+                    let success = matches!(tx_result, Ok(Ok(())));
+                    match tx_result {
+                        Ok(Ok(())) => info!("lora-phy: Transmission complete!"),
+                        Ok(Err(e)) => error!("lora-phy: Transmission failed: {:?}", e),
+                        Err(_) => {
+                            error!("lora-phy: Transmission timed out; forcing RX recovery")
+                        }
+                    }
+                    // Return to the configured RX mode after transmission.
+                    let _ = embassy_time::with_timeout(
+                        Duration::from_secs(1),
+                        lora.prepare_for_rx(rx_mode, &mdltn_params, &rx_pkt_params),
+                    )
+                    .await;
+
+                    if success {
+                        next_tx_allowed_ms =
+                            Instant::now().as_millis() as u64 + TX_GAP_MS;
+                        if duty_pct < 100 {
+                            tx_budget_ms = (tx_budget_ms - airtime as i64).max(0);
+                        }
+                        crate::companion::usb::RADIO_TELEMETRY.lock(|t| {
+                            let mut tel = t.borrow_mut();
+                            tel.tx_beacons = tel.tx_beacons.saturating_add(1);
+                            tel.tx_air_ms = tel.tx_air_ms.saturating_add(airtime);
+                            let wait = now.saturating_sub(enqueued_at_ms) as u32;
+                            tel.tx_wait_max_ms = tel.tx_wait_max_ms.max(wait);
+                        });
+                    } else {
+                        crate::companion::usb::RADIO_TELEMETRY.lock(|t| {
+                            let mut tel = t.borrow_mut();
+                            tel.tx_retries = tel.tx_retries.saturating_add(1);
+                            if attempts + 1 >= TX_MAX_ATTEMPTS {
+                                tel.tx_dropped = tel.tx_dropped.saturating_add(1);
+                            }
+                        });
+                        if attempts + 1 < TX_MAX_ATTEMPTS {
+                            let backoff = (50u64 << (attempts + 1)).min(500);
+                            let mut retry = item;
+                            retry.attempts = attempts + 1;
+                            retry.eligible_at_ms =
+                                Instant::now().as_millis() as u64 + backoff;
+                            let _ = schedule.push(retry);
+                        }
+                    }
+                    continue;
+                } else if duty_pct > 0 {
+                    let deficit = airtime as i64 - tx_budget_ms;
+                    let refill_ms = (deficit * 100 / duty_pct).max(1) as u64;
+                    wake_at = wake_at.min(now.saturating_add(refill_ms));
+                }
+            }
+        }
+
+        if let Some(deadline) = schedule.next_deadline(now) {
+            wake_at = wake_at.min(deadline);
+        }
+        let wait_ms = wake_at.saturating_sub(now).clamp(1, 60_000) as u32;
+
         // Re-arm RX if no packet arrives for a minute. This is a safety net
         // for the case where the SX1262 stops raising DIO1 (for example after
         // a cancelled TX/RX operation) and `lora.rx` would otherwise wait
         // forever: the task would still be alive but permanently deaf.
         let rx_fut = embassy_time::with_timeout(
-            embassy_time::Duration::from_secs(60),
+            Duration::from_secs(60),
             lora.rx(&rx_pkt_params, &mut rx_buf),
         );
 
-        match select3(rx_fut, LORA_TX_CHANNEL.receive(), LORA_CFG_CHANNEL.receive()).await {
-            Either3::First(rx_result) => match rx_result {
+        match select4(
+            rx_fut,
+            LORA_TX_CHANNEL.receive(),
+            LORA_CFG_CHANNEL.receive(),
+            Timer::after(Duration::from_millis(wait_ms as u64)),
+        )
+        .await
+        {
+            Either4::First(rx_result) => match rx_result {
                 Ok(Ok((len, status))) => {
                     rx_backoff_ms = 50;
                     info!("lora-phy: RX {} bytes, RSSI: {} dBm, SNR: {} dB", len, status.rssi, status.snr);
@@ -309,7 +473,7 @@ pub async fn lora_phy_task(
                     // A duty-cycle window ending without a preamble is normal.
                     if matches!(rx_mode, RxMode::DutyCycle(_)) && e == RadioError::ReceiveTimeout {
                         match embassy_time::with_timeout(
-                            embassy_time::Duration::from_secs(1),
+                            Duration::from_secs(1),
                             lora.prepare_for_rx(rx_mode, &mdltn_params, &rx_pkt_params),
                         )
                         .await
@@ -326,13 +490,13 @@ pub async fn lora_phy_task(
                     // Yield first. Without this, an immediate RX error after a
                     // failed reconfiguration turns this task into a busy loop
                     // and the whole executor stops running.
-                    embassy_time::Timer::after_millis(rx_backoff_ms).await;
+                    Timer::after_millis(rx_backoff_ms).await;
                     rx_backoff_ms = (rx_backoff_ms * 2).min(1000);
 
                     // Re-enter RX if an error occurred, but never let a stuck
                     // BUSY line wedge the whole task forever.
                     match embassy_time::with_timeout(
-                        embassy_time::Duration::from_secs(1),
+                        Duration::from_secs(1),
                         lora.prepare_for_rx(rx_mode, &mdltn_params, &rx_pkt_params),
                     )
                     .await
@@ -346,7 +510,7 @@ pub async fn lora_phy_task(
                     // RX watchdog fired: no DIO1 for 60 s. Re-arm the receiver.
                     debug!("lora-phy: RX watchdog re-arm");
                     match embassy_time::with_timeout(
-                        embassy_time::Duration::from_secs(1),
+                        Duration::from_secs(1),
                         lora.prepare_for_rx(rx_mode, &mdltn_params, &rx_pkt_params),
                     )
                     .await
@@ -357,44 +521,23 @@ pub async fn lora_phy_task(
                     }
                 }
             },
-            Either3::Second(tx_packet) => {
-                info!("lora-phy: Transmitting {} bytes...", tx_packet.len);
-                // A TX that never sees DIO1 would otherwise wedge this task
-                // forever, leaving the node alive but unable to receive.
-                let tx_result = embassy_time::with_timeout(
-                    embassy_time::Duration::from_secs(20),
-                    async {
-                        let mut tx_pkt_params = lora.create_tx_packet_params(
-                            preamble,
-                            false,
-                            true,
-                            false,
-                            &mdltn_params,
-                        )?;
-                        lora.prepare_for_tx(
-                            &mdltn_params,
-                            &mut tx_pkt_params,
-                            tx_power_dbm as i32,
-                            &tx_packet.data[..tx_packet.len],
-                        )
-                        .await?;
-                        lora.tx().await
-                    },
-                )
-                .await;
-                match tx_result {
-                    Ok(Ok(())) => info!("lora-phy: Transmission complete!"),
-                    Ok(Err(e)) => error!("lora-phy: Transmission failed: {:?}", e),
-                    Err(_) => error!("lora-phy: Transmission timed out; forcing RX recovery"),
+            Either4::Second(item) => {
+                let received_at = Instant::now().as_millis() as u64;
+                if item.eligible_at_ms > received_at {
+                    crate::companion::usb::RADIO_TELEMETRY.lock(|t| {
+                        let mut tel = t.borrow_mut();
+                        tel.tx_deferred = tel.tx_deferred.saturating_add(1);
+                    });
                 }
-                // Return to the configured RX mode after transmission.
-                let _ = embassy_time::with_timeout(
-                    embassy_time::Duration::from_secs(1),
-                    lora.prepare_for_rx(rx_mode, &mdltn_params, &rx_pkt_params),
-                )
-                .await;
+                if schedule.push(item).is_err() {
+                    crate::companion::usb::RADIO_TELEMETRY.lock(|t| {
+                        let mut tel = t.borrow_mut();
+                        tel.tx_dropped = tel.tx_dropped.saturating_add(1);
+                    });
+                    error!("lora-phy: transmit schedule full");
+                }
             }
-            Either3::Third(cfg) => {
+            Either4::Third(cfg) => {
                 let requested = (
                     cfg.frequency_hz,
                     cfg.tx_power_dbm,
@@ -437,7 +580,7 @@ pub async fn lora_phy_task(
                                 current_cfg = requested;
                                 rx_backoff_ms = 50;
                                 match embassy_time::with_timeout(
-                                    embassy_time::Duration::from_secs(1),
+                                    Duration::from_secs(1),
                                     lora.prepare_for_rx(
                                         rx_mode,
                                         &mdltn_params,
@@ -467,7 +610,7 @@ pub async fn lora_phy_task(
                                 // The previous RX future was cancelled; restore it
                                 // rather than leaving the radio idle and erroring.
                                 let _ = embassy_time::with_timeout(
-                                    embassy_time::Duration::from_secs(1),
+                                    Duration::from_secs(1),
                                     lora.prepare_for_rx(
                                         rx_mode,
                                         &mdltn_params,
@@ -481,7 +624,7 @@ pub async fn lora_phy_task(
                     Err(e) => {
                         error!("lora-phy: reconfigure failed: {:?}", e);
                         let _ = embassy_time::with_timeout(
-                            embassy_time::Duration::from_secs(1),
+                            Duration::from_secs(1),
                             lora.prepare_for_rx(
                                 rx_mode,
                                 &mdltn_params,
@@ -491,6 +634,10 @@ pub async fn lora_phy_task(
                         .await;
                     }
                 }
+            }
+            Either4::Fourth(_) => {
+                // Timer fired: loop around and re-evaluate eligibility and the
+                // duty-cycle budget. RX remains armed.
             }
         }
     }

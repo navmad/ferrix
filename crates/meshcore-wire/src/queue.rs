@@ -60,9 +60,20 @@ impl SeenPacketFilter {
     }
 }
 
+/// An outbound packet with the timing metadata used by the transmit
+/// scheduler. `eligible_at_ms` is on the same monotonic millisecond clock as
+/// the radio task; `enqueued_at_ms` is used for wait-time telemetry.
+#[derive(Clone, Debug)]
+pub struct QueuedPacket {
+    pub packet: Packet,
+    pub eligible_at_ms: u64,
+    pub enqueued_at_ms: u64,
+    pub is_forward: bool,
+}
+
 /// Outbound Transmit FIFO Queue
 pub struct PacketQueue {
-    queue: Deque<Packet, OUTBOUND_QUEUE_SIZE>,
+    queue: Deque<QueuedPacket, OUTBOUND_QUEUE_SIZE>,
 }
 
 impl PacketQueue {
@@ -72,16 +83,43 @@ impl PacketQueue {
         }
     }
 
-    pub fn push(&mut self, pkt: Packet) -> Result<(), Packet> {
-        self.queue.push_back(pkt)
+    /// Queue a locally produced packet for immediate transmission.
+    pub fn push(&mut self, pkt: Packet, now_ms: u64) -> Result<(), QueuedPacket> {
+        self.push_at(pkt, now_ms, now_ms, false)
     }
 
-    pub fn pop(&mut self) -> Option<Packet> {
+    /// Queue a forwarded flood packet with deterministic spreading delay.
+    pub fn push_forward(
+        &mut self,
+        pkt: Packet,
+        now_ms: u64,
+        node_hash: &[u8],
+    ) -> Result<(), QueuedPacket> {
+        let delay = crate::tx::forward_delay_ms(&pkt.calculate_packet_hash(), node_hash);
+        self.push_at(pkt, now_ms.saturating_add(delay), now_ms, true)
+    }
+
+    pub fn push_at(
+        &mut self,
+        pkt: Packet,
+        eligible_at_ms: u64,
+        enqueued_at_ms: u64,
+        is_forward: bool,
+    ) -> Result<(), QueuedPacket> {
+        self.queue.push_back(QueuedPacket {
+            packet: pkt,
+            eligible_at_ms,
+            enqueued_at_ms,
+            is_forward,
+        })
+    }
+
+    pub fn pop(&mut self) -> Option<QueuedPacket> {
         self.queue.pop_front()
     }
 
     /// Peek at the next packet without removing it.
-    pub fn front(&self) -> Option<&Packet> {
+    pub fn front(&self) -> Option<&QueuedPacket> {
         self.queue.front()
     }
 
