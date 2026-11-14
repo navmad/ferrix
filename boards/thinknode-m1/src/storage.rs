@@ -44,14 +44,29 @@ pub fn load() {
 pub fn spawn_storage(
     spawner: embassy_executor::Spawner,
     sd: &'static nrf_softdevice::Softdevice,
+    qspi: ferrix_nrf52::qspi::QspiPins,
 ) {
-    let _ = spawner.spawn(storage_task(sd));
+    let _ = spawner.spawn(storage_task(sd, qspi));
 }
+
+static QSPI: static_cell::StaticCell<
+    embassy_nrf::qspi::Qspi<'static, embassy_nrf::peripherals::QSPI>,
+> = static_cell::StaticCell::new();
 
 /// Background storage task that serializes all flash writes.
 #[embassy_executor::task]
-pub async fn storage_task(sd: &'static nrf_softdevice::Softdevice) -> ! {
+pub async fn storage_task(
+    sd: &'static nrf_softdevice::Softdevice,
+    qspi_pins: ferrix_nrf52::qspi::QspiPins,
+) -> ! {
     let mut flash = ferrix_nrf52::flash::take(sd);
+
+    // The external flash is on a switched rail. Bring it up here rather than
+    // at boot, and let the self-test retry if the rail is still settling.
+    embassy_time::Timer::after_millis(10).await;
+    let qspi = QSPI.init(ferrix_nrf52::qspi::init(qspi_pins));
+    ferrix_nrf52::qspi::self_test(qspi).await;
+
     defmt::info!("Storage: Flash persistence task started");
     if storage_loop(&mut flash, &REGIONS).await == StorageExit::FactoryReset {
         ferrix_nrf52::reset::system_reset();

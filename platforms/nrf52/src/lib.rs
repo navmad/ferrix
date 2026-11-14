@@ -7,6 +7,7 @@
 
 pub mod ble;
 pub mod flash;
+pub mod qspi;
 pub mod reset;
 pub mod seed;
 pub mod usb;

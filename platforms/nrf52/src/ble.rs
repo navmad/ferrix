@@ -661,8 +661,9 @@ pub async fn ble_companion_supervisor_task(
     capabilities: u32,
     model_name: &'static str,
     host: &'static dyn CliHost,
+    qspi: crate::qspi::QspiPins,
     fault_handler: fn(u32) -> !,
-    storage_spawn: fn(embassy_executor::Spawner, &'static Softdevice),
+    storage_spawn: fn(embassy_executor::Spawner, &'static Softdevice, crate::qspi::QspiPins),
 ) {
     FAULT.store(fault_handler as *mut (), Ordering::Relaxed);
     // Wait 500ms so USB CDC-ACM and SX1262 LoRa tasks are completely booted
@@ -735,7 +736,7 @@ pub async fn ble_companion_supervisor_task(
                 ))
                 .is_ok()
         {
-            storage_spawn(spawner, sd);
+            storage_spawn(spawner, sd, qspi);
             info!("MeshCore BLE companion service successfully started!");
             BLE_STATUS.store(3, Ordering::Relaxed);
         } else {
@@ -754,8 +755,9 @@ pub fn init_ble_companion(
     capabilities: u32,
     model_name: &'static str,
     host: &'static dyn CliHost,
+    qspi: crate::qspi::QspiPins,
     fault_handler: fn(u32) -> !,
-    storage_spawn: fn(embassy_executor::Spawner, &'static Softdevice),
+    storage_spawn: fn(embassy_executor::Spawner, &'static Softdevice, crate::qspi::QspiPins),
 ) -> bool {
     spawner
         .spawn(ble_companion_supervisor_task(
@@ -766,6 +768,7 @@ pub fn init_ble_companion(
             capabilities,
             model_name,
             host,
+            qspi,
             fault_handler,
             storage_spawn,
         ))

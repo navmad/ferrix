@@ -1154,6 +1154,31 @@ pub async fn handle_text_cli<W: TextSink>(
             );
             let _ = sender.send( s.as_bytes()).await;
         }
+        "qspi" | "stats-qspi" => {
+            use core::sync::atomic::Ordering;
+            let status = crate::state::QSPI_STATUS.load(Ordering::Relaxed);
+            let id = crate::state::QSPI_ID.load(Ordering::Relaxed);
+            let test = crate::state::QSPI_SELFTEST.load(Ordering::Relaxed);
+            let status_s = match status {
+                0 => "not initialized",
+                1 => "ready",
+                2 => "id mismatch",
+                _ => "io error",
+            };
+            let test_s = match test {
+                0 => "not run",
+                1 => "pass",
+                2 => "fail",
+                _ => "?",
+            };
+            let mut s: heapless::String<160> = heapless::String::new();
+            let _ = write!(
+                s,
+                "  -> QSPI: {} id={:06x} selftest={}\r\n",
+                status_s, id, test_s
+            );
+            let _ = sender.send( s.as_bytes()).await;
+        }
         "stats-disc" => {
             let mut s: heapless::String<160> = heapless::String::new();
             let _ = write!(

@@ -174,6 +174,7 @@ pub struct BoardPins {
     pub saadc: peripherals::SAADC,
     pub bat_adc_pin: peripherals::P0_04,
     pub usbd: peripherals::USBD,
+    pub qspi: ferrix_nrf52::qspi::QspiPins,
 }
 
 /// Initialize the ThinkNode M1 pinout and peripherals.
@@ -248,6 +249,17 @@ pub fn init(p: embassy_nrf::Peripherals) -> BoardPins {
             red_led,
         };
 
+        // --- External QSPI Flash (MX25R1635F) ---
+        let qspi = ferrix_nrf52::qspi::QspiPins {
+            qspi: p.QSPI,
+            sck: p.P1_14,
+            csn: p.P1_15,
+            io0: p.P1_12,
+            io1: p.P1_13,
+            io2: p.P0_07,
+            io3: p.P0_05,
+        };
+
         BoardPins {
             lora,
             display: Some(display),
@@ -261,6 +273,7 @@ pub fn init(p: embassy_nrf::Peripherals) -> BoardPins {
             saadc: p.SAADC,
             bat_adc_pin: p.P0_04,
             usbd: p.USBD,
+            qspi,
         }
 }
 
