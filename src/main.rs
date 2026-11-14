@@ -236,8 +236,8 @@ async fn flush_tx_queue(mesh: &mut MeshEngine, lora: &mut LoraPhyChannelRadio) {
         if lora
             .transmit_at(
                 &buf[..len],
-                queued.eligible_at_ms,
-                queued.enqueued_at_ms,
+                queued.due_at_ms,
+                queued.queued_at_ms,
                 queued.is_forward,
             )
             .await

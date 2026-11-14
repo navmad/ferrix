@@ -1,5 +1,7 @@
 //! Generic LoRa Radio Subsystem & Transceiver Drivers
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
 pub mod commands;
 pub mod lora_phy;
 pub mod sx1262;
@@ -57,6 +59,57 @@ impl Default for LoraConfig {
     }
 }
 
+/// Flood-forward spreading overrides. Zero/zero means derive the delay from
+/// the packet's airtime at runtime.
+pub static TX_SPREAD_BASE_MS: AtomicU32 = AtomicU32::new(0);
+pub static TX_SPREAD_WINDOW_MS: AtomicU32 = AtomicU32::new(0);
+/// Effective values used by the last scheduled forward, for telemetry.
+pub static TX_SPREAD_LAST_BASE_MS: AtomicU32 = AtomicU32::new(0);
+pub static TX_SPREAD_LAST_WINDOW_MS: AtomicU32 = AtomicU32::new(0);
+
+/// Forwarding counters used to derive the spreading window on a live mesh.
+pub static FORWARD_SCHEDULED: AtomicU32 = AtomicU32::new(0);
+pub static FORWARD_SENT: AtomicU32 = AtomicU32::new(0);
+
+const DUP_BUCKETS: [AtomicU32; 6] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+
+/// Record how long after enqueueing a forward another copy was heard.
+pub fn record_duplicate_delta(ms: u64) {
+    let bucket = match ms {
+        0..=19 => 0,
+        20..=39 => 1,
+        40..=79 => 2,
+        80..=159 => 3,
+        160..=319 => 4,
+        _ => 5,
+    };
+    DUP_BUCKETS[bucket].fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn duplicate_deltas() -> [u32; 6] {
+    [
+        DUP_BUCKETS[0].load(Ordering::Relaxed),
+        DUP_BUCKETS[1].load(Ordering::Relaxed),
+        DUP_BUCKETS[2].load(Ordering::Relaxed),
+        DUP_BUCKETS[3].load(Ordering::Relaxed),
+        DUP_BUCKETS[4].load(Ordering::Relaxed),
+        DUP_BUCKETS[5].load(Ordering::Relaxed),
+    ]
+}
+
+pub fn clear_duplicate_deltas() {
+    for bucket in &DUP_BUCKETS {
+        bucket.store(0, Ordering::Relaxed);
+    }
+}
+
 /// Duty-cycle percentage implied by the airtime factor setting.
 pub fn tx_duty_pct(af_tenths: u8) -> i64 {
     1000 / (af_tenths as i64 + 10)
@@ -81,12 +134,12 @@ pub trait LoraRadio {
     async fn transmit(&mut self, payload: &[u8]) -> Result<(), Self::Error>;
 
     /// Queue a packet for the radio task to transmit no earlier than
-    /// `eligible_at_ms` (monotonic milliseconds).
+    /// `due_at_ms` (monotonic milliseconds).
     async fn transmit_at(
         &mut self,
         payload: &[u8],
-        eligible_at_ms: u64,
-        enqueued_at_ms: u64,
+        due_at_ms: u64,
+        queued_at_ms: u64,
         is_forward: bool,
     ) -> Result<(), Self::Error>;
 

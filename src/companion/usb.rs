@@ -445,7 +445,7 @@ pub struct RadioTelemetry {
     /// Longest wait from enqueue to transmission in milliseconds.
     pub tx_wait_max_ms: u32,
     /// Requests queued with a future eligibility time (jittered forwards).
-    pub tx_deferred: u32,
+    pub tx_delayed: u32,
     /// Radio-level retries after a failed transmission.
     pub tx_retries: u32,
     /// Requests dropped after exhausting retries or because a queue was full.
@@ -461,7 +461,7 @@ pub static RADIO_TELEMETRY: Mutex<SharedRawMutex, RefCell<RadioTelemetry>> = Mut
     tx_air_ms: 0,
     rx_air_ms: 0,
     tx_wait_max_ms: 0,
-    tx_deferred: 0,
+    tx_delayed: 0,
     tx_retries: 0,
     tx_dropped: 0,
 }));
@@ -1472,6 +1472,67 @@ async fn handle_text_cli<W: CliSink>(
             crate::storage::messages::queue_clear().await;
             let _ = sender.send( b"  -> OK (Messages cleared)\r\n").await;
         }
+        "get tx.spread" => {
+            use core::sync::atomic::Ordering::Relaxed;
+            let base = crate::radio::TX_SPREAD_BASE_MS.load(Relaxed);
+            let window = crate::radio::TX_SPREAD_WINDOW_MS.load(Relaxed);
+            let last_base = crate::radio::TX_SPREAD_LAST_BASE_MS.load(Relaxed);
+            let last_window = crate::radio::TX_SPREAD_LAST_WINDOW_MS.load(Relaxed);
+            let mut s: heapless::String<96> = heapless::String::new();
+            if base == 0 && window == 0 {
+                let _ = write!(s, "  -> auto (last {}/{})\r\n", last_base, last_window);
+            } else {
+                let _ = write!(s, "  -> {}/{} (last {}/{})\r\n", base, window, last_base, last_window);
+            }
+            let _ = sender.send(s.as_bytes()).await;
+        }
+        s if s.starts_with("set tx.spread ") => {
+            use core::sync::atomic::Ordering::Relaxed;
+            let mut parts = s[14..].split_whitespace();
+            let base = parts.next().and_then(|v| v.parse::<u32>().ok());
+            let window = parts.next().and_then(|v| v.parse::<u32>().ok());
+            match (base, window) {
+                (Some(base), Some(window)) if base <= 2000 && window <= 2000 => {
+                    crate::radio::TX_SPREAD_BASE_MS.store(base, Relaxed);
+                    crate::radio::TX_SPREAD_WINDOW_MS.store(window, Relaxed);
+                    let _ = sender.send(b"  -> OK\r\n").await;
+                }
+                _ => {
+                    let _ = sender
+                        .send(b"  -> Error, expected: set tx.spread <base_ms> <window_ms>\r\n")
+                        .await;
+                }
+            }
+        }
+        "stats-tx" => {
+            use core::sync::atomic::Ordering::Relaxed;
+            let base = crate::radio::TX_SPREAD_BASE_MS.load(Relaxed);
+            let window = crate::radio::TX_SPREAD_WINDOW_MS.load(Relaxed);
+            let last_base = crate::radio::TX_SPREAD_LAST_BASE_MS.load(Relaxed);
+            let last_window = crate::radio::TX_SPREAD_LAST_WINDOW_MS.load(Relaxed);
+            let scheduled = crate::radio::FORWARD_SCHEDULED.load(Relaxed);
+            let sent = crate::radio::FORWARD_SENT.load(Relaxed);
+            let d = crate::radio::duplicate_deltas();
+            let mut s: heapless::String<224> = heapless::String::new();
+            let _ = write!(
+                s,
+                "  -> spread {}/{} (auto={}), last {}/{}, forwards {} scheduled / {} sent\r\n  -> duplicate deltas <20:{} 20-40:{} 40-80:{} 80-160:{} 160-320:{} >320:{}\r\n",
+                base,
+                window,
+                if base == 0 && window == 0 { 1 } else { 0 },
+                last_base,
+                last_window,
+                scheduled,
+                sent,
+                d[0],
+                d[1],
+                d[2],
+                d[3],
+                d[4],
+                d[5]
+            );
+            let _ = sender.send(s.as_bytes()).await;
+        }
         "stats-radio" => {
             let (tx_ms, rx_ms, rssi, snr, wait_ms, deferred, retries, dropped, sent) =
                 RADIO_TELEMETRY.lock(|t| {
@@ -1482,7 +1543,7 @@ async fn handle_text_cli<W: CliSink>(
                         tel.last_rssi,
                         tel.last_snr,
                         tel.tx_wait_max_ms,
-                        tel.tx_deferred,
+                        tel.tx_delayed,
                         tel.tx_retries,
                         tel.tx_dropped,
                         tel.tx_beacons,
@@ -1491,7 +1552,7 @@ async fn handle_text_cli<W: CliSink>(
             let mut s: heapless::String<256> = heapless::String::new();
             let _ = write!(
                 s,
-                "  -> {{\"noise_floor\":-118,\"last_rssi\":{},\"last_snr\":{:.2},\"tx_air_secs\":{},\"rx_air_secs\":{},\"tx_sent\":{},\"tx_wait_max_ms\":{},\"tx_deferred\":{},\"tx_retries\":{},\"tx_dropped\":{}}}\r\n",
+                "  -> {{\"noise_floor\":-118,\"last_rssi\":{},\"last_snr\":{:.2},\"tx_air_secs\":{},\"rx_air_secs\":{},\"tx_sent\":{},\"tx_wait_max_ms\":{},\"tx_delayed\":{},\"tx_retries\":{},\"tx_dropped\":{}}}\r\n",
                 rssi,
                 snr as f32,
                 tx_ms / 1000,
@@ -1723,7 +1784,14 @@ async fn handle_text_cli<W: CliSink>(
                 tel.tx_air_ms = 0;
                 tel.rx_air_ms = 0;
                 tel.has_rx = false;
+                tel.tx_wait_max_ms = 0;
+                tel.tx_delayed = 0;
+                tel.tx_retries = 0;
+                tel.tx_dropped = 0;
             });
+            crate::radio::FORWARD_SCHEDULED.store(0, core::sync::atomic::Ordering::Relaxed);
+            crate::radio::FORWARD_SENT.store(0, core::sync::atomic::Ordering::Relaxed);
+            crate::radio::clear_duplicate_deltas();
             let _ = sender.send( b"  -> OK\r\n").await;
         }
         "advert" => {

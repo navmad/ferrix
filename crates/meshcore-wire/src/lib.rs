@@ -27,7 +27,7 @@ pub use packets::{
     GrpTextPacket, MultipartPacket, PathPacket, RawPacket, TracePacket, TxtMsgPacket,
 };
 pub use queue::{PacketQueue, QueuedPacket, SeenPacketFilter};
-pub use tx::{TxItem, TxScheduler};
+pub use tx::{PendingTx, PendingTxQueue};
 
 #[cfg(test)]
 mod tests {

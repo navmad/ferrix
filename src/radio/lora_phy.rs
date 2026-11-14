@@ -3,6 +3,8 @@
 //! Bridges the community-standard `lora-phy` crate into Ferrix
 //! using an asynchronous Embassy radio task and bounded IPC channels.
 
+use core::sync::atomic::Ordering;
+
 use defmt::{debug, error, info};
 use embassy_futures::select::{select4, Either4};
 use embassy_nrf::gpio::{Input, Output};
@@ -18,7 +20,7 @@ use lora_phy::iv::GenericSx126xInterfaceVariant;
 use lora_phy::mod_params::{Bandwidth, CodingRate, DutyCycleParams, RadioError, RxMode, SpreadingFactor};
 use lora_phy::sx126x::{Config as Sx126xConfig, Sx1262, Sx126x, TcxoCtrlVoltage};
 use lora_phy::LoRa;
-use meshcore_wire::tx::{TxItem, TxScheduler};
+use meshcore_wire::tx::{PendingTx, PendingTxQueue};
 
 use crate::radio::{LoraConfig, LoraRadio};
 
@@ -29,7 +31,7 @@ pub struct TxPacket {
 }
 
 pub static LORA_RX_CHANNEL: Channel<SharedRawMutex, (usize, i16, i8, [u8; 256]), 4> = Channel::new();
-pub static LORA_TX_CHANNEL: Channel<SharedRawMutex, TxItem<TxPacket>, 8> = Channel::new();
+pub static LORA_TX_CHANNEL: Channel<SharedRawMutex, PendingTx<TxPacket>, 8> = Channel::new();
 pub static LORA_CFG_CHANNEL: Channel<SharedRawMutex, LoraConfig, 4> = Channel::new();
 
 /// Ask the radio task to apply the current `RADIO_SETTINGS`.
@@ -168,8 +170,8 @@ impl LoraRadio for LoraPhyChannelRadio {
     async fn transmit_at(
         &mut self,
         payload: &[u8],
-        eligible_at_ms: u64,
-        enqueued_at_ms: u64,
+        due_at_ms: u64,
+        queued_at_ms: u64,
         is_forward: bool,
     ) -> Result<(), Self::Error> {
         if payload.is_empty() || payload.len() > 256 {
@@ -180,10 +182,10 @@ impl LoraRadio for LoraPhyChannelRadio {
             data: [0u8; 256],
         };
         pkt.data[..payload.len()].copy_from_slice(payload);
-        let item = TxItem {
+        let item = PendingTx {
             payload: pkt,
-            eligible_at_ms,
-            enqueued_at_ms,
+            due_at_ms,
+            queued_at_ms,
             is_forward,
             attempts: 0,
         };
@@ -309,7 +311,7 @@ pub async fn lora_phy_task(
     // yielding: the executor is cooperative, and a tight loop here starves the
     // main loop, USB and BLE tasks.
     let mut rx_backoff_ms = 50u64;
-    let mut schedule: TxScheduler<TxPacket, 8> = TxScheduler::new();
+    let mut schedule: PendingTxQueue<TxPacket, 8> = PendingTxQueue::new();
     let mut next_tx_allowed_ms: u64 = 0;
     let mut tx_budget_ms = crate::radio::tx_budget_max(airtime_factor());
     let mut tx_budget_last = Instant::now();
@@ -337,12 +339,12 @@ pub async fn lora_phy_task(
         // Transmit the earliest eligible request when the gap and budget allow.
         if now >= next_tx_allowed_ms {
             if let Some(index) = schedule.next_due_index(now) {
-                let (len, enqueued_at_ms, attempts) = schedule
+                let (len, queued_at_ms, attempts) = schedule
                     .get(index)
                     .map(|item| {
                         (
                             item.payload.len,
-                            item.enqueued_at_ms,
+                            item.queued_at_ms,
                             item.attempts,
                         )
                     })
@@ -359,7 +361,7 @@ pub async fn lora_phy_task(
                     info!(
                         "lora-phy: Transmitting {} bytes (queued {} ms ago)...",
                         item.payload.len,
-                        now.saturating_sub(item.enqueued_at_ms)
+                        now.saturating_sub(item.queued_at_ms)
                     );
                     // A TX that never sees DIO1 would otherwise wedge this task
                     // forever, leaving the node alive but unable to receive.
@@ -405,11 +407,14 @@ pub async fn lora_phy_task(
                         if duty_pct < 100 {
                             tx_budget_ms = (tx_budget_ms - airtime as i64).max(0);
                         }
+                        if item.is_forward {
+                            crate::radio::FORWARD_SENT.fetch_add(1, Ordering::Relaxed);
+                        }
                         crate::companion::usb::RADIO_TELEMETRY.lock(|t| {
                             let mut tel = t.borrow_mut();
                             tel.tx_beacons = tel.tx_beacons.saturating_add(1);
                             tel.tx_air_ms = tel.tx_air_ms.saturating_add(airtime);
-                            let wait = now.saturating_sub(enqueued_at_ms) as u32;
+                            let wait = now.saturating_sub(queued_at_ms) as u32;
                             tel.tx_wait_max_ms = tel.tx_wait_max_ms.max(wait);
                         });
                     } else {
@@ -424,7 +429,7 @@ pub async fn lora_phy_task(
                             let backoff = (50u64 << (attempts + 1)).min(500);
                             let mut retry = item;
                             retry.attempts = attempts + 1;
-                            retry.eligible_at_ms =
+                            retry.due_at_ms =
                                 Instant::now().as_millis() as u64 + backoff;
                             let _ = schedule.push(retry);
                         }
@@ -438,7 +443,7 @@ pub async fn lora_phy_task(
             }
         }
 
-        if let Some(deadline) = schedule.next_deadline(now) {
+        if let Some(deadline) = schedule.next_due_at(now) {
             wake_at = wake_at.min(deadline);
         }
         let wait_ms = wake_at.saturating_sub(now).clamp(1, 60_000) as u32;
@@ -523,10 +528,10 @@ pub async fn lora_phy_task(
             },
             Either4::Second(item) => {
                 let received_at = Instant::now().as_millis() as u64;
-                if item.eligible_at_ms > received_at {
+                if item.due_at_ms > received_at {
                     crate::companion::usb::RADIO_TELEMETRY.lock(|t| {
                         let mut tel = t.borrow_mut();
-                        tel.tx_deferred = tel.tx_deferred.saturating_add(1);
+                        tel.tx_delayed = tel.tx_delayed.saturating_add(1);
                     });
                 }
                 if schedule.push(item).is_err() {
