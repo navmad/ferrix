@@ -33,6 +33,102 @@ pub static RADIO_SETTINGS: Mutex<SharedRawMutex, RefCell<RadioSettings>> =
         airtime_factor_tenths: 90,
     }));
 
+/// Frequencies where off-grid client repeat is permitted.
+pub const OFFGRID_FREQ_RANGES: [(u32, u32); 3] = [
+    (433_000, 433_000),
+    (869_495, 869_495),
+    (918_000, 918_000),
+];
+
+pub fn is_offgrid_freq_khz(khz: u32) -> bool {
+    OFFGRID_FREQ_RANGES
+        .iter()
+        .any(|&(lo, hi)| khz >= lo && khz <= hi)
+}
+
+pub fn is_offgrid_freq_hz(hz: u32) -> bool {
+    is_offgrid_freq_khz(hz / 1000)
+}
+
+/// Off-grid active: client repeat set AND on an allowed frequency.
+pub fn offgrid_active() -> bool {
+    RADIO_SETTINGS.lock(|r| {
+        let s = r.borrow();
+        s.client_repeat && is_offgrid_freq_hz(s.frequency_hz)
+    })
+}
+
+/// Effective forwarding flag: a dedicated repeater role, or off-grid mode.
+pub fn forwarding_enabled() -> bool {
+    RADIO_SETTINGS.lock(|r| r.borrow().is_repeater) || offgrid_active()
+}
+
+/// Nearest allowed off-grid frequency to `freq_hz`, or None above 960 MHz.
+pub fn nearest_offgrid_freq_hz(freq_hz: u32) -> Option<u32> {
+    let khz = freq_hz / 1000;
+    if khz > 960_000 {
+        return None;
+    }
+    let mut best = None;
+    let mut best_dist = u32::MAX;
+    for (lo, hi) in OFFGRID_FREQ_RANGES {
+        let c = khz.clamp(lo, hi);
+        let dist = c.abs_diff(khz);
+        if dist < best_dist {
+            best_dist = dist;
+            best = Some(c * 1000);
+        }
+    }
+    best
+}
+
+pub struct OffgridChange {
+    pub changed: bool,
+    pub freq_changed: bool,
+    pub no_band: bool,
+}
+
+/// Toggle client-repeat/off-grid mode. Turning it on retunes to the nearest
+/// allowed band and remembers the previous frequency; turning it off restores
+/// that frequency.
+pub fn offgrid_set(on: bool) -> OffgridChange {
+    RADIO_SETTINGS.lock(|r| {
+        let mut s = r.borrow_mut();
+        if on {
+            if s.client_repeat && is_offgrid_freq_hz(s.frequency_hz) {
+                return OffgridChange { changed: false, freq_changed: false, no_band: false };
+            }
+            if is_offgrid_freq_hz(s.frequency_hz) {
+                s.client_repeat = true;
+                s.offgrid_home_freq = 0;
+                return OffgridChange { changed: true, freq_changed: false, no_band: false };
+            }
+            if let Some(hz) = nearest_offgrid_freq_hz(s.frequency_hz) {
+                s.offgrid_home_freq = s.frequency_hz;
+                s.frequency_hz = hz;
+                s.client_repeat = true;
+                return OffgridChange { changed: true, freq_changed: true, no_band: false };
+            }
+            OffgridChange { changed: false, freq_changed: false, no_band: true }
+        } else {
+            let was_set = s.client_repeat;
+            let home = if s.client_repeat && is_offgrid_freq_hz(s.frequency_hz) {
+                s.offgrid_home_freq
+            } else {
+                0
+            };
+            s.client_repeat = false;
+            s.offgrid_home_freq = 0;
+            if home != 0 {
+                s.frequency_hz = home;
+                OffgridChange { changed: true, freq_changed: true, no_band: false }
+            } else {
+                OffgridChange { changed: was_set, freq_changed: false, no_band: false }
+            }
+        }
+    })
+}
+
 pub static AUTOADD_SETTINGS: Mutex<SharedRawMutex, RefCell<AutoAddSettings>> =
     Mutex::new(RefCell::new(AutoAddSettings {
         manual_add_contacts: 0,

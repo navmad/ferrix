@@ -1,8 +1,7 @@
-//! Companion protocol: transport framing and command handling.
-//!
-//! Framing is platform-independent. Command handling migrates here next; it
-//! currently lives in the board crate while the storage and radio interfaces
-//! are still being inverted.
+//! Companion protocol: transport framing, contact encoding and command
+//! handling. Board services are reached through
+//! [`protocol::CompanionHost`].
 
 pub mod contacts;
+pub mod protocol;
 pub mod framing;

@@ -43,7 +43,7 @@ type SmallStyle = MonoTextStyle<'static, BinaryColor>;
 type TitleStyle = MonoTextStyle<'static, BinaryColor>;
 
 /// Render the active page onto the framebuffer.
-pub fn render_page(page: u8, node: &CompanionNode, fb: &mut EpdFrameBuffer) {
+pub fn render_page(page: u8, node: &CompanionNode<'_>, fb: &mut EpdFrameBuffer) {
     fb.clear();
 
     let small = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
@@ -91,7 +91,7 @@ fn draw_action_bar(page: u8, fb: &mut EpdFrameBuffer, small: SmallStyle) {
 }
 
 /// Top bar: node name on the left, clock + battery right-aligned.
-fn draw_top_bar(node: &CompanionNode, fb: &mut EpdFrameBuffer, small: SmallStyle, title: TitleStyle) {
+fn draw_top_bar(node: &CompanionNode<'_>, fb: &mut EpdFrameBuffer, small: SmallStyle, title: TitleStyle) {
     // Right block first so the name can be clipped to the remaining space.
     let mut right: String<20> = String::new();
     if node.epoch_time > 1_700_000_000 {
@@ -138,7 +138,7 @@ fn draw_page_dots(page: u8, fb: &mut EpdFrameBuffer) {
     }
 }
 
-fn render_messages(node: &CompanionNode, fb: &mut EpdFrameBuffer, small: SmallStyle) {
+fn render_messages(node: &CompanionNode<'_>, fb: &mut EpdFrameBuffer, small: SmallStyle) {
     let ble_connected =
         crate::companion::ble::BLE_CONNECTED.load(core::sync::atomic::Ordering::Relaxed);
     let ble_status = crate::companion::ble::BLE_STATUS.load(core::sync::atomic::Ordering::Relaxed);
@@ -178,7 +178,7 @@ fn render_messages(node: &CompanionNode, fb: &mut EpdFrameBuffer, small: SmallSt
     draw_centered(fb, buf.as_str(), CONTENT_Y + 90, small);
 }
 
-fn render_recent(node: &CompanionNode, fb: &mut EpdFrameBuffer, small: SmallStyle) {
+fn render_recent(node: &CompanionNode<'_>, fb: &mut EpdFrameBuffer, small: SmallStyle) {
     let mut recent: heapless::Vec<(u32, String<16>), 4> = heapless::Vec::new();
 
     crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| {
@@ -285,7 +285,7 @@ fn render_traffic(fb: &mut EpdFrameBuffer, small: SmallStyle) {
     draw_centered(fb, buf.as_str(), CONTENT_Y + 58, small);
 }
 
-fn render_gps(node: &CompanionNode, fb: &mut EpdFrameBuffer, small: SmallStyle) {
+fn render_gps(node: &CompanionNode<'_>, fb: &mut EpdFrameBuffer, small: SmallStyle) {
     let mut buf: String<32> = String::new();
 
     let power = crate::gps::gps_enabled();
@@ -439,6 +439,6 @@ fn draw_centered(fb: &mut EpdFrameBuffer, text: &str, y: i32, style: SmallStyle)
 }
 
 /// Backward compatibility helper for render_dashboard.
-pub fn render_dashboard(node: &CompanionNode, fb: &mut EpdFrameBuffer) {
+pub fn render_dashboard(node: &CompanionNode<'_>, fb: &mut EpdFrameBuffer) {
     render_page(node.current_page, node, fb);
 }

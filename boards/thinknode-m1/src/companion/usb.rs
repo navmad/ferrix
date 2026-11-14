@@ -15,17 +15,7 @@ use core::sync::atomic::Ordering;
 use defmt::{debug, info};
 use embassy_nrf::peripherals::USBD;
 use embassy_nrf::usb::Driver;
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::channel::Channel;
 
-/// Shared raw mutex type for cross-module synchronization.
-///
-/// The BLE GATT callback can run in a SoftDevice event context, so shared
-/// state must be protected against preemption. `CriticalSectionRawMutex` uses
-/// the nrf-softdevice critical-section implementation, which is nested-safe and
-/// only disables non-reserved interrupts for the short critical section. Keep
-/// cryptographic work outside these locks.
-type SharedRawMutex = CriticalSectionRawMutex;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, Sender, State};
 use embassy_usb::{Builder, Config, UsbDevice};
 use static_cell::StaticCell;
@@ -54,18 +44,7 @@ pub fn set_leds_disabled(disabled: bool) {
 
 /// Convert the internal integer kHz bandwidth to the precise Hz value used by
 /// the companion protocol and the SX1262 (62 -> 62.5 kHz, 7 -> 7.8 kHz, ...).
-pub fn bw_khz_to_hz(bw_khz: u32) -> u32 {
-    match bw_khz {
-        7 => 7_800,
-        10 => 10_400,
-        15 => 15_600,
-        20 => 20_800,
-        31 => 31_250,
-        41 => 41_670,
-        62 => 62_500,
-        other => other * 1000,
-    }
-}
+pub use ferrix_core::airtime::bw_khz_to_hz;
 
 /// Parse a frequency from the USB CLI. Accepts:
 /// - `910.525` (MHz, decimal)
@@ -174,161 +153,12 @@ fn format_bw(bw_khz: u32) -> heapless::String<16> {
 }
 
 /// Allowed client-repeat (off-grid) frequencies (kHz).
-pub const OFFGRID_FREQ_RANGES: [(u32, u32); 3] = [
-    (433_000, 433_000),
-    (869_495, 869_495),
-    (918_000, 918_000),
-];
+pub use ferrix_core::state::{
+    forwarding_enabled, is_offgrid_freq_hz, is_offgrid_freq_khz, nearest_offgrid_freq_hz,
+    offgrid_active, offgrid_set, OffgridChange, OFFGRID_FREQ_RANGES,
+};
 
-pub fn is_offgrid_freq_khz(khz: u32) -> bool {
-    OFFGRID_FREQ_RANGES
-        .iter()
-        .any(|&(lo, hi)| khz >= lo && khz <= hi)
-}
-
-pub fn is_offgrid_freq_hz(hz: u32) -> bool {
-    is_offgrid_freq_khz(hz / 1000)
-}
-
-/// Off-grid active: client repeat set AND on an allowed frequency.
-pub fn offgrid_active() -> bool {
-    RADIO_SETTINGS.lock(|r| {
-        let s = r.borrow();
-        s.client_repeat && is_offgrid_freq_hz(s.frequency_hz)
-    })
-}
-
-/// Effective forwarding flag: a dedicated repeater role, or off-grid mode.
-pub fn forwarding_enabled() -> bool {
-    RADIO_SETTINGS.lock(|r| r.borrow().is_repeater) || offgrid_active()
-}
-
-/// Nearest allowed off-grid frequency to `freq_hz`, or None above 960 MHz.
-pub fn nearest_offgrid_freq_hz(freq_hz: u32) -> Option<u32> {
-    let khz = freq_hz / 1000;
-    if khz > 960_000 {
-        return None;
-    }
-    let mut best = None;
-    let mut best_dist = u32::MAX;
-    for (lo, hi) in OFFGRID_FREQ_RANGES {
-        let c = khz.clamp(lo, hi);
-        let dist = c.abs_diff(khz);
-        if dist < best_dist {
-            best_dist = dist;
-            best = Some(c * 1000);
-        }
-    }
-    best
-}
-
-pub struct OffgridChange {
-    pub changed: bool,
-    pub freq_changed: bool,
-    pub no_band: bool,
-}
-
-/// Toggle client-repeat/off-grid mode. Turning it on
-/// retunes to the nearest allowed band and remembers the previous frequency;
-/// turning it off restores that frequency.
-pub fn offgrid_set(on: bool) -> OffgridChange {
-    RADIO_SETTINGS.lock(|r| {
-        let mut s = r.borrow_mut();
-        if on {
-            if s.client_repeat && is_offgrid_freq_hz(s.frequency_hz) {
-                return OffgridChange { changed: false, freq_changed: false, no_band: false };
-            }
-            if is_offgrid_freq_hz(s.frequency_hz) {
-                s.client_repeat = true;
-                s.offgrid_home_freq = 0;
-                return OffgridChange { changed: true, freq_changed: false, no_band: false };
-            }
-            if let Some(hz) = nearest_offgrid_freq_hz(s.frequency_hz) {
-                s.offgrid_home_freq = s.frequency_hz;
-                s.frequency_hz = hz;
-                s.client_repeat = true;
-                return OffgridChange { changed: true, freq_changed: true, no_band: false };
-            }
-            OffgridChange { changed: false, freq_changed: false, no_band: true }
-        } else {
-            let was_set = s.client_repeat;
-            let home = if s.client_repeat && is_offgrid_freq_hz(s.frequency_hz) {
-                s.offgrid_home_freq
-            } else {
-                0
-            };
-            s.client_repeat = false;
-            s.offgrid_home_freq = 0;
-            if home != 0 {
-                s.frequency_hz = home;
-                OffgridChange { changed: true, freq_changed: true, no_band: false }
-            } else {
-                OffgridChange { changed: was_set, freq_changed: false, no_band: false }
-            }
-        }
-    })
-}
-
-#[derive(Clone, Debug)]
-pub enum UsbCommand {
-    SetName(heapless::String<32>),
-    SetPrivateKey([u8; 64]),
-    SetTime(u64),
-    TriggerAdvert { flood: bool },
-    SetAdvertLatLon { lat: i32, lon: i32 },
-    SetAutoAddConfig { config: u8, max_hops: u8 },
-    SendGroupText {
-        channel_idx: u8,
-        timestamp: u32,
-        text: heapless::String<160>,
-    },
-    SendDirectText {
-        /// First six bytes of the destination public key.
-        dest_prefix: [u8; 6],
-        timestamp: u32,
-        txt_type: u8,
-        attempt: u8,
-        text: heapless::String<160>,
-    },
-    SendChannelData {
-        channel_idx: u8,
-        path_len: u8,
-        path: [u8; 64],
-        data_type: u16,
-        data: heapless::Vec<u8, 165>,
-    },
-    SendControlData {
-        data: heapless::Vec<u8, 183>,
-    },
-    SendRawData {
-        path_len: u8,
-        path: [u8; 64],
-        payload: heapless::Vec<u8, 184>,
-    },
-    SendRawPacket {
-        raw: heapless::Vec<u8, 255>,
-    },
-    SendTracePath {
-        tag: u32,
-        auth: u32,
-        flags: u8,
-        path_len: u8,
-        path: [u8; 64],
-    },
-    SetFrequency(u32),
-    SetRadio {
-        frequency_hz: u32,
-        bw_khz: u32,
-        sf: u8,
-        cr: u8,
-    },
-    SetTxPower(i8),
-    SetRepeat(bool),
-    SetSpreadingFactor(u8),
-    SetBandwidth(u32),
-    SetCodingRate(u8),
-    SetPathHashMode(u8),
-}
+pub use ferrix_core::command::{UsbCommand, USB_COMMAND_CHANNEL};
 
 #[inline]
 fn hex_to_nibble(b: u8) -> u8 {
@@ -351,8 +181,6 @@ fn hex_to_nibble_opt(b: u8) -> Option<u8> {
 }
 
 use embassy_nrf::usb::vbus_detect::SoftwareVbusDetect;
-
-pub static USB_COMMAND_CHANNEL: Channel<SharedRawMutex, UsbCommand, 4> = Channel::new();
 
 pub type UsbDriver = Driver<'static, USBD, &'static SoftwareVbusDetect>;
 
@@ -451,7 +279,7 @@ impl CliSink for CliBuffer<'_> {
 }
 
 /// Run one local CLI line and collect its reply for `PACKET_CLI_REPLY`.
-pub async fn cli_reply(line: &str, node: &mut CompanionNode, out: &mut heapless::String<512>) {
+pub async fn cli_reply(line: &str, node: &mut CompanionNode<'_>, out: &mut heapless::String<512>) {
     let mut sink = CliBuffer(out);
     handle_text_cli(&mut sink, line, node, false).await;
 }
@@ -459,7 +287,7 @@ pub async fn cli_reply(line: &str, node: &mut CompanionNode, out: &mut heapless:
 async fn handle_text_cli<W: CliSink>(
     sender: &mut W,
     cmd_line: &str,
-    node: &mut CompanionNode,
+    node: &mut CompanionNode<'_>,
     echo: bool,
 ) {
     let trimmed = cmd_line.trim();
@@ -1694,6 +1522,7 @@ pub async fn cdc_acm_task(
         CurrentBoard::CAPABILITIES,
         public_key,
         private_key,
+        &crate::companion::protocol::BOARD_HOST,
     );
 
     let mut frame_reader = UsbFrameReader::new();
@@ -1775,7 +1604,7 @@ pub async fn cdc_acm_task(
                                             stream_contacts_usb(&mut sender).await;
                                         } else {
                                             let mut responses = heapless::Vec::<heapless::Vec<u8, 200>, 10>::new();
-                                            node.handle_command(payload, |resp| {
+                                            crate::companion::protocol::handle_command(&mut node, payload, |resp| {
                                                 let mut v = heapless::Vec::new();
                                                 let _ = v.extend_from_slice(resp);
                                                 let _ = responses.push(v);

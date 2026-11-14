@@ -5,10 +5,7 @@ use core::sync::atomic::{AtomicU16, Ordering};
 /// Latest measured battery voltage. 0 means "not sampled / no battery".
 static BATTERY_MV: AtomicU16 = AtomicU16::new(0);
 
-/// A single Li-ion cell is protection-cut well above 2 V. Lower readings are
-/// ADC noise, a failed sample, or a board without a battery, and must not
-/// replace the last good value (which would briefly show 0%).
-pub const MIN_PLAUSIBLE_BATTERY_MV: u16 = 2000;
+pub use ferrix_core::battery::{millivolts_to_percentage, MIN_PLAUSIBLE_BATTERY_MV};
 
 pub fn set_battery_millivolts(mv: u16) {
     if mv >= MIN_PLAUSIBLE_BATTERY_MV {
@@ -32,18 +29,6 @@ pub fn battery_percentage() -> u8 {
 pub fn adc_raw_to_battery_millivolts(raw: u16) -> u16 {
     let mv = (raw as u32 * 7236) / 4096;
     mv.min(u16::MAX as u32) as u16
-}
-
-/// Convert raw battery ADC millivolts to an estimated percentage (3.2V to 4.2V LiPo curve)
-pub fn millivolts_to_percentage(mv: u16) -> u8 {
-    if mv >= 4200 {
-        100
-    } else if mv <= 3300 {
-        0
-    } else {
-        // Linear interpolation between 3.3V (0%) and 4.2V (100%)
-        (((mv - 3300) as u32 * 100) / (4200 - 3300)) as u8
-    }
 }
 
 #[cfg(test)]

@@ -8,3 +8,8 @@ meshcore-wire = { path = "../meshcore-wire" }
 heapless = { version = "0.8", features = ["defmt-03"] }
 embassy-sync = { version = "0.6", features = ["defmt"] }
 embassy-time = { version = "0.4", features = ["defmt"] }
+
+[dev-dependencies]
+# Host tests lock the shared state through embassy-sync; the embedded build
+# gets its critical-section implementation from the nRF SoftDevice.
+critical-section = { version = "1", features = ["std"] }

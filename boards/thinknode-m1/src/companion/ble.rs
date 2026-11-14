@@ -9,13 +9,9 @@ use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use core::task::Poll;
 
 use defmt::{debug, error, info};
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::channel::Channel;
 use embassy_sync::waitqueue::AtomicWaker;
 
-/// Shared raw mutex type — see usb.rs for documentation.
-type SharedRawMutex = CriticalSectionRawMutex;
-use heapless::{String, Vec};
+use heapless::Vec;
 use nrf_softdevice::ble::gatt_server;
 use nrf_softdevice::ble::peripheral;
 use nrf_softdevice::ble::security::{IoCapabilities, SecurityHandler};
@@ -53,7 +49,6 @@ pub struct MeshCoreGattServer {
 /// Responses are queued here and drained by `push_fut`, never notified from
 /// inside the GATT callback. Sized for a full contact sync burst
 /// (`GET_CONTACTS` emits at most: start + 32 contacts + end).
-pub static COMPANION_PUSH_CHANNEL: Channel<SharedRawMutex, Vec<u8, 256>, 40> = Channel::new();
 
 /// Largest companion command accepted over NUS.
 const CMD_MAX_LEN: usize = 247;
@@ -161,35 +156,7 @@ impl CmdRing {
 static BLE_CMD_RING: CmdRing = CmdRing::new();
 static BLE_CMD_WAKER: AtomicWaker = AtomicWaker::new();
 
-/// Contact operation deferred out of the command handler so contact storage
-/// never runs inside the BLE/SoftDevice path.
-pub enum ContactOperation {
-    AddOrUpdate {
-        pub_key: [u8; 32],
-        callsign: String<32>,
-        node_id: [u8; 4],
-        last_seen_epoch: u32,
-        latitude: i32,
-        longitude: i32,
-        flags: u8,
-        contact_type: u8,
-        out_path: [u8; 64],
-        out_path_len: u8,
-        last_advert_ts: u32,
-    },
-    /// Clear a contact's learned path.
-    ResetPath {
-        pub_key: [u8; 32],
-    },
-    Remove {
-        pub_key: [u8; 32],
-    },
-}
-
-/// Channel for deferring contact mutations outside the GATT callback's
-/// SoftDevice critical section. Capacity 4 is sufficient since contact
-/// operations are infrequent and the channel is drained promptly.
-pub static CONTACT_OP_CHANNEL: Channel<SharedRawMutex, ContactOperation, 4> = Channel::new();
+pub use ferrix_core::command::{ContactOperation, COMPANION_PUSH_CHANNEL, CONTACT_OP_CHANNEL};
 
 /// Applies deferred contact mutations away from the GATT callback and the
 /// main routing loop, in its own task/future state.
@@ -383,6 +350,7 @@ pub async fn ble_companion_task(
         CurrentBoard::CAPABILITIES,
         public_key,
         private_key,
+        &crate::companion::protocol::BOARD_HOST,
     );
 
     // Use fast advertising (20ms) for the first 30 seconds for discovery,
@@ -510,7 +478,7 @@ pub async fn ble_companion_task(
                     if cmd_buf[..len].first() == Some(&crate::companion::protocol::CMD_GET_CONTACTS) {
                         stream_contacts().await;
                     } else {
-                        node.handle_command(&cmd_buf[..len], |resp| {
+                        crate::companion::protocol::handle_command(&mut node, &cmd_buf[..len], |resp| {
                             let mut vec = Vec::<u8, 256>::new();
                             let copy_len = resp.len().min(247);
                             let _ = vec.extend_from_slice(&resp[..copy_len]);

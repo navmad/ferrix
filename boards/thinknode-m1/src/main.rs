@@ -347,6 +347,7 @@ async fn main(spawner: Spawner) {
         CurrentBoard::CAPABILITIES,
         pub_key,
         priv_key,
+        &crate::companion::protocol::BOARD_HOST,
     );
 
     // Initialize BLE Companion peripheral (Nordic UART Service)
