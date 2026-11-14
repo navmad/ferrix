@@ -23,7 +23,6 @@ use embedded_graphics::primitives::{Line, PrimitiveStyle, Rectangle};
 use embedded_graphics::text::Text;
 use heapless::String;
 
-use crate::boards::Board;
 use crate::companion::protocol::CompanionNode;
 use crate::display::epd::{EpdFrameBuffer, EPD_WIDTH};
 
@@ -111,7 +110,7 @@ fn draw_top_bar(node: &CompanionNode<'_>, fb: &mut EpdFrameBuffer, small: SmallS
         let _ = name.push(c);
     }
     if name.is_empty() {
-        let _ = name.push_str(crate::boards::CurrentBoard::NAME);
+        let _ = name.push_str(crate::board::NAME);
     }
     draw_text(fb, name.as_str(), 2, 14, title);
 }

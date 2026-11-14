@@ -1,11 +1,8 @@
 //! Generic LoRa Radio Subsystem & Transceiver Drivers
 
-pub mod commands;
 pub mod lora_phy;
-pub mod sx1262;
 
 pub use lora_phy::{lora_phy_task, LoraPhyChannelRadio};
-pub use sx1262::Sx1262;
 
 pub use ferrix_core::airtime::estimate_airtime_ms;
 pub use ferrix_core::scheduler::{tx_budget_max, tx_duty_pct};

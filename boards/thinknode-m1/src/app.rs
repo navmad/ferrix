@@ -8,8 +8,7 @@ use embassy_time::{Duration, Instant, Timer};
 use ferrix_core::companion::protocol::CompanionNode;
 use ferrix_runtime::app::AppBoard;
 
-use crate::boards::thinknode_m1::GpsPins;
-use crate::boards::{Board, CurrentBoard};
+use crate::board::GpsPins;
 use crate::display::{NodeDisplay, ThinkNodeDisplay};
 use crate::gps;
 
@@ -78,7 +77,7 @@ impl AppBoard for ThinkNodeApp {
     }
 
     fn has_battery_adc(&self) -> bool {
-        CurrentBoard::HAS_BATTERY_ADC
+        crate::board::HAS_BATTERY_ADC
     }
 
     fn gps_enabled(&self) -> bool {
@@ -143,7 +142,7 @@ impl AppBoard for ThinkNodeApp {
     }
 
     async fn sample_battery(&mut self) -> Option<u16> {
-        if !CurrentBoard::HAS_BATTERY_ADC {
+        if !crate::board::HAS_BATTERY_ADC {
             return None;
         }
         self.battery_adc.sample(&mut self.battery_buf).await;

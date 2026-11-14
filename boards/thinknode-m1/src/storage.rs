@@ -10,7 +10,6 @@ pub use ferrix_core::storage::{
     set_custom_priv_key, set_path_hash_mode, util, MappedFlash, MessageCommand, StorageRegions,
 };
 
-use crate::boards::{Board, CurrentBoard};
 use ferrix_runtime::storage::{storage_loop, StorageExit};
 use heapless::String;
 
@@ -28,7 +27,7 @@ pub fn init_config() -> (String<32>, Option<[u8; 64]>) {
     let len = (REGIONS.config.end - REGIONS.config.start) as usize;
     // SAFETY: the config page is memory-mapped flash.
     let page = unsafe { core::slice::from_raw_parts(REGIONS.config.start as *const u8, len) };
-    ferrix_core::storage::config::init_config(page, CurrentBoard::NAME)
+    ferrix_core::storage::config::init_config(page, crate::board::NAME)
 }
 
 /// Load the advert log into RAM. Called once at boot, before the tasks start.

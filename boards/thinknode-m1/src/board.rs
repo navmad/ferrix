@@ -11,8 +11,7 @@ use embassy_nrf::gpio::{Input, Level, Output, OutputDrive, Pull};
 use embassy_nrf::peripherals;
 use embassy_time::Timer;
 
-use crate::boards::Board;
-use crate::companion::protocol::{CAP_BLE, CAP_CLIENT, CAP_EPD, CAP_GPS};
+use ferrix_core::companion::protocol::{CAP_BLE, CAP_CLIENT, CAP_EPD, CAP_GPS};
 use crate::input::{InputDevice, InputEvent};
 
 /// Semtech SX1262 LoRa Radio Pin Configuration
@@ -123,6 +122,13 @@ pub struct TelemetryPins {
     pub red_led: Output<'static>,
 }
 
+/// Board metadata used by the application and transports.
+pub const NAME: &str = "ThinkNode M1";
+pub const HAS_DISPLAY: bool = true;
+pub const HAS_GPS: bool = true;
+pub const HAS_BATTERY_ADC: bool = true;
+pub const CAPABILITIES: u32 = CAP_CLIENT | CAP_GPS | CAP_EPD | CAP_BLE;
+
 /// Combined Board Peripherals struct for ThinkNode M1
 pub struct BoardPins {
     pub lora: LoraPins,
@@ -139,18 +145,8 @@ pub struct BoardPins {
     pub usbd: peripherals::USBD,
 }
 
-pub struct ThinkNodeM1;
-
-impl Board for ThinkNodeM1 {
-    const NAME: &'static str = "ThinkNode M1";
-    const HAS_DISPLAY: bool = true;
-    const HAS_GPS: bool = true;
-    const HAS_BATTERY_ADC: bool = true;
-    const CAPABILITIES: u32 = CAP_CLIENT | CAP_GPS | CAP_EPD | CAP_BLE;
-
-    type Pins = BoardPins;
-
-    fn init(p: embassy_nrf::Peripherals) -> Self::Pins {
+/// Initialize the ThinkNode M1 pinout and peripherals.
+pub fn init(p: embassy_nrf::Peripherals) -> BoardPins {
         // --- Peripheral Power Enable (P0.12) ---
         // Powers on EPD display, LoRa, GPS, and sensors
         let power_en = Output::new(p.P0_12, Level::High, OutputDrive::Standard);
@@ -235,8 +231,6 @@ impl Board for ThinkNodeM1 {
             bat_adc_pin: p.P0_04,
             usbd: p.USBD,
         }
-    }
 }
-
 
 pub use ferrix_nrf52::seed::hardware_seed;

@@ -2,7 +2,7 @@
 #![no_main]
 
 pub mod app;
-pub mod boards;
+pub mod board;
 pub mod companion;
 pub mod display;
 pub mod gps;
@@ -26,7 +26,6 @@ use embassy_time::Timer;
 use static_cell::StaticCell;
 
 use crate::app::{set_blue_led, ThinkNodeApp};
-use crate::boards::{Board, CurrentBoard};
 use crate::companion::protocol::CompanionNode;
 #[cfg(feature = "thinknode-m1")]
 use crate::display::{EpdFrameBuffer, NodeDisplay, Ssd1681, ThinkNodeDisplay};
@@ -140,7 +139,7 @@ async fn main(spawner: Spawner) {
     embassy_nrf::interrupt::TWISPI1.set_priority(Priority::P3);
     embassy_nrf::interrupt::SAADC.set_priority(Priority::P3);
 
-    let mut board = CurrentBoard::init(p);
+    let mut board = crate::board::init(p);
 
     // Keep the GPS module held in reset until the user enables it from the
     // dashboard. P1.02 is GPS_EN, P1.05 is the active-low reset.
@@ -163,7 +162,7 @@ async fn main(spawner: Spawner) {
     // Take one sample before the companion/display start so a freshly booted
     // device never reports 0 mV (and therefore 0%) to the app.
     let mut battery_buf = [0i16; 1];
-    if CurrentBoard::HAS_BATTERY_ADC {
+    if crate::board::HAS_BATTERY_ADC {
         battery_adc.sample(&mut battery_buf).await;
         let raw = battery_buf[0].max(0) as u16;
         crate::telemetry::set_battery_millivolts(
@@ -183,10 +182,10 @@ async fn main(spawner: Spawner) {
     let local_id = if let Some(key) = custom_key {
         LocalIdentity::from_private(node_name.as_str(), &key).unwrap_or_else(|| {
             info!("Stored private key is reserved or invalid; using hardware seed");
-            LocalIdentity::from_seed(node_name.as_str(), &crate::boards::hardware_seed())
+            LocalIdentity::from_seed(node_name.as_str(), &crate::board::hardware_seed())
         })
     } else {
-        LocalIdentity::from_seed(node_name.as_str(), &crate::boards::hardware_seed())
+        LocalIdentity::from_seed(node_name.as_str(), &crate::board::hardware_seed())
     };
     let pub_key = local_id.pub_key_bytes();
     let priv_key = local_id.private_key_bytes();
@@ -218,22 +217,22 @@ async fn main(spawner: Spawner) {
             cdc_class,
             pub_key,
             priv_key,
-            CurrentBoard::NAME,
-            CurrentBoard::CAPABILITIES,
+            crate::board::NAME,
+            crate::board::CAPABILITIES,
             &crate::companion::protocol::BOARD_HOST,
         ))
         .unwrap();
     spawner.spawn(crate::companion::ble::contact_task()).unwrap();
     spawner.spawn(crate::companion::protocol::delayed_push_task()).unwrap();
     spawner
-        .spawn(crate::boards::thinknode_m1::thinknode_input_task(board.inputs))
+        .spawn(crate::board::thinknode_input_task(board.inputs))
         .unwrap();
 
     // Initial node companion state
     let mut node = CompanionNode::new(
         node_name.as_str(),
-        CurrentBoard::NAME,
-        CurrentBoard::CAPABILITIES,
+        crate::board::NAME,
+        crate::board::CAPABILITIES,
         pub_key,
         priv_key,
         &crate::companion::protocol::BOARD_HOST,
@@ -244,8 +243,8 @@ async fn main(spawner: Spawner) {
         spawner,
         pub_key,
         priv_key,
-        CurrentBoard::NAME,
-        CurrentBoard::CAPABILITIES,
+        crate::board::NAME,
+        crate::board::CAPABILITIES,
         "MeshCore-M1",
         "ThinkNode M1",
         &crate::companion::protocol::BOARD_HOST,
@@ -255,7 +254,7 @@ async fn main(spawner: Spawner) {
 
     info!("====================================================");
     info!(" Ferrix Companion Firmware (ferrix) ");
-    info!(" Active Board: {} ", CurrentBoard::NAME);
+    info!(" Active Board: {} ", crate::board::NAME);
     info!(" Runtime: Embassy async no_std (nRF52840 Cortex-M4) ");
     info!("====================================================");
 
@@ -297,7 +296,7 @@ async fn main(spawner: Spawner) {
 
     // 2. Initialize Display via generic NodeDisplay trait
     #[cfg(feature = "thinknode-m1")]
-    let display = if CurrentBoard::HAS_DISPLAY {
+    let display = if crate::board::HAS_DISPLAY {
         if let Some(disp) = board.display {
             let mut spim1_config = spim::Config::default();
             spim1_config.frequency = spim::Frequency::M4;

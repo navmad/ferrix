@@ -27,19 +27,26 @@ boards/thinknode-m1/          <-- BOARD CRATE
 ├── Cargo.toml                 <-- binary: ferrix
 ├── memory.x                   <-- flash/RAM layout
 └── src/
-    ├── main.rs                <-- hardware init & board interface
+    ├── main.rs                <-- hardware init & startup
+    ├── board.rs               <-- pins, board metadata & init
     ├── app.rs                 <-- AppBoard: LED, display, GPS, battery
-    ├── radio/                 <-- SX1262 driver & LoRa task
-    ├── companion/             <-- USB CDC / BLE framing & protocol
+    ├── meshcore.rs            <-- engine context & wire re-exports
+    ├── radio/                 <-- SX1262/lora-phy driver
+    ├── companion/             <-- companion host binding
     ├── display/               <-- SSD1681 e-paper & dashboard
-    ├── gps/                   <-- L76K NMEA driver
-    └── telemetry/             <-- battery ADC
+    ├── storage.rs             <-- flash layout adapter
+    ├── gps.rs                 <-- GPS power state
+    ├── input.rs               <-- button-to-event mapper
+    └── telemetry.rs           <-- battery ADC
 
 crates/
 ├── meshcore-wire/             <-- pure MeshCore codecs
-├── ferrix-hal/                <-- hardware traits (extracted)
+├── ferrix-hal/                <-- hardware traits
 ├── ferrix-core/               <-- application, protocol and storage formats
 └── ferrix-runtime/            <-- application, radio and storage loops
+
+platforms/
+└── nrf52/                     <-- USB, BLE, reset, seed and flash access
 ```
 
 ### Adding a New Board
