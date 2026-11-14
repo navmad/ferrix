@@ -516,7 +516,8 @@ pub async fn ble_companion_task(
                             if COMPANION_PUSH_CHANNEL.try_send(vec).is_err() {
                                 debug!("BLE: response queue full, dropping response");
                             }
-                        });
+                        })
+                        .await;
                     }
                     embassy_futures::yield_now().await;
                 } else {

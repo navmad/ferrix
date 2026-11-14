@@ -8,7 +8,8 @@
 
 use crate::meshcore::identity::LocalIdentity;
 use crate::meshcore::packet::{
-    Packet, PAYLOAD_TYPE_ACK, PAYLOAD_TYPE_ADVERT, PAYLOAD_TYPE_ANON_REQ, PAYLOAD_TYPE_GRP_DATA,
+    Packet, PAYLOAD_TYPE_ACK, PAYLOAD_TYPE_ADVERT, PAYLOAD_TYPE_ANON_REQ,
+    PAYLOAD_TYPE_GRP_DATA, PAYLOAD_TYPE_MULTIPART,
     PAYLOAD_TYPE_GRP_TXT, PAYLOAD_TYPE_PATH, PAYLOAD_TYPE_REQ, PAYLOAD_TYPE_RESPONSE,
     PAYLOAD_TYPE_CONTROL, PAYLOAD_TYPE_TRACE, PAYLOAD_TYPE_TXT_MSG, ROUTE_TYPE_DIRECT,
     ROUTE_TYPE_FLOOD,
@@ -16,7 +17,7 @@ use crate::meshcore::packet::{
 use crate::meshcore::packets::advert::{ADV_TYPE_CHAT, ADV_TYPE_REPEATER};
 use crate::meshcore::packets::{
     AckPacket, AddressedPacket, AdvertPacket, AnonReqPacket, GrpDataPacket, GrpTextPacket,
-    PathPacket, TxtMsgPacket,
+    MultipartPacket, PathPacket, TxtMsgPacket,
 };
 use crate::meshcore::queue::{PacketQueue, SeenPacketFilter};
 
@@ -507,6 +508,20 @@ impl MeshEngine {
                                 arrival_path_len: pkt.path_len,
                                 arrival_path,
                             };
+                        }
+                    }
+                }
+                InboundAction::Unhandled
+            }
+            PAYLOAD_TYPE_MULTIPART => {
+                // v1.18 uses MULTIPART for batched ACKs: the first byte is
+                // (remaining << 4 | inner_type), followed by the inner payload.
+                // Only the ACK form exists today; feed it to the normal ACK
+                // path so delivery confirmations are not lost.
+                if let Ok(mp) = MultipartPacket::decode(&pkt.payload[..pkt.payload_len]) {
+                    if mp.inner_type == PAYLOAD_TYPE_ACK && mp.body.len() >= 4 {
+                        if let Ok(ack) = AckPacket::decode(&mp.body) {
+                            return InboundAction::ReceivedAck(ack);
                         }
                     }
                 }

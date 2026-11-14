@@ -61,3 +61,20 @@ impl MultipartPacket {
         Ok(pkt)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roundtrip() {
+        let body = [0x11, 0x22, 0x33, 0x44, 0x55];
+        let original = MultipartPacket::new(2, crate::packet::PAYLOAD_TYPE_ACK, &body).unwrap();
+        let mut buf = [0u8; 184];
+        let len = original.encode(&mut buf).unwrap();
+        let decoded = MultipartPacket::decode(&buf[..len]).unwrap();
+        assert_eq!(decoded, original);
+        assert_eq!(decoded.remaining, 2);
+        assert_eq!(decoded.inner_type, crate::packet::PAYLOAD_TYPE_ACK);
+    }
+}

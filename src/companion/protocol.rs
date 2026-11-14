@@ -702,6 +702,7 @@ pub const CMD_SET_DEFAULT_FLOOD_SCOPE: u8 = 0x3F;
 pub const CMD_GET_DEFAULT_FLOOD_SCOPE: u8 = 0x40;
 pub const CMD_SEND_RAW_PACKET: u8 = 0x41;
 pub const CMD_SEND_RAW_DATA: u8 = 0x19;
+pub const CMD_RUN_CLI_COMMAND: u8 = 0x42;
 
 pub const RESP_CODE_OK: u8 = 0;
 pub const RESP_CODE_ERR: u8 = 1;
@@ -758,6 +759,8 @@ pub const PUSH_CODE_PATH_DISCOVERY_RESP: u8 = 0x8D;
 pub const PUSH_CODE_CONTROL_DATA: u8 = 0x8E;
 /// Inbound channel datagram frame (same value as the reference packet code).
 pub const PACKET_CHANNEL_DATA_RECV: u8 = 0x1B;
+/// Local CLI reply for `CMD_RUN_CLI_COMMAND`.
+pub const PACKET_CLI_REPLY: u8 = 0x1D;
 pub const PUSH_CODE_CONTACT_DELETED: u8 = 0x8F;
 pub const PUSH_CODE_CONTACTS_FULL: u8 = 0x90;
 
@@ -934,7 +937,7 @@ impl CompanionNode {
 
     /// Process an inbound frame payload from the companion app
     /// and generate corresponding response frames via the `emit` callback.
-    pub fn handle_command<F: FnMut(&[u8])>(&mut self, payload: &[u8], mut emit: F) {
+    pub async fn handle_command<F: FnMut(&[u8])>(&mut self, payload: &[u8], mut emit: F) {
         if payload.is_empty() {
             return;
         }
@@ -2461,6 +2464,22 @@ impl CompanionNode {
                 }
                 let mut resp = Vec::<u8, 4>::new();
                 let _ = resp.push(if ok { RESP_CODE_OK } else { RESP_CODE_ERR });
+                emit(&resp);
+            }
+
+            CMD_RUN_CLI_COMMAND => {
+                // [0x42][CLI line...] -> [0x1D][text...]
+                // Runs the same local CLI as the USB text sideband.
+                let line = core::str::from_utf8(&payload[1..])
+                    .unwrap_or("")
+                    .trim_end_matches('\0');
+                let mut out = heapless::String::<512>::new();
+                crate::companion::usb::cli_reply(line, self, &mut out).await;
+                let mut resp = Vec::<u8, { crate::companion::framing::MAX_FRAME_PAYLOAD_SIZE }>::new();
+                let _ = resp.push(PACKET_CLI_REPLY);
+                let bytes = out.as_bytes();
+                let max = crate::companion::framing::MAX_FRAME_PAYLOAD_SIZE - 1;
+                let _ = resp.extend_from_slice(&bytes[..bytes.len().min(max)]);
                 emit(&resp);
             }
 

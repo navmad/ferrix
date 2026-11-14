@@ -606,26 +606,64 @@ async fn write_all(sender: &mut Sender<'static, UsbDriver>, mut data: &[u8]) -> 
 }
 
 /// Handle a text command line from `meshcore-cli -r`
-async fn handle_text_cli(
-    sender: &mut Sender<'static, UsbDriver>,
+/// Output sink for the text CLI.
+///
+/// The USB CLI writes to the CDC endpoint; `CMD_RUN_CLI_COMMAND` collects the
+/// exact same output into a buffer for `PACKET_CLI_REPLY`, so both paths share
+/// one command implementation.
+trait CliSink {
+    async fn send(&mut self, data: &[u8]) -> Result<(), ()>;
+}
+
+impl CliSink for Sender<'static, UsbDriver> {
+    async fn send(&mut self, mut data: &[u8]) -> Result<(), ()> {
+        while !data.is_empty() {
+            let chunk = data.len().min(64);
+            self.write_packet(&data[..chunk]).await.map_err(|_| ())?;
+            data = &data[chunk..];
+        }
+        Ok(())
+    }
+}
+
+struct CliBuffer<'a>(&'a mut heapless::String<512>);
+
+impl CliSink for CliBuffer<'_> {
+    async fn send(&mut self, data: &[u8]) -> Result<(), ()> {
+        let text = core::str::from_utf8(data).map_err(|_| ())?;
+        self.0.push_str(text).map_err(|_| ())
+    }
+}
+
+/// Run one local CLI line and collect its reply for `PACKET_CLI_REPLY`.
+pub async fn cli_reply(line: &str, node: &mut CompanionNode, out: &mut heapless::String<512>) {
+    let mut sink = CliBuffer(out);
+    handle_text_cli(&mut sink, line, node, false).await;
+}
+
+async fn handle_text_cli<W: CliSink>(
+    sender: &mut W,
     cmd_line: &str,
     node: &mut CompanionNode,
+    echo: bool,
 ) {
     let trimmed = cmd_line.trim();
     if trimmed.is_empty() {
         return;
     }
 
-    // Echo the command line back to the host terminal
-    let _ = write_all(sender, cmd_line.as_bytes()).await;
-    let _ = write_all(sender, b"\r\n").await;
+    // Echo the command line back to the host terminal (interactive CLI only).
+    if echo {
+        let _ = sender.send(cmd_line.as_bytes()).await;
+        let _ = sender.send(b"\r\n").await;
+    }
 
     match trimmed {
         "get name" | "name" => {
             let mut s: heapless::String<64> = heapless::String::new();
             let callsign = crate::storage::get_callsign();
             let _ = write!(s, "  -> > {}\r\n", callsign.as_str());
-            let _ = write_all(sender, s.as_bytes()).await;
+            let _ = sender.send( s.as_bytes()).await;
         }
         "get public.key" | "get public_key" | "public.key" | "get pubkey" => {
             let mut s: heapless::String<128> = heapless::String::new();
@@ -634,7 +672,7 @@ async fn handle_text_cli(
                 let _ = write!(s, "{:02x}", b);
             }
             let _ = write!(s, "\r\n");
-            let _ = write_all(sender, s.as_bytes()).await;
+            let _ = sender.send( s.as_bytes()).await;
         }
         "get prv.key" | "get private_key" | "prv.key" => {
             let mut s: heapless::String<256> = heapless::String::new();
@@ -643,7 +681,7 @@ async fn handle_text_cli(
                 let _ = write!(s, "{:02x}", b);
             }
             let _ = write!(s, "\r\n");
-            let _ = write_all(sender, s.as_bytes()).await;
+            let _ = sender.send( s.as_bytes()).await;
         }
         s if s.starts_with("set prv.key ") => {
             let hex_str = s[12..].trim();
@@ -667,10 +705,10 @@ async fn handle_text_cli(
                         crate::storage::set_custom_priv_key(key);
                         info!("Node expanded private & public key updated via CLI");
                         let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetPrivateKey(key));
-                        let _ = write_all(sender, b"  -> OK\r\n").await;
+                        let _ = sender.send( b"  -> OK\r\n").await;
                     }
                     None => {
-                        let _ = write_all(sender, b"  -> Error, reserved public key\r\n").await;
+                        let _ = sender.send( b"  -> Error, reserved public key\r\n").await;
                     }
                 }
             } else if valid_hex && hex_str.len() == 64 {
@@ -692,13 +730,13 @@ async fn handle_text_cli(
                 crate::storage::set_custom_priv_key(key);
                 info!("Node seed imported and expanded; public key updated via CLI");
                 let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetPrivateKey(key));
-                let _ = write_all(sender, b"  -> OK\r\n").await;
+                let _ = sender.send( b"  -> OK\r\n").await;
             } else {
-                let _ = write_all(sender, b"  -> Error, expected 64 or 128 hex chars\r\n").await;
+                let _ = sender.send( b"  -> Error, expected 64 or 128 hex chars\r\n").await;
             }
         }
         "set name" => {
-            let _ = write_all(sender, b"  -> Error, bad chars\r\n").await;
+            let _ = sender.send( b"  -> Error, bad chars\r\n").await;
         }
         s if s.starts_with("set name ") || s.starts_with("name ") => {
             let new_name = if let Some(rest) = s.strip_prefix("set name ") {
@@ -729,24 +767,24 @@ async fn handle_text_cli(
                 let _ = node.callsign.push_str(new_name);
                 info!("Node callsign updated to: {}", new_name);
                 let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetName(node.callsign.clone()));
-                let _ = write_all(sender, b"  -> OK\r\n").await;
+                let _ = sender.send( b"  -> OK\r\n").await;
             } else {
-                let _ = write_all(sender, b"  -> Error, bad chars\r\n").await;
+                let _ = sender.send( b"  -> Error, bad chars\r\n").await;
             }
         }
         "ver" => {
-            let _ = write_all(sender, b"  -> 0.1.0-ferrix\r\n").await;
+            let _ = sender.send( b"  -> 0.1.0-ferrix\r\n").await;
         }
         "board" => {
             let mut s: heapless::String<64> = heapless::String::new();
             let _ = write!(s, "  -> {} (nRF52840, SX1262 LoRa)\r\n", CurrentBoard::NAME);
-            let _ = write_all(sender, s.as_bytes()).await;
+            let _ = sender.send( s.as_bytes()).await;
         }
         "get freq" => {
             let f = RADIO_SETTINGS.lock(|r| r.borrow().frequency_hz);
             let mut s: heapless::String<48> = heapless::String::new();
             let _ = write!(s, "> {:.3}\r\n", f as f32 / 1_000_000.0);
-            let _ = write_all(sender, s.as_bytes()).await;
+            let _ = sender.send( s.as_bytes()).await;
         }
         "get radio" | "radio" => {
             let (f, sf, bw, cr) = RADIO_SETTINGS.lock(|r| {
@@ -756,7 +794,7 @@ async fn handle_text_cli(
             let mut s: heapless::String<64> = heapless::String::new();
             let bw_str = format_bw(bw);
             let _ = write!(s, "> {:.3},{},{},{}\r\n", f as f32 / 1_000_000.0, bw_str.as_str(), sf, cr);
-            let _ = write_all(sender, s.as_bytes()).await;
+            let _ = sender.send( s.as_bytes()).await;
         }
         s if s == "set radio" || s.starts_with("set radio ") => {
             let arg = s["set radio".len()..].trim();
@@ -816,11 +854,10 @@ async fn handle_text_cli(
                         sf,
                         cr
                     );
-                    let _ = write_all(sender, resp.as_bytes()).await;
+                    let _ = sender.send( resp.as_bytes()).await;
                 }
                 _ => {
-                    let _ = write_all(
-                        sender,
+                    let _ = sender.send(
                         b"Error: freq 150-960, bw 7-500, sf 5-12, cr 5-8, or default\r\n",
                     )
                     .await;
@@ -839,19 +876,19 @@ async fn handle_text_cli(
                     let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetFrequency(f));
                     let mut s: heapless::String<64> = heapless::String::new();
                     let _ = write!(s, "OK - {:.3}\r\n", f as f32 / 1_000_000.0);
-                    let _ = write_all(sender, s.as_bytes()).await;
+                    let _ = sender.send( s.as_bytes()).await;
                 } else {
-                    let _ = write_all(sender, b"Error: frequency out of range (150-960 MHz)\r\n").await;
+                    let _ = sender.send( b"Error: frequency out of range (150-960 MHz)\r\n").await;
                 }
             } else {
-                let _ = write_all(sender, b"Error: invalid frequency format\r\n").await;
+                let _ = sender.send( b"Error: invalid frequency format\r\n").await;
             }
         }
         "get tx" => {
             let tx = RADIO_SETTINGS.lock(|r| r.borrow().tx_power_dbm);
             let mut s: heapless::String<32> = heapless::String::new();
             let _ = write!(s, "> {}\r\n", tx);
-            let _ = write_all(sender, s.as_bytes()).await;
+            let _ = sender.send( s.as_bytes()).await;
         }
         s if s.starts_with("set tx ") => {
             if let Ok(tx) = s[7..].trim().parse::<i8>() {
@@ -863,19 +900,19 @@ async fn handle_text_cli(
                     let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetTxPower(tx));
                     let mut s: heapless::String<32> = heapless::String::new();
                     let _ = write!(s, "OK - tx power={} dBm\r\n", tx);
-                    let _ = write_all(sender, s.as_bytes()).await;
+                    let _ = sender.send( s.as_bytes()).await;
                 } else {
-                    let _ = write_all(sender, b"Error: TX power must be between -9 and 22 dBm\r\n").await;
+                    let _ = sender.send( b"Error: TX power must be between -9 and 22 dBm\r\n").await;
                 }
             } else {
-                let _ = write_all(sender, b"Error: invalid TX power number\r\n").await;
+                let _ = sender.send( b"Error: invalid TX power number\r\n").await;
             }
         }
         "get sf" => {
             let sf = RADIO_SETTINGS.lock(|r| r.borrow().sf);
             let mut s: heapless::String<32> = heapless::String::new();
             let _ = write!(s, "> {}\r\n", sf);
-            let _ = write_all(sender, s.as_bytes()).await;
+            let _ = sender.send( s.as_bytes()).await;
         }
         s if s.starts_with("set sf ") => {
             let val = s[7..].trim().trim_start_matches("sf").trim_start_matches("SF");
@@ -888,12 +925,12 @@ async fn handle_text_cli(
                     let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetSpreadingFactor(sf));
                     let mut s: heapless::String<32> = heapless::String::new();
                     let _ = write!(s, "OK - {}\r\n", sf);
-                    let _ = write_all(sender, s.as_bytes()).await;
+                    let _ = sender.send( s.as_bytes()).await;
                 } else {
-                    let _ = write_all(sender, b"Error: SF must be between 5 and 12\r\n").await;
+                    let _ = sender.send( b"Error: SF must be between 5 and 12\r\n").await;
                 }
             } else {
-                let _ = write_all(sender, b"Error: invalid SF\r\n").await;
+                let _ = sender.send( b"Error: invalid SF\r\n").await;
             }
         }
         "get bw" => {
@@ -901,7 +938,7 @@ async fn handle_text_cli(
             let mut s: heapless::String<32> = heapless::String::new();
             let bw_str = format_bw(bw);
             let _ = write!(s, "> {}\r\n", bw_str.as_str());
-            let _ = write_all(sender, s.as_bytes()).await;
+            let _ = sender.send( s.as_bytes()).await;
         }
         s if s.starts_with("set bw ") => {
             let val = s[7..].trim();
@@ -914,16 +951,16 @@ async fn handle_text_cli(
                 let mut s: heapless::String<32> = heapless::String::new();
                 let bw_str = format_bw(bw);
                 let _ = write!(s, "OK - {}\r\n", bw_str.as_str());
-                let _ = write_all(sender, s.as_bytes()).await;
+                let _ = sender.send( s.as_bytes()).await;
             } else {
-                let _ = write_all(sender, b"Error: supported BW are 7.8, 10.4, 15.6, 20.8, 31.25, 41.67, 62.5, 125, 250, 500 kHz (or Hz)\r\n").await;
+                let _ = sender.send( b"Error: supported BW are 7.8, 10.4, 15.6, 20.8, 31.25, 41.67, 62.5, 125, 250, 500 kHz (or Hz)\r\n").await;
             }
         }
         "get cr" => {
             let cr = RADIO_SETTINGS.lock(|r| r.borrow().cr);
             let mut s: heapless::String<32> = heapless::String::new();
             let _ = write!(s, "> {}\r\n", cr);
-            let _ = write_all(sender, s.as_bytes()).await;
+            let _ = sender.send( s.as_bytes()).await;
         }
         s if s.starts_with("set cr ") => {
             let val = s[7..].trim();
@@ -935,16 +972,16 @@ async fn handle_text_cli(
                 let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetCodingRate(cr));
                 let mut s: heapless::String<32> = heapless::String::new();
                 let _ = write!(s, "OK - 4/{}\r\n", cr);
-                let _ = write_all(sender, s.as_bytes()).await;
+                let _ = sender.send( s.as_bytes()).await;
             } else {
-                let _ = write_all(sender, b"Error: supported CR values are 4/5, 4/6, 4/7, 4/8\r\n").await;
+                let _ = sender.send( b"Error: supported CR values are 4/5, 4/6, 4/7, 4/8\r\n").await;
             }
         }
         "get path.hash.mode" | "get hash-mode" | "get hash-size" => {
             let mode = RADIO_SETTINGS.lock(|r| r.borrow().path_hash_mode);
             let mut resp = heapless::String::<64>::new();
             let _ = write!(resp, "> {}\r\n", mode);
-            let _ = write_all(sender, resp.as_bytes()).await;
+            let _ = sender.send( resp.as_bytes()).await;
         }
         s if s.starts_with("set path.hash.mode ") || s.starts_with("set hash-mode ") => {
             let val_str = s.split_whitespace().last().unwrap_or("");
@@ -957,12 +994,12 @@ async fn handle_text_cli(
                     let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetPathHashMode(mode));
                     let mut resp = heapless::String::<64>::new();
                     let _ = write!(resp, "OK\r\n");
-                    let _ = write_all(sender, resp.as_bytes()).await;
+                    let _ = sender.send( resp.as_bytes()).await;
                 } else {
-                    let _ = write_all(sender, b"Error: path.hash.mode must be 0, 1 or 2\r\n").await;
+                    let _ = sender.send( b"Error: path.hash.mode must be 0, 1 or 2\r\n").await;
                 }
             } else {
-                let _ = write_all(sender, b"  -> Error: invalid number\r\n").await;
+                let _ = sender.send( b"  -> Error: invalid number\r\n").await;
             }
         }
         s if s.starts_with("set hash-size ") => {
@@ -977,12 +1014,12 @@ async fn handle_text_cli(
                     let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetPathHashMode(mode));
                     let mut resp = heapless::String::<64>::new();
                     let _ = write!(resp, "OK\r\n");
-                    let _ = write_all(sender, resp.as_bytes()).await;
+                    let _ = sender.send( resp.as_bytes()).await;
                 } else {
-                    let _ = write_all(sender, b"Error: hash-size must be 1, 2 or 3 bytes\r\n").await;
+                    let _ = sender.send( b"Error: hash-size must be 1, 2 or 3 bytes\r\n").await;
                 }
             } else {
-                let _ = write_all(sender, b"  -> Error: invalid number\r\n").await;
+                let _ = sender.send( b"  -> Error: invalid number\r\n").await;
             }
         }
         "get repeat" => {
@@ -990,25 +1027,24 @@ async fn handle_text_cli(
             let on = crate::companion::usb::offgrid_active();
             let mut s: heapless::String<16> = heapless::String::new();
             let _ = write!(s, "> {}\r\n", if on { "on" } else { "off" });
-            let _ = write_all(sender, s.as_bytes()).await;
+            let _ = sender.send( s.as_bytes()).await;
         }
         "get role" => {
             let is_rep = RADIO_SETTINGS.lock(|r| r.borrow().is_repeater);
             let mut s: heapless::String<16> = heapless::String::new();
             let _ = write!(s, "> {}\r\n", if is_rep { "on" } else { "off" });
-            let _ = write_all(sender, s.as_bytes()).await;
+            let _ = sender.send( s.as_bytes()).await;
         }
         s if s.starts_with("set repeat ") => {
             let val = s[11..].trim();
             let on = matches!(val, "on" | "1" | "true");
             let off = matches!(val, "off" | "0" | "false");
             if !on && !off {
-                let _ = write_all(sender, b"Error: must be on or off\r\n").await;
+                let _ = sender.send( b"Error: must be on or off\r\n").await;
             } else {
                 let change = crate::companion::usb::offgrid_set(on);
                 if change.no_band {
-                    let _ = write_all(
-                        sender,
+                    let _ = sender.send(
                         b"Error: no off-grid frequency in this band\r\n",
                     )
                     .await;
@@ -1027,7 +1063,7 @@ async fn handle_text_cli(
                     } else {
                         b"OK - repeat is now OFF\r\n"
                     };
-                    let _ = write_all(sender, msg).await;
+                    let _ = sender.send( msg).await;
                 }
             }
         }
@@ -1043,12 +1079,12 @@ async fn handle_text_cli(
             ));
             let mut s: heapless::String<32> = heapless::String::new();
             let _ = write!(s, "OK - role={}\r\n", if is_rep { "repeater" } else { "client" });
-            let _ = write_all(sender, s.as_bytes()).await;
+            let _ = sender.send( s.as_bytes()).await;
         }
         s if s.starts_with("send ") => {
             let msg = s[5..].trim();
             if msg.is_empty() {
-                let _ = write_all(sender, b"  -> Error: message cannot be empty\r\n").await;
+                let _ = sender.send( b"  -> Error: message cannot be empty\r\n").await;
             } else {
                 let mut s_msg = heapless::String::<160>::new();
                 let _ = s_msg.push_str(msg);
@@ -1061,7 +1097,7 @@ async fn handle_text_cli(
                     let mut tel = t.borrow_mut();
                     tel.tx_beacons = tel.tx_beacons.saturating_add(1);
                 });
-                let _ = write_all(sender, b"  -> OK (Group message broadcast queued)\r\n").await;
+                let _ = sender.send( b"  -> OK (Group message broadcast queued)\r\n").await;
             }
         }
         s if s.starts_with("msg ") => {
@@ -1117,42 +1153,40 @@ async fn handle_text_cli(
                                         "  -> OK (Direct message queued to {})\r\n",
                                         hex_str
                                     );
-                                    let _ = write_all(sender, out_str.as_bytes()).await;
+                                    let _ = sender.send( out_str.as_bytes()).await;
                                 } else {
-                                    let _ = write_all(
-                                        sender,
+                                    let _ = sender.send(
                                         b"  -> Error: message exceeds 160 bytes\r\n",
                                     )
                                     .await;
                                 }
                             }
                             None => {
-                                let _ = write_all(
-                                    sender,
+                                let _ = sender.send(
                                     b"  -> Error: no contact with that 4-byte hash\r\n",
                                 )
                                 .await;
                             }
                         }
                     } else {
-                        let _ = write_all(sender, b"  -> Error: invalid hex ID or empty text\r\n").await;
+                        let _ = sender.send( b"  -> Error: invalid hex ID or empty text\r\n").await;
                     }
                 } else {
-                    let _ = write_all(sender, b"  -> Error: target ID must be 8 hex characters (4 bytes)\r\n").await;
+                    let _ = sender.send( b"  -> Error: target ID must be 8 hex characters (4 bytes)\r\n").await;
                 }
             } else {
-                let _ = write_all(sender, b"  -> Usage: msg <8-hex-id> <message>\r\n").await;
+                let _ = sender.send( b"  -> Usage: msg <8-hex-id> <message>\r\n").await;
             }
         }
         "contacts" | "get contacts" => {
             let count = DISCOVERED_CONTACTS.lock(|c| c.borrow().len());
             if count == 0 {
-                let _ = write_all(sender, b"  -> No contacts discovered yet (listening for adverts...)\r\n").await;
+                let _ = sender.send( b"  -> No contacts discovered yet (listening for adverts...)\r\n").await;
             } else {
                 let mut hdr = heapless::String::<64>::new();
                 let _ = write!(hdr, "  -> Discovered Contacts ({}):\r\n", count);
-                let _ = write_all(sender, hdr.as_bytes()).await;
-                let _ = write_all(sender, b"  -> ID        TYPE  CALLSIGN        RSSI     SNR   LAT        LON        SEEN\r\n").await;
+                let _ = sender.send( hdr.as_bytes()).await;
+                let _ = sender.send( b"  -> ID        TYPE  CALLSIGN        RSSI     SNR   LAT        LON        SEEN\r\n").await;
                 for idx in 0..count {
                     let Some(c) = DISCOVERED_CONTACTS.lock(|c| c.borrow().get(idx).cloned()) else {
                         continue;
@@ -1172,20 +1206,19 @@ async fn handle_text_cli(
                         c.callsign.as_str(),
                         c.rssi, c.snr, c.latitude, c.longitude, c.last_seen_epoch
                     );
-                    let _ = write_all(sender, s.as_bytes()).await;
+                    let _ = sender.send( s.as_bytes()).await;
                 }
             }
         }
         "get leds" => {
             let mut s: heapless::String<32> = heapless::String::new();
             let _ = write!(s, "  -> {}\r\n", if leds_disabled() { "off" } else { "on" });
-            let _ = write_all(sender, s.as_bytes()).await;
+            let _ = sender.send( s.as_bytes()).await;
         }
         "set leds on" | "set leds off" => {
             let disabled = trimmed == "set leds off";
             set_leds_disabled(disabled);
-            let _ = write_all(
-                sender,
+            let _ = sender.send(
                 if disabled {
                     b"  -> OK (LEDs off)\r\n" as &[u8]
                 } else {
@@ -1198,15 +1231,14 @@ async fn handle_text_cli(
             let on = RADIO_SETTINGS.lock(|r| r.borrow().rx_duty_cycle);
             let mut s: heapless::String<32> = heapless::String::new();
             let _ = write!(s, "  -> {}\r\n", if on { "on" } else { "off" });
-            let _ = write_all(sender, s.as_bytes()).await;
+            let _ = sender.send( s.as_bytes()).await;
         }
         "set rxduty on" | "set rxduty off" => {
             let on = trimmed == "set rxduty on";
             RADIO_SETTINGS.lock(|r| r.borrow_mut().rx_duty_cycle = on);
             crate::storage::request_save_config();
             let _ = crate::radio::lora_phy::request_radio_config();
-            let _ = write_all(
-                sender,
+            let _ = sender.send(
                 if on {
                     b"  -> OK (RX duty cycle on)\r\n" as &[u8]
                 } else {
@@ -1219,7 +1251,7 @@ async fn handle_text_cli(
             let af = RADIO_SETTINGS.lock(|r| r.borrow().airtime_factor_tenths);
             let mut s: heapless::String<32> = heapless::String::new();
             let _ = write!(s, "  -> {}.{:02}\r\n", af / 10, af % 10);
-            let _ = write_all(sender, s.as_bytes()).await;
+            let _ = sender.send( s.as_bytes()).await;
         }
         s if s.starts_with("set af ") => {
             if let Some(af) = parse_decimal_tenths(&s[7..]).map(|v| v.min(90) as u8) {
@@ -1227,9 +1259,9 @@ async fn handle_text_cli(
                 crate::storage::request_save_config();
                 let mut out: heapless::String<48> = heapless::String::new();
                 let _ = write!(out, "  -> OK - af={}.{:02}\r\n", af / 10, af % 10);
-                let _ = write_all(sender, out.as_bytes()).await;
+                let _ = sender.send( out.as_bytes()).await;
             } else {
-                let _ = write_all(sender, b"Error: af must be between 0 and 9\r\n").await;
+                let _ = sender.send( b"Error: af must be between 0 and 9\r\n").await;
             }
         }
         "get dutycycle" | "get duty" => {
@@ -1237,7 +1269,7 @@ async fn handle_text_cli(
             let duty_x10 = 10_000 / (af + 10);
             let mut s: heapless::String<32> = heapless::String::new();
             let _ = write!(s, "  -> {}.{}%\r\n", duty_x10 / 10, duty_x10 % 10);
-            let _ = write_all(sender, s.as_bytes()).await;
+            let _ = sender.send( s.as_bytes()).await;
         }
         s if s.starts_with("set dutycycle ") || s.starts_with("set duty ") => {
             let arg = s
@@ -1262,9 +1294,9 @@ async fn handle_text_cli(
                     duty_x10 / 10,
                     duty_x10 % 10
                 );
-                let _ = write_all(sender, out.as_bytes()).await;
+                let _ = sender.send( out.as_bytes()).await;
             } else {
-                let _ = write_all(sender, b"Error: dutycycle must be 10-100%\r\n").await;
+                let _ = sender.send( b"Error: dutycycle must be 10-100%\r\n").await;
             }
         }
         "get autoadd" | "get auto-add" => {
@@ -1280,7 +1312,7 @@ async fn handle_text_cli(
                 a.config,
                 a.max_hops
             );
-            let _ = write_all(sender, s.as_bytes()).await;
+            let _ = sender.send( s.as_bytes()).await;
         }
         "get companion" => {
             use core::sync::atomic::Ordering;
@@ -1294,7 +1326,7 @@ async fn handle_text_cli(
                 "  -> device_query={} get_autoadd={} set_autoadd={} last_cmd=0x{:02X}\r\n",
                 dq, ga, sa, lc
             );
-            let _ = write_all(sender, s.as_bytes()).await;
+            let _ = sender.send( s.as_bytes()).await;
         }
         s if s == "set autoadd" || s.starts_with("set autoadd ") => {
             let arg = s["set autoadd".len()..].trim();
@@ -1349,10 +1381,9 @@ async fn handle_text_cli(
                         config, max_hops
                     );
                 }
-                let _ = write_all(sender, s.as_bytes()).await;
+                let _ = sender.send( s.as_bytes()).await;
             } else {
-                let _ = write_all(
-                    sender,
+                let _ = sender.send(
                     b"Error: use set autoadd on|off or set autoadd <config>,<max_hops>\r\n",
                 )
                 .await;
@@ -1363,14 +1394,14 @@ async fn handle_text_cli(
                 c.borrow_mut().clear();
             });
             crate::storage::contacts::queue_clear().await;
-            let _ = write_all(sender, b"  -> OK (Contacts cleared)\r\n").await;
+            let _ = sender.send( b"  -> OK (Contacts cleared)\r\n").await;
         }
         "messages" | "inbox" | "get messages" => {
             let total = MESSAGE_LOG.lock(|m| m.borrow().len());
             if total == 0 {
-                let _ = write_all(sender, b"  -> No messages received yet\r\n").await;
+                let _ = sender.send( b"  -> No messages received yet\r\n").await;
             } else {
-                let _ = write_all(sender, b"  -> === Recent Messages ===\r\n").await;
+                let _ = sender.send( b"  -> === Recent Messages ===\r\n").await;
                 // Stream in small chunks: a 256-entry clone would overflow the
                 // CLI task stack.
                 let mut start = 0usize;
@@ -1416,7 +1447,7 @@ async fn handle_text_cli(
                                 );
                             }
                         }
-                        let _ = write_all(sender, s.as_bytes()).await;
+                        let _ = sender.send( s.as_bytes()).await;
                     }
                     start += chunk.len();
                 }
@@ -1427,7 +1458,7 @@ async fn handle_text_cli(
                 m.borrow_mut().clear();
             });
             crate::storage::messages::queue_clear().await;
-            let _ = write_all(sender, b"  -> OK (Messages cleared)\r\n").await;
+            let _ = sender.send( b"  -> OK (Messages cleared)\r\n").await;
         }
         "stats-radio" => {
             let (tx_ms, rx_ms, rssi, snr) = RADIO_TELEMETRY.lock(|t| {
@@ -1443,7 +1474,7 @@ async fn handle_text_cli(
                 tx_ms / 1000,
                 rx_ms / 1000
             );
-            let _ = write_all(sender, s.as_bytes()).await;
+            let _ = sender.send( s.as_bytes()).await;
         }
         "stats-flash" => {
             use core::sync::atomic::Ordering::Relaxed;
@@ -1473,7 +1504,7 @@ async fn handle_text_cli(
                 crate::storage::config::CONFIG_SAVES.load(Relaxed),
                 crate::storage::config::CONFIG_ERASES.load(Relaxed)
             );
-            let _ = write_all(sender, s.as_bytes()).await;
+            let _ = sender.send( s.as_bytes()).await;
         }
         "stats-disc" => {
             let mut s: heapless::String<160> = heapless::String::new();
@@ -1493,7 +1524,7 @@ async fn handle_text_cli(
                 crate::companion::protocol::DISC_RX_IN.load(core::sync::atomic::Ordering::Relaxed),
                 crate::companion::protocol::DISC_RX_RTT_MS.load(core::sync::atomic::Ordering::Relaxed)
             );
-            let _ = write_all(sender, s.as_bytes()).await;
+            let _ = sender.send( s.as_bytes()).await;
         }
         "stats-binary" => {
             let mut s: heapless::String<160> = heapless::String::new();
@@ -1511,7 +1542,7 @@ async fn handle_text_cli(
                 crate::companion::protocol::REQ_RX_TAG.load(core::sync::atomic::Ordering::Relaxed),
                 crate::companion::protocol::REQ_RX_LEN.load(core::sync::atomic::Ordering::Relaxed)
             );
-            let _ = write_all(sender, s.as_bytes()).await;
+            let _ = sender.send( s.as_bytes()).await;
         }
         "stats-login" => {
             let mut s: heapless::String<160> = heapless::String::new();
@@ -1532,7 +1563,7 @@ async fn handle_text_cli(
                 crate::companion::protocol::LOGIN_RX_LEN.load(core::sync::atomic::Ordering::Relaxed),
                 crate::companion::protocol::LOGIN_RESULT.load(core::sync::atomic::Ordering::Relaxed)
             );
-            let _ = write_all(sender, s.as_bytes()).await;
+            let _ = sender.send( s.as_bytes()).await;
         }
         "stats-scope" => {
             let p = crate::companion::protocol::prefs();
@@ -1556,7 +1587,7 @@ async fn handle_text_cli(
                 if over.0 { "set" } else { "none" },
                 over.1
             );
-            let _ = write_all(sender, s.as_bytes()).await;
+            let _ = sender.send( s.as_bytes()).await;
         }
         "stats-trace" => {
             let mut s: heapless::String<160> = heapless::String::new();
@@ -1578,7 +1609,7 @@ async fn handle_text_cli(
                 crate::companion::protocol::TRACE_RX_HASHES.load(core::sync::atomic::Ordering::Relaxed),
                 crate::companion::protocol::TRACE_RX_SNRS.load(core::sync::atomic::Ordering::Relaxed)
             );
-            let _ = write_all(sender, s.as_bytes()).await;
+            let _ = sender.send( s.as_bytes()).await;
         }
         "stats-adverts" => {
             let (cursor, pending, erase_pending) = crate::storage::adverts::stats();
@@ -1599,7 +1630,7 @@ async fn handle_text_cli(
                 crate::companion::protocol::ADVERT_LAST_TS.load(core::sync::atomic::Ordering::Relaxed),
                 if crate::companion::protocol::ADVERT_LAST_HAD_BLOB.load(core::sync::atomic::Ordering::Relaxed) { "yes" } else { "no" }
             );
-            let _ = write_all(sender, s.as_bytes()).await;
+            let _ = sender.send( s.as_bytes()).await;
         }
         "stats-ble" | "get ble" => {
             let st = crate::companion::ble::BLE_STATUS.load(core::sync::atomic::Ordering::Relaxed);
@@ -1626,7 +1657,7 @@ async fn handle_text_cli(
                     let _ = write!(s, "  -> BLE: Error state {}\r\n", code);
                 }
             }
-            let _ = write_all(sender, s.as_bytes()).await;
+            let _ = sender.send( s.as_bytes()).await;
         }
         "stats-core" => {
             let uptime = embassy_time::Instant::now().as_secs();
@@ -1634,14 +1665,14 @@ async fn handle_text_cli(
             let pct = crate::telemetry::battery_percentage();
             let mut s: heapless::String<128> = heapless::String::new();
             let _ = write!(s, "  -> {{\"battery_mv\":{},\"battery_pct\":{},\"uptime_secs\":{},\"errors\":0,\"queue_len\":0}}\r\n", mv, pct, uptime);
-            let _ = write_all(sender, s.as_bytes()).await;
+            let _ = sender.send( s.as_bytes()).await;
         }
         "battery" | "get battery" | "batt" | "get batt" => {
             let mv = crate::telemetry::battery_millivolts();
             let pct = crate::telemetry::battery_percentage();
             let mut s: heapless::String<64> = heapless::String::new();
             let _ = write!(s, "  -> {} mV ({}%)\r\n", mv, pct);
-            let _ = write_all(sender, s.as_bytes()).await;
+            let _ = sender.send( s.as_bytes()).await;
         }
         "stats-packets" => {
             let (tx, rx) = RADIO_TELEMETRY.lock(|t| {
@@ -1654,7 +1685,7 @@ async fn handle_text_cli(
                 "  -> {{\"recv\":{},\"sent\":{},\"flood_tx\":{},\"direct_tx\":0,\"flood_rx\":{},\"direct_rx\":0,\"recv_errors\":0}}\r\n",
                 rx, tx, tx, rx
             );
-            let _ = write_all(sender, s.as_bytes()).await;
+            let _ = sender.send( s.as_bytes()).await;
         }
         "clear stats" => {
             RADIO_TELEMETRY.lock(|t| {
@@ -1665,7 +1696,7 @@ async fn handle_text_cli(
                 tel.rx_air_ms = 0;
                 tel.has_rx = false;
             });
-            let _ = write_all(sender, b"  -> OK\r\n").await;
+            let _ = sender.send( b"  -> OK\r\n").await;
         }
         "advert" => {
             RADIO_TELEMETRY.lock(|t| {
@@ -1673,13 +1704,13 @@ async fn handle_text_cli(
                 tel.tx_beacons = tel.tx_beacons.saturating_add(1);
             });
             let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::TriggerAdvert { flood: true });
-            let _ = write_all(sender, b"  -> OK (MeshCore Advert broadcast queued)\r\n").await;
+            let _ = sender.send( b"  -> OK (MeshCore Advert broadcast queued)\r\n").await;
         }
         "time" | "get time" => {
             let mut s: heapless::String<32> = heapless::String::new();
             let epoch = get_device_time();
             let _ = write!(s, "  -> {}\r\n", epoch);
-            let _ = write_all(sender, s.as_bytes()).await;
+            let _ = sender.send( s.as_bytes()).await;
         }
         s if s.starts_with("set time ") || s.starts_with("time ") => {
             let time_str = if s.starts_with("set time ") { &s[9..] } else { &s[5..] }.trim();
@@ -1692,7 +1723,7 @@ async fn handle_text_cli(
             node.epoch_time = epoch;
             set_device_time(epoch as u32);
             let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetTime(epoch));
-            let _ = write_all(sender, b"  -> OK (Clock synchronized)\r\n").await;
+            let _ = sender.send( b"  -> OK (Clock synchronized)\r\n").await;
         }
         "channels" | "channel" => {
             let mut buf: heapless::String<256> = heapless::String::new();
@@ -1707,30 +1738,30 @@ async fn handle_text_cli(
                     }
                 }
             });
-            let _ = write_all(sender, buf.as_bytes()).await;
+            let _ = sender.send( buf.as_bytes()).await;
         }
         "clock sync" | "sync_time" => {
-            let _ = write_all(sender, b"  -> OK\r\n").await;
+            let _ = sender.send( b"  -> OK\r\n").await;
         }
         "dfu" | "bootloader" => {
-            let _ = write_all(sender, b"  -> Entering DFU bootloader...\r\n").await;
+            let _ = sender.send( b"  -> Entering DFU bootloader...\r\n").await;
             embassy_time::Timer::after_millis(50).await;
             reboot_to_bootloader();
         }
         "reboot" => {
-            let _ = write_all(sender, b"  -> Rebooting device...\r\n").await;
+            let _ = sender.send( b"  -> Rebooting device...\r\n").await;
             embassy_time::Timer::after_millis(50).await;
             cortex_m::peripheral::SCB::sys_reset();
         }
         "save" => {
             crate::storage::request_save_config();
-            let _ = write_all(sender, b"  -> OK (Config save queued to flash)\r\n").await;
+            let _ = sender.send( b"  -> OK (Config save queued to flash)\r\n").await;
         }
         "help" => {
-            let _ = write_all(sender, b"  -> Commands:\r\n  ->   Identity: get/set name, get/set prv.key, get public.key\r\n  ->   Radio:    get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq/tx/sf/bw/cr, get/set repeat, get/set rxduty, get/set af, get/set dutycycle, get/set hash-mode, stats-radio\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, get/set autoadd, advert, time, channels\r\n  ->   System:   save, ver, board, get/set leds, stats-core, stats-packets, clear stats/contacts/messages, reboot\r\n").await;
+            let _ = sender.send( b"  -> Commands:\r\n  ->   Identity: get/set name, get/set prv.key, get public.key\r\n  ->   Radio:    get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq/tx/sf/bw/cr, get/set repeat, get/set rxduty, get/set af, get/set dutycycle, get/set hash-mode, stats-radio\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, get/set autoadd, advert, time, channels\r\n  ->   System:   save, ver, board, get/set leds, stats-core, stats-packets, clear stats/contacts/messages, reboot\r\n").await;
         }
         _ => {
-            let _ = write_all(sender, b"  -> Unknown command\r\n").await;
+            let _ = sender.send( b"  -> Unknown command\r\n").await;
         }
     }
 }
@@ -1839,7 +1870,8 @@ pub async fn cdc_acm_task(
                                                 let mut v = heapless::Vec::new();
                                                 let _ = v.extend_from_slice(resp);
                                                 let _ = responses.push(v);
-                                            });
+                                            })
+                                            .await;
                                             for resp in responses {
                                                 let mut out_frame = [0u8; 300];
                                                 if let Ok(flen) = encode_usb_frame(&resp, &mut out_frame) {
@@ -1856,7 +1888,7 @@ pub async fn cdc_acm_task(
                                     if b == b'\r' || b == b'\n' {
                                         if text_line_len > 0 {
                                             let cmd_str = core::str::from_utf8(&text_line_buf[..text_line_len]).unwrap_or("");
-                                            handle_text_cli(&mut sender, cmd_str, &mut node).await;
+                                            handle_text_cli(&mut sender, cmd_str, &mut node, true).await;
                                             text_line_len = 0;
                                         }
                                     } else if b == 0x08 || b == 0x7F {
