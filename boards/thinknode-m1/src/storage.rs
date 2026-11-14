@@ -13,14 +13,20 @@ pub use ferrix_core::storage::{
 use ferrix_runtime::storage::{storage_loop, StorageExit};
 use heapless::String;
 
-/// Flash layout for ThinkNode M1 (nRF52840, 1 MB).
+/// Flash layout for ThinkNode M1 (nRF52840, 1 MB internal + 2 MB external).
+///
+/// The external QSPI regions are offsets into the 2 MB chip.
 pub static REGIONS: StorageRegions = StorageRegions {
+    // Internal: config and bonds stay here for now; the advert log is still
+    // internal until the async blob read path lands.
     config: 0x000E_C000..0x000E_D000,
-    contacts: 0x000B_0000..0x000C_C000,
-    messages: 0x000C_C000..0x000E_C000,
-    adverts: 0x000A_0000..0x000A_F000,
     bonds: 0x000A_F000..0x000B_0000,
+    adverts: 0x000A_0000..0x000A_F000,
+    // External QSPI.
+    contacts: 0x0000_0000..0x0002_C000,
+    messages: 0x0004_0000..0x0014_0000,
     factory_reset: 0x000A_0000..0x000E_D000,
+    factory_reset_external: 0x0000_0000..0x0014_0000,
 };
 
 /// Initialize configuration from the reserved page, or defaults.
@@ -68,7 +74,7 @@ pub async fn storage_task(
     ferrix_nrf52::qspi::self_test(qspi).await;
 
     defmt::info!("Storage: Flash persistence task started");
-    if storage_loop(&mut flash, &REGIONS).await == StorageExit::FactoryReset {
+    if storage_loop(&mut flash, qspi, &REGIONS).await == StorageExit::FactoryReset {
         ferrix_nrf52::reset::system_reset();
     }
     core::future::pending().await

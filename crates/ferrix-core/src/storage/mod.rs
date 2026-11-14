@@ -28,16 +28,18 @@ pub use messages::MessageCommand;
 pub struct StorageRegions {
     /// Configuration page (one erase sector).
     pub config: Range<u32>,
-    /// Contact key-value map.
+    /// Contact key-value map (external flash).
     pub contacts: Range<u32>,
-    /// Message FIFO.
+    /// Message FIFO (external flash).
     pub messages: Range<u32>,
     /// Advert blob log.
     pub adverts: Range<u32>,
     /// BLE bond table.
     pub bonds: Range<u32>,
-    /// Everything erased by a factory reset.
+    /// Internal data regions erased by a factory reset.
     pub factory_reset: Range<u32>,
+    /// External flash regions erased by a factory reset.
+    pub factory_reset_external: Range<u32>,
 }
 
 /// Synchronous reader over a memory-mapped flash region.
