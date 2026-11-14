@@ -24,6 +24,19 @@ use ferrix_core::storage::get_callsign;
 
 pub type UsbDriver = Driver<'static, USBD, &'static SoftwareVbusDetect>;
 
+embassy_nrf::bind_interrupts!(pub struct UsbIrqs {
+    USBD => embassy_nrf::usb::InterruptHandler<USBD>;
+});
+
+static VBUS_DETECT: StaticCell<SoftwareVbusDetect> = StaticCell::new();
+
+/// Build the USB driver with the platform's interrupt binding and VBUS
+/// detector, so each board does not repeat the same static wiring.
+pub fn driver(usbd: USBD) -> UsbDriver {
+    let vbus = &*VBUS_DETECT.init(SoftwareVbusDetect::new(true, true));
+    Driver::new(usbd, UsbIrqs, vbus)
+}
+
 static CONFIG_DESC: StaticCell<[u8; 256]> = StaticCell::new();
 static BOS_DESC: StaticCell<[u8; 256]> = StaticCell::new();
 static MSOS_DESC: StaticCell<[u8; 256]> = StaticCell::new();

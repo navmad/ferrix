@@ -12,7 +12,6 @@ pub mod meshcore;
 pub mod radio;
 pub mod storage;
 pub mod telemetry;
-pub mod watchdog;
 
 use defmt::info;
 use defmt_rtt as _;
@@ -22,7 +21,6 @@ use embassy_nrf::bind_interrupts;
 use embassy_nrf::peripherals;
 use embassy_nrf::saadc;
 use embassy_nrf::spim::{self, Spim};
-use embassy_nrf::usb;
 use embassy_time::{Delay, Duration, Timer};
 #[cfg(feature = "thinknode-m1")]
 use static_cell::StaticCell;
@@ -36,13 +34,10 @@ use crate::meshcore::{LocalIdentity, MeshEngine};
 use crate::radio::{sx1262_task, LoraConfig, ChannelRadio, LoraRadio};
 
 bind_interrupts!(struct Irqs {
-    USBD => usb::InterruptHandler<peripherals::USBD>;
     TWISPI0 => spim::InterruptHandler<peripherals::TWISPI0>;
     TWISPI1 => spim::InterruptHandler<peripherals::TWISPI1>;
     SAADC => saadc::InterruptHandler;
 });
-
-static VBUS_DETECT: StaticCell<embassy_nrf::usb::vbus_detect::SoftwareVbusDetect> = StaticCell::new();
 
 // Static allocations for display framebuffer
 #[cfg(feature = "thinknode-m1")]
@@ -137,33 +132,14 @@ async fn delayed_push_task() -> ! {
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    use core::sync::atomic::Ordering;
-    use embassy_nrf::interrupt::{InterruptExt, Priority};
-
-    // Capture why the previous boot ended before anything can clear it.
-    let reset_reason = unsafe { core::ptr::read_volatile(0x4000_0400 as *const u32) };
-    ferrix_core::state::RESET_REASON.store(reset_reason, Ordering::Relaxed);
-
-    // SoftDevice S140 reserves interrupt priorities P0, P1, and P4.
-    // Configure all Embassy system and peripheral interrupts to P2 or P3.
-    let mut nrf_config = embassy_nrf::config::Config::default();
-    nrf_config.gpiote_interrupt_priority = Priority::P2;
-    nrf_config.time_interrupt_priority = Priority::P2;
-    let p = embassy_nrf::init(nrf_config);
-
-    embassy_nrf::interrupt::USBD.set_priority(Priority::P3);
-    embassy_nrf::interrupt::TWISPI0.set_priority(Priority::P3);
-    embassy_nrf::interrupt::TWISPI1.set_priority(Priority::P3);
-    embassy_nrf::interrupt::SAADC.set_priority(Priority::P3);
-    embassy_nrf::interrupt::QSPI.set_priority(Priority::P3);
-    embassy_nrf::interrupt::UARTE0.set_priority(Priority::P3);
+    let p = ferrix_nrf52::startup::init();
 
     let mut board = crate::board::init(p);
     let qspi = board.qspi;
 
-    let wdt_handle = crate::watchdog::start(board.wdt);
+    let wdt_handle = ferrix_nrf52::watchdog::start(board.wdt);
     spawner
-        .spawn(crate::watchdog::watchdog_task(wdt_handle))
+        .spawn(ferrix_nrf52::watchdog::watchdog_task(wdt_handle))
         .unwrap();
 
     // The GPS task owns the L76K UART and control pins; it holds the module
@@ -233,9 +209,7 @@ async fn main(spawner: Spawner) {
 
     // 0. Initialize USB CDC-ACM Serial & 1200-baud DFU Auto-Reset FIRST
     // This guarantees serial CLI, packet logging, and DFU auto-reset are always available.
-    let vbus: &'static embassy_nrf::usb::vbus_detect::SoftwareVbusDetect =
-        &*VBUS_DETECT.init(embassy_nrf::usb::vbus_detect::SoftwareVbusDetect::new(true, true));
-    let usb_driver = usb::Driver::new(board.usbd, Irqs, vbus);
+    let usb_driver = ferrix_nrf52::usb::driver(board.usbd);
     let (usb_dev, cdc_class) = crate::companion::usb::init_usb(
         usb_driver,
         0x239A,
