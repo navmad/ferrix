@@ -4,3 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+meshcore-wire = { path = "../meshcore-wire" }
+heapless = { version = "0.8", features = ["defmt-03"] }
+embassy-sync = { version = "0.6", features = ["defmt"] }

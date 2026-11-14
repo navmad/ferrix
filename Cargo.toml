@@ -29,6 +29,11 @@ incremental = false
 opt-level = "s"
 lto = "fat"
 
+# Host tests link the std test harness; fat LTO on the dev profile hits the
+# macOS object-section limit for the core crate's large static state.
+[profile.test]
+lto = "off"
+
 [profile.release]
 codegen-units = 1
 debug = 2

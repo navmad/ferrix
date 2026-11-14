@@ -755,6 +755,11 @@ checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
 [[package]]
 name = "ferrix-core"
 version = "0.1.0"
+dependencies = [
+ "embassy-sync 0.6.2",
+ "heapless 0.8.0",
+ "meshcore-wire",
+]
 
 [[package]]
 name = "ferrix-hal"
@@ -784,6 +789,7 @@ dependencies = [
  "embedded-hal-bus",
  "embedded-io-async",
  "embedded-storage-async",
+ "ferrix-core",
  "heapless 0.8.0",
  "lora-phy",
  "meshcore-wire",

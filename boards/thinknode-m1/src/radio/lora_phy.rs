@@ -715,6 +715,20 @@ pub async fn lora_phy_task(
             continue;
         }
 
+        if now < next_tx_allowed_ms {
+            wake_at = next_tx_allowed_ms;
+        }
+        if let Some(due) = next_flood_due(&floods, base_ms, slot_ms) {
+            if due > now {
+                wake_at = wake_at.min(due);
+            }
+        }
+        if budget_wait_ms > 0 {
+            wake_at = wake_at.min(now.saturating_add(budget_wait_ms));
+        }
+        if (!control.is_empty() || !background.is_empty()) && budget_wait_ms == 0 {
+            wake_at = now;
+        }
         let wait_ms = if wake_at == u64::MAX {
             60_000
         } else {

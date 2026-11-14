@@ -40,3 +40,4 @@ sequential-storage = { version = "8", features = ["defmt"] }
 nmea = { version = "0.6", default-features = false }
 
 meshcore-wire = { path = "../../crates/meshcore-wire" }
+ferrix-core = { path = "../../crates/ferrix-core" }

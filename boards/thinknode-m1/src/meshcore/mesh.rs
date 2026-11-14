@@ -48,65 +48,7 @@ fn route_for(out_path_len: u8) -> (u8, u8) {
     }
 }
 
-/// Discovered MeshCore Contact in range
-#[derive(Clone, Debug)]
-pub struct DiscoveredContact {
-    pub pub_key: [u8; 32],
-    pub callsign: heapless::String<32>,
-    pub node_id: [u8; 4],
-    pub last_seen_epoch: u32,
-    pub rssi: i16,
-    pub snr: i8,
-    pub latitude: i32,       // Changed from f32 to i32 (degrees * 1,000,000)
-    pub longitude: i32,      // Changed from f32 to i32 (degrees * 1,000,000)
-    pub flags: u8,           // raw advert app_data[0] (kind nibble + masks)
-    /// Authoritative contact type (`ADV_TYPE_CHAT/REPEATER/ROOM/SENSOR`).
-    /// Set from the companion `type` byte for app-added contacts and derived
-    /// from the advert flags for auto-added/imported contacts.
-    pub contact_type: u8,
-    /// Learned return path (encoded path byte in `out_path_len`).
-    pub out_path: [u8; 64],
-    /// `0xFF` means unknown; otherwise a validated encoded path byte.
-    pub out_path_len: u8,
-    /// Timestamp from the last accepted advert (anti-replay).
-    pub last_advert_ts: u32,
-    /// Hash of the fields last written to flash (0 = never saved).
-    pub saved_hash: u32,
-    /// Newest signed-message timestamp accepted from this contact (room
-    /// servers use it to decide which posts to replay).
-    pub sync_since: u32,
-}
-
-/// Recently received message entry for message history / inbox
-#[derive(Clone, Debug)]
-pub struct ReceivedMessage {
-    pub channel_idx: u8,
-    pub path_len: u8,
-    pub sender: heapless::String<32>,
-    /// Full sender public key for direct messages; zero for channel messages.
-    pub sender_pub: [u8; 32],
-    pub text: heapless::String<160>,
-    pub timestamp: u32,
-    pub rssi: i16,
-    pub snr: i8,
-    pub is_direct: bool,
-    /// MeshCore text type (`0` plain, `1` CLI data, `2` signed, `3` CLI command).
-    pub txt_type: u8,
-    /// Signing-key prefix for signed messages; zero otherwise.
-    pub signed_prefix: [u8; 4],
-}
-
-/// A received channel datagram (GRP_DATA), delivered to the companion as
-/// `PACKET_CHANNEL_DATA_RECV`.
-#[derive(Clone, Debug)]
-pub struct ReceivedChannelData {
-    pub channel_idx: u8,
-    /// `0xFF` when the packet did not arrive over a flood route.
-    pub path_len: u8,
-    pub snr: i8,
-    pub data_type: u16,
-    pub data: heapless::Vec<u8, { crate::meshcore::packets::grpdata::MAX_GROUP_DATA }>,
-}
+pub use ferrix_core::types::{DiscoveredContact, ReceivedChannelData, ReceivedMessage};
 
 /// Actions resulting from processing an inbound over-the-air packet
 pub enum InboundAction {

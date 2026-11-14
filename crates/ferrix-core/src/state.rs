@@ -1,0 +1,120 @@
+//! Shared application state.
+//!
+//! Still global for now; the runtime will later own a single `State` value and
+//! pass it explicitly. Keeping the types and statics here removes the
+//! board/application coupling without changing behavior.
+
+use core::cell::RefCell;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::Mutex;
+use heapless::Vec;
+
+use crate::types::{
+    AutoAddSettings, ChannelData, DiscoveredContact, InboxItem, RadioSettings, RadioTelemetry,
+    MAX_CHANNELS, MAX_CONTACTS, MAX_MESSAGES,
+};
+
+type SharedRawMutex = CriticalSectionRawMutex;
+
+pub static RADIO_SETTINGS: Mutex<SharedRawMutex, RefCell<RadioSettings>> =
+    Mutex::new(RefCell::new(RadioSettings {
+        frequency_hz: 910_525_000,
+        tx_power_dbm: 22,
+        sf: 7,
+        bw_khz: 62,
+        cr: 5,
+        is_repeater: false,
+        client_repeat: false,
+        offgrid_home_freq: 0,
+        path_hash_mode: 0,
+        rx_duty_cycle: false,
+        airtime_factor_tenths: 90,
+    }));
+
+pub static AUTOADD_SETTINGS: Mutex<SharedRawMutex, RefCell<AutoAddSettings>> =
+    Mutex::new(RefCell::new(AutoAddSettings {
+        manual_add_contacts: 0,
+        config: 0x00,
+        max_hops: 0,
+    }));
+
+/// Current local identity, shared by every companion transport.
+pub static NODE_PUBLIC_KEY: Mutex<SharedRawMutex, RefCell<[u8; 32]>> =
+    Mutex::new(RefCell::new([0u8; 32]));
+pub static NODE_PRIVATE_KEY: Mutex<SharedRawMutex, RefCell<[u8; 64]>> =
+    Mutex::new(RefCell::new([0u8; 64]));
+
+pub fn set_identity(public_key: [u8; 32], private_key: [u8; 64]) {
+    NODE_PUBLIC_KEY.lock(|k| *k.borrow_mut() = public_key);
+    NODE_PRIVATE_KEY.lock(|k| *k.borrow_mut() = private_key);
+}
+
+pub fn current_public_key() -> [u8; 32] {
+    NODE_PUBLIC_KEY.lock(|k| *k.borrow())
+}
+
+pub fn current_private_key() -> [u8; 64] {
+    NODE_PRIVATE_KEY.lock(|k| *k.borrow())
+}
+
+/// Blue status LED disabled by the user (persisted in the config page).
+pub static LEDS_DISABLED: AtomicBool = AtomicBool::new(false);
+
+pub fn leds_disabled() -> bool {
+    LEDS_DISABLED.load(Ordering::Relaxed)
+}
+
+pub fn init_leds_disabled(disabled: bool) {
+    LEDS_DISABLED.store(disabled, Ordering::Relaxed);
+}
+
+pub const DEFAULT_PUBLIC_SECRET: [u8; 16] = [
+    0x8b, 0x33, 0x87, 0xe9, 0xc5, 0xcd, 0xea, 0x6a, 0xc9, 0xe5, 0xed, 0xba, 0xa1, 0x15, 0xcd, 0x72,
+];
+
+pub const fn default_channels() -> [ChannelData; MAX_CHANNELS] {
+    let mut channels = [ChannelData {
+        name: [0u8; 32],
+        secret: [0u8; 16],
+    }; MAX_CHANNELS];
+    channels[0].name[0] = b'P';
+    channels[0].name[1] = b'u';
+    channels[0].name[2] = b'b';
+    channels[0].name[3] = b'l';
+    channels[0].name[4] = b'i';
+    channels[0].name[5] = b'c';
+    channels[0].secret = DEFAULT_PUBLIC_SECRET;
+    channels
+}
+
+pub static CHANNELS: Mutex<SharedRawMutex, RefCell<[ChannelData; MAX_CHANNELS]>> =
+    Mutex::new(RefCell::new(default_channels()));
+
+pub static DISCOVERED_CONTACTS: Mutex<
+    SharedRawMutex,
+    RefCell<Vec<DiscoveredContact, MAX_CONTACTS>>,
+> = Mutex::new(RefCell::new(Vec::new()));
+
+pub static MESSAGE_LOG: Mutex<SharedRawMutex, RefCell<Vec<InboxItem, MAX_MESSAGES>>> =
+    Mutex::new(RefCell::new(Vec::new()));
+
+pub static RADIO_TELEMETRY: Mutex<SharedRawMutex, RefCell<RadioTelemetry>> =
+    Mutex::new(RefCell::new(RadioTelemetry {
+        tx_beacons: 0,
+        rx_packets: 0,
+        last_rssi: 0,
+        last_snr: 0,
+        has_rx: false,
+        tx_air_ms: 0,
+        rx_air_ms: 0,
+        tx_wait_max_ms: 0,
+        tx_control: 0,
+        tx_flood: 0,
+        tx_background: 0,
+        tx_stale: 0,
+        tx_cancelled: 0,
+        tx_retries: 0,
+        tx_dropped: 0,
+    }));

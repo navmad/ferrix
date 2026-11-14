@@ -12,7 +12,7 @@
 
 use core::cell::RefCell;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::Ordering;
 use defmt::{debug, info};
 use embassy_nrf::peripherals::USBD;
 use embassy_nrf::usb::Driver;
@@ -35,127 +35,22 @@ use static_cell::StaticCell;
 use crate::boards::{Board, CurrentBoard};
 use crate::companion::framing::{encode_usb_frame, UsbFrameReader, USB_INBOUND_DELIMITER};
 use crate::companion::protocol::CompanionNode;
-use crate::meshcore::mesh::{DiscoveredContact, ReceivedMessage};
-
-#[derive(Clone, Copy, Debug)]
-pub struct RadioSettings {
-    pub frequency_hz: u32,
-    pub tx_power_dbm: i8,
-    pub sf: u8,
-    pub bw_khz: u32,
-    pub cr: u8,
-    pub is_repeater: bool,
-    /// Off-grid "client repeat" mode (`client_repeat`). Distinct from
-    /// the repeater node role: it enables forwarding only on an allowed
-    /// off-grid frequency.
-    pub client_repeat: bool,
-    /// Frequency to return to when off-grid mode is turned off.
-    pub offgrid_home_freq: u32,
-    pub path_hash_mode: u8,
-    /// Listen in duty-cycle/sniff mode instead of continuous RX.
-    pub rx_duty_cycle: bool,
-    /// Transmit airtime factor in tenths (0..90; af=90 -> 10% duty).
-    pub airtime_factor_tenths: u8,
-}
-
-pub static RADIO_SETTINGS: Mutex<SharedRawMutex, RefCell<RadioSettings>> = Mutex::new(RefCell::new(RadioSettings {
-    frequency_hz: 910_525_000,
-    tx_power_dbm: 22,
-    sf: 7,
-    bw_khz: 62,
-    cr: 5,
-    is_repeater: false,
-    client_repeat: false,
-    offgrid_home_freq: 0,
-    path_hash_mode: 0,
-    rx_duty_cycle: false,
-    airtime_factor_tenths: 90,
-}));
-
-/// Contact auto-add policy, shared by every companion transport and the main
-/// loop. `manual_add_contacts` bit 0 selects the policy: 0 = add every advert,
-/// 1 = add only the types enabled in `config`.
-#[derive(Clone, Copy, Debug)]
-pub struct AutoAddSettings {
-    pub manual_add_contacts: u8,
-    pub config: u8,
-    pub max_hops: u8,
-}
-
-pub static AUTOADD_SETTINGS: Mutex<SharedRawMutex, RefCell<AutoAddSettings>> =
-    Mutex::new(RefCell::new(AutoAddSettings {
-        // MeshCore's fresh-node default: auto-add all advert types. The type
-        // mask starts empty because it is only consulted when manual mode is
-        // selected.
-        manual_add_contacts: 0,
-        config: 0x00,
-        max_hops: 0,
-    }));
-
-/// Current local identity, shared by every companion transport. A key import
-/// over one transport must be visible to the others without a reboot.
-pub static NODE_PUBLIC_KEY: Mutex<SharedRawMutex, RefCell<[u8; 32]>> =
-    Mutex::new(RefCell::new([0u8; 32]));
-pub static NODE_PRIVATE_KEY: Mutex<SharedRawMutex, RefCell<[u8; 64]>> =
-    Mutex::new(RefCell::new([0u8; 64]));
-
-pub fn set_identity(public_key: [u8; 32], private_key: [u8; 64]) {
-    NODE_PUBLIC_KEY.lock(|k| *k.borrow_mut() = public_key);
-    NODE_PRIVATE_KEY.lock(|k| *k.borrow_mut() = private_key);
-}
-
-pub fn current_public_key() -> [u8; 32] {
-    NODE_PUBLIC_KEY.lock(|k| *k.borrow())
-}
-
-pub fn current_private_key() -> [u8; 64] {
-    NODE_PRIVATE_KEY.lock(|k| *k.borrow())
-}
-
-/// Blue status LED disabled by the user (persisted in the config page).
-pub static LEDS_DISABLED: AtomicBool = AtomicBool::new(false);
-
-pub fn leds_disabled() -> bool {
-    LEDS_DISABLED.load(Ordering::Relaxed)
-}
-
-/// Load the persisted value without requesting another flash save.
-pub fn init_leds_disabled(disabled: bool) {
-    LEDS_DISABLED.store(disabled, Ordering::Relaxed);
-}
+pub use ferrix_core::state::{
+    current_private_key, current_public_key, default_channels, init_leds_disabled,
+    leds_disabled, set_identity, AUTOADD_SETTINGS, CHANNELS, DEFAULT_PUBLIC_SECRET,
+    DISCOVERED_CONTACTS, LEDS_DISABLED, MESSAGE_LOG, NODE_PRIVATE_KEY, NODE_PUBLIC_KEY,
+    RADIO_SETTINGS, RADIO_TELEMETRY,
+};
+pub use ferrix_core::types::{
+    AutoAddSettings, ChannelData, DiscoveredContact, InboxItem, RadioSettings,
+    RadioTelemetry, ReceivedChannelData, ReceivedMessage, MAX_CHANNELS, MAX_CONTACTS,
+    MAX_MESSAGES,
+};
 
 pub fn set_leds_disabled(disabled: bool) {
     if LEDS_DISABLED.swap(disabled, Ordering::Relaxed) != disabled {
         crate::storage::request_save_config();
     }
-}
-
-/// Companion defaults on nRF52840: 350 contacts, 40 channels.
-pub const MAX_CONTACTS: usize = 350;
-/// Companion default group-channel count.
-pub const MAX_CHANNELS: usize = 40;
-
-pub static DISCOVERED_CONTACTS: Mutex<SharedRawMutex, RefCell<heapless::Vec<DiscoveredContact, MAX_CONTACTS>>> =
-    Mutex::new(RefCell::new(heapless::Vec::new()));
-
-/// Number of retained inbox entries (text messages and channel datagrams).
-pub const MAX_MESSAGES: usize = 256;
-
-/// One entry in the companion inbox. Text messages and channel datagrams are
-/// kept in a single FIFO so `CMD_SYNC_NEXT_MESSAGE` preserves receive order.
-#[derive(Clone, Debug)]
-pub enum InboxItem {
-    Text(ReceivedMessage),
-    ChannelData(crate::meshcore::mesh::ReceivedChannelData),
-}
-
-pub static MESSAGE_LOG: Mutex<SharedRawMutex, RefCell<heapless::Vec<InboxItem, MAX_MESSAGES>>> =
-    Mutex::new(RefCell::new(heapless::Vec::new()));
-
-#[derive(Clone, Copy, Debug)]
-pub struct ChannelData {
-    pub name: [u8; 32],
-    pub secret: [u8; 16],
 }
 
 /// Convert the internal integer kHz bandwidth to the precise Hz value used by
@@ -375,29 +270,6 @@ pub fn offgrid_set(on: bool) -> OffgridChange {
     })
 }
 
-pub const DEFAULT_PUBLIC_SECRET: [u8; 16] = [
-    0x8b, 0x33, 0x87, 0xe9, 0xc5, 0xcd, 0xea, 0x6a,
-    0xc9, 0xe5, 0xed, 0xba, 0xa1, 0x15, 0xcd, 0x72,
-];
-
-pub(crate) const fn default_channels() -> [ChannelData; MAX_CHANNELS] {
-    let mut chs = [ChannelData {
-        name: [0u8; 32],
-        secret: [0u8; 16],
-    }; MAX_CHANNELS];
-    chs[0].name[0] = b'P';
-    chs[0].name[1] = b'u';
-    chs[0].name[2] = b'b';
-    chs[0].name[3] = b'l';
-    chs[0].name[4] = b'i';
-    chs[0].name[5] = b'c';
-    chs[0].secret = DEFAULT_PUBLIC_SECRET;
-    chs
-}
-
-pub static CHANNELS: Mutex<SharedRawMutex, RefCell<[ChannelData; MAX_CHANNELS]>> =
-    Mutex::new(RefCell::new(default_channels()));
-
 #[derive(Clone, Copy, Debug)]
 pub struct DeviceClock {
     pub base_epoch: u32,
@@ -430,53 +302,6 @@ pub fn set_device_time(epoch: u32) {
         };
     });
 }
-
-#[derive(Clone, Copy, Debug)]
-pub struct RadioTelemetry {
-    pub tx_beacons: u32,
-    pub rx_packets: u32,
-    pub last_rssi: i16,
-    pub last_snr: i8,
-    pub has_rx: bool,
-    /// Estimated cumulative transmit airtime in milliseconds.
-    pub tx_air_ms: u32,
-    /// Estimated cumulative receive airtime in milliseconds.
-    pub rx_air_ms: u32,
-    /// Longest wait from enqueue to transmission in milliseconds.
-    pub tx_wait_max_ms: u32,
-    /// Control-lane transmissions.
-    pub tx_control: u32,
-    /// Flood-calendar transmissions.
-    pub tx_flood: u32,
-    /// Background (advert) transmissions.
-    pub tx_background: u32,
-    /// Floods dropped because their slot was missed.
-    pub tx_stale: u32,
-    /// Floods cancelled after another repeater was heard first.
-    pub tx_cancelled: u32,
-    /// Radio-level retries after a failed transmission.
-    pub tx_retries: u32,
-    /// Requests dropped after exhausting retries or because a queue was full.
-    pub tx_dropped: u32,
-}
-
-pub static RADIO_TELEMETRY: Mutex<SharedRawMutex, RefCell<RadioTelemetry>> = Mutex::new(RefCell::new(RadioTelemetry {
-    tx_beacons: 0,
-    rx_packets: 0,
-    last_rssi: 0,
-    last_snr: 0,
-    has_rx: false,
-    tx_air_ms: 0,
-    rx_air_ms: 0,
-    tx_wait_max_ms: 0,
-    tx_control: 0,
-    tx_flood: 0,
-    tx_background: 0,
-    tx_stale: 0,
-    tx_cancelled: 0,
-    tx_retries: 0,
-    tx_dropped: 0,
-}));
 
 #[derive(Clone, Debug)]
 pub enum UsbCommand {
