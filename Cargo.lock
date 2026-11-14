@@ -757,6 +757,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrix-l76k"
+version = "0.1.0"
+dependencies = [
+ "embedded-hal 1.0.0",
+ "embedded-hal-async",
+ "embedded-io-async",
+]
+
+[[package]]
 name = "ferrix-nrf52"
 version = "0.1.0"
 dependencies = [
@@ -833,6 +842,7 @@ dependencies = [
  "embedded-io-async",
  "ferrix-core",
  "ferrix-hal",
+ "ferrix-l76k",
  "ferrix-nrf52",
  "ferrix-runtime",
  "ferrix-ssd1681",

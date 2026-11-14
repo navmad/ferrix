@@ -523,6 +523,11 @@ pub fn bump_storage_heartbeat() {
 /// Number of successful watchdog feeds since boot (diagnostic).
 pub static WDT_PETS: AtomicU32 = AtomicU32::new(0);
 
+/// Raw bytes received from the GNSS UART since the last power-on.
+pub static GPS_BYTES: AtomicU32 = AtomicU32::new(0);
+/// Complete GNSS sentences parsed since the last power-on.
+pub static GPS_SENTENCES: AtomicU32 = AtomicU32::new(0);
+
 /// POWER.RESETREAS captured at boot. Bit 1 is the watchdog (DOG) flag.
 pub static RESET_REASON: AtomicU32 = AtomicU32::new(0);
 

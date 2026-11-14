@@ -42,3 +42,4 @@ ferrix-nrf52 = { path = "../../platforms/nrf52" }
 ferrix-runtime = { path = "../../crates/ferrix-runtime" }
 ferrix-sx1262 = { path = "../../drivers/radio/sx1262" }
 ferrix-ssd1681 = { path = "../../drivers/display/ssd1681" }
+ferrix-l76k = { path = "../../drivers/gnss/l76k" }
