@@ -17,9 +17,9 @@ use heapless::String;
 ///
 /// The external QSPI regions are offsets into the 2 MB chip.
 pub static REGIONS: StorageRegions = StorageRegions {
-    // Internal: config and bonds stay here for now.
-    config: 0x000E_C000..0x000E_D000,
-    bonds: 0x000A_F000..0x000B_0000,
+    // Internal: 64 KB config journal and 16 KB bond map.
+    config: 0x000A_0000..0x000B_0000,
+    bonds: 0x000B_0000..0x000B_4000,
     // External QSPI.
     contacts: 0x0000_0000..0x0002_C000,
     adverts: 0x0002_C000..0x0004_0000,
@@ -28,12 +28,13 @@ pub static REGIONS: StorageRegions = StorageRegions {
     factory_reset_external: 0x0000_0000..0x0014_0000,
 };
 
-/// Initialize configuration from the reserved page, or defaults.
+/// Initialize configuration from the journal, or defaults.
 pub fn init_config() -> (String<32>, Option<[u8; 64]>) {
-    let len = (REGIONS.config.end - REGIONS.config.start) as usize;
-    // SAFETY: the config page is memory-mapped flash.
-    let page = unsafe { core::slice::from_raw_parts(REGIONS.config.start as *const u8, len) };
-    ferrix_core::storage::config::init_config(page, crate::board::NAME)
+    ferrix_core::storage::config::init_config(
+        &ferrix_nrf52::flash::MAPPED,
+        REGIONS.config.clone(),
+        crate::board::NAME,
+    )
 }
 
 /// Load the advert log into RAM. Called once at boot, before the tasks start.

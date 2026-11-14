@@ -1,39 +1,36 @@
-//! MeshCore Persistent Flash Storage & Configuration Management
+//! MeshCore persistent configuration.
 //!
-//! Stores node identity (callsign), cryptographic keys, radio settings,
-//! and group channel table permanently in nRF52840 internal flash.
-//!
-//! Preserved across firmware updates, serial DFU flashing, and power cycles.
+//! Settings and per-channel records live in a `sequential-storage` map in a
+//! 64 KB internal-flash journal. Each save appends one settings record and any
+//! dirty channel records, so frequent setting changes wear-level across the
+//! whole journal instead of erasing a single page.
+
+use core::ops::Range;
 
 use defmt::{error, info};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::channel::Channel;
-
-/// Shared raw mutex type — see usb.rs for documentation.
-type SharedRawMutex = embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embedded_storage_async::nor_flash::NorFlash;
+use embedded_storage_async::nor_flash::{MultiwriteNorFlash, NorFlash};
 use heapless::String;
+use sequential_storage::cache::{Cache, Uncached};
+use sequential_storage::map::{MapConfig, MapStorage};
 
+use super::counted_flash::CountedFlash;
+use super::util::{self, fixed_str, str_from_fixed, MappedAsyncFlash};
+use super::MappedFlash;
 use crate::types::{ChannelData, MAX_CHANNELS};
 
-pub const CONFIG_MAGIC: u32 = 0x4D434647; // 'MCFG' (MeshCore Config)
-pub const CONFIG_VERSION: u32 = 1;
+type SharedRawMutex = CriticalSectionRawMutex;
 
-/// BLE PIN record lives after the config struct in the same 4 KB page.
-const PIN_OFFSET: usize = 3072;
-const PIN_MAGIC: u32 = 0x5049_4E42; // "BINP"
+pub const CONFIG_MAGIC: u32 = 0x4643_4647; // "FCFG"
+pub const CONFIG_VERSION: u16 = 1;
 const DEFAULT_BLE_PIN: u32 = 123_456;
+const SETTINGS_KEY: u16 = 0x0001;
+const CHANNEL_KEY_BASE: u16 = 0x0100;
+const SCRATCH_SIZE: usize = 256;
 
-#[repr(C, align(4))]
-#[derive(Clone, Copy)]
-struct PinRecord {
-    magic: u32,
-    pin: u32,
-    checksum: u32,
-}
-
-const _: () = assert!(core::mem::size_of::<PersistentConfig>() <= PIN_OFFSET);
-
-/// Completed config-page writes and erases since boot.
+/// Completed config writes and page erases since boot.
 pub static CONFIG_SAVES: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 pub static CONFIG_ERASES: core::sync::atomic::AtomicU32 =
@@ -41,40 +38,49 @@ pub static CONFIG_ERASES: core::sync::atomic::AtomicU32 =
 
 #[repr(C, align(4))]
 #[derive(Clone, Copy)]
-pub struct PersistentConfig {
-    pub magic: u32,
-    pub version: u32,
-    pub callsign: [u8; 32],
-    /// MeshCore's 64-byte expanded private key (`scalar ‖ nonce_prefix`).
-    pub custom_priv_key: [u8; 64],
-    pub has_custom_key: u8,
-    pub is_repeater: u8,
-    /// Off-grid client-repeat mode (MeshCore `client_repeat`).
-    pub client_repeat: u8,
-    /// Frequency to restore when off-grid mode is disabled.
-    pub offgrid_home_freq: u32,
-    pub radio_tx_power: i8,
-    pub radio_sf: u8,
-    pub radio_cr: u8,
-    pub path_hash_mode: u8,
-    pub autoadd_config: u8,     // bitmask: overwrite_oldest, chat, repeater, room_server, sensor
-    pub autoadd_max_hops: u8,   // 0 = no limit, N = up to N-1 hops
-    pub manual_add_contacts: u8, // bit 0: 0 = auto-add all, 1 = use autoadd_config
-    pub leds_disabled: u8,      // 1 = all user LEDs off
-    pub rx_duty_cycle: u8,      // 1 = duty-cycle/sniff RX
-    pub airtime_factor_tenths: u8, // 0..90; 90 = 9.0 -> 10% duty
-    pub flood_scope_name: [u8; 31],
-    pub flood_scope_key: [u8; 16],
-    pub advert_loc_policy: u8,
-    pub telemetry_mode_base: u8,
-    pub telemetry_mode_loc: u8,
-    pub telemetry_mode_env: u8,
-    pub multi_acks: u8,
-    pub radio_freq_hz: u32,
-    pub radio_bw_khz: u32,
-    pub channels: [ChannelData; MAX_CHANNELS],
-    pub checksum: u32,
+struct SettingsRecord {
+    magic: u32,
+    version: u16,
+    _pad: u16,
+    callsign: [u8; 32],
+    custom_priv_key: [u8; 64],
+    has_custom_key: u8,
+    is_repeater: u8,
+    client_repeat: u8,
+    offgrid_home_freq: u32,
+    radio_tx_power: i8,
+    radio_sf: u8,
+    radio_cr: u8,
+    path_hash_mode: u8,
+    autoadd_config: u8,
+    autoadd_max_hops: u8,
+    manual_add_contacts: u8,
+    leds_disabled: u8,
+    rx_duty_cycle: u8,
+    airtime_factor_tenths: u8,
+    flood_scope_name: [u8; 31],
+    flood_scope_key: [u8; 16],
+    advert_loc_policy: u8,
+    telemetry_mode_base: u8,
+    telemetry_mode_loc: u8,
+    telemetry_mode_env: u8,
+    multi_acks: u8,
+    ble_pin: u32,
+    radio_freq_hz: u32,
+    radio_bw_khz: u32,
 }
+
+#[repr(C, align(4))]
+#[derive(Clone, Copy)]
+struct ChannelRecord {
+    present: u8,
+    name: [u8; 32],
+    secret: [u8; 16],
+    _pad: [u8; 3],
+}
+
+const _: () = assert!(core::mem::size_of::<SettingsRecord>() <= SCRATCH_SIZE);
+const _: () = assert!(core::mem::size_of::<ChannelRecord>() <= SCRATCH_SIZE);
 
 pub use crate::state::{BLE_PIN, CUSTOM_PRIV_KEY, NODE_CALLSIGN};
 
@@ -83,59 +89,27 @@ static SAVE_REQUEST_CHANNEL: Channel<SharedRawMutex, u32, 2> = Channel::new();
 static SAVE_ACKED_SEQ: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 /// Next sequence number for a synchronous save request.
+#[cfg(not(test))]
 static NEXT_SAVE_SEQ: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(1);
 
-/// Compute a 32-bit checksum covering a configuration structure up to its
-/// checksum field.
-fn compute_checksum<T>(cfg: &T) -> u32 {
-    let words = unsafe {
-        core::slice::from_raw_parts(
-            cfg as *const T as *const u32,
-            (core::mem::size_of::<T>() - 4) / 4,
-        )
-    };
-    let mut sum = 0u32;
-    for &w in words {
-        sum = sum.wrapping_add(w);
-    }
-    sum
-}
+/// Channels whose records must be written on the next save.
+static DIRTY_CHANNELS: Mutex<SharedRawMutex, core::cell::RefCell<[bool; MAX_CHANNELS]>> =
+    Mutex::new(core::cell::RefCell::new([false; MAX_CHANNELS]));
 
-/// Read and validate the persisted configuration.
-///
-/// The layout starts fresh at version 1: a page written by any older firmware
-/// (or with a different layout) is ignored and defaults are used.
-pub fn read_config(page: &[u8]) -> Option<PersistentConfig> {
-    if page.len() < core::mem::size_of::<PersistentConfig>() {
-        return None;
-    }
-    let cfg = unsafe { core::ptr::read_unaligned(page.as_ptr() as *const PersistentConfig) };
-    if cfg.magic == CONFIG_MAGIC
-        && cfg.version == CONFIG_VERSION
-        && compute_checksum(&cfg) == cfg.checksum
-    {
-        Some(cfg)
-    } else {
-        None
-    }
-}
+type ConfigCache = Cache<Uncached, Uncached, Uncached, u16>;
+type ConfigMap<'a, F> = MapStorage<u16, CountedFlash<'a, F>, ConfigCache>;
 
-fn read_ble_pin(page: &[u8]) -> Option<u32> {
-    if page.len() < PIN_OFFSET + core::mem::size_of::<PinRecord>() {
-        return None;
-    }
-    let rec = unsafe {
-        core::ptr::read_unaligned(page.as_ptr().add(PIN_OFFSET) as *const PinRecord)
-    };
-    if rec.magic == PIN_MAGIC
-        && rec.checksum == rec.pin ^ PIN_MAGIC
-        && (100_000..=999_999).contains(&rec.pin)
-    {
-        Some(rec.pin)
-    } else {
-        None
-    }
+fn open<'a, F>(flash: &'a mut F, region: &Range<u32>) -> ConfigMap<'a, F>
+where
+    F: NorFlash + MultiwriteNorFlash,
+    F::Error: defmt::Format,
+{
+    MapStorage::new(
+        CountedFlash::new(flash, &CONFIG_ERASES),
+        MapConfig::new(region.clone()),
+        Cache::new_uncached(),
+    )
 }
 
 /// Retrieve the active node callsign
@@ -187,6 +161,13 @@ pub fn set_custom_priv_key(key: [u8; 64]) {
     request_save_config();
 }
 
+/// Mark one channel slot dirty so its record is rewritten on the next save.
+pub fn mark_channel_dirty(index: usize) {
+    if index < MAX_CHANNELS {
+        DIRTY_CHANNELS.lock(|d| d.borrow_mut()[index] = true);
+    }
+}
+
 /// Wait for a coalesced configuration save request.
 ///
 /// Returns the request's sequence number: zero for a fire-and-forget save, or
@@ -210,6 +191,7 @@ pub fn request_save_config() {
     let _ = SAVE_REQUEST_CHANNEL.try_send(0);
 }
 
+#[cfg(not(test))]
 fn next_save_seq() -> u32 {
     loop {
         let seq = NEXT_SAVE_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
@@ -265,35 +247,78 @@ pub fn notify_save_complete(seq: u32) {
     }
 }
 
-/// Initialize configuration from flash (or defaults if flash is uninitialized)
-pub fn init_config(page: &[u8], default_name: &str) -> (String<32>, Option<[u8; 64]>) {
-    BLE_PIN.store(
-        read_ble_pin(page).unwrap_or(DEFAULT_BLE_PIN),
-        core::sync::atomic::Ordering::Relaxed,
-    );
+/// Initialize configuration from the journal, or defaults if it is empty.
+pub fn init_config(
+    reader: &'static dyn MappedFlash,
+    region: Range<u32>,
+    default_name: &str,
+) -> (String<32>, Option<[u8; 64]>) {
+    let mut flash = MappedAsyncFlash::new(reader, region.clone());
+    let mut sbuf = [0u8; SCRATCH_SIZE];
+    let mut cbuf = [0u8; SCRATCH_SIZE];
 
-    if let Some(cfg) = read_config(page) {
-        info!("Storage: Found valid persistent config page");
+    let (settings, channels, found) = util::block_on(async {
+        let mut map = open(&mut flash, &region);
+        let settings = match map.fetch_item::<&[u8]>(&mut sbuf, &SETTINGS_KEY).await {
+            Ok(Some(value)) if value.len() >= core::mem::size_of::<SettingsRecord>() => {
+                let rec =
+                    unsafe { core::ptr::read_unaligned(value.as_ptr() as *const SettingsRecord) };
+                if rec.magic == CONFIG_MAGIC && rec.version == CONFIG_VERSION {
+                    Some(rec)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
 
-        // Load callsign
-        let name_len = cfg.callsign.iter().position(|&b| b == 0).unwrap_or(32);
-        let mut name = String::<32>::new();
-        if name_len > 0 {
-            if let Ok(s) = core::str::from_utf8(&cfg.callsign[..name_len]) {
-                let _ = name.push_str(s);
+        let mut channels = [ChannelData {
+            name: [0u8; 32],
+            secret: [0u8; 16],
+        }; MAX_CHANNELS];
+        let mut found = [false; MAX_CHANNELS];
+        for i in 0..MAX_CHANNELS {
+            let key = CHANNEL_KEY_BASE + i as u16;
+            if let Ok(Some(value)) = map.fetch_item::<&[u8]>(&mut cbuf, &key).await {
+                if value.len() >= core::mem::size_of::<ChannelRecord>() {
+                    let rec = unsafe {
+                        core::ptr::read_unaligned(value.as_ptr() as *const ChannelRecord)
+                    };
+                    channels[i] = ChannelData {
+                        name: rec.name,
+                        secret: rec.secret,
+                    };
+                    found[i] = rec.present != 0;
+                }
             }
         }
+        (settings, channels, found)
+    });
+
+    if let Some(cfg) = settings {
+        info!("Storage: Loaded persistent configuration");
+
+        let mut name = String::<32>::new();
+        let _ = name.push_str(str_from_fixed(&cfg.callsign));
         if name.is_empty() {
             let _ = name.push_str(default_name);
         }
         NODE_CALLSIGN.lock(|c| *c.borrow_mut() = name.clone());
 
-        // Load channels
-        crate::state::CHANNELS.lock(|c| {
-            *c.borrow_mut() = cfg.channels;
+        crate::state::CHANNELS.lock(|c| *c.borrow_mut() = channels);
+        let missing = DIRTY_CHANNELS.lock(|d| {
+            let mut dirty = d.borrow_mut();
+            let mut missing = false;
+            for i in 0..MAX_CHANNELS {
+                dirty[i] = !found[i];
+                missing |= !found[i];
+            }
+            missing
         });
+        if missing {
+            request_save_config();
+        }
 
-        // Load radio settings
         crate::state::RADIO_SETTINGS.lock(|r| {
             let mut s = r.borrow_mut();
             s.frequency_hz = cfg.radio_freq_hz;
@@ -304,12 +329,15 @@ pub fn init_config(page: &[u8], default_name: &str) -> (String<32>, Option<[u8; 
             s.is_repeater = cfg.is_repeater != 0;
             s.client_repeat = cfg.client_repeat != 0;
             s.offgrid_home_freq = cfg.offgrid_home_freq;
-            s.path_hash_mode = if cfg.path_hash_mode <= 2 { cfg.path_hash_mode } else { 0 };
+            s.path_hash_mode = if cfg.path_hash_mode <= 2 {
+                cfg.path_hash_mode
+            } else {
+                0
+            };
             s.rx_duty_cycle = cfg.rx_duty_cycle != 0;
             s.airtime_factor_tenths = cfg.airtime_factor_tenths.min(90);
         });
 
-        // Load the contact auto-add policy.
         crate::state::AUTOADD_SETTINGS.lock(|a| {
             *a.borrow_mut() = crate::types::AutoAddSettings {
                 manual_add_contacts: if cfg.manual_add_contacts != 0 { 1 } else { 0 },
@@ -334,6 +362,15 @@ pub fn init_config(page: &[u8], default_name: &str) -> (String<32>, Option<[u8; 
             p.multi_acks = cfg.multi_acks;
         });
 
+        BLE_PIN.store(
+            if (100_000..=999_999).contains(&cfg.ble_pin) {
+                cfg.ble_pin
+            } else {
+                DEFAULT_BLE_PIN
+            },
+            core::sync::atomic::Ordering::Relaxed,
+        );
+
         let priv_key = if cfg.has_custom_key != 0 {
             CUSTOM_PRIV_KEY.lock(|k| *k.borrow_mut() = Some(cfg.custom_priv_key));
             Some(cfg.custom_priv_key)
@@ -341,25 +378,23 @@ pub fn init_config(page: &[u8], default_name: &str) -> (String<32>, Option<[u8; 
             None
         };
 
-        info!("Storage: Loaded callsign '{}', channels, and radio parameters", name.as_str());
+        info!("Storage: callsign '{}', channels and radio restored", name.as_str());
         (name, priv_key)
     } else {
-        info!("Storage: No persistent config found (first boot or unformatted). Initializing defaults.");
+        info!("Storage: No persistent config found; initializing defaults");
+        BLE_PIN.store(DEFAULT_BLE_PIN, core::sync::atomic::Ordering::Relaxed);
         let mut name = String::<32>::new();
         let _ = name.push_str(default_name);
         NODE_CALLSIGN.lock(|c| *c.borrow_mut() = name.clone());
+        DIRTY_CHANNELS.lock(|d| d.borrow_mut().iter_mut().for_each(|x| *x = true));
+        // Persist the defaults (including all channel slots) on first boot.
+        request_save_config();
         (name, None)
     }
 }
 
-/// Gather the active state from all subsystems into a PersistentConfig snapshot
-pub fn assemble_current_config() -> PersistentConfig {
-    let mut callsign_bytes = [0u8; 32];
-    NODE_CALLSIGN.lock(|c| {
-        let s = c.borrow();
-        let len = s.len().min(31);
-        callsign_bytes[..len].copy_from_slice(&s.as_bytes()[..len]);
-    });
+fn assemble_settings() -> SettingsRecord {
+    let callsign = NODE_CALLSIGN.lock(|c| fixed_str::<32>(c.borrow().as_str()));
 
     let (freq, tx, sf, bw, cr, is_rep, client_repeat, offgrid_home_freq, path_mode, rx_duty, af) =
         crate::state::RADIO_SETTINGS.lock(|r| {
@@ -379,8 +414,6 @@ pub fn assemble_current_config() -> PersistentConfig {
             )
         });
 
-    let channels = crate::state::CHANNELS.lock(|c| *c.borrow());
-
     let (has_custom_key, custom_priv_key) = CUSTOM_PRIV_KEY.lock(|k| {
         if let Some(key) = *k.borrow() {
             (1u8, key)
@@ -392,10 +425,11 @@ pub fn assemble_current_config() -> PersistentConfig {
     let auto = crate::state::AUTOADD_SETTINGS.lock(|a| *a.borrow());
     let prefs = crate::state::prefs();
 
-    let mut cfg = PersistentConfig {
+    SettingsRecord {
         magic: CONFIG_MAGIC,
         version: CONFIG_VERSION,
-        callsign: callsign_bytes,
+        _pad: 0,
+        callsign,
         custom_priv_key,
         has_custom_key,
         is_repeater: if is_rep { 1 } else { 0 },
@@ -418,131 +452,87 @@ pub fn assemble_current_config() -> PersistentConfig {
         telemetry_mode_loc: prefs.telemetry_mode_loc,
         telemetry_mode_env: prefs.telemetry_mode_env,
         multi_acks: prefs.multi_acks,
+        ble_pin: BLE_PIN.load(core::sync::atomic::Ordering::Relaxed),
         radio_freq_hz: freq,
         radio_bw_khz: bw,
-        channels,
-        checksum: 0,
-    };
-    cfg.checksum = compute_checksum(&cfg);
-    cfg
+    }
 }
 
-/// Commit the current configuration snapshot to the config page.
-pub async fn save_config<F>(flash: &mut F, region: &core::ops::Range<u32>)
+/// Append the current settings and any dirty channel records to the journal.
+pub async fn save_config<F>(flash: &mut F, region: &Range<u32>)
 where
-    F: NorFlash,
+    F: NorFlash + MultiwriteNorFlash,
     F::Error: defmt::Format,
 {
-    let config = assemble_current_config();
-    let config_bytes = unsafe {
+    let settings = assemble_settings();
+    let settings_bytes = unsafe {
         core::slice::from_raw_parts(
-            &config as *const _ as *const u8,
-            core::mem::size_of::<PersistentConfig>(),
+            &settings as *const SettingsRecord as *const u8,
+            core::mem::size_of::<SettingsRecord>(),
         )
     };
 
-    info!(
-        "Storage: Committing persistent configuration to flash at 0x{:08x}...",
-        region.start
-    );
-    if let Err(e) = flash.erase(region.start, region.end).await {
-        error!("Storage: Flash page erase error: {:?}", e);
-        return;
-    }
-    CONFIG_ERASES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    if let Err(e) = flash.write(region.start, config_bytes).await {
-        error!("Storage: Flash write error: {:?}", e);
-        return;
-    }
-    let pin = BLE_PIN.load(core::sync::atomic::Ordering::Relaxed);
-    let rec = PinRecord {
-        magic: PIN_MAGIC,
-        pin,
-        checksum: pin ^ PIN_MAGIC,
-    };
-    let rec_bytes = unsafe {
-        core::slice::from_raw_parts(
-            &rec as *const PinRecord as *const u8,
-            core::mem::size_of::<PinRecord>(),
-        )
-    };
-    if let Err(e) = flash
-        .write(region.start + PIN_OFFSET as u32, rec_bytes)
+    let mut buf = [0u8; SCRATCH_SIZE];
+    let mut map = open(flash, region);
+
+    if let Err(e) = map
+        .store_item(&mut buf, &SETTINGS_KEY, &settings_bytes)
         .await
     {
-        error!("Storage: BLE PIN write error: {:?}", e);
+        error!("Storage: config settings store failed: {:?}", e);
         return;
     }
-    CONFIG_SAVES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    info!("Storage: Configuration successfully saved to flash!");
-}
 
+    let dirty = {
+        let d = DIRTY_CHANNELS.lock(|c| *c.borrow());
+        d
+    };
+
+    if dirty.iter().any(|d| *d) {
+        let channels = crate::state::CHANNELS.lock(|c| *c.borrow());
+        for i in 0..MAX_CHANNELS {
+            if !dirty[i] {
+                continue;
+            }
+            let ch = channels[i];
+            let present = if ch.name[0] != 0 || ch.secret != [0u8; 16] {
+                1
+            } else {
+                0
+            };
+            let rec = ChannelRecord {
+                present,
+                name: ch.name,
+                secret: ch.secret,
+                _pad: [0; 3],
+            };
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    &rec as *const ChannelRecord as *const u8,
+                    core::mem::size_of::<ChannelRecord>(),
+                )
+            };
+            let key = CHANNEL_KEY_BASE + i as u16;
+            if let Err(e) = map.store_item(&mut buf, &key, &bytes).await {
+                error!("Storage: config channel store failed: {:?}", e);
+                return;
+            }
+        }
+    }
+
+    DIRTY_CHANNELS.lock(|c| c.borrow_mut().iter_mut().for_each(|d| *d = false));
+    CONFIG_SAVES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    info!("Storage: Configuration saved");
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn config_bytes() -> [u8; core::mem::size_of::<PersistentConfig>()] {
-        let cfg = PersistentConfig {
-            magic: CONFIG_MAGIC,
-            version: CONFIG_VERSION,
-            callsign: [0u8; 32],
-            custom_priv_key: [3u8; 64],
-            has_custom_key: 1,
-            is_repeater: 0,
-            client_repeat: 0,
-            offgrid_home_freq: 0,
-            radio_tx_power: 22,
-            radio_sf: 7,
-            radio_cr: 5,
-            path_hash_mode: 1,
-            autoadd_config: 0,
-            autoadd_max_hops: 0,
-            manual_add_contacts: 0,
-            leds_disabled: 0,
-            rx_duty_cycle: 0,
-            airtime_factor_tenths: 90,
-            flood_scope_name: [0u8; 31],
-            flood_scope_key: [0u8; 16],
-            advert_loc_policy: 0,
-            telemetry_mode_base: 0,
-            telemetry_mode_loc: 0,
-            telemetry_mode_env: 0,
-            multi_acks: 0,
-            radio_freq_hz: 910_525_000,
-            radio_bw_khz: 62,
-            channels: [ChannelData {
-                name: [0u8; 32],
-                secret: [0u8; 16],
-            }; MAX_CHANNELS],
-            checksum: 0,
-        };
-        let mut cfg = cfg;
-        cfg.checksum = compute_checksum(&cfg);
-        let mut bytes = [0u8; core::mem::size_of::<PersistentConfig>()];
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                &cfg as *const PersistentConfig as *const u8,
-                bytes.as_mut_ptr(),
-                bytes.len(),
-            );
-        }
-        bytes
-    }
-
     #[test]
-    fn parses_a_valid_page() {
-        let bytes = config_bytes();
-        let cfg = read_config(&bytes).expect("valid config");
-        assert_eq!(cfg.magic, CONFIG_MAGIC);
-        assert_eq!(cfg.radio_freq_hz, 910_525_000);
-        assert_eq!(cfg.custom_priv_key, [3u8; 64]);
-    }
-
-    #[test]
-    fn rejects_a_corrupt_page() {
-        let mut bytes = config_bytes();
-        bytes[12] ^= 0xFF;
-        assert!(read_config(&bytes).is_none());
+    fn records_fit_the_scratch_buffer() {
+        assert!(core::mem::size_of::<SettingsRecord>() <= SCRATCH_SIZE);
+        assert!(core::mem::size_of::<ChannelRecord>() <= SCRATCH_SIZE);
+        assert_eq!(core::mem::size_of::<ChannelRecord>(), 52);
     }
 }

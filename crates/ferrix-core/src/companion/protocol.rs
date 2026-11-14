@@ -1378,6 +1378,7 @@ impl<'a> CompanionNode<'a> {
                             changed
                         });
                         if changed {
+                            crate::storage::config::mark_channel_dirty(channel_idx);
                             self.host.request_save_config();
                         }
                     }
