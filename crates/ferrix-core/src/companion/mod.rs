@@ -4,4 +4,5 @@
 //! currently lives in the board crate while the storage and radio interfaces
 //! are still being inverted.
 
+pub mod contacts;
 pub mod framing;

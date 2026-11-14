@@ -510,6 +510,12 @@ pub fn note_advert(pub_key: &[u8; 32], timestamp: u32, had_blob: bool) {
     ADVERT_LAST_TS.store(timestamp, Ordering::Relaxed);
 }
 
+pub use ferrix_core::companion::contacts::{
+    encode_contacts_end, encode_contacts_start, RESP_CODE_CONTACT, RESP_CODE_CONTACTS_START,
+    RESP_CODE_END_OF_CONTACTS,
+};
+pub(crate) use ferrix_core::companion::contacts::serialize_contact;
+
 pub use ferrix_core::state::{
     advert_location, apply_flood_scope, apply_flood_scope_default, flood_scope_default,
     flood_scope_send, prefs, scope_override, update_prefs, CompanionPrefs, DEFAULT_PREFS, SCOPE,
@@ -584,9 +590,6 @@ pub const ERR_NOT_FOUND: u8 = 0x02;
 pub const ERR_TABLE_FULL: u8 = 0x03;
 pub const ERR_BAD_STATE: u8 = 0x04;
 pub const ERR_ILLEGAL_ARG: u8 = 0x06;
-pub const RESP_CODE_CONTACTS_START: u8 = 2;
-pub const RESP_CODE_CONTACT: u8 = 3;
-pub const RESP_CODE_END_OF_CONTACTS: u8 = 4;
 pub const RESP_CODE_SELF_INFO: u8 = 5;
 /// Reply to a direct send: `[is_flood][expected_ack:4][est_timeout_ms:4]`.
 pub const RESP_CODE_SENT: u8 = 0x06;
@@ -3164,41 +3167,3 @@ pub fn contact_at(idx: usize) -> Option<crate::meshcore::mesh::DiscoveredContact
     crate::companion::usb::DISCOVERED_CONTACTS.lock(|c| c.borrow().get(idx).cloned())
 }
 
-/// `RESP_CODE_CONTACTS_START` (2) `[code(2), count(u32_le)]`.
-pub fn encode_contacts_start(count: u32) -> Vec<u8, 8> {
-    let mut resp = Vec::<u8, 8>::new();
-    let _ = resp.push(RESP_CODE_CONTACTS_START);
-    let _ = resp.extend_from_slice(&count.to_le_bytes());
-    resp
-}
-
-/// `RESP_CODE_END_OF_CONTACTS` (4) `[code(4), most_recent_lastmod(u32_le)]`.
-pub fn encode_contacts_end(max_lastmod: u32) -> Vec<u8, 8> {
-    let mut resp = Vec::<u8, 8>::new();
-    let _ = resp.push(RESP_CODE_END_OF_CONTACTS);
-    let _ = resp.extend_from_slice(&max_lastmod.to_le_bytes());
-    resp
-}
-
-/// Serialize one contact in the companion `PACKET_CONTACT` layout.
-pub(crate) fn serialize_contact(c: &crate::meshcore::mesh::DiscoveredContact) -> Vec<u8, 160> {
-    let mut resp = Vec::<u8, 160>::new();
-    let _ = resp.push(RESP_CODE_CONTACT);
-    let _ = resp.extend_from_slice(&c.pub_key);
-    let _ = resp.push(c.contact_type);
-    let _ = resp.push(c.flags);
-    let _ = resp.push(c.out_path_len);
-    let _ = resp.extend_from_slice(&c.out_path);
-
-    let mut adv_name = [0u8; 32];
-    let cs = c.callsign.as_bytes();
-    let n = cs.len().min(31);
-    adv_name[..n].copy_from_slice(&cs[..n]);
-    let _ = resp.extend_from_slice(&adv_name);
-
-    let _ = resp.extend_from_slice(&c.last_advert_ts.to_le_bytes());
-    let _ = resp.extend_from_slice(&c.latitude.to_le_bytes());
-    let _ = resp.extend_from_slice(&c.longitude.to_le_bytes());
-    let _ = resp.extend_from_slice(&c.last_seen_epoch.to_le_bytes());
-    resp
-}
