@@ -1,23 +1,88 @@
 //! Display subsystem for the ThinkNode M1.
 //!
 //! The SSD1681 controller lives in `ferrix-ssd1681`; this module owns the
-//! board's 200x200 framebuffer, dashboard rendering and the `NodeDisplay`
-//! adapter used by the application loop.
+//! board's 200x200 framebuffer, its `embedded-graphics` integration and the
+//! `ThinkNodeDisplay` wrapper used by the application loop.
 
-pub mod framebuffer;
 pub mod ui;
 
 pub use ferrix_ssd1681::{PanelConfig, Ssd1681};
-pub use framebuffer::{EpdFrameBuffer, EPD_HEIGHT, EPD_WIDTH};
 pub use ui::render_dashboard;
 
 use embassy_nrf::gpio::{Input, Output};
 use embassy_nrf::peripherals::TWISPI1;
 use embassy_nrf::spim::Spim;
 use embassy_time::Delay;
+use embedded_graphics::pixelcolor::BinaryColor;
+use embedded_graphics::prelude::*;
 use embedded_hal_bus::spi::ExclusiveDevice;
 use ferrix_core::companion::protocol::CompanionNode;
 use ferrix_runtime::app::UiState;
+
+pub const EPD_WIDTH: usize = 200;
+pub const EPD_HEIGHT: usize = 200;
+pub const EPD_BUFFER_SIZE: usize = (EPD_WIDTH * EPD_HEIGHT) / 8;
+
+/// In-memory monochrome framebuffer for the 200x200 panel.
+pub struct EpdFrameBuffer {
+    pub buffer: [u8; EPD_BUFFER_SIZE],
+}
+
+impl EpdFrameBuffer {
+    pub const fn new() -> Self {
+        // 1 = white in SSD1681 RAM.
+        Self {
+            buffer: [0xFF; EPD_BUFFER_SIZE],
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.buffer.fill(0xFF);
+    }
+}
+
+impl Default for EpdFrameBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OriginDimensions for EpdFrameBuffer {
+    fn size(&self) -> Size {
+        Size::new(EPD_WIDTH as u32, EPD_HEIGHT as u32)
+    }
+}
+
+impl DrawTarget for EpdFrameBuffer {
+    type Color = BinaryColor;
+    type Error = core::convert::Infallible;
+
+    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = Pixel<Self::Color>>,
+    {
+        for Pixel(coord, color) in pixels.into_iter() {
+            if coord.x >= 0
+                && coord.x < EPD_WIDTH as i32
+                && coord.y >= 0
+                && coord.y < EPD_HEIGHT as i32
+            {
+                let x = coord.x as usize;
+                let y = coord.y as usize;
+                let byte_idx = (y * EPD_WIDTH + x) / 8;
+                let bit_mask = 0x80 >> (x % 8);
+
+                match color {
+                    // Black: cleared bit.
+                    BinaryColor::On => self.buffer[byte_idx] &= !bit_mask,
+                    // White: set bit.
+                    BinaryColor::Off => self.buffer[byte_idx] |= bit_mask,
+                }
+            }
+        }
+        Ok(())
+    }
+}
 
 type EpdSpi = ExclusiveDevice<Spim<'static, TWISPI1>, Output<'static>, Delay>;
 
@@ -31,36 +96,7 @@ pub type ThinkNodeEpd = Ssd1681<
     Delay,
 >;
 
-/// Common display interface for MeshCore nodes.
-#[allow(async_fn_in_trait)]
-pub trait NodeDisplay {
-    type Error: core::fmt::Debug;
-
-    /// Initialize the display controller.
-    async fn init(&mut self) -> Result<(), Self::Error>;
-
-    /// Render and flush the dashboard (fast differential refresh).
-    async fn render_dashboard(
-        &mut self,
-        node: &CompanionNode<'_>,
-        ui: &UiState,
-    ) -> Result<(), Self::Error>;
-
-    /// Render the full dashboard with a full OTP clearing refresh.
-    async fn render_dashboard_full(
-        &mut self,
-        node: &CompanionNode<'_>,
-        ui: &UiState,
-    ) -> Result<(), Self::Error>;
-
-    /// Render the boot splash.
-    async fn render_boot(&mut self, node: &CompanionNode<'_>) -> Result<(), Self::Error>;
-
-    /// Put the display into ultra-low-power sleep.
-    async fn sleep(&mut self) -> Result<(), Self::Error>;
-}
-
-/// ThinkNode M1 display wrapper implementing `NodeDisplay`.
+/// ThinkNode M1 display wrapper.
 pub struct ThinkNodeDisplay {
     epd: ThinkNodeEpd,
     fb: &'static mut EpdFrameBuffer,
@@ -75,39 +111,43 @@ impl ThinkNodeDisplay {
     pub fn set_backlight(&mut self, enabled: bool) {
         let _ = self.epd.set_backlight(enabled);
     }
-}
 
-impl NodeDisplay for ThinkNodeDisplay {
-    type Error = ferrix_ssd1681::Error;
-
-    async fn init(&mut self) -> Result<(), Self::Error> {
+    /// Initialise the panel controller.
+    pub async fn init(&mut self) -> Result<(), ferrix_ssd1681::Error> {
         self.epd.init().await
     }
 
-    async fn render_dashboard(
+    /// Render and flush the dashboard with a fast differential refresh.
+    pub async fn render_dashboard(
         &mut self,
         node: &CompanionNode<'_>,
         ui: &UiState,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), ferrix_ssd1681::Error> {
         ui::render_dashboard(node, ui, self.fb);
         self.epd.display_frame_fast(&self.fb.buffer).await
     }
 
-    async fn render_dashboard_full(
+    /// Render the dashboard with a full OTP clearing refresh.
+    pub async fn render_dashboard_full(
         &mut self,
         node: &CompanionNode<'_>,
         ui: &UiState,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), ferrix_ssd1681::Error> {
         ui::render_dashboard(node, ui, self.fb);
         self.epd.display_frame_full(&self.fb.buffer).await
     }
 
-    async fn render_boot(&mut self, node: &CompanionNode<'_>) -> Result<(), Self::Error> {
+    /// Render the boot splash.
+    pub async fn render_boot(
+        &mut self,
+        node: &CompanionNode<'_>,
+    ) -> Result<(), ferrix_ssd1681::Error> {
         ui::render_boot(node, self.fb);
         self.epd.display_frame_full(&self.fb.buffer).await
     }
 
-    async fn sleep(&mut self) -> Result<(), Self::Error> {
+    /// Put the panel into deep sleep.
+    pub async fn sleep(&mut self) -> Result<(), ferrix_ssd1681::Error> {
         self.epd.sleep().await
     }
 }

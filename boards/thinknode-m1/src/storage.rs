@@ -32,7 +32,7 @@ pub fn init_config() -> (String<32>, Option<[u8; 64]>) {
     ferrix_core::storage::config::init_config(
         &ferrix_nrf52::flash::MAPPED,
         REGIONS.config.clone(),
-        crate::board::NAME,
+        crate::NAME,
     )
 }
 

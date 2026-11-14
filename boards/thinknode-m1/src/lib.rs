@@ -8,16 +8,14 @@
 #![no_std]
 
 pub mod app;
-pub mod board;
-pub mod companion;
 pub mod display;
 pub mod gps;
 pub mod host;
-pub mod input;
-pub mod meshcore;
+pub mod pins;
 pub mod radio;
 pub mod storage;
-pub mod telemetry;
+
+use core::sync::atomic::{AtomicU16, Ordering};
 
 use defmt_rtt as _;
 
@@ -28,20 +26,69 @@ use embassy_nrf::saadc;
 use embassy_nrf::spim::{self, Spim};
 use embassy_time::{Delay, Duration, Timer};
 use ferrix_core::companion::cli::CliHost;
-use ferrix_core::companion::protocol::CompanionHost;
+use ferrix_core::companion::protocol::{
+    CompanionHost, CompanionNode, CAP_BLE, CAP_CLIENT, CAP_EPD, CAP_GPS,
+};
 use ferrix_core::engine::EngineContext;
 use ferrix_role_companion::CompanionBoard;
+use ferrix_runtime::radio::ChannelRadio;
 use heapless::String;
 use static_cell::StaticCell;
 
 use crate::app::ThinkNodeApp;
-use crate::board::{BoardPins, LoraPins, TelemetryPins};
-use crate::display::{EpdFrameBuffer, NodeDisplay, PanelConfig, Ssd1681, ThinkNodeDisplay};
+use crate::display::{EpdFrameBuffer, PanelConfig, Ssd1681, ThinkNodeDisplay};
+use crate::host::BOARD_ENGINE_CONTEXT;
 use crate::host::BOARD_HOST;
-use crate::meshcore::BOARD_ENGINE_CONTEXT;
-use crate::radio::{sx1262_task, ChannelRadio};
+use crate::pins::{BoardIrqs, DisplayPins, LoraPins, Pins, TelemetryPins};
+use crate::radio::sx1262_task;
+
+/// Hardware model reported to MeshCore companion apps.
+pub const NAME: &str = "ThinkNode M1";
+/// Whether this board has a display.
+pub const HAS_DISPLAY: bool = true;
+/// Whether this board has a GNSS receiver.
+pub const HAS_GPS: bool = true;
+/// Whether this board has a battery ADC.
+pub const HAS_BATTERY_ADC: bool = true;
+/// Protocol capability bits.
+pub const CAPABILITIES: u32 = CAP_CLIENT | CAP_GPS | CAP_EPD | CAP_BLE;
+
+pub use ferrix_nrf52::seed::hardware_seed;
 
 static EPD_FRAMEBUFFER: StaticCell<EpdFrameBuffer> = StaticCell::new();
+
+// ---------------------------------------------------------------------------
+// Battery telemetry
+// ---------------------------------------------------------------------------
+
+/// Latest measured battery voltage. 0 means "not sampled / no battery".
+static BATTERY_MV: AtomicU16 = AtomicU16::new(0);
+
+pub use ferrix_core::battery::MIN_PLAUSIBLE_BATTERY_MV;
+
+pub fn set_battery_millivolts(mv: u16) {
+    if mv >= MIN_PLAUSIBLE_BATTERY_MV {
+        BATTERY_MV.store(mv, Ordering::Relaxed);
+    }
+}
+
+pub fn battery_millivolts() -> u16 {
+    BATTERY_MV.load(Ordering::Relaxed)
+}
+
+pub fn battery_percentage() -> u8 {
+    ferrix_core::battery::millivolts_to_percentage(battery_millivolts())
+}
+
+/// ThinkNode M1 battery ADC: AIN2 (P0.04), 150K+150K divider (2:1), SAADC
+/// gain 1/6 with the internal 0.6 V reference.
+///
+/// `7236 / 4096` matches the board's `vbat-mv-multiplier` (2:1 divider,
+/// 3.6 V full scale, +0.5% SAADC gain trim).
+pub fn adc_raw_to_battery_millivolts(raw: u16) -> u16 {
+    let mv = (raw as u32 * 7236) / 4096;
+    mv.min(u16::MAX as u32) as u16
+}
 
 // ---------------------------------------------------------------------------
 // Fatal-error indicators
@@ -118,7 +165,7 @@ unsafe fn HardFault(_frame: &cortex_m_rt::ExceptionFrame) -> ! {
 
 /// Persistent state the role needs across the startup phases.
 pub struct ThinkNodeBoard {
-    pins: Option<BoardPins>,
+    pins: Option<Pins>,
     _power_en: Option<Output<'static>>,
     telemetry: Option<TelemetryPins>,
     battery_adc: Option<saadc::Saadc<'static, 1>>,
@@ -134,7 +181,7 @@ impl ThinkNodeBoard {
     /// Take the nRF peripherals and hold the board pin configuration.
     pub fn new(p: embassy_nrf::Peripherals) -> Self {
         Self {
-            pins: Some(crate::board::init(p)),
+            pins: Some(crate::pins::init(p)),
             _power_en: None,
             telemetry: None,
             battery_adc: None,
@@ -147,22 +194,12 @@ impl ThinkNodeBoard {
         }
     }
 
-    fn build_display(
-        &mut self,
-        spim1: peripherals::TWISPI1,
-        pins: crate::board::DisplayPins,
-    ) {
+    fn build_display(&mut self, spim1: peripherals::TWISPI1, pins: DisplayPins) {
         let mut config = spim::Config::default();
         config.frequency = spim::Frequency::M4;
         config.mode = spim::MODE_0;
 
-        let spim1 = Spim::new_txonly(
-            spim1,
-            crate::board::BoardIrqs,
-            pins.sclk,
-            pins.mosi,
-            config,
-        );
+        let spim1 = Spim::new_txonly(spim1, BoardIrqs, pins.sclk, pins.mosi, config);
         let spi = embedded_hal_bus::spi::ExclusiveDevice::new(spim1, pins.cs, Delay).unwrap();
         let epd = Ssd1681::new(
             spi,
@@ -183,11 +220,11 @@ impl CompanionBoard for ThinkNodeBoard {
     type Radio = ChannelRadio;
 
     fn name(&self) -> &'static str {
-        crate::board::NAME
+        NAME
     }
 
     fn capabilities(&self) -> u32 {
-        crate::board::CAPABILITIES
+        CAPABILITIES
     }
 
     fn usb_ids(&self) -> (u16, u16) {
@@ -203,7 +240,7 @@ impl CompanionBoard for ThinkNodeBoard {
     }
 
     fn ble_model(&self) -> &'static str {
-        crate::board::NAME
+        NAME
     }
 
     fn companion_host(&self) -> &'static dyn CompanionHost {
@@ -219,16 +256,16 @@ impl CompanionBoard for ThinkNodeBoard {
     }
 
     fn hardware_seed(&self) -> [u8; 32] {
-        crate::board::hardware_seed()
+        hardware_seed()
     }
 
     fn forwarding_enabled(&self) -> bool {
-        crate::companion::usb::forwarding_enabled()
+        ferrix_core::state::forwarding_enabled()
     }
 
     async fn init(&mut self, spawner: Spawner) -> (String<32>, Option<[u8; 64]>) {
         let pins = self.pins.take().expect("board peripherals already taken");
-        let BoardPins {
+        let Pins {
             lora,
             display: display_pins,
             gps,
@@ -255,19 +292,17 @@ impl CompanionBoard for ThinkNodeBoard {
         // The GPS task owns the L76K UART and control pins; it holds the module
         // in reset/sleep until the dashboard enables it.
         if let Some(gps) = gps {
-            spawner
-                .spawn(crate::gps::gps_task(uarte0, gps))
-                .unwrap();
+            spawner.spawn(crate::gps::gps_task(uarte0, gps)).unwrap();
         }
 
         spawner
-            .spawn(crate::board::thinknode_input_task(inputs))
+            .spawn(crate::pins::thinknode_input_task(inputs))
             .unwrap();
 
         // Battery ADC: ThinkNode M1 AIN2 (P0.04), 150K+150K divider (2:1).
         let mut battery_adc = saadc::Saadc::new(
             saadc,
-            crate::board::BoardIrqs,
+            BoardIrqs,
             saadc::Config::default(),
             [saadc::ChannelConfig::single_ended(bat_adc_pin)],
         );
@@ -275,7 +310,7 @@ impl CompanionBoard for ThinkNodeBoard {
         // Take one sample before the companion/display start so a freshly
         // booted device never reports 0 mV to the app.
         let mut battery_buf = [0i16; 1];
-        if crate::board::HAS_BATTERY_ADC {
+        if HAS_BATTERY_ADC {
             match embassy_futures::select::select(
                 battery_adc.sample(&mut battery_buf),
                 Timer::after_millis(100),
@@ -284,9 +319,7 @@ impl CompanionBoard for ThinkNodeBoard {
             {
                 embassy_futures::select::Either::First(_) => {
                     let raw = battery_buf[0].max(0) as u16;
-                    crate::telemetry::set_battery_millivolts(
-                        crate::telemetry::adc_raw_to_battery_millivolts(raw),
-                    );
+                    set_battery_millivolts(adc_raw_to_battery_millivolts(raw));
                 }
                 embassy_futures::select::Either::Second(_) => {}
             }
@@ -310,7 +343,7 @@ impl CompanionBoard for ThinkNodeBoard {
     }
 
     fn publish_identity(&mut self, public_key: [u8; 32], private_key: [u8; 64]) {
-        crate::companion::usb::set_identity(public_key, private_key);
+        ferrix_core::state::set_identity(public_key, private_key);
     }
 
     fn start_transports(
@@ -322,7 +355,7 @@ impl CompanionBoard for ThinkNodeBoard {
         let usbd = self.usbd.take().expect("USB peripheral already taken");
         let usb_driver = ferrix_nrf52::usb::driver(usbd);
         let (vid, pid) = self.usb_ids();
-        let (usb_dev, cdc_class) = crate::companion::usb::init_usb(
+        let (usb_dev, cdc_class) = ferrix_nrf52::usb::init_usb(
             usb_driver,
             vid,
             pid,
@@ -331,10 +364,10 @@ impl CompanionBoard for ThinkNodeBoard {
         );
 
         spawner
-            .spawn(crate::companion::usb::usb_task(usb_dev))
+            .spawn(ferrix_nrf52::usb::usb_task(usb_dev))
             .unwrap();
         spawner
-            .spawn(crate::companion::usb::cdc_acm_task(
+            .spawn(ferrix_nrf52::usb::cdc_acm_task(
                 cdc_class,
                 public_key,
                 private_key,
@@ -344,10 +377,10 @@ impl CompanionBoard for ThinkNodeBoard {
             ))
             .unwrap();
         spawner
-            .spawn(crate::companion::ble::contact_task())
+            .spawn(ferrix_nrf52::ble::contact_task())
             .unwrap();
 
-        crate::companion::ble::init_ble_companion(
+        ferrix_nrf52::ble::init_ble_companion(
             spawner,
             public_key,
             private_key,
@@ -361,7 +394,7 @@ impl CompanionBoard for ThinkNodeBoard {
         );
     }
 
-    async fn start_ui(&mut self, node: &ferrix_core::companion::protocol::CompanionNode<'_>) {
+    async fn start_ui(&mut self, node: &CompanionNode<'_>) {
         if let Some(display) = &mut self.display {
             defmt::info!("Initializing display and drawing Ferrix boot splash...");
             display.init().await.ok();
@@ -387,7 +420,7 @@ impl CompanionBoard for ThinkNodeBoard {
 
         let spim0 = Spim::new(
             spim0,
-            crate::board::BoardIrqs,
+            BoardIrqs,
             lora.sck,
             lora.miso,
             lora.mosi,
@@ -419,5 +452,21 @@ impl CompanionBoard for ThinkNodeBoard {
 
     fn take_radio(&mut self) -> Self::Radio {
         self.radio.take().expect("radio already taken")
+    }
+}
+
+#[cfg(test)]
+mod battery_tests {
+    use super::*;
+
+    #[test]
+    fn adc_raw_to_battery_millivolts() {
+        // Full-scale 3.6 V at the pin, 2:1 divider -> ~7.2 V battery.
+        assert_eq!(adc_raw_to_battery_millivolts(4095), 7234);
+        assert_eq!(adc_raw_to_battery_millivolts(0), 0);
+        // ~4.2 V battery -> ~2377 counts.
+        assert_eq!(adc_raw_to_battery_millivolts(2377), 4199);
+        // 3.7 V battery.
+        assert_eq!(adc_raw_to_battery_millivolts(2094), 3699);
     }
 }

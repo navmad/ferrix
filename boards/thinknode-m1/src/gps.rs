@@ -15,7 +15,7 @@ use embassy_time::{Delay, Timer};
 use ferrix_core::state::clear_gps_state;
 use ferrix_l76k::{L76k, L76kConfig};
 
-use crate::board::GpsPins;
+use crate::pins::GpsPins;
 
 /// GPS module power state controlled from the dashboard.
 pub static GPS_ENABLED: AtomicBool = AtomicBool::new(false);

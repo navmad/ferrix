@@ -34,18 +34,14 @@ boards/
 └── thinknode-m1/              <-- pins, UI, storage layout, AppBoard
     ├── memory.x               <-- flash/RAM layout
     └── src/
-        ├── lib.rs             <-- CompanionBoard implementation
-        ├── board.rs           <-- pins and board metadata
+        ├── lib.rs             <-- CompanionBoard impl, identity, battery
+        ├── pins.rs            <-- pinout, input mapper and peripheral init
         ├── app.rs             <-- AppBoard: LED, display, GPS, battery
-        ├── meshcore.rs        <-- engine context & wire re-exports
-        ├── radio/sx1262.rs    <-- board radio task and channel bridge
-        ├── host.rs            <-- protocol/CLI host binding
-        ├── companion.rs       <-- transport re-exports
+        ├── host.rs            <-- protocol, CLI and engine-context bindings
+        ├── radio.rs           <-- SX1262 task and board wiring
         ├── display/           <-- framebuffer and dashboard renderer
         ├── storage.rs         <-- flash layout adapter
-        ├── gps.rs             <-- GNSS task and NMEA line handling
-        ├── input.rs           <-- button-to-event mapper
-        └── telemetry.rs       <-- battery ADC
+        └── gps.rs             <-- GNSS task and NMEA line handling
 
 drivers/
 ├── radio/sx1262/              <-- ferrix-sx1262
