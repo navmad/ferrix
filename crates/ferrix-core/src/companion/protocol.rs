@@ -2279,10 +2279,11 @@ impl<'a> CompanionNode<'a> {
                     let pin = if raw == 0 { 123_456 } else { raw };
                     if (100_000..=999_999).contains(&pin) {
                         let changed = crate::state::BLE_PIN.swap(pin, Ordering::Relaxed) != pin;
-                        if changed {
-                            self.host.request_save_config();
-                        }
-                        ok = true;
+                        // The app applies a new PIN by rebooting the node as
+                        // soon as it gets this reply. Wait for the flash write,
+                        // otherwise the next boot restores the old PIN.
+                        ok = !changed
+                            || crate::storage::config::request_save_config_and_wait().await;
                     }
                 }
                 let mut resp = Vec::<u8, 4>::new();

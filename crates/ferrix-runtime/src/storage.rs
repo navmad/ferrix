@@ -57,11 +57,20 @@ where
                     return StorageExit::FactoryReset;
                 }
                 Either::First(selected) => match selected {
-                    Either5::First(_) => {
-                        // Debounce in case several settings are saved together.
-                        Timer::after_millis(200).await;
-                        config::drain_save_requests();
+                    Either5::First(seq) => {
+                        // A caller waiting for durability (for example a BLE
+                        // PIN change, which the app applies by rebooting) must
+                        // not be delayed. Ordinary setting changes still
+                        // coalesce for 200 ms.
+                        if seq == 0 {
+                            Timer::after_millis(200).await;
+                        }
+                        let ack = seq.max(config::drain_save_requests());
+                        let before = config::CONFIG_SAVES.load(core::sync::atomic::Ordering::Relaxed);
                         config::save_config(flash, &regions.config).await;
+                        if config::CONFIG_SAVES.load(core::sync::atomic::Ordering::Relaxed) != before {
+                            config::notify_save_complete(ack);
+                        }
                     }
                     Either5::Second(_) => {
                         // Advert/app bursts arrive together; coalesce them.
