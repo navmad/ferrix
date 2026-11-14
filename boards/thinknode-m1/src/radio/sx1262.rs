@@ -101,15 +101,15 @@ fn make_rx_mode(sf: u8, bw_khz: u32, duty_cycle: bool) -> RxMode {
 
 
 /// ThinkNode M1 LoRa Radio Adapter implementing `LoraRadio` via channels.
-pub struct LoraPhyChannelRadio;
+pub struct ChannelRadio;
 
-impl LoraPhyChannelRadio {
+impl ChannelRadio {
     pub const fn new() -> Self {
         Self
     }
 }
 
-impl LoraRadio for LoraPhyChannelRadio {
+impl LoraRadio for ChannelRadio {
     type Error = ();
 
     async fn init(&mut self, _config: &LoraConfig) -> Result<(), Self::Error> {
@@ -308,7 +308,7 @@ impl RadioDevice for Sx1262Radio {
 
 /// Standalone Embassy task managing the SX1262 radio via `lora-phy`.
 #[embassy_executor::task]
-pub async fn lora_phy_task(
+pub async fn sx1262_task(
     spim: Spim<'static, TWISPI0>,
     cs: Output<'static>,
     reset: Output<'static>,

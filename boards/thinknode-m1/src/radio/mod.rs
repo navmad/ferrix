@@ -2,7 +2,7 @@
 
 pub mod sx1262;
 
-pub use sx1262::{lora_phy_task, LoraPhyChannelRadio};
+pub use sx1262::{sx1262_task, ChannelRadio};
 
 pub use ferrix_core::airtime::estimate_airtime_ms;
 pub use ferrix_core::scheduler::{tx_budget_max, tx_duty_pct};

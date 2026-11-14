@@ -32,7 +32,7 @@ use crate::host::BOARD_HOST;
 #[cfg(feature = "thinknode-m1")]
 use crate::display::{EpdFrameBuffer, NodeDisplay, Ssd1681, ThinkNodeDisplay};
 use crate::meshcore::{LocalIdentity, MeshEngine};
-use crate::radio::{lora_phy_task, LoraConfig, LoraPhyChannelRadio, LoraRadio};
+use crate::radio::{sx1262_task, LoraConfig, ChannelRadio, LoraRadio};
 
 bind_interrupts!(struct Irqs {
     USBD => usb::InterruptHandler<peripherals::USBD>;
@@ -292,7 +292,7 @@ async fn main(spawner: Spawner) {
     );
 
     // Spawn background lora-phy radio task on ThinkNode M1 SX1262
-    spawner.spawn(lora_phy_task(
+    spawner.spawn(sx1262_task(
         spim0,
         board.lora.cs,
         board.lora.reset,
@@ -301,7 +301,7 @@ async fn main(spawner: Spawner) {
         board.lora.rf_sw,
     )).unwrap();
 
-    let mut lora = LoraPhyChannelRadio::new();
+    let mut lora = ChannelRadio::new();
     let _ = lora.init(&LoraConfig::default()).await;
     lora.start_receive().await;
 
