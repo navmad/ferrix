@@ -2,7 +2,6 @@
 name = "ferrix-thinknode-m1"
 version = "0.1.0"
 edition = "2021"
-build = "build.rs"
 
 [dependencies]
 cortex-m = { version = "0.7", features = ["inline-asm"] }
@@ -13,12 +12,8 @@ defmt-rtt = "0.4"
 embassy-executor = { version = "0.7", features = ["arch-cortex-m", "executor-thread", "executor-interrupt", "defmt", "task-arena-size-40960"] }
 embassy-time = { version = "0.4", features = ["defmt", "generic-queue-8"] }
 embassy-nrf = { version = "0.3", features = ["defmt", "nrf52840", "time-driver-rtc1", "gpiote", "reset-pin-as-gpio", "qspi-multiwrite-flash"] }
-embassy-sync = { version = "0.6", features = ["defmt"] }
 embassy-futures = { version = "0.1", features = ["defmt"] }
-embassy-usb = { version = "0.4", features = ["defmt"] }
 
-embedded-hal = "1.0"
-embedded-hal-async = "1.0"
 embedded-hal-bus = { version = "0.2", features = ["async"] }
 embedded-io-async = { version = "0.6", features = ["defmt-03"] }
 embedded-graphics = "0.8"

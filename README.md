@@ -12,9 +12,9 @@ See [FEATURES.md](FEATURES.md) for the full feature set and current limitations.
 
 ## Supported Boards
 
-| Board Target | Feature Flag | MCU | Radio | Display | GNSS / GPS |
+| Board Target | Firmware package | MCU | Radio | Display | GNSS / GPS |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Elecrow ThinkNode M1** | `thinknode-m1` (default) | nRF52840 | Semtech SX1262 | 1.54" SSD1681 E-Paper | Quectel L76K |
+| **Elecrow ThinkNode M1** | `ferrix-thinknode-m1-companion` | nRF52840 | Semtech SX1262 | 1.54" SSD1681 E-Paper | Quectel L76K |
 
 ---
 
@@ -23,39 +23,54 @@ See [FEATURES.md](FEATURES.md) for the full feature set and current limitations.
 The firmware decouples application logic from board-specific pinouts and radio hardware:
 
 ```text
-boards/thinknode-m1/          <-- BOARD CRATE
-├── Cargo.toml                 <-- binary: ferrix
-├── memory.x                   <-- flash/RAM layout
-└── src/
-    ├── main.rs                <-- hardware init & startup
-    ├── board.rs               <-- pins, board metadata & init
-    ├── app.rs                 <-- AppBoard: LED, display, GPS, battery
-    ├── meshcore.rs            <-- engine context & wire re-exports
-    ├── radio/sx1262.rs        <-- SX1262 driver & startup
-    ├── host.rs               <-- protocol/CLI host binding
-    ├── companion.rs          <-- transport re-exports
-    ├── display/               <-- SSD1681 e-paper & dashboard
-    ├── storage.rs             <-- flash layout adapter
-    ├── gps.rs                 <-- GPS power state
-    ├── input.rs               <-- button-to-event mapper
-    └── telemetry.rs           <-- battery ADC
+firmware/
+└── thinknode-m1-companion/    <-- binary: ferrix (board + role)
+
+roles/
+├── companion/                 <-- identity, transports and app loop
+└── repeater/                  <-- placeholder, not built yet
+
+boards/
+└── thinknode-m1/              <-- pins, UI, storage layout, AppBoard
+    ├── memory.x               <-- flash/RAM layout
+    └── src/
+        ├── lib.rs             <-- CompanionBoard implementation
+        ├── board.rs           <-- pins and board metadata
+        ├── app.rs             <-- AppBoard: LED, display, GPS, battery
+        ├── meshcore.rs        <-- engine context & wire re-exports
+        ├── radio/sx1262.rs    <-- board radio task and channel bridge
+        ├── host.rs            <-- protocol/CLI host binding
+        ├── companion.rs       <-- transport re-exports
+        ├── display/           <-- framebuffer and dashboard renderer
+        ├── storage.rs         <-- flash layout adapter
+        ├── gps.rs             <-- GNSS task and NMEA line handling
+        ├── input.rs           <-- button-to-event mapper
+        └── telemetry.rs       <-- battery ADC
+
+drivers/
+├── radio/sx1262/              <-- ferrix-sx1262
+├── display/ssd1681/           <-- ferrix-ssd1681
+└── gnss/l76k/                 <-- ferrix-l76k
+
+platforms/
+└── nrf52/                     <-- startup, watchdog, USB, BLE, flash, QSPI
 
 crates/
 ├── meshcore-wire/             <-- pure MeshCore codecs
-├── ferrix-hal/                <-- hardware traits
-├── ferrix-core/               <-- application, protocol and storage formats
-└── ferrix-runtime/            <-- application, radio and storage loops
-
-platforms/
-└── nrf52/                     <-- USB, BLE, reset, seed and flash access
+├── ferrix-hal/                <-- hardware traits and radio math
+├── ferrix-core/               <-- protocol, state and storage formats
+└── ferrix-runtime/            <-- role-agnostic app, radio and storage loops
 ```
 
 ### Adding a New Board
-1. Add a crate under `boards/<name>` with its `memory.x`, pinout and devices.
-2. Implement the `ferrix-hal` traits and pass the devices to `ferrix-runtime`.
-3. Add the board to the workspace and to the build/test tooling.
-4. The application crates (`ferrix-core`, `ferrix-runtime`) must not need
-   board-specific changes.
+1. Add a library crate under `boards/<name>` with its `memory.x`, pinout and
+   device wiring.
+2. Implement the role trait from `roles/<role>` (for example
+   `CompanionBoard`) and the `ferrix-runtime` traits.
+3. Add a binary crate under `firmware/<board>-<role>` that selects the board
+   and role.
+4. Add the board and firmware package to the workspace and the build/test
+   tooling. Drivers and roles must not need board-specific changes.
 
 ---
 
@@ -152,6 +167,6 @@ To flash without dragging and dropping or pressing buttons:
 
 If using a J-Link, CMSIS-DAP, or ST-Link:
 ```bash
-cargo run --release --features thinknode-m1
+./tools/build.sh thinknode-m1 run --release
 ```
 *(Configured with `probe-rs run --chip nRF52840_xxAA`)*

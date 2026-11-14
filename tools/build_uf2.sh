@@ -13,15 +13,26 @@ BOARD="${1:-thinknode-m1}"
 PROFILE="${2:-release}"
 TARGET="thumbv7em-none-eabihf"
 
+case "$BOARD" in
+    thinknode-m1)
+        pkg="ferrix-thinknode-m1-companion"
+        ;;
+    *)
+        echo "unknown board: $BOARD" >&2
+        echo "boards: thinknode-m1" >&2
+        exit 2
+        ;;
+esac
+
 echo "==> Building ferrix for board: ${BOARD} [${PROFILE}] (${TARGET})..."
 cd "${ROOT_DIR}"
 
-CARGO_FLAGS=("--target" "${TARGET}" "--no-default-features" "--features" "${BOARD}")
+CARGO_FLAGS=("--target" "${TARGET}")
 if [ "${PROFILE}" = "release" ]; then
     CARGO_FLAGS+=("--release")
 fi
 
-cargo build -p ferrix-thinknode-m1 "${CARGO_FLAGS[@]}"
+cargo build -p "${pkg}" "${CARGO_FLAGS[@]}"
 
 ELF="${ROOT_DIR}/target/${TARGET}/${PROFILE}/ferrix"
 
