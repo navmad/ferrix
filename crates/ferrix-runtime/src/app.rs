@@ -237,6 +237,13 @@ async fn send_advert<B: AppBoard>(
 }
 
 /// Run the application loop until the executor stops.
+fn sync_gps(node: &mut CompanionNode<'_>) {
+    let gps = gps_state();
+    node.gps_fix = gps.fix;
+    node.latitude = gps.latitude;
+    node.longitude = gps.longitude;
+}
+
 pub async fn run<B: AppBoard, R: LoraRadio>(
     board: &mut B,
     mesh: &mut MeshEngine<'_>,
@@ -244,6 +251,7 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
     lora: &mut R,
 ) -> ! {
     let mut rx_buf = [0u8; 256];
+    sync_gps(node);
     let mut ticker = Ticker::every(Duration::from_secs(2));
     let mut tick: u32 = 0;
     let mut ui = UiState::default();
@@ -1218,6 +1226,7 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
         Either4::Fourth(_) => {
             tick = tick.wrapping_add(1);
             protocol::keepalive_tick();
+            sync_gps(node);
 
             board.tick(node, &ui, tick).await;
 

@@ -467,6 +467,46 @@ pub static RADIO_TELEMETRY: Mutex<SharedRawMutex, RefCell<RadioTelemetry>> =
         tx_dropped: 0,
     }));
 
+/// Latest GNSS solution shared by the UART task, UI and adverts.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GpsState {
+    pub fix: bool,
+    pub latitude: f32,
+    pub longitude: f32,
+    pub satellites: u8,
+    pub hdop: f32,
+    pub altitude_m: f32,
+    pub speed_knots: f32,
+    pub course_deg: f32,
+    /// Milliseconds since boot when the last valid NMEA sentence was parsed.
+    pub last_update_ms: u64,
+}
+
+pub static GPS_STATE: Mutex<SharedRawMutex, RefCell<GpsState>> =
+    Mutex::new(RefCell::new(GpsState {
+        fix: false,
+        latitude: 0.0,
+        longitude: 0.0,
+        satellites: 0,
+        hdop: 0.0,
+        altitude_m: 0.0,
+        speed_knots: 0.0,
+        course_deg: 0.0,
+        last_update_ms: 0,
+    }));
+
+pub fn gps_state() -> GpsState {
+    GPS_STATE.lock(|g| *g.borrow())
+}
+
+pub fn update_gps_state(state: GpsState) {
+    GPS_STATE.lock(|g| *g.borrow_mut() = state);
+}
+
+pub fn clear_gps_state() {
+    update_gps_state(GpsState::default());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

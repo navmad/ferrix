@@ -8,7 +8,6 @@ use embassy_time::{Duration, Instant, Timer};
 use ferrix_core::companion::protocol::CompanionNode;
 use ferrix_runtime::app::{AppBoard, UiState};
 
-use crate::board::GpsPins;
 use crate::display::{NodeDisplay, ThinkNodeDisplay};
 use crate::gps;
 
@@ -19,7 +18,6 @@ const BACKLIGHT_IDLE_SECS: u64 = 15;
 pub struct ThinkNodeApp {
     led: Output<'static>,
     display: Option<ThinkNodeDisplay<'static, TWISPI1>>,
-    gps: Option<GpsPins>,
     battery_adc: saadc::Saadc<'static, 1>,
     battery_buf: [i16; 1],
     backlight_on: bool,
@@ -31,13 +29,11 @@ impl ThinkNodeApp {
     pub fn new(
         led: Output<'static>,
         display: Option<ThinkNodeDisplay<'static, TWISPI1>>,
-        gps: Option<GpsPins>,
         battery_adc: saadc::Saadc<'static, 1>,
     ) -> Self {
         Self {
             led,
             display,
-            gps,
             battery_adc,
             battery_buf: [0i16; 1],
             backlight_on: true,
@@ -85,15 +81,6 @@ impl AppBoard for ThinkNodeApp {
     }
 
     fn set_gps_enabled(&mut self, on: bool) {
-        if let Some(g) = self.gps.as_mut() {
-            if on {
-                g.standby.set_high();
-                g.reinit.set_high();
-            } else {
-                g.standby.set_low();
-                g.reinit.set_low();
-            }
-        }
         gps::set_gps_enabled(on);
         info!("Input: GPS power {}", if on { "on" } else { "off" });
     }

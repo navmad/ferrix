@@ -150,16 +150,15 @@ async fn main(spawner: Spawner) {
     embassy_nrf::interrupt::TWISPI1.set_priority(Priority::P3);
     embassy_nrf::interrupt::SAADC.set_priority(Priority::P3);
     embassy_nrf::interrupt::QSPI.set_priority(Priority::P3);
+    embassy_nrf::interrupt::UARTE0.set_priority(Priority::P3);
 
     let mut board = crate::board::init(p);
     let qspi = board.qspi;
 
-    // Keep the GPS module held in reset until the user enables it from the
-    // dashboard. P1.02 is GPS_EN, P1.05 is the active-low reset.
-    let mut gps = board.gps;
-    if let Some(g) = gps.as_mut() {
-        g.standby.set_low();
-        g.reinit.set_low();
+    // The GPS task owns the L76K UART and control pins; it holds the module
+    // in reset/sleep until the dashboard enables it.
+    if let Some(gps) = board.gps.take() {
+        spawner.spawn(crate::gps::gps_task(board.uarte0, gps)).unwrap();
     }
 
     // Battery ADC: ThinkNode M1 AIN2 (P0.04), 150K+150K divider (2:1).
@@ -364,7 +363,6 @@ async fn main(spawner: Spawner) {
     let mut app = ThinkNodeApp::new(
         board.telemetry.blue_led,
         display,
-        gps,
         battery_adc,
     );
     ferrix_runtime::app::run(&mut app, &mut mesh, &mut node, &mut lora).await;
