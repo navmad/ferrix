@@ -28,7 +28,6 @@ pub const DEFAULT_MAX_HOPS: u8 = 64;
 struct PendingForward {
     hash: [u8; 8],
     queued_at_ms: u64,
-    due_at_ms: u64,
 }
 
 /// Monotonic milliseconds for transmit eligibility.
@@ -244,61 +243,35 @@ impl MeshEngine {
         peers
     }
 
-    /// Queue a flood packet for forwarding, with the currently configured
-    /// spreading delay. Keep the hash until the due time so a duplicate heard
-    /// from another repeater can be measured (and later cancelled).
+    /// Queue a flood packet for forwarding.
     fn queue_forward(&mut self, pkt: Packet) {
         let now = now_ms();
-        let mut base = crate::radio::TX_SPREAD_BASE_MS.load(Ordering::Relaxed) as u64;
-        let mut window = crate::radio::TX_SPREAD_WINDOW_MS.load(Ordering::Relaxed) as u64;
-
-        // Default: spread over two airtimes, starting half an airtime in.
-        // That keeps two repeaters from occupying the channel simultaneously
-        // without adding a fixed delay unrelated to the modem settings.
-        if base == 0 && window == 0 {
-            let mut probe = [0u8; 256];
-            let len = pkt.write_to(&mut probe).unwrap_or(pkt.payload_len);
-            let (sf, bw_khz, cr) = crate::companion::usb::RADIO_SETTINGS.lock(|r| {
-                let s = r.borrow();
-                (s.sf, s.bw_khz, s.cr)
-            });
-            let preamble = if sf <= 8 { 32 } else { 16 };
-            let airtime =
-                crate::radio::estimate_airtime_ms(len, sf, bw_khz, cr, preamble) as u64;
-            base = airtime / 2;
-            window = airtime.saturating_mul(2);
-        }
-        crate::radio::TX_SPREAD_LAST_BASE_MS.store(base as u32, Ordering::Relaxed);
-        crate::radio::TX_SPREAD_LAST_WINDOW_MS.store(window as u32, Ordering::Relaxed);
-
-        let node = *self.identity.pub_key();
         let hash = pkt.calculate_packet_hash();
-        let delay = meshcore_wire::tx::flood_spread_ms(&hash, &node[..4], base, window);
-        let due_at_ms = now.saturating_add(delay);
-
         if self.pending_forwards.is_full() {
             self.pending_forwards.remove(0);
         }
         let _ = self.pending_forwards.push(PendingForward {
             hash,
             queued_at_ms: now,
-            due_at_ms,
         });
-        let _ = self.tx_queue.push_at(pkt, due_at_ms, now, true);
+        let _ = self.tx_queue.push_flood(pkt, now);
         crate::radio::FORWARD_SCHEDULED.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// When a duplicate arrives, record how late the other copy was relative
-    /// to our own scheduled forward, provided ours has not gone out yet.
+    /// When a duplicate arrives, record how late the other copy was and stop
+    /// tracking the pending forward.
     fn note_duplicate_of_pending(&mut self, pkt: &Packet) {
         let now = now_ms();
         self.pending_forwards
-            .retain(|entry| entry.due_at_ms.saturating_add(1000) >= now);
+            .retain(|entry| entry.queued_at_ms.saturating_add(5000) >= now);
         let hash = pkt.calculate_packet_hash();
-        if let Some(entry) = self.pending_forwards.iter().find(|entry| entry.hash == hash) {
-            if now < entry.due_at_ms {
-                crate::radio::record_duplicate_delta(now.saturating_sub(entry.queued_at_ms));
-            }
+        if let Some(index) = self
+            .pending_forwards
+            .iter()
+            .position(|entry| entry.hash == hash)
+        {
+            let entry = self.pending_forwards.remove(index);
+            crate::radio::record_duplicate_delta(now.saturating_sub(entry.queued_at_ms));
         }
     }
 
@@ -368,7 +341,7 @@ impl MeshEngine {
                 if relay.path_len < 64 {
                     relay.path[relay.path_len as usize] = (snr.saturating_mul(4)) as u8;
                     relay.path_len += 1;
-                    let _ = self.tx_queue.push(relay, now_ms());
+                    let _ = self.tx_queue.push_control(relay, now_ms());
                 }
                 return InboundAction::Forwarded;
             }
@@ -751,7 +724,7 @@ impl MeshEngine {
             pkt.path_len = 0;
         }
         self.seen_filter.mark_seen(pkt.calculate_packet_hash());
-        let _ = self.tx_queue.push(pkt.clone(), now_ms());
+        let _ = self.tx_queue.push_control(pkt.clone(), now_ms());
         Ok(pkt)
     }
 
@@ -762,7 +735,7 @@ impl MeshEngine {
         pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
         crate::companion::protocol::apply_flood_scope(&mut pkt);
         self.seen_filter.mark_seen(pkt.calculate_packet_hash());
-        let _ = self.tx_queue.push(pkt.clone(), now_ms());
+        let _ = self.tx_queue.push_control(pkt.clone(), now_ms());
         Ok(pkt)
     }
 
@@ -783,7 +756,7 @@ impl MeshEngine {
             pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
             crate::companion::protocol::apply_flood_scope(&mut pkt);
             self.seen_filter.mark_seen(pkt.calculate_packet_hash());
-            let _ = self.tx_queue.push(pkt.clone(), now_ms());
+            let _ = self.tx_queue.push_control(pkt.clone(), now_ms());
             Ok(pkt)
         } else {
             let mut pkt = grp.to_packet(channel_secret, ROUTE_TYPE_DIRECT)?;
@@ -791,7 +764,7 @@ impl MeshEngine {
             let n = pkt.path_byte_len();
             pkt.path[..n].copy_from_slice(&path[..n]);
             self.seen_filter.mark_seen(pkt.calculate_packet_hash());
-            let _ = self.tx_queue.push(pkt.clone(), now_ms());
+            let _ = self.tx_queue.push_control(pkt.clone(), now_ms());
             Ok(pkt)
         }
     }
@@ -894,7 +867,7 @@ impl MeshEngine {
             pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
         }
         self.seen_filter.mark_seen(pkt.calculate_packet_hash());
-        let _ = self.tx_queue.push(pkt.clone(), now_ms());
+        let _ = self.tx_queue.push_control(pkt.clone(), now_ms());
         pkt
     }
 }

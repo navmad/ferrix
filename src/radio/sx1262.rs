@@ -358,12 +358,12 @@ impl<'a, T: embassy_nrf::spim::Instance> LoraRadio for Sx1262<'a, T> {
         self.transmit(payload).await
     }
 
-    async fn transmit_at(
+    async fn transmit_lane(
         &mut self,
         payload: &[u8],
-        _eligible_at_ms: u64,
-        _enqueued_at_ms: u64,
-        _is_forward: bool,
+        _lane: meshcore_wire::tx::TxLane,
+        _queued_at_ms: u64,
+        _hash: [u8; 8],
     ) -> Result<(), Self::Error> {
         // The direct driver transmits immediately; scheduling lives in the
         // channel-based adapter used by the firmware.

@@ -6,6 +6,7 @@
 //! 2. `PacketQueue`: Outbound packet FIFO buffer.
 
 use crate::packet::Packet;
+use crate::tx::TxLane;
 use heapless::Deque;
 
 /// Matches the C++ `SimpleMeshTables` ring: 160 eight-byte hashes.
@@ -60,15 +61,12 @@ impl SeenPacketFilter {
     }
 }
 
-/// An outbound packet with the timing metadata used by the transmit
-/// scheduler. `due_at_ms` is on the same monotonic millisecond clock as
-/// the radio task; `queued_at_ms` is used for wait-time telemetry.
+/// An outbound packet with its lane and enqueue time.
 #[derive(Clone, Debug)]
 pub struct QueuedPacket {
     pub packet: Packet,
-    pub due_at_ms: u64,
+    pub lane: TxLane,
     pub queued_at_ms: u64,
-    pub is_forward: bool,
 }
 
 /// Outbound Transmit FIFO Queue
@@ -83,45 +81,28 @@ impl PacketQueue {
         }
     }
 
-    /// Queue a locally produced packet for immediate transmission.
-    pub fn push(&mut self, pkt: Packet, now_ms: u64) -> Result<(), QueuedPacket> {
-        self.push_at(pkt, now_ms, now_ms, false)
-    }
-
-    /// Queue a forwarded flood packet with deterministic spreading delay.
-    pub fn push_forward(
-        &mut self,
-        pkt: Packet,
-        now_ms: u64,
-        node_hash: &[u8],
-        base_ms: u64,
-        window_ms: u64,
-    ) -> Result<(), QueuedPacket> {
-        let delay =
-            crate::tx::flood_spread_ms(&pkt.calculate_packet_hash(), node_hash, base_ms, window_ms);
-        self.push_at(pkt, now_ms.saturating_add(delay), now_ms, true)
-    }
-
-    pub fn push_at(
-        &mut self,
-        pkt: Packet,
-        due_at_ms: u64,
-        queued_at_ms: u64,
-        is_forward: bool,
-    ) -> Result<(), QueuedPacket> {
+    pub fn push(&mut self, pkt: Packet, now_ms: u64, lane: TxLane) -> Result<(), QueuedPacket> {
         self.queue.push_back(QueuedPacket {
             packet: pkt,
-            due_at_ms,
-            queued_at_ms,
-            is_forward,
+            lane,
+            queued_at_ms: now_ms,
         })
+    }
+
+    /// ACKs, path returns, admin replies and locally originated sends.
+    pub fn push_control(&mut self, pkt: Packet, now_ms: u64) -> Result<(), QueuedPacket> {
+        self.push(pkt, now_ms, TxLane::Control)
+    }
+
+    /// Forwarded floods, scheduled by the radio's flood calendar.
+    pub fn push_flood(&mut self, pkt: Packet, now_ms: u64) -> Result<(), QueuedPacket> {
+        self.push(pkt, now_ms, TxLane::Flood)
     }
 
     pub fn pop(&mut self) -> Option<QueuedPacket> {
         self.queue.pop_front()
     }
 
-    /// Peek at the next packet without removing it.
     pub fn front(&self) -> Option<&QueuedPacket> {
         self.queue.front()
     }
@@ -138,4 +119,3 @@ impl PacketQueue {
         self.queue.iter()
     }
 }
-

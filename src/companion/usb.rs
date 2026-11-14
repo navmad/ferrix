@@ -444,8 +444,12 @@ pub struct RadioTelemetry {
     pub rx_air_ms: u32,
     /// Longest wait from enqueue to transmission in milliseconds.
     pub tx_wait_max_ms: u32,
-    /// Requests queued with a future eligibility time (jittered forwards).
-    pub tx_delayed: u32,
+    /// Control-lane transmissions.
+    pub tx_control: u32,
+    /// Flood-calendar transmissions.
+    pub tx_flood: u32,
+    /// Floods dropped because their slot was missed.
+    pub tx_stale: u32,
     /// Radio-level retries after a failed transmission.
     pub tx_retries: u32,
     /// Requests dropped after exhausting retries or because a queue was full.
@@ -461,7 +465,9 @@ pub static RADIO_TELEMETRY: Mutex<SharedRawMutex, RefCell<RadioTelemetry>> = Mut
     tx_air_ms: 0,
     rx_air_ms: 0,
     tx_wait_max_ms: 0,
-    tx_delayed: 0,
+    tx_control: 0,
+    tx_flood: 0,
+    tx_stale: 0,
     tx_retries: 0,
     tx_dropped: 0,
 }));
@@ -1472,69 +1478,62 @@ async fn handle_text_cli<W: CliSink>(
             crate::storage::messages::queue_clear().await;
             let _ = sender.send( b"  -> OK (Messages cleared)\r\n").await;
         }
-        "get tx.spread" => {
+        "get tx.slot" => {
             use core::sync::atomic::Ordering::Relaxed;
-            let base = crate::radio::TX_SPREAD_BASE_MS.load(Relaxed);
-            let window = crate::radio::TX_SPREAD_WINDOW_MS.load(Relaxed);
-            let last_base = crate::radio::TX_SPREAD_LAST_BASE_MS.load(Relaxed);
-            let last_window = crate::radio::TX_SPREAD_LAST_WINDOW_MS.load(Relaxed);
-            let mut s: heapless::String<96> = heapless::String::new();
-            if base == 0 && window == 0 {
-                let _ = write!(s, "  -> auto (last {}/{})\r\n", last_base, last_window);
+            let override_ms = crate::radio::TX_SLOT_MS_OVERRIDE.load(Relaxed);
+            let last = crate::radio::TX_SLOT_MS_LAST.load(Relaxed);
+            let mut s: heapless::String<80> = heapless::String::new();
+            if override_ms == 0 {
+                let _ = write!(s, "  -> auto (last {} ms)\r\n", last);
             } else {
-                let _ = write!(s, "  -> {}/{} (last {}/{})\r\n", base, window, last_base, last_window);
+                let _ = write!(s, "  -> {} ms (last {})\r\n", override_ms, last);
             }
             let _ = sender.send(s.as_bytes()).await;
         }
-        s if s.starts_with("set tx.spread ") => {
+        s if s.starts_with("set tx.slot ") => {
             use core::sync::atomic::Ordering::Relaxed;
-            let mut parts = s[14..].split_whitespace();
-            let base = parts.next().and_then(|v| v.parse::<u32>().ok());
-            let window = parts.next().and_then(|v| v.parse::<u32>().ok());
-            match (base, window) {
-                (Some(base), Some(window)) if base <= 2000 && window <= 2000 => {
-                    crate::radio::TX_SPREAD_BASE_MS.store(base, Relaxed);
-                    crate::radio::TX_SPREAD_WINDOW_MS.store(window, Relaxed);
+            match s[12..].trim().parse::<u32>() {
+                Ok(ms) if ms <= 5000 => {
+                    crate::radio::TX_SLOT_MS_OVERRIDE.store(ms, Relaxed);
                     let _ = sender.send(b"  -> OK\r\n").await;
                 }
                 _ => {
                     let _ = sender
-                        .send(b"  -> Error, expected: set tx.spread <base_ms> <window_ms>\r\n")
+                        .send(b"  -> Error, expected: set tx.slot <ms> (0 = auto)\r\n")
                         .await;
                 }
             }
         }
         "stats-tx" => {
             use core::sync::atomic::Ordering::Relaxed;
-            let base = crate::radio::TX_SPREAD_BASE_MS.load(Relaxed);
-            let window = crate::radio::TX_SPREAD_WINDOW_MS.load(Relaxed);
-            let last_base = crate::radio::TX_SPREAD_LAST_BASE_MS.load(Relaxed);
-            let last_window = crate::radio::TX_SPREAD_LAST_WINDOW_MS.load(Relaxed);
+            let override_ms = crate::radio::TX_SLOT_MS_OVERRIDE.load(Relaxed);
+            let slot_ms = crate::radio::TX_SLOT_MS_LAST.load(Relaxed);
+            let used = crate::radio::TX_SLOT_USED.load(Relaxed);
             let scheduled = crate::radio::FORWARD_SCHEDULED.load(Relaxed);
             let sent = crate::radio::FORWARD_SENT.load(Relaxed);
+            let (control, flood, stale) = RADIO_TELEMETRY.lock(|t| {
+                let tel = t.borrow();
+                (tel.tx_control, tel.tx_flood, tel.tx_stale)
+            });
             let d = crate::radio::duplicate_deltas();
-            let mut s: heapless::String<224> = heapless::String::new();
+            let mut s: heapless::String<256> = heapless::String::new();
             let _ = write!(
                 s,
-                "  -> spread {}/{} (auto={}), last {}/{}, forwards {} scheduled / {} sent\r\n  -> duplicate deltas <20:{} 20-40:{} 40-80:{} 80-160:{} 160-320:{} >320:{}\r\n",
-                base,
-                window,
-                if base == 0 && window == 0 { 1 } else { 0 },
-                last_base,
-                last_window,
+                "  -> slot {} ms (auto={}), used {}/4, control {} / flood {} sent, stale {}\r\n  -> forwards {} scheduled / {} sent, duplicate deltas <20:{} 20-40:{} 40-80:{} 80-160:{} 160-320:{} >320:{}\r\n",
+                slot_ms,
+                if override_ms == 0 { 1 } else { 0 },
+                used,
+                control,
+                flood,
+                stale,
                 scheduled,
                 sent,
-                d[0],
-                d[1],
-                d[2],
-                d[3],
-                d[4],
-                d[5]
+                d[0], d[1], d[2], d[3], d[4], d[5]
             );
             let _ = sender.send(s.as_bytes()).await;
         }
         "stats-radio" => {
-            let (tx_ms, rx_ms, rssi, snr, wait_ms, deferred, retries, dropped, sent) =
+            let (tx_ms, rx_ms, rssi, snr, wait_ms, control, flood, stale, retries, dropped, sent) =
                 RADIO_TELEMETRY.lock(|t| {
                     let tel = t.borrow();
                     (
@@ -1543,7 +1542,9 @@ async fn handle_text_cli<W: CliSink>(
                         tel.last_rssi,
                         tel.last_snr,
                         tel.tx_wait_max_ms,
-                        tel.tx_delayed,
+                        tel.tx_control,
+                        tel.tx_flood,
+                        tel.tx_stale,
                         tel.tx_retries,
                         tel.tx_dropped,
                         tel.tx_beacons,
@@ -1552,14 +1553,16 @@ async fn handle_text_cli<W: CliSink>(
             let mut s: heapless::String<256> = heapless::String::new();
             let _ = write!(
                 s,
-                "  -> {{\"noise_floor\":-118,\"last_rssi\":{},\"last_snr\":{:.2},\"tx_air_secs\":{},\"rx_air_secs\":{},\"tx_sent\":{},\"tx_wait_max_ms\":{},\"tx_delayed\":{},\"tx_retries\":{},\"tx_dropped\":{}}}\r\n",
+                "  -> {{\"noise_floor\":-118,\"last_rssi\":{},\"last_snr\":{:.2},\"tx_air_secs\":{},\"rx_air_secs\":{},\"tx_sent\":{},\"tx_wait_max_ms\":{},\"tx_control\":{},\"tx_flood\":{},\"tx_stale\":{},\"tx_retries\":{},\"tx_dropped\":{}}}\r\n",
                 rssi,
                 snr as f32,
                 tx_ms / 1000,
                 rx_ms / 1000,
                 sent,
                 wait_ms,
-                deferred,
+                control,
+                flood,
+                stale,
                 retries,
                 dropped
             );
@@ -1785,7 +1788,9 @@ async fn handle_text_cli<W: CliSink>(
                 tel.rx_air_ms = 0;
                 tel.has_rx = false;
                 tel.tx_wait_max_ms = 0;
-                tel.tx_delayed = 0;
+                tel.tx_control = 0;
+                tel.tx_flood = 0;
+                tel.tx_stale = 0;
                 tel.tx_retries = 0;
                 tel.tx_dropped = 0;
             });

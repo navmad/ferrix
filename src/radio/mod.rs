@@ -59,13 +59,12 @@ impl Default for LoraConfig {
     }
 }
 
-/// Flood-forward spreading overrides. Zero/zero means derive the delay from
-/// the packet's airtime at runtime.
-pub static TX_SPREAD_BASE_MS: AtomicU32 = AtomicU32::new(0);
-pub static TX_SPREAD_WINDOW_MS: AtomicU32 = AtomicU32::new(0);
-/// Effective values used by the last scheduled forward, for telemetry.
-pub static TX_SPREAD_LAST_BASE_MS: AtomicU32 = AtomicU32::new(0);
-pub static TX_SPREAD_LAST_WINDOW_MS: AtomicU32 = AtomicU32::new(0);
+/// Flood calendar slot width override. Zero means derive it from the
+/// modem's airtime at runtime.
+pub static TX_SLOT_MS_OVERRIDE: AtomicU32 = AtomicU32::new(0);
+/// Effective slot width and occupancy, for telemetry.
+pub static TX_SLOT_MS_LAST: AtomicU32 = AtomicU32::new(0);
+pub static TX_SLOT_USED: AtomicU32 = AtomicU32::new(0);
 
 /// Forwarding counters used to derive the spreading window on a live mesh.
 pub static FORWARD_SCHEDULED: AtomicU32 = AtomicU32::new(0);
@@ -133,14 +132,14 @@ pub trait LoraRadio {
     /// Transmit a packet asynchronously
     async fn transmit(&mut self, payload: &[u8]) -> Result<(), Self::Error>;
 
-    /// Queue a packet for the radio task to transmit no earlier than
-    /// `due_at_ms` (monotonic milliseconds).
-    async fn transmit_at(
+    /// Queue a packet in a transmit lane. Control traffic is sent at the next
+    /// opportunity; floods are scheduled into the slot calendar.
+    async fn transmit_lane(
         &mut self,
         payload: &[u8],
-        due_at_ms: u64,
+        lane: meshcore_wire::tx::TxLane,
         queued_at_ms: u64,
-        is_forward: bool,
+        hash: [u8; 8],
     ) -> Result<(), Self::Error>;
 
     /// Enter continuous reception mode

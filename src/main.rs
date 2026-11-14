@@ -234,11 +234,11 @@ async fn flush_tx_queue(mesh: &mut MeshEngine, lora: &mut LoraPhyChannelRadio) {
             continue;
         };
         if lora
-            .transmit_at(
+            .transmit_lane(
                 &buf[..len],
-                queued.due_at_ms,
+                queued.lane,
                 queued.queued_at_ms,
-                queued.is_forward,
+                queued.packet.calculate_packet_hash(),
             )
             .await
             .is_err()
@@ -1103,7 +1103,7 @@ async fn main(spawner: Spawner) {
                                 mesh.seen_filter.mark_seen(pkt.calculate_packet_hash());
                                 let _ = mesh
                                     .tx_queue
-                                    .push(pkt, embassy_time::Instant::now().as_millis() as u64);
+                                    .push_control(pkt, embassy_time::Instant::now().as_millis() as u64);
                             }
                         }
                     }
@@ -1125,7 +1125,7 @@ async fn main(spawner: Spawner) {
                             mesh.seen_filter.mark_seen(pkt.calculate_packet_hash());
                             let _ = mesh
                                     .tx_queue
-                                    .push(pkt, embassy_time::Instant::now().as_millis() as u64);
+                                    .push_control(pkt, embassy_time::Instant::now().as_millis() as u64);
                         }
                     }
                 }
@@ -1134,7 +1134,7 @@ async fn main(spawner: Spawner) {
                         mesh.seen_filter.mark_seen(pkt.calculate_packet_hash());
                         let _ = mesh
                                     .tx_queue
-                                    .push(pkt, embassy_time::Instant::now().as_millis() as u64);
+                                    .push_control(pkt, embassy_time::Instant::now().as_millis() as u64);
                     }
                 }
                 UsbCommand::SendTracePath {
@@ -1159,7 +1159,7 @@ async fn main(spawner: Spawner) {
                                 mesh.seen_filter.mark_seen(pkt.calculate_packet_hash());
                                 let _ = mesh
                                     .tx_queue
-                                    .push(pkt, embassy_time::Instant::now().as_millis() as u64);
+                                    .push_control(pkt, embassy_time::Instant::now().as_millis() as u64);
                             }
                         }
                     }

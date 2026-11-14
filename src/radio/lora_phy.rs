@@ -20,7 +20,7 @@ use lora_phy::iv::GenericSx126xInterfaceVariant;
 use lora_phy::mod_params::{Bandwidth, CodingRate, DutyCycleParams, RadioError, RxMode, SpreadingFactor};
 use lora_phy::sx126x::{Config as Sx126xConfig, Sx1262, Sx126x, TcxoCtrlVoltage};
 use lora_phy::LoRa;
-use meshcore_wire::tx::{PendingTx, PendingTxQueue};
+use meshcore_wire::tx::{flood_slot, TxLane};
 
 use crate::radio::{LoraConfig, LoraRadio};
 
@@ -28,10 +28,14 @@ use crate::radio::{LoraConfig, LoraRadio};
 pub struct TxPacket {
     pub len: usize,
     pub data: [u8; 256],
+    pub lane: TxLane,
+    pub queued_at_ms: u64,
+    pub hash: [u8; 8],
+    pub attempts: u8,
 }
 
 pub static LORA_RX_CHANNEL: Channel<SharedRawMutex, (usize, i16, i8, [u8; 256]), 4> = Channel::new();
-pub static LORA_TX_CHANNEL: Channel<SharedRawMutex, PendingTx<TxPacket>, 8> = Channel::new();
+pub static LORA_TX_CHANNEL: Channel<SharedRawMutex, TxPacket, 8> = Channel::new();
 pub static LORA_CFG_CHANNEL: Channel<SharedRawMutex, LoraConfig, 4> = Channel::new();
 
 /// Ask the radio task to apply the current `RADIO_SETTINGS`.
@@ -146,6 +150,83 @@ fn airtime_factor() -> u8 {
         .lock(|r| r.borrow().airtime_factor_tenths)
 }
 
+const FLOOD_SLOTS: usize = 4;
+const CONTROL_QUEUE: usize = 8;
+const SLOT_GUARD_MS: u64 = 50;
+const SLOT_MIN_MS: u64 = 100;
+const SLOT_MAX_MS: u64 = 1500;
+const TX_GAP_MS: u64 = 30;
+const TX_MAX_ATTEMPTS: u8 = 4;
+const FLOOD_MAX_AGE_SLOTS: u64 = 8;
+
+struct FloodSlot {
+    req: TxPacket,
+    slot_id: u64,
+}
+
+/// Slot width for the flood calendar, derived from the modem. A reference
+/// frame of 128 bytes plus a guard keeps consecutive flood transmissions from
+/// overlapping without quantizing short packets too coarsely.
+fn slot_width_ms(sf: u8, bw_khz: u32, cr: u8, preamble: u16) -> u64 {
+    let airtime = crate::radio::estimate_airtime_ms(128, sf, bw_khz, cr, preamble) as u64;
+    (airtime + SLOT_GUARD_MS).clamp(SLOT_MIN_MS, SLOT_MAX_MS)
+}
+
+fn assign_flood(
+    floods: &mut [Option<FloodSlot>; FLOOD_SLOTS],
+    req: TxPacket,
+    now: u64,
+    base: u64,
+    slot_ms: u64,
+    node_key: &[u8; 32],
+) -> Result<(), TxPacket> {
+    let current = now.saturating_sub(base) / slot_ms.max(1);
+    let first = current + flood_slot(&req.hash, &node_key[..4], FLOOD_SLOTS) as u64;
+    for slot_id in first..=current + FLOOD_SLOTS as u64 {
+        let index = (slot_id % FLOOD_SLOTS as u64) as usize;
+        if floods[index].is_none() {
+            floods[index] = Some(FloodSlot { req, slot_id });
+            return Ok(());
+        }
+    }
+    Err(req)
+}
+
+fn due_flood(
+    floods: &[Option<FloodSlot>; FLOOD_SLOTS],
+    now: u64,
+    base: u64,
+    slot_ms: u64,
+) -> Option<(usize, u64)> {
+    floods
+        .iter()
+        .enumerate()
+        .filter_map(|(index, slot)| {
+            slot.as_ref().map(|s| {
+                (
+                    index,
+                    base.saturating_add(s.slot_id.saturating_mul(slot_ms)),
+                )
+            })
+        })
+        .filter(|(_, due)| *due <= now)
+        .min_by_key(|(_, due)| *due)
+}
+
+fn next_flood_due(
+    floods: &[Option<FloodSlot>; FLOOD_SLOTS],
+    base: u64,
+    slot_ms: u64,
+) -> Option<u64> {
+    floods
+        .iter()
+        .filter_map(|slot| {
+            slot.as_ref()
+                .map(|s| base.saturating_add(s.slot_id.saturating_mul(slot_ms)))
+        })
+        .min()
+}
+
 /// ThinkNode M1 LoRa Radio Adapter implementing `LoraRadio` via channels
 pub struct LoraPhyChannelRadio;
 
@@ -164,15 +245,15 @@ impl LoraRadio for LoraPhyChannelRadio {
 
     async fn transmit(&mut self, payload: &[u8]) -> Result<(), Self::Error> {
         let now = Instant::now().as_millis() as u64;
-        self.transmit_at(payload, now, now, false).await
+        self.transmit_lane(payload, TxLane::Control, now, [0; 8]).await
     }
 
-    async fn transmit_at(
+    async fn transmit_lane(
         &mut self,
         payload: &[u8],
-        due_at_ms: u64,
+        lane: TxLane,
         queued_at_ms: u64,
-        is_forward: bool,
+        hash: [u8; 8],
     ) -> Result<(), Self::Error> {
         if payload.is_empty() || payload.len() > 256 {
             return Ok(());
@@ -180,17 +261,14 @@ impl LoraRadio for LoraPhyChannelRadio {
         let mut pkt = TxPacket {
             len: payload.len(),
             data: [0u8; 256],
-        };
-        pkt.data[..payload.len()].copy_from_slice(payload);
-        let item = PendingTx {
-            payload: pkt,
-            due_at_ms,
+            lane,
             queued_at_ms,
-            is_forward,
+            hash,
             attempts: 0,
         };
+        pkt.data[..payload.len()].copy_from_slice(payload);
         // The caller keeps the packet queued and retries when this fails.
-        LORA_TX_CHANNEL.try_send(item).map_err(|_| ())
+        LORA_TX_CHANNEL.try_send(pkt).map_err(|_| ())
     }
 
     async fn start_receive(&mut self) {
@@ -303,21 +381,42 @@ pub async fn lora_phy_task(
         freq_hz, sf, bw_khz, cr, rx_mode
     );
 
-    const TX_GAP_MS: u64 = 30;
-    const TX_MAX_ATTEMPTS: u8 = 4;
-
     let mut rx_buf = [0u8; 256];
     // If the radio starts returning immediate RX errors, never spin without
     // yielding: the executor is cooperative, and a tight loop here starves the
     // main loop, USB and BLE tasks.
     let mut rx_backoff_ms = 50u64;
-    let mut schedule: PendingTxQueue<TxPacket, 8> = PendingTxQueue::new();
-    let mut next_tx_allowed_ms: u64 = 0;
+    let mut control: heapless::Deque<TxPacket, CONTROL_QUEUE> = heapless::Deque::new();
+    let mut floods: [Option<FloodSlot>; FLOOD_SLOTS] = [None, None, None, None];
     let mut tx_budget_ms = crate::radio::tx_budget_max(airtime_factor());
     let mut tx_budget_last = Instant::now();
+    let mut next_tx_allowed_ms: u64 = 0;
+    let mut base_ms = Instant::now().as_millis() as u64;
+    let mut slot_ms = slot_width_ms(current_cfg.2, current_cfg.3, current_cfg.4, preamble);
+    let mut slot_override_active = false;
+    let node_key = crate::companion::usb::current_public_key();
 
     loop {
         let now = Instant::now().as_millis() as u64;
+
+        // Runtime slot-width override.
+        let override_ms = crate::radio::TX_SLOT_MS_OVERRIDE.load(Ordering::Relaxed) as u64;
+        if override_ms != 0 {
+            if override_ms != slot_ms || !slot_override_active {
+                slot_ms = override_ms.clamp(SLOT_MIN_MS, 5000);
+                base_ms = now;
+                slot_override_active = true;
+            }
+        } else if slot_override_active {
+            slot_ms = slot_width_ms(current_cfg.2, current_cfg.3, current_cfg.4, preamble);
+            base_ms = now;
+            slot_override_active = false;
+        }
+        crate::radio::TX_SLOT_MS_LAST.store(slot_ms as u32, Ordering::Relaxed);
+        crate::radio::TX_SLOT_USED.store(
+            floods.iter().filter(|slot| slot.is_some()).count() as u32,
+            Ordering::Relaxed,
+        );
 
         // Refill the duty-cycle budget.
         let af = airtime_factor();
@@ -330,125 +429,166 @@ pub async fn lora_phy_task(
         }
         tx_budget_ms = tx_budget_ms.min(max_budget);
 
-        // Work out the earliest thing that needs attention.
         let mut wake_at = u64::MAX;
-        if now < next_tx_allowed_ms {
-            wake_at = next_tx_allowed_ms;
-        }
+        let mut budget_wait_ms = 0u64;
+        let mut pick: Option<(TxPacket, bool, u32)> = None;
 
-        // Transmit the earliest eligible request when the gap and budget allow.
         if now >= next_tx_allowed_ms {
-            if let Some(index) = schedule.next_due_index(now) {
-                let (len, queued_at_ms, attempts) = schedule
-                    .get(index)
-                    .map(|item| {
-                        (
-                            item.payload.len,
-                            item.queued_at_ms,
-                            item.attempts,
-                        )
-                    })
-                    .unwrap_or((0, now, 0));
+            // Control lane first.
+            if let Some(req) = control.front() {
                 let airtime = crate::radio::estimate_airtime_ms(
-                    len,
+                    req.len,
                     current_cfg.2,
                     current_cfg.3,
                     current_cfg.4,
                     preamble,
                 );
                 if duty_pct >= 100 || tx_budget_ms >= airtime as i64 {
-                    let item = schedule.remove(index);
-                    info!(
-                        "lora-phy: Transmitting {} bytes (queued {} ms ago)...",
-                        item.payload.len,
-                        now.saturating_sub(item.queued_at_ms)
-                    );
-                    // A TX that never sees DIO1 would otherwise wedge this task
-                    // forever, leaving the node alive but unable to receive.
-                    let tx_result = embassy_time::with_timeout(
-                        Duration::from_secs(20),
-                        async {
-                            let mut tx_pkt_params = lora.create_tx_packet_params(
-                                preamble,
-                                false,
-                                true,
-                                false,
-                                &mdltn_params,
-                            )?;
-                            lora.prepare_for_tx(
-                                &mdltn_params,
-                                &mut tx_pkt_params,
-                                tx_power_dbm as i32,
-                                &item.payload.data[..item.payload.len],
-                            )
-                            .await?;
-                            lora.tx().await
-                        },
-                    )
-                    .await;
-                    let success = matches!(tx_result, Ok(Ok(())));
-                    match tx_result {
-                        Ok(Ok(())) => info!("lora-phy: Transmission complete!"),
-                        Ok(Err(e)) => error!("lora-phy: Transmission failed: {:?}", e),
-                        Err(_) => {
-                            error!("lora-phy: Transmission timed out; forcing RX recovery")
-                        }
-                    }
-                    // Return to the configured RX mode after transmission.
-                    let _ = embassy_time::with_timeout(
-                        Duration::from_secs(1),
-                        lora.prepare_for_rx(rx_mode, &mdltn_params, &rx_pkt_params),
-                    )
-                    .await;
-
-                    if success {
-                        next_tx_allowed_ms =
-                            Instant::now().as_millis() as u64 + TX_GAP_MS;
-                        if duty_pct < 100 {
-                            tx_budget_ms = (tx_budget_ms - airtime as i64).max(0);
-                        }
-                        if item.is_forward {
-                            crate::radio::FORWARD_SENT.fetch_add(1, Ordering::Relaxed);
-                        }
-                        crate::companion::usb::RADIO_TELEMETRY.lock(|t| {
-                            let mut tel = t.borrow_mut();
-                            tel.tx_beacons = tel.tx_beacons.saturating_add(1);
-                            tel.tx_air_ms = tel.tx_air_ms.saturating_add(airtime);
-                            let wait = now.saturating_sub(queued_at_ms) as u32;
-                            tel.tx_wait_max_ms = tel.tx_wait_max_ms.max(wait);
-                        });
-                    } else {
-                        crate::companion::usb::RADIO_TELEMETRY.lock(|t| {
-                            let mut tel = t.borrow_mut();
-                            tel.tx_retries = tel.tx_retries.saturating_add(1);
-                            if attempts + 1 >= TX_MAX_ATTEMPTS {
-                                tel.tx_dropped = tel.tx_dropped.saturating_add(1);
-                            }
-                        });
-                        if attempts + 1 < TX_MAX_ATTEMPTS {
-                            let backoff = (50u64 << (attempts + 1)).min(500);
-                            let mut retry = item;
-                            retry.attempts = attempts + 1;
-                            retry.due_at_ms =
-                                Instant::now().as_millis() as u64 + backoff;
-                            let _ = schedule.push(retry);
-                        }
-                    }
-                    continue;
+                    let req = control.pop_front().unwrap();
+                    pick = Some((req, false, airtime));
                 } else if duty_pct > 0 {
                     let deficit = airtime as i64 - tx_budget_ms;
-                    let refill_ms = (deficit * 100 / duty_pct).max(1) as u64;
-                    wake_at = wake_at.min(now.saturating_add(refill_ms));
+                    budget_wait_ms = (deficit * 100 / duty_pct).max(1) as u64;
+                }
+            }
+
+            // Then the next due flood slot.
+            if pick.is_none() {
+                if let Some((index, due)) = due_flood(&floods, now, base_ms, slot_ms) {
+                    let req = floods[index].as_ref().unwrap().req;
+                    let airtime = crate::radio::estimate_airtime_ms(
+                        req.len,
+                        current_cfg.2,
+                        current_cfg.3,
+                        current_cfg.4,
+                        preamble,
+                    );
+                    if duty_pct >= 100 || tx_budget_ms >= airtime as i64 {
+                        let slot = floods[index].take().unwrap();
+                        if now
+                            > due.saturating_add(
+                                FLOOD_MAX_AGE_SLOTS.saturating_mul(slot_ms),
+                            )
+                        {
+                            crate::companion::usb::RADIO_TELEMETRY.lock(|t| {
+                                let mut tel = t.borrow_mut();
+                                tel.tx_stale = tel.tx_stale.saturating_add(1);
+                            });
+                            continue;
+                        }
+                        pick = Some((slot.req, true, airtime));
+                    } else if duty_pct > 0 {
+                        let deficit = airtime as i64 - tx_budget_ms;
+                        let wait = (deficit * 100 / duty_pct).max(1) as u64;
+                        budget_wait_ms = budget_wait_ms.max(wait);
+                    }
                 }
             }
         }
 
-        if let Some(deadline) = schedule.next_due_at(now) {
-            wake_at = wake_at.min(deadline);
-        }
-        let wait_ms = wake_at.saturating_sub(now).clamp(1, 60_000) as u32;
+        if let Some((req, is_flood, airtime)) = pick {
+            info!(
+                "lora-phy: TX {} bytes ({}, queued {} ms ago)",
+                req.len,
+                if is_flood { "flood" } else { "control" },
+                now.saturating_sub(req.queued_at_ms)
+            );
+            let tx_result = embassy_time::with_timeout(
+                Duration::from_secs(20),
+                async {
+                    let mut tx_pkt_params = lora.create_tx_packet_params(
+                        preamble,
+                        false,
+                        true,
+                        false,
+                        &mdltn_params,
+                    )?;
+                    lora.prepare_for_tx(
+                        &mdltn_params,
+                        &mut tx_pkt_params,
+                        tx_power_dbm as i32,
+                        &req.data[..req.len],
+                    )
+                    .await?;
+                    lora.tx().await
+                },
+            )
+            .await;
+            let success = matches!(tx_result, Ok(Ok(())));
+            match tx_result {
+                Ok(Ok(())) => info!("lora-phy: Transmission complete!"),
+                Ok(Err(e)) => error!("lora-phy: Transmission failed: {:?}", e),
+                Err(_) => error!("lora-phy: Transmission timed out; forcing RX recovery"),
+            }
+            let _ = embassy_time::with_timeout(
+                Duration::from_secs(1),
+                lora.prepare_for_rx(rx_mode, &mdltn_params, &rx_pkt_params),
+            )
+            .await;
 
-        // Re-arm RX if no packet arrives for a minute. This is a safety net
+            if success {
+                next_tx_allowed_ms = Instant::now().as_millis() as u64 + TX_GAP_MS;
+                if duty_pct < 100 {
+                    tx_budget_ms = (tx_budget_ms - airtime as i64).max(0);
+                }
+                if is_flood {
+                    crate::radio::FORWARD_SENT.fetch_add(1, Ordering::Relaxed);
+                }
+                crate::companion::usb::RADIO_TELEMETRY.lock(|t| {
+                    let mut tel = t.borrow_mut();
+                    tel.tx_beacons = tel.tx_beacons.saturating_add(1);
+                    tel.tx_air_ms = tel.tx_air_ms.saturating_add(airtime);
+                    let wait = now.saturating_sub(req.queued_at_ms) as u32;
+                    tel.tx_wait_max_ms = tel.tx_wait_max_ms.max(wait);
+                    if is_flood {
+                        tel.tx_flood = tel.tx_flood.saturating_add(1);
+                    } else {
+                        tel.tx_control = tel.tx_control.saturating_add(1);
+                    }
+                });
+            } else {
+                crate::companion::usb::RADIO_TELEMETRY.lock(|t| {
+                    let mut tel = t.borrow_mut();
+                    tel.tx_retries = tel.tx_retries.saturating_add(1);
+                    if req.attempts + 1 >= TX_MAX_ATTEMPTS {
+                        tel.tx_dropped = tel.tx_dropped.saturating_add(1);
+                    }
+                });
+                if req.attempts + 1 < TX_MAX_ATTEMPTS {
+                    let mut retry = req;
+                    retry.attempts += 1;
+                    let now_retry = Instant::now().as_millis() as u64;
+                    let requeued = if is_flood {
+                        assign_flood(
+                            &mut floods,
+                            retry,
+                            now_retry,
+                            base_ms,
+                            slot_ms,
+                            &node_key,
+                        )
+                        .is_ok()
+                    } else {
+                        control.push_back(retry).is_ok()
+                    };
+                    if !requeued {
+                        crate::companion::usb::RADIO_TELEMETRY.lock(|t| {
+                            let mut tel = t.borrow_mut();
+                            tel.tx_dropped = tel.tx_dropped.saturating_add(1);
+                        });
+                    }
+                }
+            }
+            continue;
+        }
+
+        let wait_ms = if wake_at == u64::MAX {
+            60_000
+        } else {
+            wake_at.saturating_sub(now).clamp(1, 60_000)
+        };
+
+    // Re-arm RX if no packet arrives for a minute. This is a safety net
         // for the case where the SX1262 stops raising DIO1 (for example after
         // a cancelled TX/RX operation) and `lora.rx` would otherwise wait
         // forever: the task would still be alive but permanently deaf.
@@ -526,20 +666,34 @@ pub async fn lora_phy_task(
                     }
                 }
             },
-            Either4::Second(item) => {
+            Either4::Second(req) => {
                 let received_at = Instant::now().as_millis() as u64;
-                if item.due_at_ms > received_at {
-                    crate::companion::usb::RADIO_TELEMETRY.lock(|t| {
-                        let mut tel = t.borrow_mut();
-                        tel.tx_delayed = tel.tx_delayed.saturating_add(1);
-                    });
-                }
-                if schedule.push(item).is_err() {
-                    crate::companion::usb::RADIO_TELEMETRY.lock(|t| {
-                        let mut tel = t.borrow_mut();
-                        tel.tx_dropped = tel.tx_dropped.saturating_add(1);
-                    });
-                    error!("lora-phy: transmit schedule full");
+                match req.lane {
+                    TxLane::Flood => {
+                        if assign_flood(
+                            &mut floods,
+                            req,
+                            received_at,
+                            base_ms,
+                            slot_ms,
+                            &node_key,
+                        )
+                        .is_err()
+                        {
+                            crate::companion::usb::RADIO_TELEMETRY.lock(|t| {
+                                let mut tel = t.borrow_mut();
+                                tel.tx_dropped = tel.tx_dropped.saturating_add(1);
+                            });
+                        }
+                    }
+                    _ => {
+                        if control.push_back(req).is_err() {
+                            crate::companion::usb::RADIO_TELEMETRY.lock(|t| {
+                                let mut tel = t.borrow_mut();
+                                tel.tx_dropped = tel.tx_dropped.saturating_add(1);
+                            });
+                        }
+                    }
                 }
             }
             Either4::Third(cfg) => {
@@ -583,6 +737,13 @@ pub async fn lora_phy_task(
                                     cfg.rx_duty_cycle,
                                 );
                                 current_cfg = requested;
+                                slot_ms = slot_width_ms(
+                                    current_cfg.2,
+                                    current_cfg.3,
+                                    current_cfg.4,
+                                    preamble,
+                                );
+                                base_ms = Instant::now().as_millis() as u64;
                                 rx_backoff_ms = 50;
                                 match embassy_time::with_timeout(
                                     Duration::from_secs(1),
