@@ -12,11 +12,9 @@ use defmt::{error, info};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use heapless::String;
-use embedded_storage_async::nor_flash::NorFlash;
-use sequential_storage::cache::{Cache, Uncached};
-use sequential_storage::map::{MapConfig, MapStorage};
+use embedded_storage_async::nor_flash::{MultiwriteNorFlash, NorFlash};
 
-use super::counted_flash::CountedFlash;
+use super::contact_map::{self, SCRATCH_SIZE};
 use super::util::{fixed_str, fnv_bytes, str_from_fixed, FNV_INIT};
 use crate::state::DISCOVERED_CONTACTS;
 use crate::types::DiscoveredContact;
@@ -24,8 +22,6 @@ use crate::types::DiscoveredContact;
 const CONTACT_RECORD_SIZE: usize = 164;
 /// Size of records written before `sync_since` was added.
 const LEGACY_CONTACT_RECORD_SIZE: usize = 156;
-/// Key (32) + serialized contact, rounded up to a whole flash word.
-const SCRATCH_SIZE: usize = 200;
 
 /// Completed contact record writes and page erases since boot.
 pub static SAVES: AtomicU32 = AtomicU32::new(0);
@@ -56,19 +52,12 @@ const _: () = assert!(core::mem::size_of::<PersistContact>() == CONTACT_RECORD_S
 #[repr(C, align(4))]
 struct Scratch([u8; SCRATCH_SIZE]);
 
-type ContactCache = Cache<Uncached, Uncached, Uncached, [u8; 32]>;
-type ContactMap<'a, F> = MapStorage<[u8; 32], CountedFlash<'a, F>, ContactCache>;
-
-fn open<'a, F>(flash: &'a mut F, region: &Range<u32>) -> ContactMap<'a, F>
+fn open<'a, F>(flash: &'a mut F, region: &Range<u32>) -> contact_map::Map<'a, F>
 where
-    F: NorFlash + embedded_storage_async::nor_flash::MultiwriteNorFlash,
+    F: NorFlash + MultiwriteNorFlash,
     F::Error: defmt::Format,
 {
-    MapStorage::new(
-        CountedFlash::new(flash, &ERASES),
-        MapConfig::new(region.clone()),
-        Cache::new_uncached(),
-    )
+    contact_map::open(flash, region, &ERASES)
 }
 
 static SAVE_CHANNEL: Channel<CriticalSectionRawMutex, (), 1> = Channel::new();
@@ -201,9 +190,13 @@ where
     match map.fetch_all_items(&mut buf.0).await {
         Ok(mut iter) => {
             while let Ok(Some((key, value))) = iter.next::<&[u8]>(&mut buf.0).await {
+                if contact_map::key_tag(&key) != contact_map::CONTACT_TAG {
+                    continue;
+                }
                 if value.len() < LEGACY_CONTACT_RECORD_SIZE {
                     continue;
                 }
+                let pub_key = contact_map::key_pub_key(&key);
                 // Older records are shorter (no sync_since); copy only what is
                 // present into a zeroed struct.
                 let mut rec: PersistContact = unsafe { core::mem::zeroed() };
@@ -219,7 +212,7 @@ where
                 ct.saved_hash = structural_hash_of(&ct);
                 DISCOVERED_CONTACTS.lock(|c| {
                     let mut list = c.borrow_mut();
-                    if let Some(existing) = list.iter().position(|x| x.pub_key == key) {
+                    if let Some(existing) = list.iter().position(|x| x.pub_key == pub_key) {
                         list[existing] = ct;
                     } else if list.len() < list.capacity() {
                         let _ = list.push(ct);
@@ -264,7 +257,10 @@ where
             )
         };
         let value: &[u8] = bytes;
-        match map.store_item(&mut buf.0, &ct.pub_key, &value).await {
+        match map
+            .store_item(&mut buf.0, &contact_map::contact_key(&ct.pub_key), &value)
+            .await
+        {
             Ok(()) => {
                 written += 1;
                 DISCOVERED_CONTACTS.lock(|c| {
@@ -297,8 +293,14 @@ where
 {
     let mut map = open(flash, region);
     let mut buf = Scratch([0u8; SCRATCH_SIZE]);
-    if let Err(e) = map.remove_item(&mut buf.0, &pub_key).await {
+    let contact_key = contact_map::contact_key(&pub_key);
+    if let Err(e) = map.remove_item(&mut buf.0, &contact_key).await {
         error!("Persistence: contact map remove failed: {:?}", e);
+    }
+    // The advert blob shares this map, so remove it with the contact.
+    let blob_key = contact_map::blob_key(&pub_key);
+    if let Err(e) = map.remove_item(&mut buf.0, &blob_key).await {
+        error!("Persistence: blob map remove failed: {:?}", e);
     }
 }
 

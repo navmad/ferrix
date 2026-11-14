@@ -54,13 +54,10 @@ where
         // coalescing delay of a save request.
         let op_fut = contacts::wait_operation();
 
-        match select(select(select5_fut, storage::wait_factory_reset()), op_fut).await {
-            Either::Second(op) => match op {
-                ContactOp::Remove(pub_key) => {
-                    contacts::remove(external, &regions.contacts, pub_key).await
-                }
-                ContactOp::Clear => contacts::clear(external, &regions.contacts).await,
-            },
+        let events_fut = select(select5_fut, storage::wait_factory_reset());
+        let side_fut = select(op_fut, storage::wait_flush_request());
+
+        match select(events_fut, side_fut).await {
             Either::First(inner) => match inner {
                 Either::Second(_) => {
                     info!("Storage: factory reset - erasing data pages");
@@ -128,14 +125,45 @@ where
                             // New contacts are rare; batch a discovery burst first.
                             Timer::after_millis(1000).await;
                             adverts::drain_save_requests();
-                            adverts::save(external).await;
+                            adverts::save(external, &regions.contacts).await;
                         }
-                        Either::Second(req) => adverts::serve_fetch(external, req).await,
+                        Either::Second(req) => {
+                            adverts::serve_fetch(external, &regions.contacts, req).await
+                        }
                     },
                     Either5::Fifth(_) => {
                         bonds::save(internal, &regions.bonds).await;
                     }
                 },
+            },
+            Either::Second(side) => match side {
+                Either::First(op) => match op {
+                    ContactOp::Remove(pub_key) => {
+                        contacts::remove(external, &regions.contacts, pub_key).await
+                    }
+                    ContactOp::Clear => contacts::clear(external, &regions.contacts).await,
+                },
+                Either::Second(_) => {
+                    // Flush pending writes before reboot/DFU. The blob map
+                    // shares the contact region, so one save covers both.
+                    let pending_config = config::has_pending_save();
+                    let seq = config::drain_save_requests();
+                    if pending_config {
+                        let before =
+                            config::CONFIG_SAVES.load(core::sync::atomic::Ordering::Relaxed);
+                        config::save_config(internal, &regions.config).await;
+                        if config::CONFIG_SAVES.load(core::sync::atomic::Ordering::Relaxed) != before
+                        {
+                            config::notify_save_complete(seq);
+                        }
+                    }
+                    contacts::drain_save_requests();
+                    contacts::save(external, &regions.contacts).await;
+                    adverts::drain_save_requests();
+                    adverts::save(external, &regions.contacts).await;
+                    bonds::save(internal, &regions.bonds).await;
+                    storage::complete_flush();
+                }
             },
         }
     }

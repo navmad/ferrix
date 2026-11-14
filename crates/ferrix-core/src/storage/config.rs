@@ -191,6 +191,11 @@ pub fn request_save_config() {
     let _ = SAVE_REQUEST_CHANNEL.try_send(0);
 }
 
+/// True when a config save request is queued.
+pub fn has_pending_save() -> bool {
+    !SAVE_REQUEST_CHANNEL.is_empty()
+}
+
 #[cfg(not(test))]
 fn next_save_seq() -> u32 {
     loop {

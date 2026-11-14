@@ -66,6 +66,12 @@ const _: () = assert!(core::mem::size_of::<PersistBond>() == RECORD_SIZE);
 
 pub static BOND_ERASES: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
+pub static BOND_SAVES: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+pub static BOND_SAVE_ERRORS: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+pub static BOND_LOADED: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
 
 struct Store {
     bonds: [Option<Bond>; MAX_BONDS],
@@ -223,6 +229,7 @@ pub fn init(reader: &'static dyn MappedFlash, region: Range<u32>) {
         store.seq = seq;
         store.sequence = next;
     });
+    BOND_LOADED.store(count as u32, core::sync::atomic::Ordering::Relaxed);
     #[cfg(not(test))]
     info!("BLE: loaded {} bond(s)", count);
 }
@@ -393,6 +400,7 @@ where
 
     for key in removed.iter().flatten() {
         if let Err(_e) = map.remove_item(&mut buf, key).await {
+            BOND_SAVE_ERRORS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             #[cfg(not(test))]
             error!("BLE: bond remove failed: {:?}", _e);
             return false;
@@ -412,6 +420,7 @@ where
         };
         let key = bond_key(bond);
         if let Err(_e) = map.store_item(&mut buf, &key, &bytes).await {
+            BOND_SAVE_ERRORS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             #[cfg(not(test))]
             error!("BLE: bond write failed: {:?}", _e);
             return false;
@@ -423,6 +432,7 @@ where
         store.dirty = [false; MAX_BONDS];
         store.removed = [None; MAX_BONDS];
     });
+    BOND_SAVES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     true
 }
 

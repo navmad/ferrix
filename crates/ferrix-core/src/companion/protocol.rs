@@ -1289,6 +1289,9 @@ impl<'a> CompanionNode<'a> {
 
             CMD_REBOOT => {
                 if payload.len() >= 7 && &payload[1..7] == b"reboot" {
+                    // The app reconnects after a reboot; make sure pending
+                    // contacts/blobs/config are durable before resetting.
+                    let _ = crate::storage::flush_pending().await;
                     let mut resp = Vec::<u8, 4>::new();
                     let _ = resp.push(RESP_CODE_OK);
                     emit(&resp);
