@@ -22,28 +22,7 @@ pub struct LoraConfig {
     pub rx_duty_cycle: bool,
 }
 
-/// Estimate LoRa airtime in milliseconds (preamble + header + payload + CRC).
-pub fn estimate_airtime_ms(
-    len: usize,
-    sf: u8,
-    bw_khz: u32,
-    cr: u8,
-    preamble: u16,
-) -> u32 {
-    let bw_hz = crate::companion::usb::bw_khz_to_hz(bw_khz) as u64;
-    if bw_hz == 0 {
-        return 0;
-    }
-    let sym_ns = ((1u64 << sf) * 1_000_000_000) / bw_hz;
-    let de = if sym_ns > 16_380_000 { 1u64 } else { 0 };
-    let num = (8u64 * len as u64).saturating_sub(4 * sf as u64) + 44;
-    let den = (4 * (sf as u64 - 2 * de)).max(4);
-    let nibbles = (num + den - 1) / den;
-    let payload_symbols = 8 + nibbles * cr as u64;
-    let preamble_ns = (preamble as u64 * 4 + 17) * sym_ns / 4;
-    let total_ns = preamble_ns + payload_symbols * sym_ns;
-    ((total_ns + 999_999) / 1_000_000) as u32
-}
+pub use ferrix_core::airtime::estimate_airtime_ms;
 
 impl Default for LoraConfig {
     fn default() -> Self {
@@ -109,15 +88,7 @@ pub fn clear_duplicate_deltas() {
     }
 }
 
-/// Duty-cycle percentage implied by the airtime factor setting.
-pub fn tx_duty_pct(af_tenths: u8) -> i64 {
-    1000 / (af_tenths as i64 + 10)
-}
-
-/// Airtime budget for a one-hour duty-cycle window.
-pub fn tx_budget_max(af_tenths: u8) -> i64 {
-    3_600_000 * tx_duty_pct(af_tenths) / 100
-}
+pub use ferrix_core::scheduler::{tx_budget_max, tx_duty_pct};
 
 /// Generic Asynchronous LoRa Radio Trait
 ///

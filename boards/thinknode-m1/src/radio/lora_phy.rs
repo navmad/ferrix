@@ -20,19 +20,14 @@ use lora_phy::iv::GenericSx126xInterfaceVariant;
 use lora_phy::mod_params::{Bandwidth, CodingRate, DutyCycleParams, RadioError, RxMode, SpreadingFactor};
 use lora_phy::sx126x::{Config as Sx126xConfig, Sx1262, Sx126x, TcxoCtrlVoltage};
 use lora_phy::LoRa;
-use meshcore_wire::tx::{flood_slot, TxLane};
+use meshcore_wire::tx::TxLane;
 
 use crate::radio::{LoraConfig, LoraRadio};
-
-#[derive(Clone, Copy)]
-pub struct TxPacket {
-    pub len: usize,
-    pub data: [u8; 256],
-    pub lane: TxLane,
-    pub queued_at_ms: u64,
-    pub hash: [u8; 8],
-    pub attempts: u8,
-}
+use ferrix_core::scheduler::{
+    assign_flood, cancel_slot, due_flood, next_flood_due, preamble_for, remember_cancel,
+    slot_width_ms, take_cancelled, FloodSlot, TxPacket, CONTROL_QUEUE, FLOOD_MAX_AGE_SLOTS,
+    FLOOD_SLOTS, SLOT_MIN_MS, TX_GAP_MS, TX_MAX_ATTEMPTS,
+};
 
 pub static LORA_RX_CHANNEL: Channel<SharedRawMutex, (usize, i16, i8, [u8; 256]), 4> = Channel::new();
 pub static LORA_TX_CHANNEL: Channel<SharedRawMutex, TxPacket, 8> = Channel::new();
@@ -99,20 +94,11 @@ fn cr_from_u8(cr: u8) -> CodingRate {
     }
 }
 
-/// MeshCore parity: longer preamble for SF <= 8 (32 symbols), 16 otherwise.
-fn preamble_for(sf: u8) -> u16 {
-    if sf <= 8 {
-        32
-    } else {
-        16
-    }
-}
-
 /// Estimate SX126x RX duty-cycle timings. The RX window only needs to catch
 /// a preamble (`SetStopTimerOnPreamble` keeps the radio listening once it
 /// does), but it must also leave room to finish a short packet.
 fn duty_cycle_params(sf: u8, bw_khz: u32, preamble: u16) -> Option<DutyCycleParams> {
-    let bw_hz = crate::companion::usb::bw_khz_to_hz(bw_khz) as u64;
+    let bw_hz = ferrix_core::airtime::bw_khz_to_hz(bw_khz) as u64;
     let sym_us = ((1u64 << sf) * 1_000_000) / bw_hz;
     let detect = if sf >= 7 { 8u64 } else { 12u64 };
     let p = preamble as u64;
@@ -155,120 +141,6 @@ fn make_rx_mode(sf: u8, bw_khz: u32, duty_cycle: bool) -> RxMode {
 fn airtime_factor() -> u8 {
     crate::companion::usb::RADIO_SETTINGS
         .lock(|r| r.borrow().airtime_factor_tenths)
-}
-
-const FLOOD_SLOTS: usize = 4;
-const CONTROL_QUEUE: usize = 8;
-const SLOT_GUARD_MS: u64 = 50;
-const SLOT_MIN_MS: u64 = 100;
-const SLOT_MAX_MS: u64 = 1500;
-const TX_GAP_MS: u64 = 30;
-const TX_MAX_ATTEMPTS: u8 = 4;
-const FLOOD_MAX_AGE_SLOTS: u64 = 8;
-
-struct FloodSlot {
-    req: TxPacket,
-    slot_id: u64,
-}
-
-/// Slot width for the flood calendar, derived from the modem. A reference
-/// frame of 128 bytes plus a guard keeps consecutive flood transmissions from
-/// overlapping without quantizing short packets too coarsely.
-fn slot_width_ms(sf: u8, bw_khz: u32, cr: u8, preamble: u16) -> u64 {
-    let airtime = crate::radio::estimate_airtime_ms(128, sf, bw_khz, cr, preamble) as u64;
-    (airtime + SLOT_GUARD_MS).clamp(SLOT_MIN_MS, SLOT_MAX_MS)
-}
-
-fn assign_flood(
-    floods: &mut [Option<FloodSlot>; FLOOD_SLOTS],
-    req: TxPacket,
-    now: u64,
-    base: u64,
-    slot_ms: u64,
-    node_key: &[u8; 32],
-) -> Result<(), TxPacket> {
-    let current = now.saturating_sub(base) / slot_ms.max(1);
-    let first = current + flood_slot(&req.hash, &node_key[..4], FLOOD_SLOTS) as u64;
-    for slot_id in first..=current + FLOOD_SLOTS as u64 {
-        let index = (slot_id % FLOOD_SLOTS as u64) as usize;
-        if floods[index].is_none() {
-            floods[index] = Some(FloodSlot { req, slot_id });
-            return Ok(());
-        }
-    }
-    Err(req)
-}
-
-fn remember_cancel(
-    cancelled: &mut heapless::Vec<([u8; 8], u64), 16>,
-    hash: [u8; 8],
-    now: u64,
-) {
-    cancelled.retain(|(_, at)| now.saturating_sub(*at) < 8000);
-    if cancelled.len() >= 16 {
-        let _ = cancelled.remove(0);
-    }
-    let _ = cancelled.push((hash, now));
-}
-
-fn take_cancelled(
-    cancelled: &mut heapless::Vec<([u8; 8], u64), 16>,
-    hash: [u8; 8],
-) -> bool {
-    if let Some(index) = cancelled.iter().position(|(h, _)| *h == hash) {
-        cancelled.remove(index);
-        true
-    } else {
-        false
-    }
-}
-
-fn cancel_slot(
-    floods: &mut [Option<FloodSlot>; FLOOD_SLOTS],
-    hash: [u8; 8],
-) -> bool {
-    for slot in floods.iter_mut() {
-        if slot.as_ref().is_some_and(|s| s.req.hash == hash) {
-            *slot = None;
-            return true;
-        }
-    }
-    false
-}
-
-fn due_flood(
-    floods: &[Option<FloodSlot>; FLOOD_SLOTS],
-    now: u64,
-    base: u64,
-    slot_ms: u64,
-) -> Option<(usize, u64)> {
-    floods
-        .iter()
-        .enumerate()
-        .filter_map(|(index, slot)| {
-            slot.as_ref().map(|s| {
-                (
-                    index,
-                    base.saturating_add(s.slot_id.saturating_mul(slot_ms)),
-                )
-            })
-        })
-        .filter(|(_, due)| *due <= now)
-        .min_by_key(|(_, due)| *due)
-}
-
-fn next_flood_due(
-    floods: &[Option<FloodSlot>; FLOOD_SLOTS],
-    base: u64,
-    slot_ms: u64,
-) -> Option<u64> {
-    floods
-        .iter()
-        .filter_map(|slot| {
-            slot.as_ref()
-                .map(|s| base.saturating_add(s.slot_id.saturating_mul(slot_ms)))
-        })
-        .min()
 }
 
 /// ThinkNode M1 LoRa Radio Adapter implementing `LoraRadio` via channels

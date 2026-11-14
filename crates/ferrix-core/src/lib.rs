@@ -9,6 +9,7 @@ pub mod battery;
 pub mod command;
 pub mod companion;
 pub mod engine;
+pub mod scheduler;
 pub mod state;
 pub mod storage;
 pub mod types;
