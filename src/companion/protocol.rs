@@ -1579,25 +1579,61 @@ impl CompanionNode {
             }
 
             CMD_SEND_CHANNEL_MSG => {
-                // Inbound channel message layout:
-                // [CMD(3), txt_type(1), channel_idx(1), timestamp(4 bytes le), text...]
-                if payload.len() > 7 {
+                // [CMD(3), txt_type, channel_idx, timestamp u32 LE, text...]
+                let mut err = None;
+                if payload.len() < 8 {
+                    err = Some(ERR_ILLEGAL_ARG);
+                } else {
+                    let txt_type = payload[1];
                     let channel_idx = payload[2];
-                    let timestamp = u32::from_le_bytes([payload[3], payload[4], payload[5], payload[6]]);
+                    let timestamp = u32::from_le_bytes([
+                        payload[3],
+                        payload[4],
+                        payload[5],
+                        payload[6],
+                    ]);
                     let text_bytes = &payload[7..];
-                    if let Ok(msg_str) = core::str::from_utf8(text_bytes) {
+                    let channel_ok = crate::companion::usb::CHANNELS.lock(|c| {
+                        c.borrow()
+                            .get(channel_idx as usize)
+                            .map_or(false, |ch| ch.secret != [0u8; 16])
+                    });
+                    if txt_type != 0 {
+                        // Only plain channel text is accepted from companions.
+                        err = Some(ERR_UNSUPPORTED);
+                    } else if !channel_ok {
+                        err = Some(ERR_NOT_FOUND);
+                    } else if let Ok(msg_str) = core::str::from_utf8(text_bytes) {
                         let msg_str = msg_str.trim_end_matches('\0');
-                        let mut s = String::<160>::new();
-                        let _ = s.push_str(msg_str);
-                        let _ = crate::companion::usb::USB_COMMAND_CHANNEL.try_send(crate::companion::usb::UsbCommand::SendGroupText {
-                            channel_idx,
-                            timestamp,
-                            text: s,
-                        });
+                        let n = msg_str.len().min(160);
+                        let n = msg_str.floor_char_boundary(n);
+                        let mut text = String::<160>::new();
+                        if text.push_str(&msg_str[..n]).is_err()
+                            || crate::companion::usb::USB_COMMAND_CHANNEL
+                                .try_send(crate::companion::usb::UsbCommand::SendGroupText {
+                                    channel_idx,
+                                    timestamp,
+                                    text,
+                                })
+                                .is_err()
+                        {
+                            // Destination task queue full / internal state.
+                            err = Some(ERR_BAD_STATE);
+                        }
+                    } else {
+                        err = Some(ERR_ILLEGAL_ARG);
                     }
                 }
                 let mut resp = Vec::<u8, 4>::new();
-                let _ = resp.push(RESP_CODE_OK);
+                match err {
+                    None => {
+                        let _ = resp.push(RESP_CODE_OK);
+                    }
+                    Some(code) => {
+                        let _ = resp.push(RESP_CODE_ERR);
+                        let _ = resp.push(code);
+                    }
+                }
                 emit(&resp);
             }
 
