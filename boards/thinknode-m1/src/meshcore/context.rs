@@ -43,11 +43,11 @@ impl EngineContext for BoardEngineContext {
     }
 
     fn apply_flood_scope(&self, pkt: &mut Packet) {
-        crate::companion::protocol::apply_flood_scope(pkt);
+        ferrix_core::state::apply_flood_scope(pkt);
     }
 
     fn apply_flood_scope_default(&self, pkt: &mut Packet) {
-        crate::companion::protocol::apply_flood_scope_default(pkt);
+        ferrix_core::state::apply_flood_scope_default(pkt);
     }
 
     fn note_forward_scheduled(&self) {

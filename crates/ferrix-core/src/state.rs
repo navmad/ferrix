@@ -158,6 +158,127 @@ pub static CONNECTIONS: Mutex<SharedRawMutex, RefCell<Vec<Connection, MAX_CONNEC
 pub static PENDING_LOGIN: Mutex<SharedRawMutex, RefCell<Option<([u8; 32], u64)>>> =
     Mutex::new(RefCell::new(None));
 
+/// Packet scoping for outgoing floods.
+pub struct ScopeState {
+    pub send_key: Option<[u8; 16]>,
+    pub force_unscoped: bool,
+}
+pub static SCOPE: Mutex<SharedRawMutex, RefCell<ScopeState>> =
+    Mutex::new(RefCell::new(ScopeState {
+        send_key: None,
+        force_unscoped: false,
+    }));
+
+/// Preferences managed by `SET_OTHER_PARAMS` / default flood scope and
+/// persisted in the config page.
+#[derive(Clone, Copy)]
+pub struct CompanionPrefs {
+    pub advert_loc_policy: u8,
+    pub telemetry_mode_base: u8,
+    pub telemetry_mode_loc: u8,
+    pub telemetry_mode_env: u8,
+    pub multi_acks: u8,
+    pub scope_name: [u8; 31],
+    pub scope_key: [u8; 16],
+}
+
+pub const DEFAULT_PREFS: CompanionPrefs = CompanionPrefs {
+    advert_loc_policy: 0,
+    telemetry_mode_base: 0,
+    telemetry_mode_loc: 0,
+    telemetry_mode_env: 0,
+    multi_acks: 0,
+    scope_name: [0; 31],
+    scope_key: [0; 16],
+};
+
+static PREFS: Mutex<SharedRawMutex, RefCell<CompanionPrefs>> =
+    Mutex::new(RefCell::new(DEFAULT_PREFS));
+
+pub fn prefs() -> CompanionPrefs {
+    PREFS.lock(|p| *p.borrow())
+}
+
+pub fn update_prefs(update: impl FnOnce(&mut CompanionPrefs)) {
+    PREFS.lock(|p| update(&mut p.borrow_mut()));
+}
+
+fn non_zero_key(key: &[u8; 16]) -> Option<[u8; 16]> {
+    if key.iter().any(|b| *b != 0) {
+        Some(*key)
+    } else {
+        None
+    }
+}
+
+/// Scope for ordinary outgoing floods: explicit override, else the default.
+/// `force_unscoped` disables both.
+pub fn flood_scope_send() -> Option<[u8; 16]> {
+    SCOPE.lock(|s| {
+        let scope = s.borrow();
+        if scope.force_unscoped {
+            None
+        } else if let Some(key) = scope.send_key {
+            non_zero_key(&key)
+        } else {
+            non_zero_key(&prefs().scope_key)
+        }
+    })
+}
+
+/// `(override set, force_unscoped)` for diagnostics.
+pub fn scope_override() -> (bool, bool) {
+    SCOPE.lock(|s| {
+        let scope = s.borrow();
+        (scope.send_key.is_some() || scope.force_unscoped, scope.force_unscoped)
+    })
+}
+
+/// Scope used for self adverts: always the persisted default.
+pub fn flood_scope_default() -> Option<[u8; 16]> {
+    non_zero_key(&prefs().scope_key)
+}
+
+/// Advert position after applying the location policy.
+pub fn advert_location(lat: f32, lon: f32) -> (f32, f32) {
+    if prefs().advert_loc_policy == 0 {
+        (0.0, 0.0)
+    } else {
+        (lat, lon)
+    }
+}
+
+pub static SCOPED_FLOODS: AtomicU32 = AtomicU32::new(0);
+
+fn scope_packet(pkt: &mut meshcore_wire::Packet, key: [u8; 16]) {
+    let code = meshcore_wire::crypto::transport_code(
+        &key,
+        pkt.payload_type(),
+        &pkt.payload[..pkt.payload_len],
+    );
+    pkt.header = (pkt.header & !0x03) | meshcore_wire::packet::ROUTE_TYPE_TRANSPORT_FLOOD;
+    pkt.transport_codes = [code, 0];
+    SCOPED_FLOODS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Attach the current send scope (override or default) to a flood packet.
+pub fn apply_flood_scope(pkt: &mut meshcore_wire::Packet) {
+    if pkt.route_type() == meshcore_wire::packet::ROUTE_TYPE_FLOOD {
+        if let Some(key) = flood_scope_send() {
+            scope_packet(pkt, key);
+        }
+    }
+}
+
+/// Attach the persisted default scope (used for self adverts).
+pub fn apply_flood_scope_default(pkt: &mut meshcore_wire::Packet) {
+    if pkt.route_type() == meshcore_wire::packet::ROUTE_TYPE_FLOOD {
+        if let Some(key) = flood_scope_default() {
+            scope_packet(pkt, key);
+        }
+    }
+}
+
 /// Active node callsign, mirrored from the persisted config.
 pub static NODE_CALLSIGN: Mutex<SharedRawMutex, RefCell<heapless::String<32>>> =
     Mutex::new(RefCell::new(heapless::String::new()));
