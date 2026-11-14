@@ -201,6 +201,55 @@ pub static BLE_CONNECTED: AtomicBool = AtomicBool::new(false);
 /// Pairing PIN reported to the app and used by the security handler.
 pub static BLE_PIN: AtomicU32 = AtomicU32::new(123456);
 
+/// Flood calendar slot width override. Zero means derive it from the modem.
+pub static TX_SLOT_MS_OVERRIDE: AtomicU32 = AtomicU32::new(0);
+/// Effective slot width and occupancy, for telemetry.
+pub static TX_SLOT_MS_LAST: AtomicU32 = AtomicU32::new(0);
+pub static TX_SLOT_USED: AtomicU32 = AtomicU32::new(0);
+
+/// Forwarding counters used to derive the spreading window on a live mesh.
+pub static FORWARD_SCHEDULED: AtomicU32 = AtomicU32::new(0);
+pub static FORWARD_SENT: AtomicU32 = AtomicU32::new(0);
+
+const DUP_BUCKETS: [AtomicU32; 6] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+
+/// Record how long after enqueueing a forward another copy was heard.
+pub fn record_duplicate_delta(ms: u64) {
+    let bucket = match ms {
+        0..=19 => 0,
+        20..=39 => 1,
+        40..=79 => 2,
+        80..=159 => 3,
+        160..=319 => 4,
+        _ => 5,
+    };
+    DUP_BUCKETS[bucket].fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn duplicate_deltas() -> [u32; 6] {
+    [
+        DUP_BUCKETS[0].load(Ordering::Relaxed),
+        DUP_BUCKETS[1].load(Ordering::Relaxed),
+        DUP_BUCKETS[2].load(Ordering::Relaxed),
+        DUP_BUCKETS[3].load(Ordering::Relaxed),
+        DUP_BUCKETS[4].load(Ordering::Relaxed),
+        DUP_BUCKETS[5].load(Ordering::Relaxed),
+    ]
+}
+
+pub fn clear_duplicate_deltas() {
+    for bucket in &DUP_BUCKETS {
+        bucket.store(0, Ordering::Relaxed);
+    }
+}
+
 /// Blue status LED disabled by the user (persisted in the config page).
 pub static LEDS_DISABLED: AtomicBool = AtomicBool::new(false);
 

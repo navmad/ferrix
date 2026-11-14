@@ -3,4 +3,5 @@
 //! their flash device.
 #![cfg_attr(not(test), no_std)]
 
+pub mod radio;
 pub mod storage;
