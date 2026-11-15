@@ -20,7 +20,7 @@ use ferrix_runtime::app::{RadarSort, UiState};
 
 use crate::display::{EpdFrameBuffer, EPD_WIDTH};
 
-pub const PAGE_COUNT: u8 = 8;
+pub const PAGE_COUNT: u8 = 9;
 pub const FIRMWARE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-ferrix");
 pub const PROTOCOL_VERSION: &str = "MeshCore v1.18";
 
@@ -61,6 +61,7 @@ pub fn render_page(page: u8, node: &CompanionNode<'_>, ui: &UiState, fb: &mut Ep
         4 => page_signal(ui, node, fb, small, title),
         5 => page_position(node, fb, small, title),
         6 => page_offgrid(fb, small, title),
+        7 => page_settings(fb, small, title),
         _ => page_system(node, fb, small, title),
     }
 
@@ -504,6 +505,25 @@ fn page_offgrid(fb: &mut EpdFrameBuffer, small: SmallStyle, title: TitleStyle) {
     draw_text(fb, "off-grid", 128, 120, small);
 }
 
+fn page_settings(fb: &mut EpdFrameBuffer, small: SmallStyle, title: TitleStyle) {
+    draw_text(fb, "SETTINGS", 2, 50, title);
+
+    let mut row: String<32> = String::new();
+    let _ = write!(
+        row,
+        "LEDs   {}",
+        if ferrix_core::state::leds_disabled() { "OFF" } else { "ON" }
+    );
+    draw_text(fb, row.as_str(), 2, 78, small);
+    row.clear();
+    let _ = write!(
+        row,
+        "SOUND  {}",
+        if ferrix_core::state::buzzer_enabled() { "ON" } else { "OFF" }
+    );
+    draw_text(fb, row.as_str(), 2, 94, small);
+}
+
 fn page_system(
     node: &CompanionNode<'_>,
     fb: &mut EpdFrameBuffer,
@@ -524,12 +544,7 @@ fn page_system(
         (s.rx_duty_cycle, s.path_hash_mode)
     });
     row.clear();
-    let _ = write!(
-        row,
-        "LEDs {}   RX duty {}",
-        if ferrix_core::state::leds_disabled() { "OFF" } else { "ON" },
-        if duty { "ON" } else { "OFF" }
-    );
+    let _ = write!(row, "RX duty {}", if duty { "ON" } else { "OFF" });
     draw_text(fb, row.as_str(), 2, 100, small);
     row.clear();
     let _ = write!(row, "PATH {}B   hash {} byte/hop", path + 1, path + 1);
@@ -601,8 +616,9 @@ fn actions(page: u8) -> (&'static str, &'static str) {
         3 => ("CYCLE TX POWER", "TOGGLE RX DUTY"),
         4 => ("RESET COUNTERS", "RESET SIGNAL"),
         5 => ("TOGGLE GPS", "TOGGLE LOCATION"),
-        6 => ("TOGGLE OFF-GRID", "TOGGLE SOUND"),
-        _ => ("TOGGLE LEDs", "PATH HASH 1B/2B/3B"),
+        6 => ("TOGGLE OFF-GRID", ""),
+        7 => ("TOGGLE LEDs", "TOGGLE SOUND"),
+        _ => ("PATH HASH 1B/2B/3B", ""),
     }
 }
 

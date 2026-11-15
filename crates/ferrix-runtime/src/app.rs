@@ -1220,6 +1220,18 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                             }
                         }
                         (6, _) => {
+                            // Off-grid has one action; the secondary is unused.
+                        }
+                        (7, 1) => {
+                            let disabled = !leds_disabled();
+                            board.set_leds_disabled(disabled);
+                            board.set_led(!disabled);
+                            info!(
+                                "Input: blue LED {}",
+                                if disabled { "disabled" } else { "enabled" }
+                            );
+                        }
+                        (7, _) => {
                             let enabled = !ferrix_core::state::buzzer_enabled();
                             ferrix_core::state::set_buzzer_enabled(enabled);
                             storage::request_save_config();
@@ -1231,25 +1243,14 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                                 board.beep(UiSound::Action).await;
                             }
                         }
-                        (7, 1) => {
-                            let disabled = !leds_disabled();
-                            board.set_leds_disabled(disabled);
-                            board.set_led(!disabled);
-                            info!(
-                                "Input: blue LED {}",
-                                if disabled { "disabled" } else { "enabled" }
-                            );
-                        }
-                        (_, _) => {
+                        (8, 1) => {
                             let next = (storage::get_path_hash_mode() + 1) % 3;
                             storage::set_path_hash_mode(next);
                             mesh.set_path_hash_mode(next);
                             node.path_hash_mode = next;
-                            info!(
-                                "Input: path hash {} byte(s)/hop",
-                                next + 1
-                            );
+                            info!("Input: path hash {} byte(s)/hop", next + 1);
                         }
+                        (_, _) => {}
                     }
 
                     board.render(node, &ui, full).await;

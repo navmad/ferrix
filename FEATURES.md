@@ -185,17 +185,18 @@ Inspect with `stats-tx`; override the slot width with `set tx.slot <ms>`
 
 ## 6. Dashboard and controls
 
-Eight pages, selected with the bottom button; the top button performs the
+Nine pages, selected with the bottom button; the top button performs the
 page action:
 
-0. Messages / connection status
-1. Recently heard contacts
-2. LoRa radio and packet counters
-3. Traffic counters
-4. GPS status
-5. Off-grid (client repeat) status
-6. LEDs
-7. Power/battery
+0. Mesh / connection status
+1. Inbox
+2. Radar
+3. Radio and packet counters
+4. Signal history
+5. Position / GPS
+6. Off-grid client repeat
+7. Settings (LEDs and sound)
+8. System (battery, RX duty, path hash, firmware)
 
 The frontlight turns off after an idle period and wakes on any input.
 
