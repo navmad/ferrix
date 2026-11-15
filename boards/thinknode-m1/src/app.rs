@@ -3,7 +3,6 @@
 use defmt::info;
 use embassy_futures::select::{select, Either};
 use embassy_nrf::gpio::Output;
-use embassy_nrf::peripherals::PWM0;
 use embassy_nrf::saadc;
 use embassy_time::{Duration, Instant, Timer};
 use ferrix_core::companion::protocol::CompanionNode;
@@ -22,7 +21,7 @@ pub struct ThinkNodeApp {
     display: Option<ThinkNodeDisplay>,
     battery_adc: saadc::Saadc<'static, 1>,
     battery_buf: [i16; 1],
-    buzzer: PassiveBuzzer<'static, PWM0>,
+    buzzer: PassiveBuzzer<'static>,
     backlight_on: bool,
     epd_active: bool,
     backlight_deadline: Instant,
@@ -33,7 +32,7 @@ impl ThinkNodeApp {
         led: Output<'static>,
         display: Option<ThinkNodeDisplay>,
         battery_adc: saadc::Saadc<'static, 1>,
-        buzzer: PassiveBuzzer<'static, PWM0>,
+        buzzer: PassiveBuzzer<'static>,
     ) -> Self {
         Self {
             led,

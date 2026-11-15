@@ -139,8 +139,8 @@ pub struct Pins {
     pub usbd: peripherals::USBD,
     pub qspi: ferrix_nrf52::qspi::QspiPins,
     pub wdt: peripherals::WDT,
-    pub pwm0: peripherals::PWM0,
-    pub buzzer: peripherals::P0_06,
+    /// Passive buzzer on P0.06, driven as a GPIO square wave.
+    pub buzzer: Output<'static>,
 }
 
 /// Initialize the ThinkNode M1 pinout and peripherals.
@@ -212,6 +212,9 @@ pub fn init(p: embassy_nrf::Peripherals) -> Pins {
 
     let telemetry = TelemetryPins { blue_led, red_led };
 
+    // Passive buzzer on P0.06. The app toggles it for tones.
+    let buzzer = Output::new(p.P0_06, Level::Low, OutputDrive::Standard);
+
     // --- External QSPI Flash (MX25R1635F) ---
     let qspi = ferrix_nrf52::qspi::QspiPins {
         qspi: p.QSPI,
@@ -238,7 +241,6 @@ pub fn init(p: embassy_nrf::Peripherals) -> Pins {
         usbd: p.USBD,
         qspi,
         wdt: p.WDT,
-        pwm0: p.PWM0,
-        buzzer: p.P0_06,
+        buzzer,
     }
 }

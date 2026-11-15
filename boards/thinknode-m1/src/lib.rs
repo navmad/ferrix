@@ -22,7 +22,6 @@ use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_nrf::gpio::Output;
 use embassy_nrf::peripherals;
-use embassy_nrf::pwm::SimplePwm;
 use embassy_nrf::saadc;
 use embassy_nrf::spim::{self, Spim};
 use embassy_time::{Delay, Duration, Timer};
@@ -172,7 +171,7 @@ pub struct ThinkNodeBoard {
     telemetry: Option<TelemetryPins>,
     battery_adc: Option<saadc::Saadc<'static, 1>>,
     display: Option<ThinkNodeDisplay>,
-    buzzer: Option<PassiveBuzzer<'static, peripherals::PWM0>>,
+    buzzer: Option<PassiveBuzzer<'static>>,
     radio: Option<ChannelRadio>,
     spim0: Option<peripherals::TWISPI0>,
     lora_pins: Option<LoraPins>,
@@ -284,12 +283,11 @@ impl CompanionBoard for ThinkNodeBoard {
             usbd,
             qspi,
             wdt,
-            pwm0,
             buzzer: buzzer_pin,
         } = pins;
 
         self._power_en = Some(power_en);
-        self.buzzer = Some(PassiveBuzzer::new(SimplePwm::new_1ch(pwm0, buzzer_pin)));
+        self.buzzer = Some(PassiveBuzzer::new(buzzer_pin));
 
         let wdt_handle = ferrix_nrf52::watchdog::start(wdt);
         spawner
