@@ -405,6 +405,7 @@ impl CompanionBoard for ThinkNodeBoard {
             .spawn(ferrix_nrf52::ble::contact_task())
             .unwrap();
 
+        crate::storage::set_qspi(self.qspi.take());
         ferrix_nrf52::ble::init_ble_companion(
             spawner,
             public_key,
@@ -413,7 +414,6 @@ impl CompanionBoard for ThinkNodeBoard {
             self.capabilities(),
             self.ble_model(),
             self.cli_host(),
-            self.qspi.take().expect("QSPI pins already taken"),
             crate::fatal_blink_forever,
             crate::storage::spawn_storage,
         );

@@ -28,14 +28,18 @@ pub use messages::MessageCommand;
 /// Flash regions reserved by the board for each store.
 #[derive(Clone, Debug)]
 pub struct StorageRegions {
-    /// Configuration page (one erase sector).
+    /// Configuration journal (always internal).
     pub config: Range<u32>,
-    /// Contact key-value map (external flash).
-    pub contacts: Range<u32>,
-    /// Message FIFO (external flash).
-    pub messages: Range<u32>,
-    /// BLE bond table.
+    /// BLE bond map (always internal).
     pub bonds: Range<u32>,
+    /// Contact/advert key-value map. Internal or external per flag.
+    pub contacts: Range<u32>,
+    /// Message FIFO. Internal or external per flag.
+    pub messages: Range<u32>,
+    /// True when contacts/adverts live on the external QSPI flash.
+    pub contacts_external: bool,
+    /// True when messages live on the external QSPI flash.
+    pub messages_external: bool,
     /// Internal data regions erased by a factory reset.
     pub factory_reset: Range<u32>,
     /// External flash regions erased by a factory reset.

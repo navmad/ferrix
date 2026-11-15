@@ -22,10 +22,38 @@ pub enum StorageExit {
     FactoryReset,
 }
 
+/// Dispatch a contacts/adverts operation to the configured flash.
+macro_rules! contacts_flash {
+    ($external:expr, $internal:expr, $is_external:expr, $call:expr) => {{
+        if $is_external {
+            match $external.as_deref_mut() {
+                Some(ext) => $call(ext).await,
+                None => error!("Storage: external flash required for contacts/adverts"),
+            }
+        } else {
+            $call($internal).await
+        }
+    }};
+}
+
+/// Dispatch a messages operation to the configured flash.
+macro_rules! messages_flash {
+    ($external:expr, $internal:expr, $is_external:expr, $call:expr) => {{
+        if $is_external {
+            match $external.as_deref_mut() {
+                Some(ext) => $call(ext).await,
+                None => error!("Storage: external flash required for messages"),
+            }
+        } else {
+            $call($internal).await
+        }
+    }};
+}
+
 /// Run the storage loop until a factory reset completes.
 pub async fn storage_loop<IF, EF>(
     internal: &mut IF,
-    external: &mut EF,
+    mut external: Option<&mut EF>,
     regions: &'static StorageRegions,
 ) -> StorageExit
 where
@@ -34,8 +62,14 @@ where
     IF::Error: defmt::Format,
     EF::Error: defmt::Format,
 {
-    contacts::load(external, &regions.contacts).await;
-    messages::load(external, &regions.messages).await;
+    contacts_flash!(external, internal, regions.contacts_external, |flash| contacts::load(
+        flash,
+        &regions.contacts
+    ));
+    messages_flash!(external, internal, regions.messages_external, |flash| messages::load(
+        flash,
+        &regions.messages
+    ));
     let mut heartbeat = Ticker::every(Duration::from_secs(5));
 
     loop {
@@ -43,7 +77,10 @@ where
         // Drain consume requests even if their wake-up message was dropped.
         let consumes = messages::take_pending_consumes();
         for _ in 0..consumes {
-            messages::consume(external, &regions.messages).await;
+            messages_flash!(external, internal, regions.messages_external, |flash| messages::consume(
+                flash,
+                &regions.messages
+            ));
         }
         // The advert lane handles both coalesced saves and synchronous
         // protocol fetches, which are served from the external flash.
@@ -76,15 +113,19 @@ where
                     {
                         error!("Storage: internal factory reset erase failed");
                     }
-                    if external
-                        .erase(
-                            regions.factory_reset_external.start,
-                            regions.factory_reset_external.end,
-                        )
-                        .await
-                        .is_err()
-                    {
-                        error!("Storage: external factory reset erase failed");
+                    if regions.contacts_external || regions.messages_external {
+                        if let Some(ext) = external.as_deref_mut() {
+                            if ext
+                                .erase(
+                                    regions.factory_reset_external.start,
+                                    regions.factory_reset_external.end,
+                                )
+                                .await
+                                .is_err()
+                            {
+                                error!("Storage: external factory reset erase failed");
+                            }
+                        }
                     }
                     return StorageExit::FactoryReset;
                 }
@@ -110,25 +151,42 @@ where
                         // Advert/app bursts arrive together; coalesce them.
                         Timer::after_millis(1000).await;
                         contacts::drain_save_requests();
-                        contacts::save(external, &regions.contacts).await;
+                        contacts_flash!(external, internal, regions.contacts_external, |flash| contacts::save(
+                            flash,
+                            &regions.contacts
+                        ));
                     }
                     Either5::Third(command) => match command {
                         // One record per message; the FIFO erases a page only
                         // when it wraps, so no batching is needed or wanted.
                         messages::MessageCommand::Append(msg) => {
-                            messages::append(external, &regions.messages, &msg).await
+                            messages_flash!(external, internal, regions.messages_external, |flash| messages::append(
+                                flash,
+                                &regions.messages,
+                                &msg
+                            ))
                         }
                         messages::MessageCommand::AppendChannelData(data) => {
-                            messages::append_channel_data(external, &regions.messages, &data).await
+                            messages_flash!(external, internal, regions.messages_external, |flash| messages::append_channel_data(
+                                flash,
+                                &regions.messages,
+                                &data
+                            ))
                         }
                         messages::MessageCommand::Consume => {
                             let consumes = messages::take_pending_consumes();
                             for _ in 0..consumes {
-                                messages::consume(external, &regions.messages).await;
+                                messages_flash!(external, internal, regions.messages_external, |flash| messages::consume(
+                                    flash,
+                                    &regions.messages
+                                ));
                             }
                         }
                         messages::MessageCommand::Clear => {
-                            messages::clear(external, &regions.messages).await
+                            messages_flash!(external, internal, regions.messages_external, |flash| messages::clear(
+                                flash,
+                                &regions.messages
+                            ))
                         }
                     },
                     Either5::Fourth(event) => match event {
@@ -136,10 +194,17 @@ where
                             // New contacts are rare; batch a discovery burst first.
                             Timer::after_millis(1000).await;
                             adverts::drain_save_requests();
-                            adverts::save(external, &regions.contacts).await;
+                            contacts_flash!(external, internal, regions.contacts_external, |flash| adverts::save(
+                                flash,
+                                &regions.contacts
+                            ));
                         }
                         Either::Second(req) => {
-                            adverts::serve_fetch(external, &regions.contacts, req).await
+                            contacts_flash!(external, internal, regions.contacts_external, |flash| adverts::serve_fetch(
+                                flash,
+                                &regions.contacts,
+                                req
+                            ))
                         }
                     },
                     Either5::Fifth(_) => {
@@ -150,9 +215,16 @@ where
             Either3::Second(side) => match side {
                 Either::First(op) => match op {
                     ContactOp::Remove(pub_key) => {
-                        contacts::remove(external, &regions.contacts, pub_key).await
+                        contacts_flash!(external, internal, regions.contacts_external, |flash| contacts::remove(
+                            flash,
+                            &regions.contacts,
+                            pub_key
+                        ))
                     }
-                    ContactOp::Clear => contacts::clear(external, &regions.contacts).await,
+                    ContactOp::Clear => contacts_flash!(external, internal, regions.contacts_external, |flash| contacts::clear(
+                            flash,
+                            &regions.contacts
+                        )),
                 },
                 Either::Second(_) => {
                     // Flush pending writes before reboot/DFU. The blob map
@@ -169,9 +241,15 @@ where
                         }
                     }
                     contacts::drain_save_requests();
-                    contacts::save(external, &regions.contacts).await;
+                    contacts_flash!(external, internal, regions.contacts_external, |flash| contacts::save(
+                            flash,
+                            &regions.contacts
+                        ));
                     adverts::drain_save_requests();
-                    adverts::save(external, &regions.contacts).await;
+                    contacts_flash!(external, internal, regions.contacts_external, |flash| adverts::save(
+                                flash,
+                                &regions.contacts
+                            ));
                     bonds::save(internal, &regions.bonds).await;
                     storage::complete_flush();
                 }

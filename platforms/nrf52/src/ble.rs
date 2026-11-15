@@ -687,9 +687,8 @@ pub async fn ble_companion_supervisor_task(
     capabilities: u32,
     model_name: &'static str,
     host: &'static dyn CliHost,
-    qspi: crate::qspi::QspiPins,
     fault_handler: fn(u32) -> !,
-    storage_spawn: fn(embassy_executor::Spawner, &'static Softdevice, crate::qspi::QspiPins),
+    storage_spawn: fn(embassy_executor::Spawner, &'static Softdevice),
 ) {
     FAULT.store(fault_handler as *mut (), Ordering::Relaxed);
     BLE_STATUS.store(1, Ordering::Relaxed);
@@ -750,7 +749,7 @@ pub async fn ble_companion_supervisor_task(
 
     // Storage must run even if GATT/BLE setup fails, otherwise the watchdog
     // never sees STORAGE_HEARTBEAT and the node bootloops.
-    storage_spawn(spawner, &*sd, qspi);
+    storage_spawn(spawner, &*sd);
 
     if let Ok(server) = server {
         if spawner.spawn(softdevice_task(&*sd)).is_ok()
@@ -785,9 +784,8 @@ pub fn init_ble_companion(
     capabilities: u32,
     model_name: &'static str,
     host: &'static dyn CliHost,
-    qspi: crate::qspi::QspiPins,
     fault_handler: fn(u32) -> !,
-    storage_spawn: fn(embassy_executor::Spawner, &'static Softdevice, crate::qspi::QspiPins),
+    storage_spawn: fn(embassy_executor::Spawner, &'static Softdevice),
 ) -> bool {
     spawner
         .spawn(ble_companion_supervisor_task(
@@ -798,7 +796,6 @@ pub fn init_ble_companion(
             capabilities,
             model_name,
             host,
-            qspi,
             fault_handler,
             storage_spawn,
         ))
