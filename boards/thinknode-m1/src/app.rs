@@ -160,6 +160,9 @@ impl AppBoard for ThinkNodeApp {
     }
 
     async fn beep(&mut self, sound: UiSound) {
+        if !ferrix_core::state::buzzer_enabled() {
+            return;
+        }
         match sound {
             UiSound::Click => self.buzzer.beep(2_200, 15).await,
             UiSound::Action => self.buzzer.beep(1_800, 35).await,

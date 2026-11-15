@@ -601,7 +601,7 @@ fn actions(page: u8) -> (&'static str, &'static str) {
         3 => ("CYCLE TX POWER", "TOGGLE RX DUTY"),
         4 => ("RESET COUNTERS", "RESET SIGNAL"),
         5 => ("TOGGLE GPS", "TOGGLE LOCATION"),
-        6 => ("TOGGLE OFF-GRID", ""),
+        6 => ("TOGGLE OFF-GRID", "TOGGLE SOUND"),
         _ => ("TOGGLE LEDs", "PATH HASH 1B/2B/3B"),
     }
 }

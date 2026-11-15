@@ -273,6 +273,21 @@ pub fn init_leds_disabled(disabled: bool) {
     LEDS_DISABLED.store(disabled, Ordering::Relaxed);
 }
 
+/// Buzzer/sound output enabled by the user (persisted separately in config).
+pub static BUZZER_ENABLED: AtomicBool = AtomicBool::new(true);
+
+pub fn buzzer_enabled() -> bool {
+    BUZZER_ENABLED.load(Ordering::Relaxed)
+}
+
+pub fn set_buzzer_enabled(enabled: bool) {
+    BUZZER_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn init_buzzer_enabled(enabled: bool) {
+    BUZZER_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
 pub const DEFAULT_PUBLIC_SECRET: [u8; 16] = [
     0x8b, 0x33, 0x87, 0xe9, 0xc5, 0xcd, 0xea, 0x6a, 0xc9, 0xe5, 0xed, 0xba, 0xa1, 0x15, 0xcd, 0x72,
 ];

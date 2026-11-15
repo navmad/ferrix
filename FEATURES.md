@@ -19,7 +19,7 @@ apps and the v1.18 over-the-air protocol.
 | nRF52840 + SX1262 (SPI, DIO1, BUSY, TCXO 1.8 V, DCDC, RX boost) | Yes |
 | 1.54" 200x200 e-paper (SSD1681) | Yes |
 | Two buttons + frontlight idle timeout | Yes |
-| Passive buzzer on P0.06 (GPIO square-wave boot/click/action/message tones) | Yes |
+| Passive buzzer on P0.06 (GPIO square wave, UI/CLI toggle) | Yes |
 | Battery voltage/percentage (SAADC) | Yes |
 | USB CDC-ACM (text CLI + binary companion framing) | Yes |
 | BLE Nordic UART Service companion | Yes |
@@ -216,7 +216,7 @@ USB text CLI commands include:
 ver, board, help
 get/set name, get public.key, get/set prv.key
 get radio, get/set freq, tx, sf, bw, cr
-get/set path.hash.mode, get/set repeat (off-grid)
+get/set path.hash.mode, get/set repeat (off-grid), get/set sound
 get/set leds, rxduty, af, dutycycle
 get/set autoadd, get companion
 contacts, clear contacts

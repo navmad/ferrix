@@ -1220,8 +1220,16 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                             }
                         }
                         (6, _) => {
-                            // The off-grid page has one action; the companion
-                            // must not expose a general repeater-role toggle.
+                            let enabled = !ferrix_core::state::buzzer_enabled();
+                            ferrix_core::state::set_buzzer_enabled(enabled);
+                            storage::request_save_config();
+                            info!(
+                                "Input: sound {}",
+                                if enabled { "on" } else { "off" }
+                            );
+                            if enabled {
+                                board.beep(UiSound::Action).await;
+                            }
                         }
                         (7, 1) => {
                             let disabled = !leds_disabled();

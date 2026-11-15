@@ -400,8 +400,10 @@ impl CompanionBoard for ThinkNodeBoard {
     }
 
     async fn start_ui(&mut self, node: &CompanionNode<'_>) {
-        if let Some(buzzer) = &mut self.buzzer {
-            buzzer.melody(&[(1_800, 70), (2_400, 90)], 30).await;
+        if ferrix_core::state::buzzer_enabled() {
+            if let Some(buzzer) = &mut self.buzzer {
+                buzzer.melody(&[(1_800, 70), (2_400, 90)], 30).await;
+            }
         }
         if let Some(display) = &mut self.display {
             defmt::info!("Initializing display and drawing Ferrix boot splash...");

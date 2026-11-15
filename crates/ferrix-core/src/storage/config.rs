@@ -55,7 +55,8 @@ struct SettingsRecord {
     autoadd_config: u8,
     autoadd_max_hops: u8,
     manual_add_contacts: u8,
-    leds_disabled: u8,
+    /// Bit 0: LEDs disabled. Bit 1: sound/buzzer disabled.
+    ui_disabled_flags: u8,
     rx_duty_cycle: u8,
     airtime_factor_tenths: u8,
     flood_scope_name: [u8; 31],
@@ -351,7 +352,8 @@ pub fn init_config(
             };
         });
 
-        crate::state::init_leds_disabled(cfg.leds_disabled != 0);
+        crate::state::init_leds_disabled(cfg.ui_disabled_flags & 1 != 0);
+        crate::state::init_buzzer_enabled(cfg.ui_disabled_flags & 2 == 0);
 
         crate::state::update_prefs(|p| {
             p.scope_name = cfg.flood_scope_name;
@@ -447,7 +449,8 @@ fn assemble_settings() -> SettingsRecord {
         autoadd_config: auto.config,
         autoadd_max_hops: auto.max_hops,
         manual_add_contacts: auto.manual_add_contacts,
-        leds_disabled: if crate::state::leds_disabled() { 1 } else { 0 },
+        ui_disabled_flags: (if crate::state::leds_disabled() { 1 } else { 0 })
+            | (if crate::state::buzzer_enabled() { 0 } else { 2 }),
         rx_duty_cycle: if rx_duty { 1 } else { 0 },
         airtime_factor_tenths: af,
         flood_scope_name: prefs.scope_name,

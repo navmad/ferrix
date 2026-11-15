@@ -593,6 +593,29 @@ pub async fn handle_text_cli<W: TextSink>(
                 let _ = sender.send( b"  -> Error: invalid number\r\n").await;
             }
         }
+        "get sound" | "get buzzer" => {
+            let on = crate::state::buzzer_enabled();
+            let mut s: heapless::String<16> = heapless::String::new();
+            let _ = write!(s, "> {}\r\n", if on { "on" } else { "off" });
+            let _ = sender.send( s.as_bytes()).await;
+        }
+        s if s.starts_with("set sound ") || s.starts_with("set buzzer ") => {
+            let val = s.rsplit_once(' ').map(|(_, v)| v.trim()).unwrap_or("");
+            let on = matches!(val, "on" | "1" | "true");
+            let off = matches!(val, "off" | "0" | "false");
+            if !on && !off {
+                let _ = sender.send(b"Error: must be on or off\r\n").await;
+            } else {
+                crate::state::set_buzzer_enabled(on);
+                host.request_save_config();
+                let msg: &[u8] = if on {
+                    b"OK - sound is now ON\r\n"
+                } else {
+                    b"OK - sound is now OFF\r\n"
+                };
+                let _ = sender.send(msg).await;
+            }
+        }
         "get repeat" => {
             // For a companion this reflects off-grid mode.
             let on = crate::state::offgrid_active();
