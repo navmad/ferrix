@@ -786,6 +786,52 @@ impl<'a> CompanionNode<'a> {
         }
     }
 
+    /// Pull identity, callsign, battery, clock and preferences from the
+    /// shared state. The app node and each transport session call this so a
+    /// key import, rename or app time sync is visible everywhere.
+    pub fn sync_from_shared(&mut self) {
+        let callsign = crate::storage::get_callsign();
+        if !callsign.is_empty() {
+            self.callsign = callsign;
+        }
+
+        let public_key = crate::state::current_public_key();
+        if public_key != [0u8; 32] {
+            self.public_key = public_key;
+            self.private_key = crate::state::current_private_key();
+        }
+
+        let mv = self.host.battery_millivolts();
+        if mv >= crate::battery::MIN_PLAUSIBLE_BATTERY_MV {
+            self.battery_millivolts = mv;
+            self.battery_percentage = crate::battery::millivolts_to_percentage(mv);
+        }
+
+        let epoch = crate::state::get_device_time();
+        if epoch != 0 {
+            self.epoch_time = epoch as u64;
+        }
+
+        let (path_hash_mode, airtime_tenths) = crate::state::RADIO_SETTINGS.lock(|r| {
+            let s = r.borrow();
+            (s.path_hash_mode, s.airtime_factor_tenths)
+        });
+        self.path_hash_mode = path_hash_mode;
+        self.airtime_factor_milli = airtime_tenths as u32 * 100;
+
+        let auto = crate::state::AUTOADD_SETTINGS.lock(|a| *a.borrow());
+        self.autoadd_config = auto.config;
+        self.autoadd_max_hops = auto.max_hops;
+        self.manual_add_contacts = auto.manual_add_contacts;
+
+        let prefs = crate::state::prefs();
+        self.telemetry_mode_base = prefs.telemetry_mode_base;
+        self.telemetry_mode_loc = prefs.telemetry_mode_loc;
+        self.telemetry_mode_env = prefs.telemetry_mode_env;
+        self.advert_loc_policy = prefs.advert_loc_policy;
+        self.multi_acks = prefs.multi_acks;
+    }
+
     /// Determine the contact type from advert flags.
     /// The low nibble is a single kind value: 1 chat, 2 repeater, 3 room, 4 sensor.
     pub fn get_contact_type_from_flags(flags: u8) -> u8 {
@@ -837,19 +883,7 @@ impl<'a> CompanionNode<'a> {
             return;
         }
 
-        // Refresh the battery snapshot from the shared telemetry state (the
-        // ADC is sampled by the main loop). Keep the last good value while the
-        // ADC has not produced a plausible sample yet; overwriting it with 0
-        // makes the app briefly show 0%.
-        let battery_mv = self.host.battery_millivolts();
-        if battery_mv >= crate::battery::MIN_PLAUSIBLE_BATTERY_MV {
-            self.battery_millivolts = battery_mv;
-            self.battery_percentage = crate::battery::millivolts_to_percentage(battery_mv);
-        }
-
-        // Keep the tuning reply in sync with the shared settings.
-        self.airtime_factor_milli = crate::state::RADIO_SETTINGS
-            .lock(|r| r.borrow().airtime_factor_tenths as u32 * 100);
+        self.sync_from_shared();
 
         let cmd = payload[0];
         LAST_CMD.store(cmd, Ordering::Relaxed);

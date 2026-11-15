@@ -284,6 +284,9 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
     let mut pending_messages = MESSAGE_LOG.lock(|m| m.borrow().len());
 
     loop {
+        // Keep the app node aligned with shared state changed by a transport
+        // or CLI command (identity, callsign, clock, preferences).
+        node.sync_from_shared();
         bump_app_heartbeat();
         // Move packets queued by the previous iteration into the radio
         // scheduler before sleeping.

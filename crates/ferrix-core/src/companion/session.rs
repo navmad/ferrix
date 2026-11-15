@@ -67,6 +67,7 @@ impl<'a> CompanionSession<'a> {
     /// Reset per-connection framing and text state.
     pub fn reset(&mut self) {
         self.frame_reader.reset();
+        self.node.sync_from_shared();
         self.text_len = 0;
         self.binary_mode = false;
         self.binary_session = false;
@@ -123,6 +124,7 @@ impl<'a> CompanionSession<'a> {
 
     /// Handle one complete companion frame.
     pub async fn handle_frame<L: CompanionLink>(&mut self, payload: &[u8], link: &mut L) {
+        self.node.sync_from_shared();
         if payload.first() == Some(&protocol::CMD_GET_CONTACTS) {
             self.stream_contacts(link).await;
             return;
@@ -164,6 +166,7 @@ impl<'a> CompanionSession<'a> {
 
     /// Run one text CLI line.
     pub async fn run_cli<L: CompanionLink>(&mut self, line: &str, link: &mut L, echo: bool) {
+        self.node.sync_from_shared();
         let mut sink = LinkText(link);
         handle_text_cli(&mut sink, line, &mut self.node, self.host, echo).await;
     }
