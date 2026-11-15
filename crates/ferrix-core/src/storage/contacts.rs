@@ -46,11 +46,14 @@ struct PersistContact {
     /// Explicit padding: `sync_since` must be 4-byte aligned.
     _pad_before_sync: [u8; 2],
     sync_since: u32,
-    _pad_tail: [u8; 2],
+    /// Explicit tail padding: records are written as raw bytes, so every byte
+    /// up to `CONTACT_RECORD_SIZE` must be initialized.
+    _pad_tail: [u8; 4],
 }
 
 const _: () = assert!(core::mem::size_of::<PersistContact>() == CONTACT_RECORD_SIZE);
 const _: () = assert!(core::mem::offset_of!(PersistContact, sync_since) == 156);
+const _: () = assert!(core::mem::offset_of!(PersistContact, _pad_tail) == 160);
 const _: () = assert!(core::mem::size_of::<PersistContact>() == 164);
 
 #[repr(C, align(4))]
@@ -118,7 +121,7 @@ fn contact_to_record(c: &DiscoveredContact) -> PersistContact {
         out_path_len: c.out_path_len,
         _pad_before_sync: [0; 2],
         sync_since: c.sync_since,
-        _pad_tail: [0; 2],
+        _pad_tail: [0; 4],
     }
 }
 
