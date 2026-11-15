@@ -376,10 +376,11 @@ where
         is_tx_prep: bool,
     ) -> Result<(), RadioError> {
         let tx_params_power;
-        let ramp_time = match is_tx_prep {
-            true => RampTime::Ramp40Us,   // for instance, prior to TX or CAD
-            false => RampTime::Ramp200Us, // for instance, on initialization
-        };
+        // 200 us matches the reference SX1262 configuration and is the safe
+        // ramp for 22 dBm. The 40 us TX ramp caused weak output on the
+        // ThinkNode M1's supply/PA path.
+        let _ = is_tx_prep;
+        let ramp_time = RampTime::Ramp200Us;
 
         match self.config.chip.get_device_sel() {
             DeviceSel::LowPowerPA => {
