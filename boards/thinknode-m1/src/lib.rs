@@ -331,6 +331,21 @@ impl CompanionBoard for ThinkNodeBoard {
         }
 
         let (node_name, custom_key) = crate::storage::init_config();
+        // A node without an imported key gets a random identity on first
+        // boot, persisted immediately. Factory reset therefore rotates it.
+        let custom_key = match custom_key {
+            Some(key) => Some(key),
+            None => {
+                let identity = meshcore_wire::LocalIdentity::from_seed(
+                    node_name.as_str(),
+                    &ferrix_nrf52::seed::random_seed(),
+                );
+                let key = identity.private_key_bytes();
+                crate::storage::set_custom_priv_key(key);
+                crate::storage::request_save_config();
+                Some(key)
+            }
+        };
         crate::storage::load();
 
         if let Some(disp) = display_pins {

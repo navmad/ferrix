@@ -17,7 +17,7 @@ use sequential_storage::cache::{Cache, Uncached};
 use sequential_storage::map::{MapConfig, MapStorage};
 
 use super::counted_flash::CountedFlash;
-use super::util::{self, MappedAsyncFlash};
+use super::util::{self, AlignedBuf, MappedAsyncFlash};
 use super::MappedFlash;
 
 pub const MAX_BONDS: usize = 4;
@@ -184,15 +184,15 @@ fn same_address(a: &Bond, flags: u8, addr: [u8; 6]) -> bool {
 /// Load the bond map into RAM. Called once at boot before BLE starts.
 pub fn init(reader: &'static dyn MappedFlash, region: Range<u32>) {
     let mut flash = MappedAsyncFlash::new(reader, region.clone());
-    let mut buf = [0u8; SCRATCH_SIZE];
+    let mut buf = AlignedBuf::<SCRATCH_SIZE>::new();
 
     let (bonds, count) = util::block_on(async {
         let mut map = open(&mut flash, &region);
         let mut bonds: [Option<Bond>; MAX_BONDS] = [None; MAX_BONDS];
         let mut count = 0usize;
-        match map.fetch_all_items(&mut buf).await {
+        match map.fetch_all_items(&mut buf.0).await {
             Ok(mut iter) => {
-                while let Ok(Some((_key, value))) = iter.next::<&[u8]>(&mut buf).await {
+                while let Ok(Some((_key, value))) = iter.next::<&[u8]>(&mut buf.0).await {
                     let Some(bond) = decode(value) else {
                         continue;
                     };
@@ -395,11 +395,11 @@ where
         return true;
     }
 
-    let mut buf = [0u8; SCRATCH_SIZE];
+    let mut buf = AlignedBuf::<SCRATCH_SIZE>::new();
     let mut map = open(flash, region);
 
     for key in removed.iter().flatten() {
-        if let Err(_e) = map.remove_item(&mut buf, key).await {
+        if let Err(_e) = map.remove_item(&mut buf.0, key).await {
             BOND_SAVE_ERRORS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             #[cfg(not(test))]
             error!("BLE: bond remove failed: {:?}", _e);
@@ -419,7 +419,7 @@ where
             core::slice::from_raw_parts(&rec as *const PersistBond as *const u8, RECORD_SIZE)
         };
         let key = bond_key(bond);
-        if let Err(_e) = map.store_item(&mut buf, &key, &bytes).await {
+        if let Err(_e) = map.store_item(&mut buf.0, &key, &bytes).await {
             BOND_SAVE_ERRORS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             #[cfg(not(test))]
             error!("BLE: bond write failed: {:?}", _e);

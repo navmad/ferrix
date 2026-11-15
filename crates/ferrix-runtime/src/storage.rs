@@ -40,6 +40,11 @@ where
 
     loop {
         bump_storage_heartbeat();
+        // Drain consume requests even if their wake-up message was dropped.
+        let consumes = messages::take_pending_consumes();
+        for _ in 0..consumes {
+            messages::consume(external, &regions.messages).await;
+        }
         // The advert lane handles both coalesced saves and synchronous
         // protocol fetches, which are served from the external flash.
         let advert_fut = select(
@@ -117,7 +122,10 @@ where
                             messages::append_channel_data(external, &regions.messages, &data).await
                         }
                         messages::MessageCommand::Consume => {
-                            messages::consume(external, &regions.messages).await
+                            let consumes = messages::take_pending_consumes();
+                            for _ in 0..consumes {
+                                messages::consume(external, &regions.messages).await;
+                            }
                         }
                         messages::MessageCommand::Clear => {
                             messages::clear(external, &regions.messages).await

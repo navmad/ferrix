@@ -29,6 +29,8 @@ pub static RECORD_SAVES: AtomicU32 = AtomicU32::new(0);
 pub static PAGE_ERASES: AtomicU32 = AtomicU32::new(0);
 /// Records currently held by the flash queue.
 pub static QUEUED: AtomicU32 = AtomicU32::new(0);
+/// Consumes requested but not yet applied to the flash queue.
+pub static PENDING_CONSUMES: AtomicU32 = AtomicU32::new(0);
 
 fn open<'a, F>(flash: &'a mut F, region: &Range<u32>) -> MessageQueue<'a, F>
 where
@@ -74,12 +76,22 @@ pub async fn queue_append_channel_data(data: ReceivedChannelData) {
 }
 
 pub async fn queue_consume() {
+    PENDING_CONSUMES.fetch_add(1, Ordering::Relaxed);
     let _ = COMMAND_CHANNEL.send(MessageCommand::Consume).await;
 }
 
 /// Non-blocking variant for command handlers that cannot await.
+///
+/// The counter is the source of truth; the channel message only wakes the
+/// storage task. If the channel is full, the next drain still sees the count.
 pub fn queue_consume_now() {
+    PENDING_CONSUMES.fetch_add(1, Ordering::Relaxed);
     let _ = COMMAND_CHANNEL.try_send(MessageCommand::Consume);
+}
+
+/// Take all pending consume requests.
+pub fn take_pending_consumes() -> u32 {
+    PENDING_CONSUMES.swap(0, Ordering::AcqRel)
 }
 
 pub async fn queue_clear() {
@@ -128,8 +140,8 @@ where
     F: NorFlash + MultiwriteNorFlash,
     F::Error: defmt::Format,
 {
-    let mut buf = [0u8; 4];
-    flash.read(addr, &mut buf).await.is_ok() && u32::from_le_bytes(buf) == magic
+    let mut buf = super::util::AlignedBuf::<4>::new();
+    flash.read(addr, &mut buf.0).await.is_ok() && u32::from_le_bytes(buf.0) == magic
 }
 
 /// Replace `MESSAGE_LOG` with the unconsumed messages from flash.
@@ -155,12 +167,12 @@ where
         }
     }
 
-    let mut buf = [0u8; MESSAGE_RECORD_MAX];
+    let mut buf = super::util::AlignedBuf::<MESSAGE_RECORD_MAX>::new();
     let mut count = 0usize;
     {
         match queue.iter().await {
             Ok(mut iter) => {
-                while let Ok(Some(entry)) = iter.next(&mut buf).await {
+                while let Ok(Some(entry)) = iter.next(&mut buf.0).await {
                     let bytes = entry.into_buf();
                     let version = bytes.first().copied().unwrap_or(0);
                     let item = if version == 1 || version == 2 {
@@ -200,7 +212,7 @@ where
     // records than the companion window (for example after a lost consume).
     if count > MAX_MESSAGES {
         for _ in 0..(count - MAX_MESSAGES) {
-            if queue.pop(&mut buf).await.is_err() {
+            if queue.pop(&mut buf.0).await.is_err() {
                 break;
             }
         }
@@ -275,9 +287,9 @@ where
     F: NorFlash + MultiwriteNorFlash,
     F::Error: defmt::Format,
 {
-    let mut buf = [0u8; MESSAGE_RECORD_MAX];
+    let mut buf = super::util::AlignedBuf::<MESSAGE_RECORD_MAX>::new();
     let mut queue = open(flash, region);
-    match queue.pop(&mut buf).await {
+    match queue.pop(&mut buf.0).await {
         Ok(Some(_)) => {
             let _ = QUEUED.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                 Some(n.saturating_sub(1))

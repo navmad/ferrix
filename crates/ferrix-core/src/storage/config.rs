@@ -17,7 +17,7 @@ use sequential_storage::cache::{Cache, Uncached};
 use sequential_storage::map::{MapConfig, MapStorage};
 
 use super::counted_flash::CountedFlash;
-use super::util::{self, fixed_str, str_from_fixed, MappedAsyncFlash};
+use super::util::{self, fixed_str, str_from_fixed, AlignedBuf, MappedAsyncFlash};
 use super::MappedFlash;
 use crate::types::{ChannelData, MAX_CHANNELS};
 
@@ -47,6 +47,8 @@ struct SettingsRecord {
     has_custom_key: u8,
     is_repeater: u8,
     client_repeat: u8,
+    /// Explicit padding: `offgrid_home_freq` must be 4-byte aligned.
+    _pad_before_offgrid: u8,
     offgrid_home_freq: u32,
     radio_tx_power: i8,
     radio_sf: u8,
@@ -66,6 +68,8 @@ struct SettingsRecord {
     telemetry_mode_loc: u8,
     telemetry_mode_env: u8,
     multi_acks: u8,
+    /// Explicit padding: `ble_pin` must be 4-byte aligned.
+    _pad_before_ble_pin: [u8; 2],
     ble_pin: u32,
     radio_freq_hz: u32,
     radio_bw_khz: u32,
@@ -81,6 +85,9 @@ struct ChannelRecord {
 }
 
 const _: () = assert!(core::mem::size_of::<SettingsRecord>() <= SCRATCH_SIZE);
+const _: () = assert!(core::mem::offset_of!(SettingsRecord, offgrid_home_freq) == 108);
+const _: () = assert!(core::mem::offset_of!(SettingsRecord, ble_pin) == 176);
+const _: () = assert!(core::mem::size_of::<SettingsRecord>() == 188);
 const _: () = assert!(core::mem::size_of::<ChannelRecord>() <= SCRATCH_SIZE);
 
 pub use crate::state::{BLE_PIN, CUSTOM_PRIV_KEY, NODE_CALLSIGN};
@@ -260,12 +267,12 @@ pub fn init_config(
     default_name: &str,
 ) -> (String<32>, Option<[u8; 64]>) {
     let mut flash = MappedAsyncFlash::new(reader, region.clone());
-    let mut sbuf = [0u8; SCRATCH_SIZE];
-    let mut cbuf = [0u8; SCRATCH_SIZE];
+    let mut sbuf = AlignedBuf::<SCRATCH_SIZE>::new();
+    let mut cbuf = AlignedBuf::<SCRATCH_SIZE>::new();
 
     let (settings, channels, found) = util::block_on(async {
         let mut map = open(&mut flash, &region);
-        let settings = match map.fetch_item::<&[u8]>(&mut sbuf, &SETTINGS_KEY).await {
+        let settings = match map.fetch_item::<&[u8]>(&mut sbuf.0, &SETTINGS_KEY).await {
             Ok(Some(value)) if value.len() >= core::mem::size_of::<SettingsRecord>() => {
                 let rec =
                     unsafe { core::ptr::read_unaligned(value.as_ptr() as *const SettingsRecord) };
@@ -285,7 +292,7 @@ pub fn init_config(
         let mut found = [false; MAX_CHANNELS];
         for i in 0..MAX_CHANNELS {
             let key = CHANNEL_KEY_BASE + i as u16;
-            if let Ok(Some(value)) = map.fetch_item::<&[u8]>(&mut cbuf, &key).await {
+            if let Ok(Some(value)) = map.fetch_item::<&[u8]>(&mut cbuf.0, &key).await {
                 if value.len() >= core::mem::size_of::<ChannelRecord>() {
                     let rec = unsafe {
                         core::ptr::read_unaligned(value.as_ptr() as *const ChannelRecord)
@@ -441,6 +448,7 @@ fn assemble_settings() -> SettingsRecord {
         has_custom_key,
         is_repeater: if is_rep { 1 } else { 0 },
         client_repeat: if client_repeat { 1 } else { 0 },
+        _pad_before_offgrid: 0,
         offgrid_home_freq,
         radio_tx_power: tx,
         radio_sf: sf,
@@ -460,6 +468,7 @@ fn assemble_settings() -> SettingsRecord {
         telemetry_mode_loc: prefs.telemetry_mode_loc,
         telemetry_mode_env: prefs.telemetry_mode_env,
         multi_acks: prefs.multi_acks,
+        _pad_before_ble_pin: [0; 2],
         ble_pin: BLE_PIN.load(core::sync::atomic::Ordering::Relaxed),
         radio_freq_hz: freq,
         radio_bw_khz: bw,
@@ -480,11 +489,11 @@ where
         )
     };
 
-    let mut buf = [0u8; SCRATCH_SIZE];
+    let mut buf = AlignedBuf::<SCRATCH_SIZE>::new();
     let mut map = open(flash, region);
 
     if let Err(e) = map
-        .store_item(&mut buf, &SETTINGS_KEY, &settings_bytes)
+        .store_item(&mut buf.0, &SETTINGS_KEY, &settings_bytes)
         .await
     {
         error!("Storage: config settings store failed: {:?}", e);
@@ -521,7 +530,7 @@ where
                 )
             };
             let key = CHANNEL_KEY_BASE + i as u16;
-            if let Err(e) = map.store_item(&mut buf, &key, &bytes).await {
+            if let Err(e) = map.store_item(&mut buf.0, &key, &bytes).await {
                 error!("Storage: config channel store failed: {:?}", e);
                 return;
             }

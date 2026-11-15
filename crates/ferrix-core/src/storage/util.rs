@@ -10,6 +10,16 @@ use embedded_storage_async::nor_flash::{
 
 use super::MappedFlash;
 
+/// Word-aligned scratch buffer for the SoftDevice and QSPI DMA paths.
+#[repr(C, align(4))]
+pub struct AlignedBuf<const N: usize>(pub [u8; N]);
+
+impl<const N: usize> AlignedBuf<N> {
+    pub const fn new() -> Self {
+        Self([0; N])
+    }
+}
+
 /// FNV-1a initial value.
 pub const FNV_INIT: u32 = 0x811C_9DC5;
 const FNV_PRIME: u32 = 0x0100_0193;

@@ -23,6 +23,7 @@ use heapless::Vec;
 use meshcore_wire::packets::AdvertPacket;
 
 use super::contact_map::{self, SCRATCH_SIZE};
+use super::util::AlignedBuf;
 
 /// `pub(32) ‖ ts(4) ‖ sig(64) ‖ app_data(≤32)`.
 pub const MAX_ADVERT_PAYLOAD: usize = 132;
@@ -161,7 +162,7 @@ where
         return;
     }
 
-    let mut buf = [0u8; SCRATCH_SIZE];
+    let mut buf = AlignedBuf::<SCRATCH_SIZE>::new();
     let mut map = contact_map::open(flash, region, &ERASES);
 
     for rec in pending.iter() {
@@ -184,7 +185,7 @@ where
             )
         };
         let key = contact_map::blob_key(&rec.pub_key);
-        if let Err(e) = map.store_item(&mut buf, &key, &bytes).await {
+        if let Err(e) = map.store_item(&mut buf.0, &key, &bytes).await {
             error!("Persistence: blob map store failed: {:?}", e);
             return;
         }
@@ -199,10 +200,10 @@ where
     F: NorFlash + MultiwriteNorFlash,
     F::Error: defmt::Format,
 {
-    let mut buf = [0u8; SCRATCH_SIZE];
+    let mut buf = AlignedBuf::<SCRATCH_SIZE>::new();
     let mut map = contact_map::open(flash, region, &ERASES);
     let key = contact_map::blob_key(&req.key);
-    let rec = match map.fetch_item::<&[u8]>(&mut buf, &key).await {
+    let rec = match map.fetch_item::<&[u8]>(&mut buf.0, &key).await {
         Ok(Some(value)) if value.len() >= core::mem::size_of::<BlobRecord>() => {
             let record =
                 unsafe { core::ptr::read_unaligned(value.as_ptr() as *const BlobRecord) };
@@ -227,10 +228,10 @@ where
     F: NorFlash + MultiwriteNorFlash,
     F::Error: defmt::Format,
 {
-    let mut buf = [0u8; SCRATCH_SIZE];
+    let mut buf = AlignedBuf::<SCRATCH_SIZE>::new();
     let mut map = contact_map::open(flash, region, &ERASES);
     let key = contact_map::blob_key(pub_key);
-    if let Err(e) = map.remove_item(&mut buf, &key).await {
+    if let Err(e) = map.remove_item(&mut buf.0, &key).await {
         error!("Persistence: blob map remove failed: {:?}", e);
     }
 }

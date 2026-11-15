@@ -43,11 +43,15 @@ struct PersistContact {
     flags: u8,
     contact_type: u8,
     out_path_len: u8,
+    /// Explicit padding: `sync_since` must be 4-byte aligned.
+    _pad_before_sync: [u8; 2],
     sync_since: u32,
-    _pad: [u8; 2],
+    _pad_tail: [u8; 2],
 }
 
 const _: () = assert!(core::mem::size_of::<PersistContact>() == CONTACT_RECORD_SIZE);
+const _: () = assert!(core::mem::offset_of!(PersistContact, sync_since) == 156);
+const _: () = assert!(core::mem::size_of::<PersistContact>() == 164);
 
 #[repr(C, align(4))]
 struct Scratch([u8; SCRATCH_SIZE]);
@@ -112,8 +116,9 @@ fn contact_to_record(c: &DiscoveredContact) -> PersistContact {
         flags: c.flags,
         contact_type: c.contact_type,
         out_path_len: c.out_path_len,
+        _pad_before_sync: [0; 2],
         sync_since: c.sync_since,
-        _pad: [0; 2],
+        _pad_tail: [0; 2],
     }
 }
 
@@ -160,8 +165,8 @@ where
     F: NorFlash,
     F::Error: defmt::Format,
 {
-    let mut buf = [0u8; 4];
-    flash.read(addr, &mut buf).await.is_ok() && u32::from_le_bytes(buf) == magic
+    let mut buf = super::util::AlignedBuf::<4>::new();
+    flash.read(addr, &mut buf.0).await.is_ok() && u32::from_le_bytes(buf.0) == magic
 }
 
 pub async fn load<F>(flash: &mut F, region: &Range<u32>)
