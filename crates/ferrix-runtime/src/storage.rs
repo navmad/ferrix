@@ -4,8 +4,10 @@
 //! loop owns the policy: coalescing saves, servicing message/contact mutations
 //! and performing the factory-reset erase.
 //!
-//! Internal flash holds config, bonds and (for now) the advert blob log.
-//! External QSPI flash holds contacts and messages.
+//! Config and BLE bonds always live in internal flash. Contacts, advert blobs
+//! and messages use external QSPI when the board has it (see
+//! `StorageRegions::contacts_external` / `messages_external`) and internal
+//! ranges otherwise.
 
 use defmt::{error, info};
 use embassy_futures::select::{select, select3, select5, Either, Either3, Either5};
@@ -62,6 +64,9 @@ where
     IF::Error: defmt::Format,
     EF::Error: defmt::Format,
 {
+    // A bond region left by an older layout cannot be mounted, so reclaim it
+    // before the first pairing write.
+    bonds::format_if_needed(internal, &regions.bonds).await;
     contacts_flash!(external, internal, regions.contacts_external, |flash| contacts::load(
         flash,
         &regions.contacts

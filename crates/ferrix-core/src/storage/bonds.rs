@@ -15,6 +15,7 @@ use embassy_sync::channel::Channel;
 use embedded_storage_async::nor_flash::{MultiwriteNorFlash, NorFlash};
 use sequential_storage::cache::{Cache, Uncached};
 use sequential_storage::map::{MapConfig, MapStorage};
+use sequential_storage::Error;
 
 use super::counted_flash::CountedFlash;
 use super::util::{self, AlignedBuf, MappedAsyncFlash};
@@ -72,6 +73,18 @@ pub static BOND_SAVE_ERRORS: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 pub static BOND_LOADED: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
+/// Last persistence error, encoded by [`error_code`] (0 = none).
+pub static BOND_LAST_ERROR: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+/// Bond regions that were reformatted after a failed write.
+pub static BOND_RECOVERIES: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+
+/// Set when the boot-time read found a region that cannot be mounted. The
+/// storage task erases it before the first save instead of appending to the
+/// foreign records.
+static NEEDS_FORMAT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 struct Store {
     bonds: [Option<Bond>; MAX_BONDS],
@@ -173,8 +186,21 @@ fn decode(bytes: &[u8]) -> Option<Bond> {
     })
 }
 
+/// Whether two records describe the same physical peer.
+///
+/// Re-pairing mints a new master ID, so the peer identity (IRK, or a stable
+/// address when no IRK was distributed) must also be compared. Otherwise one
+/// phone that pairs repeatedly would consume every bond slot.
 fn same_peer(a: &Bond, b: &Bond) -> bool {
-    a.master_ediv == b.master_ediv && a.master_rand == b.master_rand
+    if a.master_ediv == b.master_ediv && a.master_rand == b.master_rand {
+        return true;
+    }
+    if a.peer_irk != [0u8; 16] && a.peer_irk == b.peer_irk {
+        return true;
+    }
+    a.peer_addr != [0u8; 6]
+        && a.peer_addr_flags == b.peer_addr_flags
+        && a.peer_addr == b.peer_addr
 }
 
 fn same_address(a: &Bond, flags: u8, addr: [u8; 6]) -> bool {
@@ -208,7 +234,16 @@ pub fn init(reader: &'static dyn MappedFlash, region: Range<u32>) {
                     }
                 }
             }
-            Err(_) => {}
+            Err(e) => {
+                // Report why the map could not be read; 0x200 marks a load
+                // failure, distinct from a write failure. The region holds
+                // no readable bonds, so the storage task reformats it.
+                NEEDS_FORMAT.store(true, core::sync::atomic::Ordering::Relaxed);
+                BOND_LAST_ERROR.store(
+                    0x200 + error_code(&e),
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+            }
         }
         (bonds, count)
     });
@@ -237,6 +272,41 @@ pub fn init(reader: &'static dyn MappedFlash, region: Range<u32>) {
 fn request_save() {
     #[cfg(not(test))]
     let _ = SAVE_CHANNEL.try_send(());
+}
+
+/// Erase the bond region when the boot-time mount failed.
+///
+/// A blank region already mounts as an empty map, so a mount failure means
+/// the region still holds data from an older layout (contacts, advert log).
+/// Nothing in it is readable as a bond, so reclaiming it is lossless.
+pub async fn format_if_needed<F>(flash: &mut F, region: &Range<u32>) -> bool
+where
+    F: NorFlash + MultiwriteNorFlash,
+    F::Error: defmt::Format,
+{
+    if !NEEDS_FORMAT.swap(false, core::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    let mut map = open(flash, region);
+    match map.erase_all().await {
+        Ok(()) => {
+            BOND_LAST_ERROR.store(0, core::sync::atomic::Ordering::Relaxed);
+            BOND_RECOVERIES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            #[cfg(not(test))]
+            info!("BLE: formatted bond region");
+            true
+        }
+        Err(e) => {
+            NEEDS_FORMAT.store(true, core::sync::atomic::Ordering::Relaxed);
+            BOND_LAST_ERROR.store(
+                0x100 + error_code(&e),
+                core::sync::atomic::Ordering::Relaxed,
+            );
+            #[cfg(not(test))]
+            error!("BLE: bond region erase failed: {:?}", e);
+            false
+        }
+    }
 }
 
 /// Wait for a pending bond write.
@@ -276,13 +346,14 @@ pub fn upsert(bond: Bond) {
 
         let mut new_bond = bond;
         if let Some(existing) = store.bonds[slot] {
-            if same_peer(&existing, &new_bond) {
+            if same_peer(&existing, &new_bond) && new_bond.sys_len == 0 {
                 // Keep sys attrs across a re-bond unless new ones are present.
-                if new_bond.sys_len == 0 {
-                    new_bond.sys_len = existing.sys_len;
-                    new_bond.sys_attrs = existing.sys_attrs;
-                }
-            } else {
+                new_bond.sys_len = existing.sys_len;
+                new_bond.sys_attrs = existing.sys_attrs;
+            }
+            if bond_key(&existing) != bond_key(&new_bond) {
+                // The slot may be reused by a new master ID, so drop the old
+                // record from flash as well.
                 store.removed[slot] = Some(bond_key(&existing));
             }
         }
@@ -381,6 +452,62 @@ pub fn clear() {
     request_save();
 }
 
+/// Encode a `sequential-storage` error for the `stats-ble` diagnostic field.
+fn error_code<S>(error: &Error<S>) -> u32 {
+    match error {
+        Error::Storage { .. } => 1,
+        Error::FullStorage => 2,
+        Error::Corrupted { .. } => 3,
+        Error::LogicBug { .. } => 4,
+        Error::BufferTooBig => 5,
+        Error::BufferTooSmall(_) => 6,
+        Error::SerializationError(_) => 7,
+        Error::ItemTooBig => 8,
+        _ => 9,
+    }
+}
+
+/// Write pending removals and dirty bonds. `rewrite_all` is used after a
+/// reformat, when the map is blank and every RAM bond must be restored.
+async fn write_pending<F>(
+    flash: &mut F,
+    region: &Range<u32>,
+    bonds: &[Option<Bond>; MAX_BONDS],
+    dirty: &[bool; MAX_BONDS],
+    removed: &[Option<[u8; 10]>; MAX_BONDS],
+    rewrite_all: bool,
+) -> Result<(), Error<F::Error>>
+where
+    F: NorFlash + MultiwriteNorFlash,
+    F::Error: defmt::Format,
+{
+    let mut buf = AlignedBuf::<SCRATCH_SIZE>::new();
+    let mut map = open(flash, region);
+
+    if !rewrite_all {
+        for key in removed.iter().flatten() {
+            map.remove_item(&mut buf.0, key).await?;
+        }
+    }
+
+    for (i, bond) in bonds.iter().enumerate() {
+        if !rewrite_all && !dirty[i] {
+            continue;
+        }
+        let Some(bond) = bond else {
+            continue;
+        };
+        let rec = encode(bond);
+        let bytes = unsafe {
+            core::slice::from_raw_parts(&rec as *const PersistBond as *const u8, RECORD_SIZE)
+        };
+        let key = bond_key(bond);
+        map.store_item(&mut buf.0, &key, &bytes).await?;
+    }
+
+    Ok(())
+}
+
 /// Persist dirty/removed bonds to the map.
 pub async fn save<F>(flash: &mut F, region: &Range<u32>) -> bool
 where
@@ -395,45 +522,77 @@ where
         return true;
     }
 
-    let mut buf = AlignedBuf::<SCRATCH_SIZE>::new();
-    let mut map = open(flash, region);
-
-    for key in removed.iter().flatten() {
-        if let Err(_e) = map.remove_item(&mut buf.0, key).await {
-            BOND_SAVE_ERRORS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            #[cfg(not(test))]
-            error!("BLE: bond remove failed: {:?}", _e);
-            return false;
+    // The bond region used to hold the internal contacts map and advert log.
+    // Leftover records from that layout can look like a valid map, so a write
+    // fails instead of repairing it. The bonds are already in RAM, so
+    // reformatting the region and rewriting them is lossless. Reformat up
+    // front when the boot-time mount already failed, otherwise retry once
+    // with a clean map after the first write error.
+    let rewrite_all = NEEDS_FORMAT.swap(false, core::sync::atomic::Ordering::Relaxed);
+    if rewrite_all {
+        let mut map = open(flash, region);
+        match map.erase_all().await {
+            Ok(()) => {
+                BOND_RECOVERIES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
+            Err(e) => {
+                NEEDS_FORMAT.store(true, core::sync::atomic::Ordering::Relaxed);
+                BOND_LAST_ERROR.store(
+                    0x100 + error_code(&e),
+                    core::sync::atomic::Ordering::Relaxed,
+                );
+                #[cfg(not(test))]
+                error!("BLE: bond map erase failed: {:?}", e);
+                BOND_SAVE_ERRORS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                return false;
+            }
         }
     }
 
-    for (i, bond) in bonds.iter().enumerate() {
-        if !dirty[i] {
-            continue;
-        }
-        let Some(bond) = bond else {
-            continue;
-        };
-        let rec = encode(bond);
-        let bytes = unsafe {
-            core::slice::from_raw_parts(&rec as *const PersistBond as *const u8, RECORD_SIZE)
-        };
-        let key = bond_key(bond);
-        if let Err(_e) = map.store_item(&mut buf.0, &key, &bytes).await {
-            BOND_SAVE_ERRORS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-            #[cfg(not(test))]
-            error!("BLE: bond write failed: {:?}", _e);
-            return false;
+    for attempt in 0..2 {
+        let all = rewrite_all || attempt > 0;
+        match write_pending(flash, region, &bonds, &dirty, &removed, all).await {
+            Ok(()) => {
+                STORE.lock(|s| {
+                    let mut store = s.borrow_mut();
+                    store.dirty = [false; MAX_BONDS];
+                    store.removed = [None; MAX_BONDS];
+                });
+                BOND_SAVES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                return true;
+            }
+            Err(e) => {
+                BOND_LAST_ERROR.store(error_code(&e), core::sync::atomic::Ordering::Relaxed);
+                #[cfg(not(test))]
+                if attempt == 0 {
+                    error!("BLE: bond write failed ({:?}), reformatting map", e);
+                } else {
+                    error!("BLE: bond write failed: {:?}", e);
+                }
+                if attempt == 0 && !rewrite_all {
+                    let mut map = open(flash, region);
+                    match map.erase_all().await {
+                        Ok(()) => {
+                            BOND_RECOVERIES
+                                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            BOND_LAST_ERROR.store(
+                                0x100 + error_code(&e),
+                                core::sync::atomic::Ordering::Relaxed,
+                            );
+                            #[cfg(not(test))]
+                            error!("BLE: bond map erase failed: {:?}", e);
+                            break;
+                        }
+                    }
+                }
+            }
         }
     }
 
-    STORE.lock(|s| {
-        let mut store = s.borrow_mut();
-        store.dirty = [false; MAX_BONDS];
-        store.removed = [None; MAX_BONDS];
-    });
-    BOND_SAVES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    true
+    BOND_SAVE_ERRORS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    false
 }
 
 #[cfg(test)]
@@ -477,6 +636,40 @@ mod tests {
         assert_eq!(decoded.master_ediv, bond.master_ediv);
         assert_eq!(decoded.master_rand, bond.master_rand);
         assert_eq!(decoded.ltk, bond.ltk);
+
+        clear();
+        assert_eq!(count(), 0);
+    }
+
+    #[test]
+    fn rebond_replaces_the_previous_slot() {
+        clear();
+
+        let mut first = sample();
+        first.master_ediv = 1;
+        first.master_rand = [1; 8];
+        first.peer_addr = [1; 6];
+        first.peer_irk = [0xCC; 16];
+        upsert(first);
+        assert_eq!(count(), 1);
+
+        // Re-pairing keeps the peer identity but mints a new master ID.
+        let mut second = first;
+        second.master_ediv = 2;
+        second.master_rand = [2; 8];
+        upsert(second);
+        assert_eq!(count(), 1);
+        assert!(get_key(1, &[1; 8]).is_none());
+        assert!(get_key(2, &[2; 8]).is_some());
+
+        // A different peer gets its own slot.
+        let mut other = first;
+        other.master_ediv = 3;
+        other.master_rand = [3; 8];
+        other.peer_addr = [2; 6];
+        other.peer_irk = [0xDD; 16];
+        upsert(other);
+        assert_eq!(count(), 2);
 
         clear();
         assert_eq!(count(), 0);

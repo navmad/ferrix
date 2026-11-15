@@ -1363,13 +1363,15 @@ pub async fn handle_text_cli<W: TextSink>(
                     let callsign = crate::storage::get_callsign();
                     let _ = write!(
                         s,
-                        "  -> BLE: Active (MeshCore-{} NUS), connected: {}, bonds: {} (loaded {}, saved {}, errors {})\r\n",
+                        "  -> BLE: Active (MeshCore-{} NUS), connected: {}, bonds: {} (loaded {}, saved {}, errors {}, err {}, recov {})\r\n",
                         callsign.as_str(),
                         connected,
                         crate::storage::bonds::count(),
                         crate::storage::bonds::BOND_LOADED.load(core::sync::atomic::Ordering::Relaxed),
                         crate::storage::bonds::BOND_SAVES.load(core::sync::atomic::Ordering::Relaxed),
-                        crate::storage::bonds::BOND_SAVE_ERRORS.load(core::sync::atomic::Ordering::Relaxed)
+                        crate::storage::bonds::BOND_SAVE_ERRORS.load(core::sync::atomic::Ordering::Relaxed),
+                        crate::storage::bonds::BOND_LAST_ERROR.load(core::sync::atomic::Ordering::Relaxed),
+                        crate::storage::bonds::BOND_RECOVERIES.load(core::sync::atomic::Ordering::Relaxed)
                     );
                 }
                 code if code >= 0x1000 => {
