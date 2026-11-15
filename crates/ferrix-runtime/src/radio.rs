@@ -166,10 +166,12 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
     let mut slot_override_active = false;
     let mut last_adapt_ms = start_ms;
     let mut last_adapt_events = 0u32;
-    let node_key = current_public_key();
 
     loop {
         let now = Instant::now().as_millis() as u64;
+        // Re-read every iteration: a private-key import changes the node hash
+        // used to place floods, and must take effect without a reboot.
+        let node_key = current_public_key();
 
         // Apply cancellations before choosing a slot to transmit. If the
         // packet is still in the channel, remember its hash and drop it on
