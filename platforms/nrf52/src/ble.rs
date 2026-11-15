@@ -436,7 +436,6 @@ pub async fn ble_companion_task(
     ];
 
     let mut adv_data = [0u8; 31];
-    let mut scan_data = [0u8; 31];
 
     // Flags: LE General Discoverable Mode, BR/EDR Not Supported
     adv_data[0] = 2; // length
@@ -447,27 +446,6 @@ pub async fn ble_companion_task(
     adv_data[3] = 17; // 1 (type) + 16 (uuid)
     adv_data[4] = 0x07; // Complete list of 128-bit Service UUIDs
     adv_data[5..21].copy_from_slice(&nus_uuid_128);
-
-    // Scan response data: Complete Local Name `MeshCore-<callsign>`, truncated
-    // to the 29-byte budget of a 31-byte BLE advertisement payload.
-    const NAME_PREFIX: &[u8] = b"MeshCore-";
-    const BLE_NAME_MAX: usize = 29;
-    let mut name_buf = [0u8; BLE_NAME_MAX];
-    let callsign_bytes = callsign.as_bytes();
-    let copy_len = callsign_bytes.len().min(BLE_NAME_MAX - NAME_PREFIX.len());
-    name_buf[..NAME_PREFIX.len()].copy_from_slice(NAME_PREFIX);
-    name_buf[NAME_PREFIX.len()..NAME_PREFIX.len() + copy_len]
-        .copy_from_slice(&callsign_bytes[..copy_len]);
-    let name = &name_buf[..NAME_PREFIX.len() + copy_len];
-
-    scan_data[0] = (name.len() + 1) as u8;
-    scan_data[1] = 0x09; // Complete Local Name
-    scan_data[2..2 + name.len()].copy_from_slice(name);
-
-    let adv = peripheral::ConnectableAdvertisement::ScannableUndirected {
-        adv_data: &adv_data[..21],
-        scan_data: &scan_data[..2 + name.len()],
-    };
 
     let mut model = Vec::<u8, 32>::new();
     let _ = model.extend_from_slice(model_name.as_bytes());
@@ -483,9 +461,29 @@ pub async fn ble_companion_task(
 
     loop {
         info!("BLE: Waiting for pairable connection from MeshCore companion app...");
-        // Pick up a PIN changed by the companion app before advertising again.
+        // Pick up a PIN or callsign changed since the last advertising cycle.
         set_static_passkey(BLE_PIN.load(Ordering::Relaxed));
 
+        const NAME_PREFIX: &[u8] = b"MeshCore-";
+        const BLE_NAME_MAX: usize = 29;
+        let callsign = ferrix_core::storage::get_callsign();
+        let mut name_buf = [0u8; BLE_NAME_MAX];
+        let callsign_bytes = callsign.as_bytes();
+        let copy_len = callsign_bytes.len().min(BLE_NAME_MAX - NAME_PREFIX.len());
+        name_buf[..NAME_PREFIX.len()].copy_from_slice(NAME_PREFIX);
+        name_buf[NAME_PREFIX.len()..NAME_PREFIX.len() + copy_len]
+            .copy_from_slice(&callsign_bytes[..copy_len]);
+        let name = &name_buf[..NAME_PREFIX.len() + copy_len];
+
+        let mut scan_data = [0u8; 31];
+        scan_data[0] = (name.len() + 1) as u8;
+        scan_data[1] = 0x09; // Complete Local Name
+        scan_data[2..2 + name.len()].copy_from_slice(name);
+
+        let adv = peripheral::ConnectableAdvertisement::ScannableUndirected {
+            adv_data: &adv_data[..21],
+            scan_data: &scan_data[..2 + name.len()],
+        };
         let advertise_fut =
             peripheral::advertise_pairable(sd, adv, &adv_config, &SECURITY_HANDLER);
         let fast_window = if adv_config.interval == 32 {
@@ -666,8 +664,6 @@ pub async fn ble_companion_supervisor_task(
     storage_spawn: fn(embassy_executor::Spawner, &'static Softdevice, crate::qspi::QspiPins),
 ) {
     FAULT.store(fault_handler as *mut (), Ordering::Relaxed);
-    // Wait 500ms so USB CDC-ACM and SX1262 LoRa tasks are completely booted
-    embassy_time::Timer::after_millis(500).await;
     BLE_STATUS.store(1, Ordering::Relaxed);
     info!("BLE: Initializing SoftDevice S140 subsystem...");
 
@@ -721,11 +717,18 @@ pub async fn ble_companion_supervisor_task(
 
     let sd = Softdevice::enable(&sd_config);
     set_static_passkey(BLE_PIN.load(Ordering::Relaxed));
-    if let Ok(server) = MeshCoreGattServer::new(sd) {
-        if spawner.spawn(softdevice_task(sd)).is_ok()
+
+    let server = MeshCoreGattServer::new(sd);
+
+    // Storage must run even if GATT/BLE setup fails, otherwise the watchdog
+    // never sees STORAGE_HEARTBEAT and the node bootloops.
+    storage_spawn(spawner, &*sd, qspi);
+
+    if let Ok(server) = server {
+        if spawner.spawn(softdevice_task(&*sd)).is_ok()
             && spawner
                 .spawn(ble_companion_task(
-                    sd,
+                    &*sd,
                     server,
                     public_key,
                     private_key,
@@ -736,7 +739,6 @@ pub async fn ble_companion_supervisor_task(
                 ))
                 .is_ok()
         {
-            storage_spawn(spawner, sd, qspi);
             info!("MeshCore BLE companion service successfully started!");
             BLE_STATUS.store(3, Ordering::Relaxed);
         } else {

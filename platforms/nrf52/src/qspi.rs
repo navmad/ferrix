@@ -111,6 +111,15 @@ pub async fn self_test(flash: &mut Qspi<'static, peripherals::QSPI>) {
     ]);
     let mut readback = Aligned([0u8; 16]);
 
+    // The last sector is spare. If the previous self-test left its pattern
+    // there, reading it proves both command and array-read paths without
+    // erasing/writing on every boot.
+    if flash.read(TEST_ADDR, &mut readback.0).await.is_ok() && readback.0 == pattern.0 {
+        QSPI_SELFTEST.store(1, Ordering::Relaxed);
+        info!("QSPI: self-test pattern already present");
+        return;
+    }
+
     let passed = flash.erase(TEST_ADDR).await.is_ok()
         && flash.write(TEST_ADDR, &pattern.0).await.is_ok()
         && flash.read(TEST_ADDR, &mut readback.0).await.is_ok()

@@ -174,7 +174,7 @@ pub fn init(p: embassy_nrf::Peripherals) -> Pins {
     let epd_reset = Output::new(p.P0_02, Level::High, OutputDrive::Standard);
     let epd_busy = Input::new(p.P0_03, Pull::None);
     // Backlight (P1.11): Active-high (High = ON)
-    let epd_backlight = Output::new(p.P1_11, Level::High, OutputDrive::Standard);
+    let epd_backlight = Output::new(p.P1_11, Level::Low, OutputDrive::Standard);
 
     let display = DisplayPins {
         sclk: p.P0_31,

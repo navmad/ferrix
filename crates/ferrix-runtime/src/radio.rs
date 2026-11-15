@@ -493,6 +493,9 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
                     auto_slot_ms =
                         slot_width_ms(current_cfg.2, current_cfg.3, current_cfg.4, preamble_for(current_cfg.2));
                     slot_ms = auto_slot_ms;
+                    // Let the top-of-loop override check re-apply a manual
+                    // slot width against the new modulation parameters.
+                    slot_override_active = false;
                     base_ms = Instant::now().as_millis() as u64;
                     last_adapt_ms = base_ms;
                     rx_backoff_ms = 50;

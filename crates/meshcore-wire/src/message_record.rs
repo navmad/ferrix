@@ -107,9 +107,13 @@ impl Default for MessageRecord {
 }
 
 fn truncate_str(dst: &mut [u8], src: &str, max: usize) -> usize {
-    let bytes = src.as_bytes();
-    let n = bytes.len().min(max).min(dst.len());
-    dst[..n].copy_from_slice(&bytes[..n]);
+    let mut n = src.len().min(max).min(dst.len());
+    // Never cut through a UTF-8 code point; the decoder would otherwise see
+    // invalid UTF-8 and replace the whole field with an empty string.
+    while n > 0 && !src.is_char_boundary(n) {
+        n -= 1;
+    }
+    dst[..n].copy_from_slice(&src.as_bytes()[..n]);
     n
 }
 
@@ -444,6 +448,15 @@ mod tests {
         let n = direct.encode(&mut buf).unwrap();
         assert_eq!(n, MESSAGE_RECORD_MAX);
         assert_eq!(MessageRecord::decode(&buf[..n]).unwrap(), direct);
+    }
+
+    #[test]
+    fn truncation_does_not_split_utf8() {
+        // 15 two-byte characters (30 bytes) plus a three-byte character.
+        // The 31-byte sender limit falls inside the last code point.
+        let sender = "ééééééééééééééé€";
+        let record = MessageRecord::new(0, 0, false, sender, [0; 32], "x", 0, 0, 0);
+        assert_eq!(record.sender_str(), "ééééééééééééééé");
     }
 
     #[test]

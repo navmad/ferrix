@@ -14,6 +14,8 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use defmt::{error, info};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
+#[cfg(not(test))]
+use embassy_sync::mutex::Mutex as AsyncMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
 use embedded_storage_async::nor_flash::{MultiwriteNorFlash, NorFlash};
@@ -60,6 +62,10 @@ pub struct FetchRequest {
 
 static FETCH_CHANNEL: Channel<CriticalSectionRawMutex, FetchRequest, 1> = Channel::new();
 static FETCH_RESPONSE: Signal<CriticalSectionRawMutex, Option<PendingBlob>> = Signal::new();
+/// Serializes USB and BLE advert fetches and prevents a stale response from
+/// a cancelled caller being delivered to the next one.
+#[cfg(not(test))]
+static FETCH_LOCK: AsyncMutex<CriticalSectionRawMutex, ()> = AsyncMutex::new(());
 
 fn request() {
     #[cfg(not(test))]
@@ -131,7 +137,11 @@ pub async fn request_payload(pub_key: &[u8; 32]) -> Option<Vec<u8, MAX_ADVERT_PA
     }
     #[cfg(not(test))]
     {
-        let _ = FETCH_CHANNEL.send(FetchRequest { key: *pub_key }).await;
+        let _guard = FETCH_LOCK.lock().await;
+        FETCH_RESPONSE.reset();
+        FETCH_CHANNEL
+            .send(FetchRequest { key: *pub_key })
+            .await;
         let rec = FETCH_RESPONSE.wait().await?;
         let len = rec.len as usize;
         let adv = AdvertPacket::decode(&rec.payload[..len]).ok()?;

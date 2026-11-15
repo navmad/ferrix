@@ -23,7 +23,6 @@ pub struct ThinkNodeApp {
     battery_buf: [i16; 1],
     buzzer: PassiveBuzzer<'static>,
     backlight_on: bool,
-    epd_active: bool,
     backlight_deadline: Instant,
 }
 
@@ -40,8 +39,7 @@ impl ThinkNodeApp {
             battery_adc,
             battery_buf: [0i16; 1],
             buzzer,
-            backlight_on: true,
-            epd_active: true,
+            backlight_on: false,
             backlight_deadline: Instant::now()
                 .checked_add(Duration::from_secs(BACKLIGHT_IDLE_SECS))
                 .unwrap(),
@@ -109,7 +107,6 @@ impl AppBoard for ThinkNodeApp {
 
     async fn input_wake(&mut self) {
         self.backlight_on = true;
-        self.epd_active = true;
         self.backlight_deadline = Instant::now()
             .checked_add(Duration::from_secs(BACKLIGHT_IDLE_SECS))
             .unwrap();
@@ -124,10 +121,9 @@ impl AppBoard for ThinkNodeApp {
                 d.set_backlight(false);
             }
             self.backlight_on = false;
-            self.epd_active = false;
         }
 
-        if tick % 30 == 0 && self.epd_active {
+        if tick % 30 == 0 {
             self.render(node, ui, false).await;
         }
     }
