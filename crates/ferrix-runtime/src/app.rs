@@ -39,6 +39,17 @@ pub enum InputEvent {
     PowerToggle,
 }
 
+/// Semantic sound requests for boards with a buzzer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UiSound {
+    /// Page navigation or light UI feedback.
+    Click,
+    /// A confirmed page action.
+    Action,
+    /// A new message arrived.
+    Notify,
+}
+
 /// Sort metric for the radar page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum RadarSort {
@@ -139,6 +150,8 @@ pub trait AppBoard {
     async fn tick(&mut self, node: &CompanionNode<'_>, ui: &UiState, tick: u32);
     async fn sample_battery(&mut self) -> Option<u16>;
     fn set_leds_disabled(&mut self, disabled: bool);
+    /// Play a UI sound. Boards without a buzzer keep the default no-op.
+    async fn beep(&mut self, _sound: UiSound) {}
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -505,6 +518,7 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                             storage::messages::queue_consume().await;
                         }
                         storage::messages::queue_append(message).await;
+                        board.beep(UiSound::Notify).await;
 
                         // Prompt companion app with PUSH_CODE_MSG_WAITING (0x83)
                         let mut msg_wait = heapless::Vec::<u8, 256>::new();
@@ -618,6 +632,7 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                             storage::messages::queue_consume().await;
                         }
                         storage::messages::queue_append(message).await;
+                        board.beep(UiSound::Notify).await;
 
                         // Prompt companion app with PUSH_CODE_MSG_WAITING (0x83)
                         let mut msg_wait = heapless::Vec::<u8, 256>::new();
@@ -1047,6 +1062,11 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
         Either4::Third(event) => {
             // Any interaction wakes the frontlight and restarts its idle timer.
             board.input_wake().await;
+            let sound = match event {
+                InputEvent::ActionPrimary | InputEvent::ActionSecondary => UiSound::Action,
+                _ => UiSound::Click,
+            };
+            board.beep(sound).await;
 
             let clicks = match event {
                 InputEvent::NextPage | InputEvent::ActionPrimary => 1,

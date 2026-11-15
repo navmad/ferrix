@@ -139,6 +139,8 @@ pub struct Pins {
     pub usbd: peripherals::USBD,
     pub qspi: ferrix_nrf52::qspi::QspiPins,
     pub wdt: peripherals::WDT,
+    pub pwm0: peripherals::PWM0,
+    pub buzzer: peripherals::P0_06,
 }
 
 /// Initialize the ThinkNode M1 pinout and peripherals.
@@ -236,5 +238,7 @@ pub fn init(p: embassy_nrf::Peripherals) -> Pins {
         usbd: p.USBD,
         qspi,
         wdt: p.WDT,
+        pwm0: p.PWM0,
+        buzzer: p.P0_06,
     }
 }

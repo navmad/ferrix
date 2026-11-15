@@ -22,6 +22,7 @@ use defmt_rtt as _;
 use embassy_executor::Spawner;
 use embassy_nrf::gpio::Output;
 use embassy_nrf::peripherals;
+use embassy_nrf::pwm::SimplePwm;
 use embassy_nrf::saadc;
 use embassy_nrf::spim::{self, Spim};
 use embassy_time::{Delay, Duration, Timer};
@@ -30,6 +31,7 @@ use ferrix_core::companion::protocol::{
     CompanionHost, CompanionNode, CAP_BLE, CAP_CLIENT, CAP_EPD, CAP_GPS,
 };
 use ferrix_core::engine::EngineContext;
+use ferrix_nrf52::buzzer::PassiveBuzzer;
 use ferrix_role_companion::CompanionBoard;
 use ferrix_runtime::radio::ChannelRadio;
 use heapless::String;
@@ -170,6 +172,7 @@ pub struct ThinkNodeBoard {
     telemetry: Option<TelemetryPins>,
     battery_adc: Option<saadc::Saadc<'static, 1>>,
     display: Option<ThinkNodeDisplay>,
+    buzzer: Option<PassiveBuzzer<'static, peripherals::PWM0>>,
     radio: Option<ChannelRadio>,
     spim0: Option<peripherals::TWISPI0>,
     lora_pins: Option<LoraPins>,
@@ -186,6 +189,7 @@ impl ThinkNodeBoard {
             telemetry: None,
             battery_adc: None,
             display: None,
+            buzzer: None,
             radio: None,
             spim0: None,
             lora_pins: None,
@@ -280,9 +284,12 @@ impl CompanionBoard for ThinkNodeBoard {
             usbd,
             qspi,
             wdt,
+            pwm0,
+            buzzer: buzzer_pin,
         } = pins;
 
         self._power_en = Some(power_en);
+        self.buzzer = Some(PassiveBuzzer::new(SimplePwm::new_1ch(pwm0, buzzer_pin)));
 
         let wdt_handle = ferrix_nrf52::watchdog::start(wdt);
         spawner
@@ -395,6 +402,9 @@ impl CompanionBoard for ThinkNodeBoard {
     }
 
     async fn start_ui(&mut self, node: &CompanionNode<'_>) {
+        if let Some(buzzer) = &mut self.buzzer {
+            buzzer.melody(&[(1_800, 70), (2_400, 90)], 30).await;
+        }
         if let Some(display) = &mut self.display {
             defmt::info!("Initializing display and drawing Ferrix boot splash...");
             display.init().await.ok();
@@ -447,6 +457,7 @@ impl CompanionBoard for ThinkNodeBoard {
             telemetry.blue_led,
             self.display.take(),
             self.battery_adc.take().expect("battery ADC already taken"),
+            self.buzzer.take().expect("buzzer already taken"),
         )
     }
 

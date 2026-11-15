@@ -3,10 +3,12 @@
 use defmt::info;
 use embassy_futures::select::{select, Either};
 use embassy_nrf::gpio::Output;
+use embassy_nrf::peripherals::PWM0;
 use embassy_nrf::saadc;
 use embassy_time::{Duration, Instant, Timer};
 use ferrix_core::companion::protocol::CompanionNode;
-use ferrix_runtime::app::{AppBoard, UiState};
+use ferrix_nrf52::buzzer::PassiveBuzzer;
+use ferrix_runtime::app::{AppBoard, UiSound, UiState};
 
 use crate::display::ThinkNodeDisplay;
 use crate::gps;
@@ -20,6 +22,7 @@ pub struct ThinkNodeApp {
     display: Option<ThinkNodeDisplay>,
     battery_adc: saadc::Saadc<'static, 1>,
     battery_buf: [i16; 1],
+    buzzer: PassiveBuzzer<'static, PWM0>,
     backlight_on: bool,
     epd_active: bool,
     backlight_deadline: Instant,
@@ -30,12 +33,14 @@ impl ThinkNodeApp {
         led: Output<'static>,
         display: Option<ThinkNodeDisplay>,
         battery_adc: saadc::Saadc<'static, 1>,
+        buzzer: PassiveBuzzer<'static, PWM0>,
     ) -> Self {
         Self {
             led,
             display,
             battery_adc,
             battery_buf: [0i16; 1],
+            buzzer,
             backlight_on: true,
             epd_active: true,
             backlight_deadline: Instant::now()
@@ -153,5 +158,15 @@ impl AppBoard for ThinkNodeApp {
 
     fn set_leds_disabled(&mut self, disabled: bool) {
         crate::host::set_leds_disabled(disabled);
+    }
+
+    async fn beep(&mut self, sound: UiSound) {
+        match sound {
+            UiSound::Click => self.buzzer.beep(2_200, 15).await,
+            UiSound::Action => self.buzzer.beep(1_800, 35).await,
+            UiSound::Notify => {
+                self.buzzer.melody(&[(2_700, 70), (3_200, 90)], 50).await;
+            }
+        }
     }
 }

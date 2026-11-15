@@ -6,6 +6,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod ble;
+pub mod buzzer;
 pub mod flash;
 pub mod qspi;
 pub mod reset;
