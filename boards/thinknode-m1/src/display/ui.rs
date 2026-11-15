@@ -54,7 +54,7 @@ pub fn render_page(page: u8, node: &CompanionNode<'_>, ui: &UiState, fb: &mut Ep
     draw_separator(fb, SEPARATOR_Y);
 
     match page {
-        0 => page_mesh(node, fb, small, title),
+        0 => page_mesh(fb, small, title),
         1 => page_inbox(node, ui, fb, small, title),
         2 => page_radar(node, ui, fb, small, title),
         3 => page_radio(fb, small, title),
@@ -131,7 +131,6 @@ fn draw_separator(fb: &mut EpdFrameBuffer, y: i32) {
 }
 
 fn page_mesh(
-    node: &CompanionNode<'_>,
     fb: &mut EpdFrameBuffer,
     small: SmallStyle,
     title: TitleStyle,
@@ -147,8 +146,9 @@ fn page_mesh(
 
     draw_mesh_glyph(fb, 100, 112, 24);
 
+    let unread = ferrix_core::state::MESSAGE_LOG.lock(|m| m.borrow().len());
     let mut row: String<32> = String::new();
-    let _ = write!(row, "unread {}", node.unread_messages);
+    let _ = write!(row, "unread {}", unread);
     draw_text(fb, row.as_str(), 2, 142, small);
     let ble = if ferrix_core::state::BLE_CONNECTED.load(core::sync::atomic::Ordering::Relaxed) {
         "BLE <ok>"

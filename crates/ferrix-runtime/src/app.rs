@@ -256,6 +256,7 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
     let mut tick: u32 = 0;
     let mut ui = UiState::default();
     let mut clicks_since_full: u32 = 0;
+    let mut pending_messages = MESSAGE_LOG.lock(|m| m.borrow().len());
 
     loop {
         bump_app_heartbeat();
@@ -460,7 +461,6 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                     }
                     InboundAction::ReceivedGroupText { channel_idx, path_len, packet: grp } => {
                         info!("MeshCore Group Text [ch {}]: <{}> {}", channel_idx, grp.sender.as_str(), grp.message.as_str());
-                        node.unread_messages = node.unread_messages.saturating_add(1);
                         let mut s_sender = heapless::String::new();
                         let _ = s_sender.push_str(grp.sender.as_str());
                         let mut s_text = heapless::String::new();
@@ -538,7 +538,6 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                             sender_pub[3], sender_pub[4], sender_pub[5],
                             msg.text.as_str()
                         );
-                        node.unread_messages = node.unread_messages.saturating_add(1);
                         // Signed room posts advance the room-sync watermark so a
                         // later login does not replay the whole backlog.
                         if msg.txt_type
@@ -1228,6 +1227,15 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
             tick = tick.wrapping_add(1);
             protocol::keepalive_tick();
             sync_gps(node);
+
+            // The companion transport drains MESSAGE_LOG when the app syncs.
+            // Redraw when the pending set changes so the badge and inbox do
+            // not stay stale between the slower board-driven refreshes.
+            let pending = MESSAGE_LOG.lock(|m| m.borrow().len());
+            if pending != pending_messages {
+                pending_messages = pending;
+                board.render(node, &ui, false).await;
+            }
 
             board.tick(node, &ui, tick).await;
 
