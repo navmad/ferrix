@@ -303,8 +303,9 @@ fn page_radar(
             .draw(fb);
     }
 
-    // Label the three nearest contacts.
-    for _ in 0..3 {
+    // Label the three nearest contacts when labels are enabled.
+    let label_count = if ui.radar_labels { 3 } else { 0 };
+    for _ in 0..label_count {
         let mut best: Option<(usize, i32)> = None;
         for (i, dot) in dots.iter().enumerate() {
             if dot.labeled {
@@ -599,7 +600,7 @@ fn actions(page: u8) -> (&'static str, &'static str) {
     match page {
         0 => ("ZERO-HOP ADVERT", "FLOOD ADVERT"),
         1 => ("NEXT MESSAGE", "PREVIOUS MESSAGE"),
-        2 => ("PING (ZERO-HOP)", "SORT AGE/SIGNAL"),
+        2 => ("TOGGLE LABELS", "SORT AGE/SIGNAL"),
         3 => ("CYCLE TX POWER", "TOGGLE RX DUTY"),
         4 => ("RESET COUNTERS", "RESET SIGNAL"),
         5 => ("TOGGLE GPS", "TOGGLE LOCATION"),

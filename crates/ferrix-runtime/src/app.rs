@@ -105,11 +105,23 @@ impl SignalHistory {
 }
 
 /// UI-only state shared by the application and the board renderer.
-#[derive(Default)]
 pub struct UiState {
     pub inbox_cursor: usize,
     pub radar_sort: RadarSort,
+    /// Whether the radar page labels the nearest contacts.
+    pub radar_labels: bool,
     pub signal: SignalHistory,
+}
+
+impl Default for UiState {
+    fn default() -> Self {
+        Self {
+            inbox_cursor: 0,
+            radar_sort: RadarSort::default(),
+            radar_labels: true,
+            signal: SignalHistory::default(),
+        }
+    }
 }
 
 /// Board services used by the application loop.
@@ -1098,8 +1110,11 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                             info!("Input: inbox previous {}", ui.inbox_cursor);
                         }
                         (2, 1) => {
-                            info!("Input: radar ping (zero-hop advert)");
-                            send_advert(board, mesh, node, false).await;
+                            ui.radar_labels = !ui.radar_labels;
+                            info!(
+                                "Input: radar labels {}",
+                                if ui.radar_labels { "on" } else { "off" }
+                            );
                         }
                         (2, _) => {
                             ui.radar_sort = match ui.radar_sort {
