@@ -210,8 +210,6 @@ pub static BLE_PIN: AtomicU32 = AtomicU32::new(123456);
 pub static QSPI_STATUS: AtomicU32 = AtomicU32::new(0);
 /// JEDEC ID read from the external QSPI flash.
 pub static QSPI_ID: AtomicU32 = AtomicU32::new(0);
-/// QSPI read/write/erase self-test (0 = not run, 1 = pass, 2 = fail).
-pub static QSPI_SELFTEST: AtomicU32 = AtomicU32::new(0);
 
 /// Flood calendar slot width override. Zero means derive it from the modem.
 pub static TX_SLOT_MS_OVERRIDE: AtomicU32 = AtomicU32::new(0);

@@ -42,6 +42,12 @@ pub struct StorageStats {
     pub advert_erases: u32,
     pub config_saves: u32,
     pub config_erases: u32,
+    /// Board uses external QSPI for contacts/messages.
+    pub external_profile: bool,
+    /// External flash is missing or unusable this session.
+    pub external_unavailable: bool,
+    /// External-store operations skipped because of the outage.
+    pub external_drops: u32,
 }
 
 /// Transmit scheduler counters shown by `stats-tx`.
@@ -1131,7 +1137,7 @@ pub async fn handle_text_cli<W: TextSink>(
             let _ = sender.send( s.as_bytes()).await;
         }
         "stats-flash" => {
-            let mut s: heapless::String<256> = heapless::String::new();
+            let mut s: heapless::String<384> = heapless::String::new();
             let _ = write!(
                 s,
                 "  -> contacts: {} saves / {} erases\r\n",
@@ -1157,31 +1163,32 @@ pub async fn handle_text_cli<W: TextSink>(
                 storage.config_saves,
                 storage.config_erases
             );
+            let external = if !storage.external_profile {
+                "internal"
+            } else if storage.external_unavailable {
+                "unavailable"
+            } else {
+                "ready"
+            };
+            let _ = write!(
+                s,
+                "  -> external: {} ({} ops skipped)\r\n",
+                external, storage.external_drops
+            );
             let _ = sender.send( s.as_bytes()).await;
         }
         "qspi" | "stats-qspi" => {
             use core::sync::atomic::Ordering;
             let status = crate::state::QSPI_STATUS.load(Ordering::Relaxed);
             let id = crate::state::QSPI_ID.load(Ordering::Relaxed);
-            let test = crate::state::QSPI_SELFTEST.load(Ordering::Relaxed);
             let status_s = match status {
                 0 => "not initialized",
                 1 => "ready",
                 2 => "id mismatch",
                 _ => "io error",
             };
-            let test_s = match test {
-                0 => "not run",
-                1 => "pass",
-                2 => "fail",
-                _ => "?",
-            };
             let mut s: heapless::String<160> = heapless::String::new();
-            let _ = write!(
-                s,
-                "  -> QSPI: {} id={:06x} selftest={}\r\n",
-                status_s, id, test_s
-            );
+            let _ = write!(s, "  -> QSPI: {} id={:06x}\r\n", status_s, id);
             let _ = sender.send( s.as_bytes()).await;
         }
         "stats-disc" => {

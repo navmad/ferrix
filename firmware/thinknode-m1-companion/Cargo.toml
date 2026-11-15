@@ -8,6 +8,10 @@ build = "build.rs"
 name = "ferrix"
 path = "src/main.rs"
 
+[features]
+default = []
+internal-storage = ["ferrix-thinknode-m1/internal-storage"]
+
 [dependencies]
 cortex-m-rt = "0.7"
 defmt-rtt = "0.4"

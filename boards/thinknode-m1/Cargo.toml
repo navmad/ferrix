@@ -3,6 +3,11 @@ name = "ferrix-thinknode-m1"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+# Keep contacts/adverts and messages in internal flash; no QSPI init.
+internal-storage = []
+
 [dependencies]
 cortex-m = { version = "0.7", features = ["inline-asm"] }
 cortex-m-rt = "0.7"

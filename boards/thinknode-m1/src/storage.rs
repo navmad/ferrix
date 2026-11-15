@@ -1,8 +1,12 @@
 //! Board binding for the storage formats owned by `ferrix-core`.
 //!
-//! The ThinkNode layout reserves the region above the application image:
-//! adverts, contacts, messages and one configuration page. The storage loop
-//! itself lives in `ferrix-runtime`.
+//! The board selects one compile-time storage profile:
+//!
+//! - default: config/bonds internal, contacts/adverts and messages on the
+//!   external QSPI chip;
+//! - `internal-storage`: all four stores in internal flash, no QSPI.
+//!
+//! The storage loop itself lives in `ferrix-runtime`.
 
 pub use ferrix_core::storage::{
     adverts, config, contacts, counted_flash, get_callsign, get_path_hash_mode, messages,
@@ -14,24 +18,42 @@ use core::cell::RefCell;
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
-use ferrix_runtime::storage::{storage_loop, StorageExit};
+#[cfg(not(feature = "internal-storage"))]
+use ferrix_runtime::storage::storage_loop_external;
+#[cfg(feature = "internal-storage")]
+use ferrix_runtime::storage::storage_loop_internal;
+use ferrix_runtime::storage::StorageExit;
 use heapless::String;
 
-/// Flash layout for ThinkNode M1 (nRF52840, 1 MB internal + 2 MB external).
-///
-/// The external QSPI regions are offsets into the 2 MB chip.
-pub static REGIONS: StorageRegions = StorageRegions {
-    // Internal on every board: config journal and bond map.
+/// Default profile: config/bonds internal, contacts/adverts and messages on
+/// the external QSPI chip (offsets into the 2 MB chip).
+pub static EXTERNAL_REGIONS: StorageRegions = StorageRegions {
     config: 0x000A_0000..0x000B_0000,
     bonds: 0x000B_0000..0x000B_4000,
-    // External QSPI when present: contacts/advert blobs and messages.
     contacts: 0x0000_0000..0x0004_0000,
     messages: 0x0004_0000..0x0014_0000,
-    contacts_external: true,
-    messages_external: true,
     factory_reset: 0x000A_0000..0x000B_4000,
     factory_reset_external: 0x0000_0000..0x0014_0000,
 };
+
+/// Internal-only profile: 128 KB contacts/adverts and 96 KB messages from
+/// the unused internal window between the bond map and the bootloader.
+pub static INTERNAL_REGIONS: StorageRegions = StorageRegions {
+    config: 0x000A_0000..0x000B_0000,
+    bonds: 0x000B_0000..0x000B_4000,
+    contacts: 0x000B_4000..0x000D_4000,
+    messages: 0x000D_4000..0x000E_C000,
+    factory_reset: 0x000A_0000..0x000E_D000,
+    factory_reset_external: 0..0,
+};
+
+const _: () = assert!(EXTERNAL_REGIONS.validate_external());
+const _: () = assert!(INTERNAL_REGIONS.validate_internal());
+
+#[cfg(not(feature = "internal-storage"))]
+pub use EXTERNAL_REGIONS as REGIONS;
+#[cfg(feature = "internal-storage")]
+pub use INTERNAL_REGIONS as REGIONS;
 
 /// Initialize configuration from the journal, or defaults.
 pub fn init_config() -> (String<32>, Option<[u8; 64]>) {
@@ -68,8 +90,10 @@ pub fn spawn_storage(
     let _ = spawner.spawn(storage_task(sd, pins));
 }
 
+#[cfg(not(feature = "internal-storage"))]
 type QspiFlash = embassy_nrf::qspi::Qspi<'static, embassy_nrf::peripherals::QSPI>;
 
+#[cfg(not(feature = "internal-storage"))]
 static QSPI: static_cell::StaticCell<QspiFlash> = static_cell::StaticCell::new();
 
 /// Background storage task that serializes all flash writes.
@@ -80,17 +104,39 @@ pub async fn storage_task(
 ) -> ! {
     let mut flash = ferrix_nrf52::flash::take(sd);
 
-    let exit = if let Some(pins) = qspi_pins {
-        // The external flash is on a switched rail. Bring it up here rather
-        // than at boot, and let the self-test retry if the rail is settling.
-        embassy_time::Timer::after_millis(10).await;
-        let qspi = QSPI.init(ferrix_nrf52::qspi::init(pins));
-        ferrix_nrf52::qspi::self_test(qspi).await;
-        defmt::info!("Storage: internal + external flash");
-        storage_loop(&mut flash, Some(qspi), &REGIONS).await
-    } else {
+    #[cfg(not(feature = "internal-storage"))]
+    let exit = {
+        let mut qspi = if let Some(pins) = qspi_pins {
+            // The external flash is on a switched rail. Give it time and let
+            // the JEDEC probe retry while the rail settles.
+            embassy_time::Timer::after_millis(10).await;
+            Some(QSPI.init(ferrix_nrf52::qspi::init(pins)))
+        } else {
+            None
+        };
+
+        let ready = match qspi.as_mut() {
+            Some(qspi) => ferrix_nrf52::qspi::probe(qspi).await,
+            None => false,
+        };
+
+        let external: Option<&mut QspiFlash> = if ready {
+            defmt::info!("Storage: internal + external flash");
+            qspi
+        } else {
+            // No fallback: external stores stay unavailable for this session.
+            ferrix_core::storage::mark_external_unavailable();
+            None
+        };
+
+        storage_loop_external(&mut flash, external, &REGIONS).await
+    };
+
+    #[cfg(feature = "internal-storage")]
+    let exit = {
+        let _ = qspi_pins;
         defmt::info!("Storage: internal flash only");
-        storage_loop(&mut flash, None::<&mut QspiFlash>, &REGIONS).await
+        storage_loop_internal(&mut flash, &REGIONS).await
     };
 
     if exit == StorageExit::FactoryReset {

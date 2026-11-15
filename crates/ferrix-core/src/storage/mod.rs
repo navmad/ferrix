@@ -13,7 +13,7 @@ pub mod messages;
 pub mod util;
 
 use core::ops::Range;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
@@ -26,24 +26,97 @@ pub use contacts::request as request_contacts;
 pub use messages::MessageCommand;
 
 /// Flash regions reserved by the board for each store.
+///
+/// The board also chooses a compile-time profile: internal contacts/messages
+/// (all four stores on the MCU flash) or external contacts/messages (those two
+/// on the QSPI flash). The profile selects the storage-loop entry point; the
+/// ranges below are interpreted against that flash.
 #[derive(Clone, Debug)]
 pub struct StorageRegions {
     /// Configuration journal (always internal).
     pub config: Range<u32>,
     /// BLE bond map (always internal).
     pub bonds: Range<u32>,
-    /// Contact/advert key-value map. Internal or external per flag.
+    /// Contact/advert key-value map.
     pub contacts: Range<u32>,
-    /// Message FIFO. Internal or external per flag.
+    /// Message FIFO.
     pub messages: Range<u32>,
-    /// True when contacts/adverts live on the external QSPI flash.
-    pub contacts_external: bool,
-    /// True when messages live on the external QSPI flash.
-    pub messages_external: bool,
     /// Internal data regions erased by a factory reset.
     pub factory_reset: Range<u32>,
     /// External flash regions erased by a factory reset.
     pub factory_reset_external: Range<u32>,
+}
+
+impl StorageRegions {
+    /// Validate a profile whose contacts/adverts and messages are external.
+    pub const fn validate_external(&self) -> bool {
+        range_valid(&self.config)
+            && range_valid(&self.bonds)
+            && range_valid(&self.contacts)
+            && range_valid(&self.messages)
+            && !overlaps(&self.contacts, &self.messages)
+            && contains(&self.factory_reset, &self.config)
+            && contains(&self.factory_reset, &self.bonds)
+            && contains(&self.factory_reset_external, &self.contacts)
+            && contains(&self.factory_reset_external, &self.messages)
+    }
+
+    /// Validate a profile whose contacts/adverts and messages are internal.
+    pub const fn validate_internal(&self) -> bool {
+        range_valid(&self.config)
+            && range_valid(&self.bonds)
+            && range_valid(&self.contacts)
+            && range_valid(&self.messages)
+            && !overlaps(&self.contacts, &self.messages)
+            && !overlaps(&self.config, &self.contacts)
+            && !overlaps(&self.config, &self.messages)
+            && !overlaps(&self.bonds, &self.contacts)
+            && !overlaps(&self.bonds, &self.messages)
+            && contains(&self.factory_reset, &self.config)
+            && contains(&self.factory_reset, &self.bonds)
+            && contains(&self.factory_reset, &self.contacts)
+            && contains(&self.factory_reset, &self.messages)
+    }
+}
+
+const fn range_valid(range: &Range<u32>) -> bool {
+    range.start < range.end && range.start % 4096 == 0 && range.end % 4096 == 0
+}
+
+const fn overlaps(a: &Range<u32>, b: &Range<u32>) -> bool {
+    a.start < b.end && b.start < a.end
+}
+
+const fn contains(outer: &Range<u32>, inner: &Range<u32>) -> bool {
+    outer.start <= inner.start && inner.end <= outer.end
+}
+
+/// True when the board expects external storage but the QSPI flash is not
+/// usable. External stores are skipped; they are never redirected to internal.
+pub static EXTERNAL_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
+/// External-store operations skipped because the flash is unavailable.
+pub static EXTERNAL_DROPS: AtomicU32 = AtomicU32::new(0);
+
+/// Mark external storage unavailable. Logs once, not per skipped operation.
+pub fn mark_external_unavailable() {
+    if !EXTERNAL_UNAVAILABLE.swap(true, Ordering::Relaxed) {
+        #[cfg(not(test))]
+        defmt::error!("Storage: external flash unavailable");
+    }
+}
+
+/// Count an external-store operation that could not run.
+pub fn note_external_skip() {
+    mark_external_unavailable();
+    EXTERNAL_DROPS.fetch_add(1, Ordering::Relaxed);
+}
+
+pub fn external_unavailable() -> bool {
+    EXTERNAL_UNAVAILABLE.load(Ordering::Relaxed)
+}
+
+pub fn external_drops() -> u32 {
+    EXTERNAL_DROPS.load(Ordering::Relaxed)
 }
 
 /// Synchronous reader over a memory-mapped flash region.

@@ -85,6 +85,9 @@ impl CliHost for BoardCompanionHost {
             advert_erases: crate::storage::adverts::ERASES.load(Ordering::Relaxed),
             config_saves: crate::storage::config::CONFIG_SAVES.load(Ordering::Relaxed),
             config_erases: crate::storage::config::CONFIG_ERASES.load(Ordering::Relaxed),
+            external_profile: cfg!(not(feature = "internal-storage")),
+            external_unavailable: ferrix_core::storage::external_unavailable(),
+            external_drops: ferrix_core::storage::external_drops(),
         }
     }
 

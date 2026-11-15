@@ -11,7 +11,7 @@ use embassy_nrf::peripherals;
 use embassy_nrf::qspi::{self, Qspi};
 use embassy_time::Timer;
 
-use ferrix_core::state::{QSPI_ID, QSPI_SELFTEST, QSPI_STATUS};
+use ferrix_core::state::{QSPI_ID, QSPI_STATUS};
 
 /// Board wiring for the external QSPI flash.
 pub struct QspiPins {
@@ -66,10 +66,12 @@ pub fn init(pins: QspiPins) -> Qspi<'static, peripherals::QSPI> {
     )
 }
 
-/// Read the JEDEC ID and verify that the flash is usable.
+/// Read the JEDEC ID and verify that the flash answers.
 ///
-/// Uses the last 4 KB page of the chip, which is outside every data region.
-pub async fn self_test(flash: &mut Qspi<'static, peripherals::QSPI>) {
+/// Read-only: there is no erase/write probe. The stores exercise the write
+/// path when they first save data, and a missing or unknown chip is reported
+/// as unavailable rather than silently ignored.
+pub async fn probe(flash: &mut Qspi<'static, peripherals::QSPI>) -> bool {
     let mut id = [0u8; 3];
     let mut ready = false;
 
@@ -94,41 +96,10 @@ pub async fn self_test(flash: &mut Qspi<'static, peripherals::QSPI>) {
             "QSPI: unexpected JEDEC ID {=u32:06x}",
             u32::from_be_bytes([0, id[0], id[1], id[2]])
         );
-        return;
+        return false;
     }
 
     QSPI_STATUS.store(1, Ordering::Relaxed);
     info!("QSPI: MX25R1635F ready");
-
-    const TEST_ADDR: u32 = FLASH_SIZE - 4096;
-
-    #[repr(C, align(4))]
-    struct Aligned([u8; 16]);
-
-    let pattern = Aligned([
-        0xA5, 0x5A, 0x01, 0xFE, 0x11, 0x22, 0x33, 0x44, 0xC3, 0x3C, 0x55, 0xAA, 0x0F, 0xF0,
-        0x99, 0x66,
-    ]);
-    let mut readback = Aligned([0u8; 16]);
-
-    // The last sector is spare. If the previous self-test left its pattern
-    // there, reading it proves both command and array-read paths without
-    // erasing/writing on every boot.
-    if flash.read(TEST_ADDR, &mut readback.0).await.is_ok() && readback.0 == pattern.0 {
-        QSPI_SELFTEST.store(1, Ordering::Relaxed);
-        info!("QSPI: self-test pattern already present");
-        return;
-    }
-
-    let passed = flash.erase(TEST_ADDR).await.is_ok()
-        && flash.write(TEST_ADDR, &pattern.0).await.is_ok()
-        && flash.read(TEST_ADDR, &mut readback.0).await.is_ok()
-        && readback.0 == pattern.0;
-
-    QSPI_SELFTEST.store(if passed { 1 } else { 2 }, Ordering::Relaxed);
-    if passed {
-        info!("QSPI: read/write/erase self-test passed");
-    } else {
-        error!("QSPI: read/write/erase self-test failed");
-    }
+    true
 }
