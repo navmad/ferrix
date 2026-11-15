@@ -344,6 +344,11 @@ impl<'a> MeshEngine<'a> {
                 && self.identity.pub_key()[..hash_size]
                     == pkt.payload[9 + offset..9 + offset + hash_size]
             {
+                // The companion role must not relay TRACE unless it is acting
+                // as a forwarder (off-grid client repeat).
+                if !self.allow_forward {
+                    return InboundAction::Unhandled;
+                }
                 if self.seen_filter.check_and_mark(&pkt) {
                     return InboundAction::DropDuplicate;
                 }
@@ -396,6 +401,21 @@ impl<'a> MeshEngine<'a> {
             }
         }
 
+        // 2b. Flood forwarding is payload-agnostic. Adverts are excluded
+        // because they must be signature-checked before relay; TRACE has its
+        // own direct handling above.
+        if self.allow_forward
+            && pkt.is_flood()
+            && !is_dupe
+            && !already_in_path
+            && pkt.payload_type() != PAYLOAD_TYPE_ADVERT
+            && pkt.payload_type() != PAYLOAD_TYPE_TRACE
+        {
+            let mut repeat_pkt = pkt.clone();
+            repeat_pkt.append_hop_bytes(self.identity.pub_key());
+            self.queue_forward(repeat_pkt);
+        }
+
         // 3. Dispatch based on payload type
         match pkt.payload_type() {
             PAYLOAD_TYPE_ADVERT => {
@@ -422,16 +442,6 @@ impl<'a> MeshEngine<'a> {
                 // Look up matching channel by channel_hash (pkt.payload[0])
                 if pkt.payload_len > 0 {
                     let ch_hash = pkt.payload[0];
-                    // Forward flood packets BEFORE trying to decrypt, matching MeshCore behavior.
-                    // This ensures repeater nodes propagate group texts even when they can't
-                    // decrypt them (e.g., unknown channel hash). The packet continues through
-                    // the mesh regardless of whether this node can read its contents.
-                    if self.allow_forward && pkt.is_flood() && !is_dupe && !already_in_path {
-                        let mut repeat_pkt = pkt.clone();
-                        repeat_pkt.append_hop_bytes(self.identity.pub_key());
-                        self.queue_forward(repeat_pkt);
-                    }
-
                     // Copy the channel array out of the lock before doing any crypto.
                     // Running SHA-256 hashing and AES-128 decryption inside a lock callback
                     // can block the BLE SoftDevice (S140) and freeze the device.
@@ -489,17 +499,6 @@ impl<'a> MeshEngine<'a> {
                 let dest = payload[0];
                 let src = payload[1];
 
-                // Only forward flood packets that are not addressed to us.
-                if dest != self.identity.pub_key()[0]
-                    && self.allow_forward
-                    && pkt.is_flood()
-                    && !is_dupe
-                    && !already_in_path
-                {
-                    let mut repeat_pkt = pkt.clone();
-                    repeat_pkt.append_hop_bytes(self.identity.pub_key());
-                    self.queue_forward(repeat_pkt);
-                }
                 if is_dupe {
                     return InboundAction::DropDuplicate;
                 }
@@ -559,6 +558,9 @@ impl<'a> MeshEngine<'a> {
                 InboundAction::Unhandled
             }
             PAYLOAD_TYPE_ACK => {
+                if is_dupe {
+                    return InboundAction::DropDuplicate;
+                }
                 if let Ok(ack) = AckPacket::decode(&pkt.payload[..pkt.payload_len]) {
                     InboundAction::ReceivedAck(ack)
                 } else {
@@ -567,11 +569,14 @@ impl<'a> MeshEngine<'a> {
             }
             PAYLOAD_TYPE_PATH => {
                 let payload = &pkt.payload[..pkt.payload_len];
-                if payload.len() <= 4 || payload[0] != self.identity.pub_key()[0] {
+                if payload.len() <= 4 {
                     return InboundAction::Unhandled;
                 }
                 if is_dupe {
                     return InboundAction::DropDuplicate;
+                }
+                if payload[0] != self.identity.pub_key()[0] {
+                    return InboundAction::Unhandled;
                 }
                 for peer in self.peers_by_hash(payload[1]).iter() {
                     if let Some(secret) = self.identity.shared_secret(peer) {
@@ -591,6 +596,9 @@ impl<'a> MeshEngine<'a> {
                 InboundAction::Unhandled
             }
             PAYLOAD_TYPE_MULTIPART => {
+                if is_dupe {
+                    return InboundAction::DropDuplicate;
+                }
                 // v1.18 uses MULTIPART for batched ACKs: the first byte is
                 // (remaining << 4 | inner_type), followed by the inner payload.
                 // Only the ACK form exists today; feed it to the normal ACK
@@ -605,6 +613,9 @@ impl<'a> MeshEngine<'a> {
                 InboundAction::Unhandled
             }
             PAYLOAD_TYPE_GRP_DATA => {
+                if is_dupe {
+                    return InboundAction::DropDuplicate;
+                }
                 if pkt.payload_len < 4 {
                     return InboundAction::Unhandled;
                 }
@@ -633,16 +644,6 @@ impl<'a> MeshEngine<'a> {
                 let dest = payload[0];
                 let src = payload[1];
 
-                if dest != self.identity.pub_key()[0]
-                    && self.allow_forward
-                    && pkt.is_flood()
-                    && !is_dupe
-                    && !already_in_path
-                {
-                    let mut repeat_pkt = pkt.clone();
-                    repeat_pkt.append_hop_bytes(self.identity.pub_key());
-                    self.queue_forward(repeat_pkt);
-                }
                 if is_dupe {
                     return InboundAction::DropDuplicate;
                 }
@@ -671,7 +672,13 @@ impl<'a> MeshEngine<'a> {
             }
             PAYLOAD_TYPE_ANON_REQ => {
                 let payload = &pkt.payload[..pkt.payload_len];
-                if payload.len() <= 35 || payload[0] != self.identity.pub_key()[0] {
+                if payload.len() <= 35 {
+                    return InboundAction::Unhandled;
+                }
+                if is_dupe {
+                    return InboundAction::DropDuplicate;
+                }
+                if payload[0] != self.identity.pub_key()[0] {
                     return InboundAction::Unhandled;
                 }
                 let mut sender_pub = [0u8; 32];

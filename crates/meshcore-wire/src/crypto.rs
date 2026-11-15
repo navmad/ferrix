@@ -58,6 +58,12 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     outer.finalize().into()
 }
 
+/// Constant-time comparison of two short MAC tags.
+fn ct_eq_2(a: &[u8; 2], b: &[u8; 2]) -> bool {
+    let diff = (a[0] ^ b[0]) | (a[1] ^ b[1]);
+    diff == 0
+}
+
 /// Compute truncated 2-byte MAC for MeshCore packets using HMAC-SHA256 with 32-byte key
 pub fn compute_mac_2b(key_32: &[u8; 32], ciphertext: &[u8]) -> [u8; 2] {
     let full = hmac_sha256(key_32, ciphertext);
@@ -163,7 +169,7 @@ pub fn meshcore_mac_then_decrypt(
     key_16.copy_from_slice(&key_32[..16]);
 
     let expected_mac = compute_mac_2b(&key_32, ct);
-    if src[0] != expected_mac[0] || src[1] != expected_mac[1] {
+    if !ct_eq_2(&[src[0], src[1]], &expected_mac) {
         return Err(());
     }
     meshcore_decrypt(&key_16, dest, ct)

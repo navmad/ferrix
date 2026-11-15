@@ -120,6 +120,10 @@ impl GrpTextPacket {
         let timestamp = u32::from_le_bytes([pt[0], pt[1], pt[2], pt[3]]);
         let combined = pt[4];
         let txt_type = combined >> 2;
+        // Group text has no signed/room variants; reject non-zero txt_type.
+        if txt_type != 0 {
+            return Err(());
+        }
         let attempt = combined & 0x03;
 
         let text_slice = &pt[5..pt_len];
@@ -177,6 +181,22 @@ mod tests {
         let d = round_trip("n7jmv", &msg);
         assert_eq!(d.sender.as_str(), "n7jmv");
         assert_eq!(d.message.as_str(), msg.as_str());
+    }
+
+    #[test]
+    fn nonzero_group_txt_type_is_rejected() {
+        let secret = [0x5Au8; 16];
+        let mut plain = [0u8; 16];
+        plain[0..4].copy_from_slice(&1234u32.to_le_bytes());
+        // Bit pattern the v1.18 C++ rejects: txt_type in the upper six bits.
+        plain[4] = GrpTextPacket::TXT_TYPE_SIGNED << 2;
+        plain[5..11].copy_from_slice(b"n7jmv:");
+
+        let mut buf = [0u8; 64];
+        buf[0] = 0x42;
+        let n = crate::crypto::meshcore_encrypt_then_mac(&secret, &mut buf[1..], &plain)
+            .expect("encode");
+        assert!(GrpTextPacket::decode_encrypted(&buf[..1 + n], &secret).is_err());
     }
 
     #[test]
