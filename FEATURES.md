@@ -167,19 +167,21 @@ Inspect with `stats-tx`; override the slot width with `set tx.slot <ms>`
 
 | Store | Region | Design |
 |---|---|---|
-| Config | 4 KB page at `0xEC000` | Single version-1 struct, checksum, change-detected saves |
-| Messages | 128 KB at `0xCC000` | Append-only FIFO (`sequential-storage`), variable-length records |
-| Contacts | 112 KB at `0xB0000` | Key-value map keyed by public key |
-| Adverts | 64 KB at `0xA0000` | Append-only ring of signed advert blobs |
+| Config | internal `0xA0000..0xB0000` (64 KB) | `sequential-storage` map: one settings record plus one record per channel |
+| BLE bonds | internal `0xB0000..0xB4000` (16 KB) | `sequential-storage` map keyed by master ID (up to 4 bonds) |
+| Contacts + adverts | QSPI `0x00000..0x40000` (256 KB) | One `sequential-storage` map keyed by public key; advert blobs share it |
+| Messages | QSPI `0x40000..0x140000` (1 MB) | `sequential-storage` FIFO with variable-length records |
 
+- Config and BLE bonds are always in internal flash. Contacts/adverts and
+  messages use external QSPI when the board has it; on boards without QSPI
+  the same stores use board-defined internal ranges.
 - A message costs one compact record (~20-60 bytes typical) and one page erase
   per ~100 messages.
 - A contact change appends ~200 bytes instead of rewriting the whole table.
 - Config setters only save when a value actually changes; boot performs no
   config write.
 - `stats-flash` reports per-store writes, erases, and queued messages.
-- Legacy snapshot banks are detected and cleared once on the first boot of
-  this storage format.
+- Legacy snapshot banks from older firmware are detected and cleared once.
 
 ---
 

@@ -25,6 +25,15 @@ MEMORY
     RAM   (rwx) : ORIGIN = 0x20006000, LENGTH = 0x20040000 - 0x20006000
 }
 
+/*
+ * External QSPI flash layout (2 MB, offsets within the chip).
+ * These stores are not part of the MCU flash map above.
+ *
+ * 0x000000 - 0x040000 : Contacts + advert blobs (256 KB, keyed map)
+ * 0x040000 - 0x140000 : Messages (1 MB, sequential-storage FIFO)
+ * 0x140000 - 0x200000 : Unused
+ */
+
 /* 
  * NOTE: If flashing baremetal via SWD (e.g. J-Link / CMSIS-DAP) with full chip erase:
  * FLASH (rx)  : ORIGIN = 0x00000000, LENGTH = 1024K
