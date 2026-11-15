@@ -215,7 +215,7 @@ USB text CLI commands include:
 ver, board, help
 get/set name, get public.key, get/set prv.key
 get radio, get/set freq, tx, sf, bw, cr
-get/set path.hash.mode, get/set repeat, get/set role
+get/set path.hash.mode, get/set repeat (off-grid)
 get/set leds, rxduty, af, dutycycle
 get/set autoadd, get companion
 contacts, clear contacts
@@ -234,7 +234,6 @@ Examples:
 ```
 set name d1nk4n
 set prv.key <128 hex chars>
-set role repeater
 set tx.slot 400
 stats-tx
 ```
@@ -276,7 +275,7 @@ To enter the bootloader from the CLI, run `dfu`, or double-click reset. A
 
 | Area | Limitation |
 |---|---|
-| Repeater/room server role | No inbound login/`REQ` responder. The node is a companion client that can forward packets, not a remotely managed repeater or room server. |
+| Repeater/room server role | No separate repeater/room firmware yet. The companion forwards only in off-grid client-repeat mode on the reserved frequencies; it is not a remotely managed repeater or room server. |
 | Older app protocol | Message frames are always V3; apps that report protocol < 3 are not supported. |
 | Multipart | Batched ACKs are received; multi-ACK sending is not implemented. |
 | Signed channel text | Signed direct/room posts are supported; signed group-channel text is passed through as a channel message. |

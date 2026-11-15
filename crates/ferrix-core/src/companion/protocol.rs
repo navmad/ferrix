@@ -683,6 +683,8 @@ pub struct CompanionNode<'a> {
     pub callsign: String<32>,
     pub hw_model: &'static str,
     pub capabilities: u32,
+    /// Node type reported in SELF_INFO and used for adverts.
+    pub advert_type: u8,
     pub public_key: [u8; 32],
     /// MeshCore's 64-byte expanded private key (`scalar ‖ nonce_prefix`).
     pub private_key: [u8; 64],
@@ -753,6 +755,7 @@ impl<'a> CompanionNode<'a> {
         Self {
             callsign: cs,
             hw_model,
+            advert_type: meshcore_wire::packets::advert::ADV_TYPE_CHAT,
             capabilities,
             public_key,
             private_key,
@@ -914,11 +917,11 @@ impl<'a> CompanionNode<'a> {
                 //  radio_freq(u32_le_khz), radio_bw(u32_le_hz), radio_sf(u8), radio_cr(u8), name(str)]
                 let mut resp = Vec::<u8, 128>::new();
                 let _ = resp.push(RESP_CODE_SELF_INFO);
-                let (is_rep, f, tx, sf, bw, cr) = crate::state::RADIO_SETTINGS.lock(|r| {
+                let (f, tx, sf, bw, cr) = crate::state::RADIO_SETTINGS.lock(|r| {
                     let s = r.borrow();
-                    (s.is_repeater, s.frequency_hz, s.tx_power_dbm, s.sf, s.bw_khz, s.cr)
+                    (s.frequency_hz, s.tx_power_dbm, s.sf, s.bw_khz, s.cr)
                 });
-                let _ = resp.push(if is_rep { 2 } else { 1 }); // 1 = client, 2 = repeater
+                let _ = resp.push(self.advert_type); // 1 = client, 2 = repeater
                 let _ = resp.push(tx as u8); // current tx power
                 let _ = resp.push(22); // max tx power
                 let public_key = crate::state::current_public_key();
@@ -1000,9 +1003,8 @@ impl<'a> CompanionNode<'a> {
                         let (rf_changed, repeat_changed, forward_changed, forward) =
                             crate::state::RADIO_SETTINGS.lock(|r| {
                                 let mut s = r.borrow_mut();
-                                let old_forward = s.is_repeater
-                                    || (s.client_repeat
-                                        && crate::state::is_offgrid_freq_hz(s.frequency_hz));
+                                let old_forward = s.client_repeat
+                                    && crate::state::is_offgrid_freq_hz(s.frequency_hz);
                                 let new_freq = freq_khz * 1000;
                                 let new_bw = bw_hz / 1000;
                                 let rf_changed = s.frequency_hz != new_freq
@@ -1018,9 +1020,8 @@ impl<'a> CompanionNode<'a> {
                                 // The app owns the frequency, so forget the
                                 // saved home frequency.
                                 s.offgrid_home_freq = 0;
-                                let forward = s.is_repeater
-                                    || (repeat
-                                        && crate::state::is_offgrid_freq_khz(freq_khz));
+                                let forward = repeat
+                                    && crate::state::is_offgrid_freq_khz(freq_khz);
                                 (rf_changed, repeat_changed, forward != old_forward, forward)
                             });
                         if rf_changed || repeat_changed {

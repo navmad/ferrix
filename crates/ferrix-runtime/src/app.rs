@@ -982,7 +982,7 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                 }
                 UsbCommand::SetRepeat(rep) => {
                     info!("Setting repeater mode: {}", rep);
-                    mesh.is_repeater = rep;
+                    mesh.allow_forward = rep;
                     if !rep {
                         mesh.cancel_pending_forwards();
                     }
@@ -990,9 +990,9 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                 UsbCommand::SetFrequency(f) => {
                     info!("Frequency updated to: {} Hz", f);
                     // Moving off an off-grid band can disable client repeat.
-                    let was_forwarding = mesh.is_repeater;
-                    mesh.is_repeater = forwarding_enabled();
-                    if was_forwarding && !mesh.is_repeater {
+                    let was_forwarding = mesh.allow_forward;
+                    mesh.allow_forward = forwarding_enabled();
+                    if was_forwarding && !mesh.allow_forward {
                         mesh.cancel_pending_forwards();
                     }
                     let _ = crate::radio::request_radio_config();
@@ -1018,7 +1018,7 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                             s.client_repeat = false;
                         }
                     });
-                    mesh.is_repeater = forwarding_enabled();
+                    mesh.allow_forward = forwarding_enabled();
                     let _ = crate::radio::request_radio_config();
                 }
                 UsbCommand::SetTxPower(tx) => {
@@ -1195,22 +1195,13 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                                 if change.freq_changed {
                                     let _ = crate::radio::request_radio_config();
                                 }
-                                mesh.is_repeater = forwarding_enabled();
+                                mesh.allow_forward = forwarding_enabled();
                                 info!("Input: offgrid {}", if active { "off" } else { "on" });
                             }
                         }
                         (6, _) => {
-                            let on = RADIO_SETTINGS.lock(|r| {
-                                let mut s = r.borrow_mut();
-                                s.is_repeater = !s.is_repeater;
-                                s.is_repeater
-                            });
-                            mesh.is_repeater = forwarding_enabled();
-                            if !mesh.is_repeater {
-                                mesh.cancel_pending_forwards();
-                            }
-                            storage::request_save_config();
-                            info!("Input: repeater role {}", if on { "on" } else { "off" });
+                            // The off-grid page has one action; the companion
+                            // must not expose a general repeater-role toggle.
                         }
                         (7, 1) => {
                             let disabled = !leds_disabled();

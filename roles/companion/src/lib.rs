@@ -17,6 +17,7 @@ use ferrix_core::companion::protocol::{next_delayed_push, CompanionHost, Compani
 use ferrix_core::engine::EngineContext;
 use ferrix_hal::radio::LoraRadio;
 use ferrix_runtime::app::AppBoard;
+use meshcore_wire::packets::advert::ADV_TYPE_CHAT;
 use meshcore_wire::LocalIdentity;
 
 /// The hardware and board services the companion role needs.
@@ -109,10 +110,10 @@ pub async fn run<B: CompanionBoard>(mut board: B, spawner: Spawner) -> ! {
 
     let mut mesh = ferrix_core::engine::MeshEngine::new(
         local_id,
-        false,
+        ADV_TYPE_CHAT,
         board.engine_context(),
     );
-    mesh.is_repeater = board.forwarding_enabled();
+    mesh.allow_forward = board.forwarding_enabled();
 
     spawner.spawn(delayed_push_task()).unwrap();
     board.start_transports(spawner, public_key, private_key);

@@ -14,7 +14,6 @@ use meshcore_wire::packet::{
     PAYLOAD_TYPE_CONTROL, PAYLOAD_TYPE_TRACE, PAYLOAD_TYPE_TXT_MSG, ROUTE_TYPE_DIRECT,
     ROUTE_TYPE_FLOOD,
 };
-use meshcore_wire::packets::advert::{ADV_TYPE_CHAT, ADV_TYPE_REPEATER};
 use meshcore_wire::packets::{
     AckPacket, AddressedPacket, AdvertPacket, AnonReqPacket, GrpDataPacket, GrpTextPacket,
     MultipartPacket, PathPacket, TxtMsgPacket,
@@ -172,7 +171,10 @@ pub struct MeshEngine<'a> {
     pub seen_filter: SeenPacketFilter,
     pub tx_queue: PacketQueue,
     pending_forwards: heapless::Vec<PendingForward, 8>,
-    pub is_repeater: bool,
+    /// Role policy: whether this node may forward packets.
+    pub allow_forward: bool,
+    /// Node type used in adverts (CHAT for companions, REPEATER for repeaters).
+    pub advert_type: u8,
     pub max_hops: u8,
     pub path_hash_mode: u8,
     context: &'a dyn EngineContext,
@@ -181,7 +183,7 @@ pub struct MeshEngine<'a> {
 impl<'a> MeshEngine<'a> {
     pub fn new(
         identity: LocalIdentity,
-        is_repeater: bool,
+        advert_type: u8,
         context: &'a dyn EngineContext,
     ) -> Self {
         Self {
@@ -189,7 +191,8 @@ impl<'a> MeshEngine<'a> {
             seen_filter: SeenPacketFilter::new(),
             tx_queue: PacketQueue::new(),
             pending_forwards: heapless::Vec::new(),
-            is_repeater,
+            allow_forward: false,
+            advert_type,
             max_hops: DEFAULT_MAX_HOPS,
             path_hash_mode: context.path_hash_mode(),
             context,
@@ -371,7 +374,7 @@ impl<'a> MeshEngine<'a> {
             if pkt.path_hash_count() > 0 {
                 let size = pkt.path_hash_size();
                 if pkt.path[..size] == self.identity.pub_key()[..size] {
-                    if self.is_repeater {
+                    if self.allow_forward {
                         let mut fwd = pkt.clone();
                         if fwd.pop_front_hop() {
                             let ack = if fwd.payload_type() == PAYLOAD_TYPE_ACK {
@@ -405,7 +408,7 @@ impl<'a> MeshEngine<'a> {
                         return InboundAction::DropDuplicate; // or a new DropInvalidSignature variant
                     }
                     // Only repeat adverts from other nodes
-                    if self.is_repeater && pkt.is_flood() && !already_in_path && adv.pub_key != *self.identity.pub_key() {
+                    if self.allow_forward && pkt.is_flood() && !already_in_path && adv.pub_key != *self.identity.pub_key() {
                         let mut repeat_pkt = pkt.clone();
                         repeat_pkt.append_hop_bytes(self.identity.pub_key());
                         self.queue_forward(repeat_pkt);
@@ -423,7 +426,7 @@ impl<'a> MeshEngine<'a> {
                     // This ensures repeater nodes propagate group texts even when they can't
                     // decrypt them (e.g., unknown channel hash). The packet continues through
                     // the mesh regardless of whether this node can read its contents.
-                    if self.is_repeater && pkt.is_flood() && !is_dupe && !already_in_path {
+                    if self.allow_forward && pkt.is_flood() && !is_dupe && !already_in_path {
                         let mut repeat_pkt = pkt.clone();
                         repeat_pkt.append_hop_bytes(self.identity.pub_key());
                         self.queue_forward(repeat_pkt);
@@ -488,7 +491,7 @@ impl<'a> MeshEngine<'a> {
 
                 // Only forward flood packets that are not addressed to us.
                 if dest != self.identity.pub_key()[0]
-                    && self.is_repeater
+                    && self.allow_forward
                     && pkt.is_flood()
                     && !is_dupe
                     && !already_in_path
@@ -631,7 +634,7 @@ impl<'a> MeshEngine<'a> {
                 let src = payload[1];
 
                 if dest != self.identity.pub_key()[0]
-                    && self.is_repeater
+                    && self.allow_forward
                     && pkt.is_flood()
                     && !is_dupe
                     && !already_in_path
@@ -697,11 +700,7 @@ impl<'a> MeshEngine<'a> {
         let lat_int = (lat_f32 * 1_000_000.0) as i32;
         let lon_int = (lon_f32 * 1_000_000.0) as i32;
 
-        let kind = if self.is_repeater {
-            ADV_TYPE_REPEATER
-        } else {
-            ADV_TYPE_CHAT
-        };
+        let kind = self.advert_type;
 
         let mut adv = AdvertPacket::new(
             *self.identity.pub_key(),
@@ -876,6 +875,7 @@ impl<'a> MeshEngine<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use meshcore_wire::packets::advert::ADV_TYPE_REPEATER;
 
     struct TestContext;
 
@@ -897,9 +897,11 @@ mod tests {
 
     #[test]
     fn engine_reads_the_host_context() {
-        let engine = MeshEngine::new(identity(), true, &TestContext);
+        let mut engine = MeshEngine::new(identity(), ADV_TYPE_REPEATER, &TestContext);
+        engine.allow_forward = true;
         assert_eq!(engine.path_hash_mode, 2);
-        assert!(engine.is_repeater);
+        assert!(engine.allow_forward);
+        assert_eq!(engine.advert_type, ADV_TYPE_REPEATER);
         assert_eq!(engine.peers_by_hash(9)[0], [9u8; 32]);
     }
 

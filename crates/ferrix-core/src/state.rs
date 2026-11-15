@@ -58,9 +58,13 @@ pub fn offgrid_active() -> bool {
     })
 }
 
-/// Effective forwarding flag: a dedicated repeater role, or off-grid mode.
+/// Forwarding policy for the companion role.
+///
+/// MeshCore companions only forward in off-grid/client-repeat mode, and only
+/// on the reserved off-grid frequencies. The dedicated repeater role sets its
+/// own forwarding policy; the companion must not reuse `is_repeater`.
 pub fn forwarding_enabled() -> bool {
-    RADIO_SETTINGS.lock(|r| r.borrow().is_repeater) || offgrid_active()
+    offgrid_active()
 }
 
 /// Nearest allowed off-grid frequency to `freq_hz`, or None above 960 MHz.

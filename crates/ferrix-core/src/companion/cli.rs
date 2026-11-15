@@ -600,12 +600,6 @@ pub async fn handle_text_cli<W: TextSink>(
             let _ = write!(s, "> {}\r\n", if on { "on" } else { "off" });
             let _ = sender.send( s.as_bytes()).await;
         }
-        "get role" => {
-            let is_rep = RADIO_SETTINGS.lock(|r| r.borrow().is_repeater);
-            let mut s: heapless::String<16> = heapless::String::new();
-            let _ = write!(s, "> {}\r\n", if is_rep { "on" } else { "off" });
-            let _ = sender.send( s.as_bytes()).await;
-        }
         s if s.starts_with("set repeat ") => {
             let val = s[11..].trim();
             let on = matches!(val, "on" | "1" | "true");
@@ -637,20 +631,6 @@ pub async fn handle_text_cli<W: TextSink>(
                     let _ = sender.send( msg).await;
                 }
             }
-        }
-        s if s.starts_with("set role ") => {
-            let val = s[9..].trim();
-            let is_rep = matches!(val, "on" | "1" | "repeater" | "true");
-            RADIO_SETTINGS.lock(|r| {
-                r.borrow_mut().is_repeater = is_rep;
-            });
-            host.request_save_config();
-            let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetRepeat(
-                crate::state::forwarding_enabled(),
-            ));
-            let mut s: heapless::String<32> = heapless::String::new();
-            let _ = write!(s, "OK - role={}\r\n", if is_rep { "repeater" } else { "client" });
-            let _ = sender.send( s.as_bytes()).await;
         }
         s if s.starts_with("send ") => {
             let msg = s[5..].trim();

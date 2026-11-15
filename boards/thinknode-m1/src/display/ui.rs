@@ -473,13 +473,12 @@ fn page_position(
 }
 
 fn page_offgrid(fb: &mut EpdFrameBuffer, small: SmallStyle, title: TitleStyle) {
-    let (active, client, repeater, freq) = ferrix_core::state::RADIO_SETTINGS
+    let (active, client, freq) = ferrix_core::state::RADIO_SETTINGS
         .lock(|r| {
             let s = r.borrow();
             (
                 s.client_repeat && ferrix_core::state::is_offgrid_freq_hz(s.frequency_hz),
                 s.client_repeat,
-                s.is_repeater,
                 s.frequency_hz,
             )
         });
@@ -498,10 +497,6 @@ fn page_offgrid(fb: &mut EpdFrameBuffer, small: SmallStyle, title: TitleStyle) {
     row.clear();
     let _ = write!(row, "client repeat {}", if client { "ON" } else { "OFF" });
     draw_text(fb, row.as_str(), 2, 90, small);
-    row.clear();
-    let _ = write!(row, "repeater role {}", if repeater { "ON" } else { "OFF" });
-    draw_text(fb, row.as_str(), 2, 104, small);
-
     let stroke = PrimitiveStyle::with_stroke(BinaryColor::On, 1);
     let _ = Circle::new(Point::new(126, 92), 48)
         .into_styled(stroke)
@@ -587,8 +582,10 @@ fn draw_action_bar(page: u8, fb: &mut EpdFrameBuffer, small: SmallStyle) {
 
     draw_text(fb, "FK1", 2, 174, small);
     draw_text(fb, a1, 24, 174, small);
-    draw_text(fb, "FK2", 2, 186, small);
-    draw_text(fb, a2, 24, 186, small);
+    if !a2.is_empty() {
+        draw_text(fb, "FK2", 2, 186, small);
+        draw_text(fb, a2, 24, 186, small);
+    }
 
     draw_text(fb, "TK next   TKx2 back", 2, 198, small);
     let mut page_no: String<12> = String::new();
@@ -604,7 +601,7 @@ fn actions(page: u8) -> (&'static str, &'static str) {
         3 => ("CYCLE TX POWER", "TOGGLE RX DUTY"),
         4 => ("RESET COUNTERS", "RESET SIGNAL"),
         5 => ("TOGGLE GPS", "TOGGLE LOCATION"),
-        6 => ("TOGGLE OFF-GRID", "TOGGLE REPEATER"),
+        6 => ("TOGGLE OFF-GRID", ""),
         _ => ("TOGGLE LEDs", "PATH HASH 1B/2B/3B"),
     }
 }

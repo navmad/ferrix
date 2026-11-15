@@ -79,6 +79,8 @@ pub struct RadioSettings {
     pub sf: u8,
     pub bw_khz: u32,
     pub cr: u8,
+    /// Reserved for the dedicated repeater role. The companion role ignores it
+    /// and forwards only through client repeat on off-grid frequencies.
     pub is_repeater: bool,
     /// Off-grid "client repeat" mode (`client_repeat`).
     pub client_repeat: bool,
