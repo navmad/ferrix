@@ -19,6 +19,7 @@ apps and the v1.18 over-the-air protocol.
 | nRF52840 + SX1262 (SPI, DIO1, BUSY, TCXO 1.8 V, DCDC, RX boost) | Yes |
 | 1.54" 200x200 e-paper (SSD1681) | Yes |
 | Two buttons + frontlight idle timeout | Yes |
+| Passive buzzer on P0.06 (PWM boot/click/action/message tones) | Yes |
 | Battery voltage/percentage (SAADC) | Yes |
 | USB CDC-ACM (text CLI + binary companion framing) | Yes |
 | BLE Nordic UART Service companion | Yes |
