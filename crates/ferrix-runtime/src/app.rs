@@ -11,7 +11,7 @@ use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Instant, Ticker, Timer};
 use ferrix_core::airtime::estimate_airtime_ms;
-use ferrix_core::command::{UsbCommand, COMPANION_PUSH_CHANNEL, USB_COMMAND_CHANNEL};
+use ferrix_core::command::{push_companion, UsbCommand, USB_COMMAND_CHANNEL};
 use ferrix_core::companion::protocol::{self, CompanionNode};
 use ferrix_core::engine::{InboundAction, MeshEngine};
 use ferrix_core::state::*;
@@ -171,21 +171,21 @@ fn push_new_advert(ct: &DiscoveredContact) {
     let mut frame = Vec::<u8, 256>::new();
     let _ = frame.push(protocol::PUSH_CODE_NEW_ADVERT);
     let _ = frame.extend_from_slice(&record[1..]);
-    let _ = COMPANION_PUSH_CHANNEL.try_send(frame);
+    push_companion(&frame);
 }
 
 fn push_advert(pub_key: &[u8; 32]) {
     let mut frame = Vec::<u8, 256>::new();
     let _ = frame.push(protocol::PUSH_CODE_ADVERT);
     let _ = frame.extend_from_slice(pub_key);
-    let _ = COMPANION_PUSH_CHANNEL.try_send(frame);
+    push_companion(&frame);
 }
 
 fn push_path_updated(pub_key: &[u8; 32]) {
     let mut frame = Vec::<u8, 256>::new();
     let _ = frame.push(protocol::PUSH_CODE_PATH_UPDATED);
     let _ = frame.extend_from_slice(pub_key);
-    let _ = COMPANION_PUSH_CHANNEL.try_send(frame);
+    push_companion(&frame);
 }
 
 fn track_pending_ack(crc: u32) {
@@ -222,7 +222,7 @@ fn handle_direct_message_confirmed(crc: u32) {
     let _ = frame.push(protocol::PUSH_CODE_SEND_CONFIRMED);
     let _ = frame.extend_from_slice(&crc.to_le_bytes());
     let _ = frame.extend_from_slice(&rtt_ms.to_le_bytes());
-    let _ = COMPANION_PUSH_CHANNEL.try_send(frame);
+    push_companion(&frame);
 }
 
 /// Hand queued packets to the radio task.
@@ -314,7 +314,7 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
             let _ = log_rx_push.push(rssi as i8 as u8);
             let copy_lora_len = len.min(256 - 3);
             let _ = log_rx_push.extend_from_slice(&rx_buf[..copy_lora_len]);
-            let _ = COMPANION_PUSH_CHANNEL.try_send(log_rx_push);
+            push_companion(&log_rx_push);
 
             // Synchronize real radio telemetry to shared USB CLI status
             let rx_air = RADIO_SETTINGS.lock(|r| {
@@ -451,7 +451,7 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                                         );
                                         let _ = push.extend_from_slice(&overwritten);
                                         let _ =
-                                            COMPANION_PUSH_CHANNEL.try_send(push);
+                                            push_companion(&push);
                                         storage::adverts::forget(&overwritten);
                                         overwritten_key = Some(overwritten);
                                         list[idx] = discovered.clone();
@@ -471,7 +471,7 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                                     protocol::PUSH_CODE_CONTACTS_FULL,
                                 );
                                 let _ =
-                                    COMPANION_PUSH_CHANNEL.try_send(push);
+                                    push_companion(&push);
                             }
                         });
                         if store_blob {
@@ -523,7 +523,7 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                         // Prompt companion app with PUSH_CODE_MSG_WAITING (0x83)
                         let mut msg_wait = heapless::Vec::<u8, 256>::new();
                         let _ = msg_wait.push(protocol::PUSH_CODE_MSG_WAITING);
-                        let _ = COMPANION_PUSH_CHANNEL.try_send(msg_wait);
+                        push_companion(&msg_wait);
                     }
                     InboundAction::ReceivedGroupData {
                         channel_idx,
@@ -555,7 +555,7 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
 
                         let mut msg_wait = heapless::Vec::<u8, 256>::new();
                         let _ = msg_wait.push(protocol::PUSH_CODE_MSG_WAITING);
-                        let _ = COMPANION_PUSH_CHANNEL.try_send(msg_wait);
+                        push_companion(&msg_wait);
                     }
                     InboundAction::ReceivedDirectText { msg, sender_pub } => {
                         info!(
@@ -637,7 +637,7 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                         // Prompt companion app with PUSH_CODE_MSG_WAITING (0x83)
                         let mut msg_wait = heapless::Vec::<u8, 256>::new();
                         let _ = msg_wait.push(protocol::PUSH_CODE_MSG_WAITING);
-                        let _ = COMPANION_PUSH_CHANNEL.try_send(msg_wait);
+                        push_companion(&msg_wait);
                     }
                     InboundAction::ReceivedRepeaterEcho { pkt_hash, hops } => {
                         info!("MeshCore Message echoed by repeater! ({} hops, pkt_hash: {:?})", hops, pkt_hash);
@@ -675,8 +675,7 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                         let _ = push.push(path_len);
                         let _ = push.extend_from_slice(&data);
                         if push.len() <= 176 {
-                            let _ = COMPANION_PUSH_CHANNEL
-                                .try_send(push);
+                            push_companion(&push);
                         }
                     }
                     InboundAction::ReceivedTrace {
@@ -712,8 +711,7 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                         let _ = push.extend_from_slice(&snrs);
                         let _ = push.push((final_snr.saturating_mul(4)) as u8);
                         if push.len() <= 176 {
-                            let _ = COMPANION_PUSH_CHANNEL
-                                .try_send(push);
+                            push_companion(&push);
                         }
                     }
                     InboundAction::ReceivedPath {

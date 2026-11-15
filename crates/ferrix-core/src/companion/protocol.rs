@@ -2188,9 +2188,7 @@ impl<'a> CompanionNode<'a> {
                                             let _ = frame.push(PUSH_CODE_NEW_ADVERT);
                                             let _ = frame.extend_from_slice(&record[1..]);
                                         }
-                                        let _ =
-                                            crate::command::COMPANION_PUSH_CHANNEL
-                                                .try_send(frame);
+                                        crate::command::push_companion(&frame);
                                         self.host.advert_remember(
                                             &adv.pub_key,
                                             &pkt.payload[..pkt.payload_len],
@@ -2655,7 +2653,7 @@ impl<'a> CompanionNode<'a> {
                     let _ = push.push(0x74);
                     let _ = push.push((scaled >> 8) as u8);
                     let _ = push.push(scaled as u8);
-                    let _ = crate::command::COMPANION_PUSH_CHANNEL.try_send(push);
+                    crate::command::push_companion(&push);
                 } else if payload.len() >= 4 + 32 {
                     let mut dest_key = [0u8; 32];
                     dest_key.copy_from_slice(&payload[4..36]);

@@ -182,6 +182,11 @@ pub struct ThinkNodeBoard {
 impl ThinkNodeBoard {
     /// Take the nRF peripherals and hold the board pin configuration.
     pub fn new(p: embassy_nrf::Peripherals) -> Self {
+        if !ferrix_core::command::register_push_sink(&ferrix_nrf52::usb::USB_PUSH_SINK)
+            || !ferrix_core::command::register_push_sink(&ferrix_nrf52::ble::BLE_PUSH_SINK)
+        {
+            defmt::warn!("push transport table is full or duplicated");
+        }
         Self {
             pins: Some(crate::pins::init(p)),
             _power_en: None,

@@ -6,23 +6,56 @@
 //!    - **Companion Mode (`meshcore-cli -s <port>`)**: Binary frame protocol.
 //! 2. 1200-baud touch detection for DFU flashing.
 
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use defmt::{debug, info};
 use embassy_nrf::peripherals::USBD;
 use embassy_nrf::usb::Driver;
 use embassy_nrf::usb::vbus_detect::SoftwareVbusDetect;
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, Sender, State};
+use heapless::Vec;
 use embassy_usb::{Builder, Config, UsbDevice};
 use static_cell::StaticCell;
 
-use ferrix_core::command::COMPANION_PUSH_CHANNEL;
+use ferrix_core::command::PushSink;
 use ferrix_core::companion::cli::CliHost;
 use ferrix_core::companion::framing::encode_usb_frame;
 use ferrix_core::companion::session::{CompanionLink, CompanionSession};
 use ferrix_core::storage::get_callsign;
 
 pub type UsbDriver = Driver<'static, USBD, &'static SoftwareVbusDetect>;
+
+/// Outbound USB pushes. Direct command responses do not use this queue.
+pub static USB_PUSH_CHANNEL: Channel<CriticalSectionRawMutex, Vec<u8, 256>, 8> = Channel::new();
+
+static USB_CONNECTED: AtomicBool = AtomicBool::new(false);
+/// True only while the companion session is in binary mode; text CLI does not
+/// consume pushes.
+static USB_PUSH_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Push sink registered with the core router.
+pub struct UsbPushSink;
+
+pub static USB_PUSH_SINK: UsbPushSink = UsbPushSink;
+
+impl PushSink for UsbPushSink {
+    fn is_connected(&self) -> bool {
+        USB_CONNECTED.load(Ordering::Relaxed) && USB_PUSH_ACTIVE.load(Ordering::Relaxed)
+    }
+
+    fn try_push(&self, frame: &[u8]) -> bool {
+        if frame.len() > 256 {
+            return false;
+        }
+        let mut vec = Vec::<u8, 256>::new();
+        if vec.extend_from_slice(frame).is_err() {
+            return false;
+        }
+        USB_PUSH_CHANNEL.try_send(vec).is_ok()
+    }
+}
 
 embassy_nrf::bind_interrupts!(pub struct UsbIrqs {
     USBD => embassy_nrf::usb::InterruptHandler<USBD>;
@@ -101,10 +134,11 @@ pub async fn cdc_acm_task(
 
     loop {
         receiver.wait_connection().await;
+        USB_CONNECTED.store(true, Ordering::Relaxed);
         info!("USB CDC-ACM Connected");
         // Drop pushes left over from a previous session so a new app never
         // receives stale events (matches the BLE disconnect drain).
-        while COMPANION_PUSH_CHANNEL.try_receive().is_ok() {}
+        while USB_PUSH_CHANNEL.try_receive().is_ok() {}
 
         if receiver.line_coding().data_rate() == 1200 {
             embassy_time::Timer::after_millis(150).await;
@@ -118,9 +152,10 @@ pub async fn cdc_acm_task(
             let mut rx_buf = [0u8; 64];
             let read_fut = receiver.read_packet(&mut rx_buf);
             let push_enabled = session.binary_session();
+            USB_PUSH_ACTIVE.store(push_enabled, Ordering::Relaxed);
             let push_fut = async {
                 if push_enabled {
-                    Some(COMPANION_PUSH_CHANNEL.receive().await)
+                    Some(USB_PUSH_CHANNEL.receive().await)
                 } else {
                     core::future::pending::<Option<heapless::Vec<u8, 256>>>().await
                 }
@@ -148,10 +183,17 @@ pub async fn cdc_acm_task(
                             session.feed_byte(b, &mut CdcLink(&mut sender)).await;
                         }
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        USB_CONNECTED.store(false, Ordering::Relaxed);
+                        USB_PUSH_ACTIVE.store(false, Ordering::Relaxed);
+                        break;
+                    }
                 },
             }
         }
+        USB_CONNECTED.store(false, Ordering::Relaxed);
+        USB_PUSH_ACTIVE.store(false, Ordering::Relaxed);
+        while USB_PUSH_CHANNEL.try_receive().is_ok() {}
     }
 }
 

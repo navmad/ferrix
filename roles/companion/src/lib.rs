@@ -11,7 +11,7 @@
 use embassy_executor::Spawner;
 use heapless::String;
 
-use ferrix_core::command::COMPANION_PUSH_CHANNEL;
+use ferrix_core::command::push_companion;
 use ferrix_core::companion::cli::CliHost;
 use ferrix_core::companion::protocol::{next_delayed_push, CompanionHost, CompanionNode};
 use ferrix_core::engine::EngineContext;
@@ -87,7 +87,7 @@ pub trait CompanionBoard {
 async fn delayed_push_task() -> ! {
     loop {
         let frame = next_delayed_push().await;
-        let _ = COMPANION_PUSH_CHANNEL.try_send(frame);
+        push_companion(&frame);
     }
 }
 

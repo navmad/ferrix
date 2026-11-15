@@ -11,6 +11,7 @@ use core::task::Poll;
 use defmt::{debug, error, info};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
+use embassy_sync::channel::Channel;
 use embassy_sync::waitqueue::AtomicWaker;
 
 use heapless::Vec;
@@ -20,6 +21,7 @@ use nrf_softdevice::ble::security::{IoCapabilities, SecurityHandler};
 use nrf_softdevice::ble::{Connection, EncryptionInfo, IdentityKey, MasterId, PasskeyReply};
 use nrf_softdevice::Softdevice;
 
+use ferrix_core::command::PushSink;
 use ferrix_core::companion::cli::CliHost;
 use ferrix_core::storage::bonds::{self, Bond};
 use ferrix_core::companion::session::{CompanionLink, CompanionSession};
@@ -159,7 +161,7 @@ impl CmdRing {
 static BLE_CMD_RING: CmdRing = CmdRing::new();
 static BLE_CMD_WAKER: AtomicWaker = AtomicWaker::new();
 
-pub use ferrix_core::command::{ContactOperation, COMPANION_PUSH_CHANNEL, CONTACT_OP_CHANNEL};
+pub use ferrix_core::command::{ContactOperation, CONTACT_OP_CHANNEL};
 
 /// Applies deferred contact mutations away from the GATT callback and the
 /// main routing loop, in its own task/future state.
@@ -374,6 +376,31 @@ pub async fn softdevice_task(sd: &'static Softdevice) -> ! {
     sd.run().await
 }
 
+/// Outbound BLE frames: command responses and asynchronous pushes.
+pub static BLE_PUSH_CHANNEL: Channel<CriticalSectionRawMutex, Vec<u8, 256>, 24> = Channel::new();
+
+/// Push sink registered with the core router.
+pub struct BlePushSink;
+
+pub static BLE_PUSH_SINK: BlePushSink = BlePushSink;
+
+impl PushSink for BlePushSink {
+    fn is_connected(&self) -> bool {
+        BLE_CONNECTED.load(Ordering::Relaxed)
+    }
+
+    fn try_push(&self, frame: &[u8]) -> bool {
+        if frame.len() > 256 {
+            return false;
+        }
+        let mut vec = Vec::<u8, 256>::new();
+        if vec.extend_from_slice(frame).is_err() {
+            return false;
+        }
+        BLE_PUSH_CHANNEL.try_send(vec).is_ok()
+    }
+}
+
 /// Companion link backed by the BLE notification queue.
 struct BleLink;
 
@@ -381,13 +408,13 @@ impl CompanionLink for BleLink {
     async fn write_frame(&mut self, frame: &[u8]) {
         let mut vec = Vec::<u8, 256>::new();
         let _ = vec.extend_from_slice(&frame[..frame.len().min(247)]);
-        let _ = COMPANION_PUSH_CHANNEL.send(vec).await;
+        let _ = BLE_PUSH_CHANNEL.send(vec).await;
     }
 
     async fn write_text(&mut self, text: &[u8]) {
         let mut vec = Vec::<u8, 256>::new();
         let _ = vec.extend_from_slice(&text[..text.len().min(247)]);
-        let _ = COMPANION_PUSH_CHANNEL.send(vec).await;
+        let _ = BLE_PUSH_CHANNEL.send(vec).await;
     }
 }
 
@@ -521,6 +548,7 @@ pub async fn ble_companion_task(
         };
 
         session.reset();
+        while BLE_PUSH_CHANNEL.try_receive().is_ok() {}
 
         // Keep a second handle so slave latency can be restored while the
         // session futures still borrow `conn`.
@@ -577,7 +605,7 @@ pub async fn ble_companion_task(
 
         let push_fut = async {
             loop {
-                let msg = COMPANION_PUSH_CHANNEL.receive().await;
+                let msg = BLE_PUSH_CHANNEL.receive().await;
                 let mut vec = Vec::<u8, 256>::new();
                 let copy_len = msg.len().min(247);
                 let _ = vec.extend_from_slice(&msg[..copy_len]);
@@ -627,7 +655,7 @@ pub async fn ble_companion_task(
                 // Drop anything left over from the closed connection so the
                 // next app session never receives stale responses.
                 BLE_CMD_RING.clear();
-                while COMPANION_PUSH_CHANNEL.try_receive().is_ok() {}
+                while BLE_PUSH_CHANNEL.try_receive().is_ok() {}
                 // After a connection, use the 1s interval for power saving.
                 adv_config.interval = ADVERTISING_SLOW_INTERVAL;
                 info!("BLE: resumed advertising at 1s interval");

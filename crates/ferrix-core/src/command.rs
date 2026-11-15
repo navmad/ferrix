@@ -4,7 +4,11 @@
 //! consumers (radio task, contact task, BLE push drain), so the types and
 //! channels live in the core crate.
 
+use core::cell::RefCell;
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::channel::Channel;
 use heapless::{String, Vec};
 
@@ -102,6 +106,58 @@ pub enum ContactOperation {
 pub static CONTACT_OP_CHANNEL: Channel<CriticalSectionRawMutex, ContactOperation, 4> =
     Channel::new();
 
-/// Outbound companion push frames (advert notifications, status responses).
-pub static COMPANION_PUSH_CHANNEL: Channel<CriticalSectionRawMutex, Vec<u8, 256>, 40> =
-    Channel::new();
+/// Maximum number of registered push transports.
+pub const MAX_PUSH_SINKS: usize = 4;
+
+/// A transport that receives asynchronous companion pushes.
+///
+/// `try_push` is synchronous and may drop when the transport queue is full;
+/// producers must never block the radio/app loop on a transport.
+pub trait PushSink: Send + Sync {
+    fn is_connected(&self) -> bool;
+    fn try_push(&self, frame: &[u8]) -> bool;
+}
+
+static PUSH_SINKS: Mutex<
+    CriticalSectionRawMutex,
+    RefCell<[Option<&'static dyn PushSink>; MAX_PUSH_SINKS]>,
+> = Mutex::new(RefCell::new([None; MAX_PUSH_SINKS]));
+
+static PUSH_DROPS: AtomicU32 = AtomicU32::new(0);
+
+/// Register a transport sink. Returns false when the table is full.
+pub fn register_push_sink(sink: &'static dyn PushSink) -> bool {
+    PUSH_SINKS.lock(|s| {
+        let mut list = s.borrow_mut();
+        for slot in list.iter_mut() {
+            if let Some(existing) = slot {
+                if core::ptr::eq(*existing, sink) {
+                    return true;
+                }
+            }
+        }
+        for slot in list.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(sink);
+                return true;
+            }
+        }
+        false
+    })
+}
+
+/// Broadcast one asynchronous push to every connected transport.
+pub fn push_companion(frame: &[u8]) {
+    PUSH_SINKS.lock(|s| {
+        for sink in s.borrow().iter().flatten() {
+            if sink.is_connected() && !sink.try_push(frame) {
+                PUSH_DROPS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    });
+}
+
+/// Number of pushes a transport refused because its queue was full.
+pub fn push_drops() -> u32 {
+    PUSH_DROPS.load(Ordering::Relaxed)
+}

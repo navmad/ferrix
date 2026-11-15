@@ -1387,8 +1387,8 @@ pub async fn handle_text_cli<W: TextSink>(
             let uptime = embassy_time::Instant::now().as_secs();
             let mv = host.battery_millivolts();
             let pct = crate::battery::millivolts_to_percentage(host.battery_millivolts());
-            let mut s: heapless::String<128> = heapless::String::new();
-            let _ = write!(s, "  -> {{\"battery_mv\":{},\"battery_pct\":{},\"uptime_secs\":{},\"errors\":0,\"queue_len\":0}}\r\n", mv, pct, uptime);
+            let mut s: heapless::String<160> = heapless::String::new();
+            let _ = write!(s, "  -> {{\"battery_mv\":{},\"battery_pct\":{},\"uptime_secs\":{},\"errors\":0,\"queue_len\":0,\"push_drops\":{}}}\r\n", mv, pct, uptime, crate::command::push_drops());
             let _ = sender.send( s.as_bytes()).await;
         }
         "battery" | "get battery" | "batt" | "get batt" => {
