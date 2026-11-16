@@ -401,23 +401,11 @@ impl<'a> MeshEngine<'a> {
             }
         }
 
-        // 2b. Flood forwarding is payload-agnostic. Adverts are excluded
-        // because they must be signature-checked before relay; TRACE has its
-        // own direct handling above.
-        if self.allow_forward
-            && pkt.is_flood()
-            && !is_dupe
-            && !already_in_path
-            && pkt.payload_type() != PAYLOAD_TYPE_ADVERT
-            && pkt.payload_type() != PAYLOAD_TYPE_TRACE
-        {
-            let mut repeat_pkt = pkt.clone();
-            repeat_pkt.append_hop_bytes(self.identity.pub_key());
-            self.queue_forward(repeat_pkt);
-        }
-
-        // 3. Dispatch based on payload type
-        match pkt.payload_type() {
+        // 3. Dispatch based on payload type, tracking whether this node
+        // consumed the packet so it is not retransmitted afterward.
+        let mut consumed = false;
+        let action = (|| {
+            match pkt.payload_type() {
             PAYLOAD_TYPE_ADVERT => {
                 if is_dupe {
                     return InboundAction::DropDuplicate;
@@ -549,6 +537,7 @@ impl<'a> MeshEngine<'a> {
                                 let _ = self.queue_ack_packet(ack, out_path_len, &out_path);
                             }
                         }
+                        consumed = true;
                         return InboundAction::ReceivedDirectText {
                             msg,
                             sender_pub: *peer,
@@ -584,6 +573,7 @@ impl<'a> MeshEngine<'a> {
                             let mut arrival_path = heapless::Vec::<u8, 64>::new();
                             let an = pkt.path_byte_len();
                             let _ = arrival_path.extend_from_slice(&pkt.path[..an]);
+                            consumed = true;
                             return InboundAction::ReceivedPath {
                                 packet: path,
                                 sender_pub: *peer,
@@ -654,6 +644,7 @@ impl<'a> MeshEngine<'a> {
                 for peer in self.peers_by_hash(src).iter() {
                     if let Some(secret) = self.identity.shared_secret(peer) {
                         if let Ok(ap) = AddressedPacket::decode(payload, &secret) {
+                            consumed = true;
                             return if pkt.payload_type() == PAYLOAD_TYPE_RESPONSE {
                                 InboundAction::ReceivedResponse {
                                     plain: ap.plain,
@@ -685,13 +676,34 @@ impl<'a> MeshEngine<'a> {
                 sender_pub.copy_from_slice(&payload[1..33]);
                 if let Some(secret) = self.identity.shared_secret(&sender_pub) {
                     if let Ok(req) = AnonReqPacket::decode(payload, &secret) {
+                        consumed = true;
                         return InboundAction::ReceivedAnonReq(req);
                     }
                 }
                 InboundAction::Unhandled
             }
             _ => InboundAction::Unhandled,
+            }
+        })();
+
+        // 4. Flood forwarding is payload-agnostic, but a flooded unicast that
+        // this node decrypted and consumed must not be relayed. Adverts are
+        // excluded because they forward only after signature verification;
+        // TRACE has its own direct handling above.
+        if self.allow_forward
+            && pkt.is_flood()
+            && !is_dupe
+            && !already_in_path
+            && !consumed
+            && pkt.payload_type() != PAYLOAD_TYPE_ADVERT
+            && pkt.payload_type() != PAYLOAD_TYPE_TRACE
+        {
+            let mut repeat_pkt = pkt.clone();
+            repeat_pkt.append_hop_bytes(self.identity.pub_key());
+            self.queue_forward(repeat_pkt);
         }
+
+        action
     }
 
     /// Construct and queue an advertisement packet for transmission
@@ -918,5 +930,152 @@ mod tests {
         assert_eq!(&channels[0].name[..6], b"Public");
         assert!(NoopContext.peers_by_hash(0).is_empty());
         assert_eq!(NoopContext.peer_path(&[0u8; 32]).0, 0xFF);
+    }
+
+    fn flood(mut pkt: Packet) -> Packet {
+        pkt.set_path_hash_size_and_count(2, 0);
+        pkt
+    }
+
+    #[test]
+    fn flooded_anon_request_for_us_is_not_forwarded() {
+        let id = identity();
+        let peer = LocalIdentity::from_seed("peer", &[9u8; 32]);
+        let sender = *peer.pub_key();
+        let secret = id.shared_secret(&sender).unwrap();
+        let request = AnonReqPacket::new(id.pub_key()[0], sender, b"ping").unwrap();
+        let pkt = flood(request.to_packet(&secret, ROUTE_TYPE_FLOOD).unwrap());
+
+        let mut engine = MeshEngine::new(id, ADV_TYPE_REPEATER, &TestContext);
+        engine.allow_forward = true;
+
+        assert!(matches!(
+            engine.handle_inbound_packet(pkt, 6),
+            InboundAction::ReceivedAnonReq(_)
+        ));
+        assert!(
+            engine.tx_queue.is_empty(),
+            "a consumed anonymous request must not be relayed"
+        );
+    }
+
+    #[test]
+    fn flooded_anon_request_for_another_node_is_forwarded() {
+        let id = identity();
+        let peer = LocalIdentity::from_seed("peer", &[9u8; 32]);
+        let sender = *peer.pub_key();
+        let secret = id.shared_secret(&sender).unwrap();
+        let dest = id.pub_key()[0] ^ 0xFF;
+        let request = AnonReqPacket::new(dest, sender, b"ping").unwrap();
+        let pkt = flood(request.to_packet(&secret, ROUTE_TYPE_FLOOD).unwrap());
+
+        let mut engine = MeshEngine::new(id, ADV_TYPE_REPEATER, &TestContext);
+        engine.allow_forward = true;
+
+        assert!(matches!(
+            engine.handle_inbound_packet(pkt, 6),
+            InboundAction::Unhandled
+        ));
+        assert!(engine
+            .tx_queue
+            .iter()
+            .any(|q| q.lane == TxLane::Flood
+                && q.packet.payload_type() == PAYLOAD_TYPE_ANON_REQ));
+    }
+
+    #[test]
+    fn flooded_direct_text_for_us_is_not_forwarded() {
+        let id = identity();
+        let src = 0x33u8;
+        let peer = [src; 32];
+        let secret = id.shared_secret(&peer).unwrap();
+        let msg = TxtMsgPacket::new(
+            id.pub_key()[0],
+            src,
+            1234,
+            meshcore_wire::packets::txtmsg::TXT_TYPE_PLAIN,
+            0,
+            "hello",
+            &peer,
+        )
+        .unwrap();
+        let pkt = flood(msg.to_packet(ROUTE_TYPE_FLOOD, &secret).unwrap());
+
+        let mut engine = MeshEngine::new(id, ADV_TYPE_REPEATER, &TestContext);
+        engine.allow_forward = true;
+
+        assert!(matches!(
+            engine.handle_inbound_packet(pkt, 6),
+            InboundAction::ReceivedDirectText { .. }
+        ));
+        // The flooded DM queues an ACK/path return, but the original text must
+        // not be retransmitted.
+        assert!(!engine
+            .tx_queue
+            .iter()
+            .any(|q| q.packet.payload_type() == PAYLOAD_TYPE_TXT_MSG));
+    }
+
+    #[test]
+    fn flooded_direct_text_for_another_node_is_forwarded() {
+        let id = identity();
+        let src = 0x33u8;
+        let peer = [src; 32];
+        let secret = id.shared_secret(&peer).unwrap();
+        let dest = id.pub_key()[0] ^ 0xFF;
+        let msg = TxtMsgPacket::new(
+            dest,
+            src,
+            1234,
+            meshcore_wire::packets::txtmsg::TXT_TYPE_PLAIN,
+            0,
+            "hello",
+            &peer,
+        )
+        .unwrap();
+        let pkt = flood(msg.to_packet(ROUTE_TYPE_FLOOD, &secret).unwrap());
+
+        let mut engine = MeshEngine::new(id, ADV_TYPE_REPEATER, &TestContext);
+        engine.allow_forward = true;
+
+        assert!(matches!(
+            engine.handle_inbound_packet(pkt, 6),
+            InboundAction::Unhandled
+        ));
+        assert!(engine
+            .tx_queue
+            .iter()
+            .any(|q| q.lane == TxLane::Flood
+                && q.packet.payload_type() == PAYLOAD_TYPE_TXT_MSG));
+    }
+
+    #[test]
+    fn flooded_group_text_is_still_forwarded() {
+        let id = identity();
+        let channels = TestContext.channels();
+        let channel = &channels[0];
+        let channel_hash = meshcore_wire::crypto::channel_hash(&channel.secret);
+        let group = GrpTextPacket::new(
+            channel_hash,
+            "other",
+            "hello",
+            1234,
+            GrpTextPacket::TXT_TYPE_PLAIN,
+            0,
+        );
+        let pkt = flood(group.to_packet(&channel.secret, ROUTE_TYPE_FLOOD).unwrap());
+
+        let mut engine = MeshEngine::new(id, ADV_TYPE_REPEATER, &TestContext);
+        engine.allow_forward = true;
+
+        assert!(matches!(
+            engine.handle_inbound_packet(pkt, 6),
+            InboundAction::ReceivedGroupText { .. }
+        ));
+        assert!(engine
+            .tx_queue
+            .iter()
+            .any(|q| q.lane == TxLane::Flood
+                && q.packet.payload_type() == PAYLOAD_TYPE_GRP_TXT));
     }
 }

@@ -17,3 +17,5 @@ embassy-time = { version = "0.4", features = ["defmt"] }
 # Host tests lock the shared state through embassy-sync; the embedded build
 # gets its critical-section implementation from the nRF SoftDevice.
 critical-section = { version = "1", features = ["std"] }
+# Engine tests exercise queueing, which reads Instant::now().
+embassy-time = { version = "0.4", features = ["mock-driver"] }
