@@ -4,7 +4,7 @@ A native `no_std` embedded Rust firmware workspace for **MeshCore v1.18** LoRa m
 
 > **Firmware identity:** Ferrix reports `1.18.0-ferrix` in version strings and its boot splash while keeping `ThinkNode M1` / `MeshCore` USB and protocol identifiers for drop-in compatibility with official MeshCore companion apps (iOS, Android, Web, and CLI).
 
-For the full protocol matrix, CLI reference, and current limitations, see [FEATURES.md](FEATURES.md) and [report.md](report.md).
+For the full protocol matrix, CLI reference, and current limitations, see [FEATURES.md](FEATURES.md).
 
 ---
 
