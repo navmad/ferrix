@@ -1,0 +1,112 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Optional version override (e.g. v1.18.0); defaults to workspace version"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Host tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Run host unit tests
+        run: ./tools/build.sh thinknode-m1 test
+
+  build:
+    name: Build ${{ matrix.firmware }}
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - firmware: thinknode-m1-companion
+            pkg: ferrix-thinknode-m1-companion
+            target: thumbv7em-none-eabihf
+            uf2_base: "0x26000"
+          # Future firmware targets can be appended here, e.g.:
+          # - firmware: thinknode-m1-repeater
+          #   pkg: ferrix-thinknode-m1-repeater
+          #   target: thumbv7em-none-eabihf
+          #   uf2_base: "0x26000"
+          # - firmware: wio-tracker-l1-pro-companion
+          #   pkg: ferrix-wio-tracker-l1-pro-companion
+          #   target: thumbv7em-none-eabihf
+          #   uf2_base: "0x26000"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: llvm-tools
+
+      - name: Resolve firmware version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_IS_TAG: ${{ startsWith(github.ref, 'refs/tags/') }}
+        run: |
+          if [ -n "$INPUT_VERSION" ]; then
+            echo "FERRIX_VERSION=$INPUT_VERSION" >> "$GITHUB_ENV"
+          elif [ "$REF_IS_TAG" = "true" ]; then
+            echo "FERRIX_VERSION=$REF_NAME" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build ${{ matrix.firmware }} UF2
+        run: |
+          cargo build -p "${{ matrix.pkg }}" --target "${{ matrix.target }}" --release
+          OBJCOPY="$(find "$(rustc --print sysroot)" -name llvm-objcopy | head -n 1)"
+          if [ -z "$OBJCOPY" ]; then
+            echo "ERROR: llvm-objcopy not found in rust sysroot" >&2
+            exit 1
+          fi
+          mkdir -p dist
+          "$OBJCOPY" -O binary \
+            "target/${{ matrix.target }}/release/ferrix" \
+            "dist/ferrix-${{ matrix.firmware }}.bin"
+          python3 tools/uf2conv.py \
+            "dist/ferrix-${{ matrix.firmware }}.bin" \
+            -o "dist/ferrix-${{ matrix.firmware }}.uf2" \
+            -b "${{ matrix.uf2_base }}"
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ferrix-${{ matrix.firmware }}
+          path: dist/ferrix-${{ matrix.firmware }}.uf2
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download built firmware
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: artifacts/*.uf2
