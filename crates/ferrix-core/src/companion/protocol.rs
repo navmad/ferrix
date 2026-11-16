@@ -921,8 +921,9 @@ impl<'a> CompanionNode<'a> {
                 );
 
                 let mut bdate = [0u8; 12];
-                let d = b"Nov 10 2026";
-                bdate[..d.len()].copy_from_slice(d);
+                let d = crate::version::BUILD_DATE.as_bytes();
+                let d_len = d.len().min(bdate.len());
+                bdate[..d_len].copy_from_slice(&d[..d_len]);
                 let _ = resp.extend_from_slice(&bdate);
 
                 let mut mmodel = [0u8; 40];
@@ -932,9 +933,10 @@ impl<'a> CompanionNode<'a> {
 
                 let mut sver = [0u8; 20];
                 // The app gates several settings on the firmware version
-                // string, so report the MeshCore-compatible one.
-                let s = b"v1.18.0";
-                sver[..s.len()].copy_from_slice(s);
+                // string, so report the MeshCore-compatible semver.
+                let s = crate::version::PROTOCOL_SEMVER.as_bytes();
+                let s_len = s.len().min(sver.len());
+                sver[..s_len].copy_from_slice(&s[..s_len]);
                 let _ = resp.extend_from_slice(&sver);
 
                 let _ = resp.push(if crate::state::offgrid_active() { 1 } else { 0 }); // offgrid mode

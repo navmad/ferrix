@@ -21,7 +21,7 @@ use ferrix_runtime::app::{RadarSort, UiState};
 use crate::display::{EpdFrameBuffer, EPD_WIDTH};
 
 pub const PAGE_COUNT: u8 = 9;
-pub const FIRMWARE_VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-ferrix");
+pub const FIRMWARE_VERSION: &str = ferrix_core::version::FIRMWARE_VERSION;
 pub const PROTOCOL_VERSION: &str = "MeshCore v1.18";
 
 const DISP_W: i32 = EPD_WIDTH as i32;

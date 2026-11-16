@@ -350,7 +350,9 @@ pub async fn handle_text_cli<W: TextSink>(
             }
         }
         "ver" => {
-            let _ = sender.send( b"  -> 0.1.0-ferrix\r\n").await;
+            let mut s: heapless::String<48> = heapless::String::new();
+            let _ = write!(s, "  -> {}\r\n", crate::version::FIRMWARE_VERSION);
+            let _ = sender.send(s.as_bytes()).await;
         }
         "board" => {
             let mut s: heapless::String<64> = heapless::String::new();

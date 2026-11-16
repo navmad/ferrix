@@ -479,7 +479,8 @@ pub async fn ble_companion_task(
     let _ = server.dis.model_number_set(&model);
 
     let mut fw = Vec::<u8, 32>::new();
-    let _ = fw.extend_from_slice(b"Ferrix 0.1.0");
+    let rev = ferrix_core::version::BLE_FW_REVISION.as_bytes();
+    let _ = fw.extend_from_slice(&rev[..rev.len().min(32)]);
     let _ = server.dis.firmware_revision_set(&fw);
 
     let mut mfg = Vec::<u8, 32>::new();

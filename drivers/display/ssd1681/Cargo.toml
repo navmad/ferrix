@@ -1,6 +1,6 @@
 [package]
 name = "ferrix-ssd1681"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 description = "Reusable SSD1681 e-paper controller driver for Ferrix boards"
 

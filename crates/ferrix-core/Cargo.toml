@@ -1,7 +1,8 @@
 [package]
 name = "ferrix-core"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
+build = "build.rs"
 
 [dependencies]
 meshcore-wire = { path = "../meshcore-wire" }

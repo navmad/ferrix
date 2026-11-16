@@ -1,6 +1,6 @@
 [package]
 name = "ferrix-l76k"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 description = "Quectel L76K GNSS power, reset and UART transport"
 

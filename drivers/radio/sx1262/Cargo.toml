@@ -1,6 +1,6 @@
 [package]
 name = "ferrix-sx1262"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 description = "Reusable SX1262 LoRa driver for Ferrix boards"
 
