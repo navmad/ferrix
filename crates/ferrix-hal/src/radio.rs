@@ -66,16 +66,29 @@ pub enum TxOutcome {
 /// A physical LoRa radio driven by the runtime scheduler.
 #[allow(async_fn_in_trait)]
 pub trait RadioDevice {
-    /// Apply new modulation settings and re-arm reception.
+    /// Apply new modulation settings and prepare reception.
     async fn configure(&mut self, config: &LoraConfig) -> bool;
 
     /// Transmit one packet, including timeout and RX recovery.
     async fn transmit(&mut self, payload: &[u8]) -> TxOutcome;
 
-    /// Wait for one packet or a radio error. The caller applies a watchdog.
-    async fn receive(&mut self, buf: &mut [u8]) -> RxOutcome;
+    /// Enter receive mode if not already armed. No-op when already listening
+    /// so duty-cycle sleep/wake phase is preserved across loop wakeups.
+    async fn arm_receive(&mut self);
 
-    /// Re-arm reception after a watchdog timeout or duty-cycle window.
+    /// Cancel-safe wait for a radio RX interrupt (must not perform SPI I/O).
+    async fn wait_rx_irq(&mut self) -> bool;
+
+    /// Process the pending RX interrupt to completion (never cancel mid-flight).
+    /// Returns `None` for intermediate IRQs (preamble/header) or ignored errors.
+    async fn handle_rx_irq(&mut self, buf: &mut [u8]) -> Option<RxOutcome>;
+
+    /// True while a preamble/header was detected and the frame has not finished yet.
+    fn is_receiving(&self) -> bool {
+        false
+    }
+
+    /// Re-arm reception after a watchdog timeout or error.
     async fn recover_receive(&mut self);
 }
 

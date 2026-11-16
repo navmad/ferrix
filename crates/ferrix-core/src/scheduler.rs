@@ -159,6 +159,69 @@ pub fn next_flood_due(
         .min()
 }
 
+/// Recompute pending flood `slot_id`s relative to a new `(now, new_slot_ms)`
+/// clock anchor so changing `slot_ms` or resetting `base = now` preserves
+/// scheduled due times. Evicts slots that are already older than
+/// `FLOOD_MAX_AGE_SLOTS * old_slot_ms` and returns how many were evicted.
+pub fn rebase_floods(
+    floods: &mut [Option<FloodSlot>; FLOOD_SLOTS],
+    now: u64,
+    old_base: u64,
+    old_slot_ms: u64,
+    new_slot_ms: u64,
+) -> u32 {
+    let denom = new_slot_ms.max(1);
+    let max_age = FLOOD_MAX_AGE_SLOTS.saturating_mul(old_slot_ms);
+    let mut stale = 0u32;
+    for slot in floods.iter_mut() {
+        if let Some(s) = slot {
+            let old_due = old_base.saturating_add(s.slot_id.saturating_mul(old_slot_ms));
+            if now > old_due.saturating_add(max_age) {
+                *slot = None;
+                stale = stale.saturating_add(1);
+            } else {
+                let rem_ms = old_due.saturating_sub(now);
+                s.slot_id = rem_ms.div_ceil(denom);
+            }
+        }
+    }
+    stale
+}
+
+/// Refill control (25%) and flood (75%) duty-cycle airtime budgets using
+/// sub-millisecond remainders (`1 / 10_000` ms units) so frequent wakeups never
+/// truncate accrued airtime to zero.
+pub fn refill_budgets(
+    elapsed_ms: i64,
+    duty_pct: i64,
+    control_max: i64,
+    flood_max: i64,
+    control_budget_ms: &mut i64,
+    flood_budget_ms: &mut i64,
+    control_rem: &mut i64,
+    flood_rem: &mut i64,
+) {
+    if elapsed_ms > 0 && duty_pct > 0 {
+        let c_num = *control_rem + elapsed_ms * duty_pct * 25;
+        let c_add = c_num / 10_000;
+        *control_rem = c_num % 10_000;
+        *control_budget_ms = (*control_budget_ms + c_add).min(control_max);
+        if *control_budget_ms >= control_max {
+            *control_rem = 0;
+        }
+
+        let f_num = *flood_rem + elapsed_ms * duty_pct * 75;
+        let f_add = f_num / 10_000;
+        *flood_rem = f_num % 10_000;
+        *flood_budget_ms = (*flood_budget_ms + f_add).min(flood_max);
+        if *flood_budget_ms >= flood_max {
+            *flood_rem = 0;
+        }
+    }
+    *control_budget_ms = (*control_budget_ms).min(control_max);
+    *flood_budget_ms = (*flood_budget_ms).min(flood_max);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -183,6 +246,24 @@ mod tests {
     }
 
     #[test]
+    fn budget_refill_does_not_lose_sub_ms_ticks() {
+        let control_max = 90_000;
+        let flood_max = 270_000;
+        let mut c = 0;
+        let mut f = 0;
+        let mut c_rem = 0;
+        let mut f_rem = 0;
+        // 1,000 ticks of 1 ms at 10% duty cycle must accrue 25 ms control and 75 ms flood.
+        for _ in 0..1_000 {
+            refill_budgets(1, 10, control_max, flood_max, &mut c, &mut f, &mut c_rem, &mut f_rem);
+        }
+        assert_eq!(c, 25);
+        assert_eq!(f, 75);
+        assert_eq!(c_rem, 0);
+        assert_eq!(f_rem, 0);
+    }
+
+    #[test]
     fn slot_width_is_clamped() {
         assert!(slot_width_ms(7, 125, 5, 16) >= SLOT_MIN_MS);
         assert_eq!(slot_width_ms(12, 7, 5, 32), SLOT_MAX_MS);
@@ -198,6 +279,32 @@ mod tests {
         assert!(cancel_slot(&mut floods, [1u8; 8]));
         assert!(floods.iter().all(Option::is_none));
         assert!(!cancel_slot(&mut floods, [1u8; 8]));
+    }
+
+    #[test]
+    fn rebase_preserves_due_time_and_evicts_stale() {
+        let mut floods = [None; FLOOD_SLOTS];
+        floods[0] = Some(FloodSlot {
+            req: packet(1),
+            slot_id: 5, // due at 0 + 5*500 = 2500
+        });
+        floods[1] = Some(FloodSlot {
+            req: packet(2),
+            slot_id: 1, // due at 500 -> stale if now > 500 + 8*500 = 4500
+        });
+        let stale = rebase_floods(&mut floods, 1_500, 0, 500, 250);
+        assert_eq!(stale, 0);
+        // slot 0: rem = 2500 - 1500 = 1000 -> 1000 / 250 = 4 -> new due = 1500 + 4*250 = 2500
+        assert_eq!(floods[0].unwrap().slot_id, 4);
+        // slot 1: already past due (500 <= 1500), not yet stale -> clamped to slot 0 (immediately due)
+        assert_eq!(floods[1].unwrap().slot_id, 0);
+
+        // Now advance past stale threshold for slot 1 (due 1500, max_age = 8*250 = 2000),
+        // while slot 0 (due 2500, 2500 + 2000 = 4500 >= 4000) remains valid.
+        let stale2 = rebase_floods(&mut floods, 4_000, 1_500, 250, 250);
+        assert_eq!(stale2, 1);
+        assert!(floods[1].is_none());
+        assert!(floods[0].is_some());
     }
 
     #[test]

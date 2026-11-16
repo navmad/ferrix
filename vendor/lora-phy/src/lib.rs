@@ -29,6 +29,16 @@ use interface::*;
 use mod_params::*;
 use mod_traits::*;
 
+/// Outcome of processing one receive IRQ via [`LoRa::handle_rx_irq`].
+pub enum RxIrqEvent {
+    /// Preamble or valid header detected; packet reception is still in progress.
+    PreambleReceived,
+    /// A complete packet was read into the caller's buffer.
+    Packet(u8, PacketStatus),
+    /// An intermediate or ignored error IRQ occurred; keep listening.
+    None,
+}
+
 /// Provides the physical layer API to support LoRa chips
 pub struct LoRa<RK, DLY>
 where
@@ -246,29 +256,56 @@ where
         packet_params: &PacketParams,
         receiving_buffer: &mut [u8],
     ) -> Result<(u8, PacketStatus), RadioError> {
+        self.start_rx().await?;
+        loop {
+            self.wait_for_irq().await?;
+            match self.handle_rx_irq(packet_params, receiving_buffer).await? {
+                RxIrqEvent::PreambleReceived | RxIrqEvent::None => continue,
+                RxIrqEvent::Packet(received_len, rx_pkt_status) => {
+                    return Ok((received_len, rx_pkt_status));
+                }
+            }
+        }
+    }
+
+    /// Enter the receive mode prepared by [`Self::prepare_for_rx`].
+    pub async fn start_rx(&mut self) -> Result<(), RadioError> {
         if let RadioMode::Receive(listen_mode) = self.radio_mode {
-            self.radio_kind.do_rx(listen_mode).await?;
-            loop {
-                self.wait_for_irq().await?;
-                match self.radio_kind.process_irq_event(self.radio_mode, None, true).await {
-                    Ok(Some(actual_state)) => match actual_state {
-                        IrqState::PreambleReceived => continue,
-                        IrqState::Done => {
-                            let received_len = self.radio_kind.get_rx_payload(packet_params, receiving_buffer).await?;
-                            let rx_pkt_status = self.radio_kind.get_rx_packet_status().await?;
-                            return Ok((received_len, rx_pkt_status));
-                        }
-                    },
-                    Ok(None) => continue,
-                    Err(err) => {
-                        // if in rx continuous mode, allow the caller to determine whether to keep receiving
-                        if self.radio_mode != RadioMode::Receive(RxMode::Continuous) {
-                            self.radio_kind.ensure_ready(self.radio_mode).await?;
-                            self.radio_kind.set_standby().await?;
-                            self.radio_mode = RadioMode::Standby;
-                        }
-                        return Err(err);
+            self.radio_kind.do_rx(listen_mode).await
+        } else {
+            Err(RadioError::InvalidRadioMode)
+        }
+    }
+
+    /// Process one RX IRQ after [`Self::wait_for_irq`] completes.
+    ///
+    /// Splitting `wait_for_irq` from `handle_rx_irq` lets callers cancel
+    /// `wait_for_irq` inside `select!` without dropping SPI transactions
+    /// mid-flight.
+    pub async fn handle_rx_irq(
+        &mut self,
+        packet_params: &PacketParams,
+        receiving_buffer: &mut [u8],
+    ) -> Result<RxIrqEvent, RadioError> {
+        if let RadioMode::Receive(_) = self.radio_mode {
+            match self.radio_kind.process_irq_event(self.radio_mode, None, true).await {
+                Ok(Some(actual_state)) => match actual_state {
+                    IrqState::PreambleReceived => Ok(RxIrqEvent::PreambleReceived),
+                    IrqState::Done => {
+                        let received_len = self.radio_kind.get_rx_payload(packet_params, receiving_buffer).await?;
+                        let rx_pkt_status = self.radio_kind.get_rx_packet_status().await?;
+                        Ok(RxIrqEvent::Packet(received_len, rx_pkt_status))
                     }
+                },
+                Ok(None) => Ok(RxIrqEvent::None),
+                Err(err) => {
+                    // if in rx continuous mode, allow the caller to determine whether to keep receiving
+                    if self.radio_mode != RadioMode::Receive(RxMode::Continuous) {
+                        self.radio_kind.ensure_ready(self.radio_mode).await?;
+                        self.radio_kind.set_standby().await?;
+                        self.radio_mode = RadioMode::Standby;
+                    }
+                    Err(err)
                 }
             }
         } else {

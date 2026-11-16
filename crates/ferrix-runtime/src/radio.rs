@@ -9,9 +9,9 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Instant, Timer};
 use ferrix_core::scheduler::{
-    assign_flood, cancel_slot, due_flood, next_flood_due, preamble_for, remember_cancel,
-    slot_width_ms, take_cancelled, FloodSlot, TxPacket, CONTROL_QUEUE, FLOOD_MAX_AGE_SLOTS,
-    FLOOD_SLOTS, SLOT_MIN_MS, TX_GAP_MS, TX_MAX_ATTEMPTS,
+    assign_flood, cancel_slot, due_flood, next_flood_due, preamble_for, rebase_floods,
+    refill_budgets, remember_cancel, slot_width_ms, take_cancelled, FloodSlot, TxPacket,
+    CONTROL_QUEUE, FLOOD_MAX_AGE_SLOTS, FLOOD_SLOTS, SLOT_MIN_MS, TX_GAP_MS, TX_MAX_ATTEMPTS,
 };
 use ferrix_core::state::{
     current_public_key, RADIO_SETTINGS, RADIO_TELEMETRY, TX_SLOT_MS_LAST, TX_SLOT_MS_OVERRIDE,
@@ -142,10 +142,14 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
     let total0 = ferrix_core::scheduler::tx_budget_max(af0);
     let mut control_budget_ms = total0 * 25 / 100;
     let mut flood_budget_ms = total0 - control_budget_ms;
-    let mut tx_budget_last = Instant::now();
-    let mut next_tx_allowed_ms: u64 = 0;
+    let mut control_rem = 0i64;
+    let mut flood_rem = 0i64;
     let start_ms = Instant::now().as_millis() as u64;
+    let mut tx_budget_last_ms = start_ms;
+    let mut next_tx_allowed_ms: u64 = 0;
     let mut base_ms = start_ms;
+    let mut last_rx_activity_ms = start_ms;
+    let mut rx_active_since: Option<u64> = None;
 
     let mut current_cfg = (
         initial.frequency_hz,
@@ -168,7 +172,16 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
     let mut last_adapt_events = 0u32;
 
     loop {
-        let now = Instant::now().as_millis() as u64;
+        let mut now = Instant::now().as_millis() as u64;
+        // Re-arm RX if no IRQ or watchdog recovery occurred for a minute.
+        if now.saturating_sub(last_rx_activity_ms) >= 60_000 {
+            debug!("radio: RX watchdog re-arm");
+            device.recover_receive().await;
+            rx_active_since = None;
+            now = Instant::now().as_millis() as u64;
+            last_rx_activity_ms = now;
+        }
+
         // Re-read every iteration: a private-key import changes the node hash
         // used to place floods, and must take effect without a reboot.
         let node_key = current_public_key();
@@ -189,12 +202,25 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
         // Runtime slot-width override.
         let override_ms = TX_SLOT_MS_OVERRIDE.load(Ordering::Relaxed) as u64;
         if override_ms != 0 {
-            if override_ms != slot_ms || !slot_override_active {
-                slot_ms = override_ms.clamp(SLOT_MIN_MS, 5000);
+            let clamped = override_ms.clamp(SLOT_MIN_MS, 5000);
+            if clamped != slot_ms || !slot_override_active {
+                let stale = rebase_floods(&mut floods, now, base_ms, slot_ms, clamped);
+                if stale > 0 {
+                    add_telemetry(|tel| {
+                        tel.tx_stale = tel.tx_stale.saturating_add(stale);
+                    });
+                }
+                slot_ms = clamped;
                 base_ms = now;
                 slot_override_active = true;
             }
         } else if slot_override_active {
+            let stale = rebase_floods(&mut floods, now, base_ms, slot_ms, auto_slot_ms);
+            if stale > 0 {
+                add_telemetry(|tel| {
+                    tel.tx_stale = tel.tx_stale.saturating_add(stale);
+                });
+            }
             slot_ms = auto_slot_ms;
             base_ms = now;
             slot_override_active = false;
@@ -235,23 +261,41 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
         let total_max = ferrix_core::scheduler::tx_budget_max(af);
         let control_max = total_max * 25 / 100;
         let flood_max = total_max - control_max;
-        let elapsed_ms = now.saturating_sub(tx_budget_last.as_millis() as u64) as i64;
-        if elapsed_ms > 0 {
-            let total_refill = elapsed_ms * duty_pct / 100;
-            let control_refill = total_refill * 25 / 100;
-            control_budget_ms = (control_budget_ms + control_refill).min(control_max);
-            flood_budget_ms = (flood_budget_ms + total_refill - control_refill).min(flood_max);
-            tx_budget_last = Instant::now();
-        }
-        control_budget_ms = control_budget_ms.min(control_max);
-        flood_budget_ms = flood_budget_ms.min(flood_max);
+        let elapsed_ms = now.saturating_sub(tx_budget_last_ms) as i64;
+        refill_budgets(
+            elapsed_ms,
+            duty_pct,
+            control_max,
+            flood_max,
+            &mut control_budget_ms,
+            &mut flood_budget_ms,
+            &mut control_rem,
+            &mut flood_rem,
+        );
+        tx_budget_last_ms = now;
 
         let preamble = preamble_for(current_cfg.2);
-        let mut wake_at = u64::MAX;
+        let mut wake_at = last_rx_activity_ms.saturating_add(60_000);
         let mut budget_wait_ms = 0u64;
         let mut pick: Option<(TxPacket, TxLane, u32)> = None;
 
-        if now >= next_tx_allowed_ms {
+        // Avoid transmitting on top of an inbound frame after preamble detection,
+        // bounded to 2.5 s so false noise preambles cannot stall TX forever.
+        let rx_busy = if device.is_receiving() {
+            let since = *rx_active_since.get_or_insert(now);
+            let until = since.saturating_add(2_500);
+            if now < until {
+                wake_at = wake_at.min(until);
+                true
+            } else {
+                false
+            }
+        } else {
+            rx_active_since = None;
+            false
+        };
+
+        if now >= next_tx_allowed_ms && !rx_busy {
             // Control lane first.
             if let Some(req) = control.front() {
                 let airtime = ferrix_core::airtime::estimate_airtime_ms(
@@ -266,21 +310,22 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
                 }
             }
 
-            // Then the next due flood slot.
+            // Then the next due flood slot (evict stale slots regardless of budget).
             if pick.is_none() {
                 if let Some((index, due)) = due_flood(&floods, now, base_ms, slot_ms) {
+                    if now > due.saturating_add(FLOOD_MAX_AGE_SLOTS.saturating_mul(slot_ms)) {
+                        floods[index] = None;
+                        add_telemetry(|tel| {
+                            tel.tx_stale = tel.tx_stale.saturating_add(1);
+                        });
+                        continue;
+                    }
                     let req = floods[index].as_ref().unwrap().req;
                     let airtime = ferrix_core::airtime::estimate_airtime_ms(
                         req.len, current_cfg.2, current_cfg.3, current_cfg.4, preamble,
                     );
                     if duty_pct >= 100 || flood_budget_ms >= airtime as i64 {
                         let slot = floods[index].take().unwrap();
-                        if now > due.saturating_add(FLOOD_MAX_AGE_SLOTS.saturating_mul(slot_ms)) {
-                            add_telemetry(|tel| {
-                                tel.tx_stale = tel.tx_stale.saturating_add(1);
-                            });
-                            continue;
-                        }
                         pick = Some((slot.req, TxLane::Flood, airtime));
                     } else if duty_pct > 0 {
                         let deficit = airtime as i64 - flood_budget_ms;
@@ -320,8 +365,11 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
                 now.saturating_sub(req.queued_at_ms)
             );
             let success = device.transmit(&req.data[..req.len]).await == TxOutcome::Sent;
+            let after_tx = Instant::now().as_millis() as u64;
+            rx_active_since = None;
+            last_rx_activity_ms = after_tx;
             if success {
-                next_tx_allowed_ms = Instant::now().as_millis() as u64 + TX_GAP_MS;
+                next_tx_allowed_ms = after_tx + TX_GAP_MS;
                 if duty_pct < 100 {
                     if lane == TxLane::Control {
                         control_budget_ms = (control_budget_ms - airtime as i64).max(0);
@@ -355,12 +403,11 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
                 if req.attempts + 1 < TX_MAX_ATTEMPTS {
                     let mut retry = req;
                     retry.attempts += 1;
-                    let now_retry = Instant::now().as_millis() as u64;
                     let requeued = match lane {
                         TxLane::Flood => assign_flood(
                             &mut floods,
                             retry,
-                            now_retry,
+                            after_tx,
                             base_ms,
                             slot_ms,
                             &node_key,
@@ -380,7 +427,7 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
         }
 
         if now < next_tx_allowed_ms {
-            wake_at = next_tx_allowed_ms;
+            wake_at = wake_at.min(next_tx_allowed_ms);
         }
         if let Some(due) = next_flood_due(&floods, base_ms, slot_ms) {
             if due > now {
@@ -390,25 +437,22 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
         if budget_wait_ms > 0 {
             wake_at = wake_at.min(now.saturating_add(budget_wait_ms));
         }
-        if (!control.is_empty() || !background.is_empty()) && budget_wait_ms == 0 {
+        if now >= next_tx_allowed_ms
+            && !rx_busy
+            && (!control.is_empty() || !background.is_empty())
+            && budget_wait_ms == 0
+        {
             wake_at = now;
         }
-        let wait_ms = if wake_at == u64::MAX {
-            60_000
-        } else {
-            wake_at.saturating_sub(now).clamp(1, 60_000)
-        };
+        let wait_ms = wake_at.saturating_sub(now).clamp(1, 60_000);
 
-        // Re-arm RX if no packet arrives for a minute. Safety net for a stuck
-        // DIO1 line.
-        let rx_fut = embassy_time::with_timeout(
-            Duration::from_secs(60),
-            device.receive(&mut rx_buf),
-        );
+        // Arm RX only if not already listening so wakeups preserve duty-cycle
+        // sleep/wake phase, and await only the cancel-safe IRQ pin in `select`.
+        device.arm_receive().await;
 
         match select(
             select4(
-                rx_fut,
+                device.wait_rx_irq(),
                 LORA_TX_CHANNEL.receive(),
                 LORA_CFG_CHANNEL.receive(),
                 Timer::after(Duration::from_millis(wait_ms)),
@@ -426,31 +470,53 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
                     remember_cancel(&mut cancelled, hash, Instant::now().as_millis() as u64);
                 }
             }
-            Either::First(Either4::First(rx_result)) => match rx_result {
-                Ok(RxOutcome::Packet { len, rssi, snr }) => {
-                    rx_backoff_ms = 50;
-                    info!("radio: RX {} bytes, RSSI: {} dBm, SNR: {} dB", len, rssi, snr);
-                    let copy_len = len.min(256);
-                    let mut packet_data = [0u8; 256];
-                    packet_data[..copy_len].copy_from_slice(&rx_buf[..copy_len]);
-                    let _ = LORA_RX_CHANNEL.try_send((copy_len, rssi, snr, packet_data));
-                }
-                Ok(RxOutcome::DutyCycleEnd) => {}
-                Ok(RxOutcome::Error) => {
-                    if rx_backoff_ms <= 50 {
-                        debug!("radio: RX error");
-                    }
-                    // Yield first. Without this, an immediate RX error after a
-                    // failed reconfiguration turns this task into a busy loop.
+            Either::First(Either4::First(irq_ok)) => {
+                if !irq_ok {
                     Timer::after_millis(rx_backoff_ms).await;
                     rx_backoff_ms = (rx_backoff_ms * 2).min(1000);
                     device.recover_receive().await;
+                    rx_active_since = None;
+                    last_rx_activity_ms = Instant::now().as_millis() as u64;
+                } else {
+                    match device.handle_rx_irq(&mut rx_buf).await {
+                        Some(RxOutcome::Packet { len, rssi, snr }) => {
+                            rx_backoff_ms = 50;
+                            rx_active_since = None;
+                            last_rx_activity_ms = Instant::now().as_millis() as u64;
+                            info!("radio: RX {} bytes, RSSI: {} dBm, SNR: {} dB", len, rssi, snr);
+                            let copy_len = len.min(256);
+                            let mut packet_data = [0u8; 256];
+                            packet_data[..copy_len].copy_from_slice(&rx_buf[..copy_len]);
+                            let _ = LORA_RX_CHANNEL.try_send((copy_len, rssi, snr, packet_data));
+                        }
+                        Some(RxOutcome::DutyCycleEnd) => {
+                            rx_active_since = None;
+                            last_rx_activity_ms = Instant::now().as_millis() as u64;
+                        }
+                        Some(RxOutcome::Error) => {
+                            if rx_backoff_ms <= 50 {
+                                debug!("radio: RX error");
+                            }
+                            // Yield first. Without this, an immediate RX error after a
+                            // failed reconfiguration turns this task into a busy loop.
+                            Timer::after_millis(rx_backoff_ms).await;
+                            rx_backoff_ms = (rx_backoff_ms * 2).min(1000);
+                            device.recover_receive().await;
+                            rx_active_since = None;
+                            last_rx_activity_ms = Instant::now().as_millis() as u64;
+                        }
+                        None => {
+                            let now_irq = Instant::now().as_millis() as u64;
+                            if device.is_receiving() {
+                                rx_active_since.get_or_insert(now_irq);
+                            } else {
+                                rx_active_since = None;
+                            }
+                            last_rx_activity_ms = now_irq;
+                        }
+                    }
                 }
-                Err(_) => {
-                    debug!("radio: RX watchdog re-arm");
-                    device.recover_receive().await;
-                }
-            },
+            }
             Either::First(Either4::Second(req)) => {
                 let received_at = Instant::now().as_millis() as u64;
                 if take_cancelled(&mut cancelled, req.hash) {
@@ -491,16 +557,30 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
                     continue;
                 }
                 if device.configure(&cfg).await {
+                    let now_cfg = Instant::now().as_millis() as u64;
+                    let new_auto = slot_width_ms(
+                        requested.2,
+                        requested.3,
+                        requested.4,
+                        preamble_for(requested.2),
+                    );
+                    let stale = rebase_floods(&mut floods, now_cfg, base_ms, slot_ms, new_auto);
+                    if stale > 0 {
+                        add_telemetry(|tel| {
+                            tel.tx_stale = tel.tx_stale.saturating_add(stale);
+                        });
+                    }
                     current_cfg = requested;
-                    auto_slot_ms =
-                        slot_width_ms(current_cfg.2, current_cfg.3, current_cfg.4, preamble_for(current_cfg.2));
+                    auto_slot_ms = new_auto;
                     slot_ms = auto_slot_ms;
                     // Let the top-of-loop override check re-apply a manual
                     // slot width against the new modulation parameters.
                     slot_override_active = false;
-                    base_ms = Instant::now().as_millis() as u64;
-                    last_adapt_ms = base_ms;
+                    base_ms = now_cfg;
+                    last_adapt_ms = now_cfg;
                     rx_backoff_ms = 50;
+                    rx_active_since = None;
+                    last_rx_activity_ms = now_cfg;
                     info!(
                         "radio: reconfigured to {} Hz (SF{}, BW{}k, CR 4/{}), {} dBm",
                         cfg.frequency_hz,
@@ -510,6 +590,8 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
                         cfg.tx_power_dbm
                     );
                 } else {
+                    rx_active_since = None;
+                    last_rx_activity_ms = Instant::now().as_millis() as u64;
                     error!("radio: reconfigure failed; keeping previous settings");
                 }
             }
