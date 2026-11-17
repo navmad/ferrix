@@ -66,8 +66,9 @@ for ThinkNode M1 pinouts and memory mapping.
   - `0` plain, `1` CLI data, `2` signed, `3` CLI command.
 - Repeater/room CLI replies (`txt_type = 1`) are shown in the app's management
   console.
-- Signed room posts (`txt_type = 2`): the 4-byte signing prefix is parsed,
-  ACKed with the signed hash, and delivered to the app as the V3 `extra` field.
+- Signed room posts (`txt_type = 2`): received posts parse the 4-byte signing
+  prefix, ACK with the signed hash, and deliver it to the app as the V3
+  `extra` field.
 - Per-contact `sync_since` advances from signed posts and is used in room
   logins, so rooms do not replay their entire backlog.
 - Channel datagrams (`GRP_DATA`): send with `CMD_SEND_CHANNEL_DATA`, receive as
@@ -313,13 +314,10 @@ To enter the bootloader from the CLI, run `dfu`, or double-click reset. A
 
 | Area | Limitation |
 |---|---|
-| Repeater/room server role | No separate repeater/room firmware yet (`roles/repeater` is a placeholder). The companion forwards only in off-grid client-repeat mode on the reserved frequencies; it is not a remotely managed repeater or room server. |
+| Node roles | Only the `companion` role is implemented; repeater, room server, and sensor node roles are not implemented (`roles/repeater` is a placeholder). Off-grid client-repeat forwarding is supported on allowed frequencies. |
 | Older app protocol | Message frames are always V3; apps that report protocol < 3 are not supported. |
-| Signed channel text | Signed direct/room posts are supported; signed group-channel text is passed through as a channel message. |
-| Region allow/deny lists | Only flood-scope keys and the default scope are implemented; repeater region ACLs are not. |
 | Factory reset | Handler implemented; the destructive path has not been exercised on hardware. |
-| OTA | USB UF2 drag-and-drop and Serial DFU only; no BLE/Wi-Fi OTA A/B update page. |
-| Wi-Fi/MQTT/telnet | Not present on this board firmware. |
+| OTA | USB UF2 drag-and-drop and Serial DFU only; no BLE OTA. |
 
 ---
 
