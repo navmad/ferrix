@@ -149,10 +149,12 @@ where
 
     /// Hardware reset pulse.
     pub async fn reset(&mut self) -> Result<(), Error> {
-        self.reset.set_low().map_err(|_| Error::Pin)?;
-        self.delay.delay_ms(20).await;
         self.reset.set_high().map_err(|_| Error::Pin)?;
-        self.delay.delay_ms(20).await;
+        self.delay.delay_ms(2).await;
+        self.reset.set_low().map_err(|_| Error::Pin)?;
+        self.delay.delay_ms(10).await;
+        self.reset.set_high().map_err(|_| Error::Pin)?;
+        self.delay.delay_ms(10).await;
         self.wait_idle().await
     }
 
@@ -214,9 +216,25 @@ where
         }
     }
 
+    /// Write the previous-frame baseline into red RAM (`0x26`) without
+    /// refreshing the panel.
+    ///
+    /// Call after waking from deep sleep / hardware reset so the next
+    /// differential refresh (`display_frame_fast`) compares against the image
+    /// currently on the panel even if controller RAM did not survive reset.
+    pub async fn sync_previous(&mut self, frame: &[u8]) -> Result<(), Error> {
+        self.check_frame(frame)?;
+        self.set_window().await?;
+        self.set_cursor().await?;
+        self.send_cmd(0x26).await?;
+        self.send_data(frame).await
+    }
+
     /// Full refresh with the OTP waveform (about 2 s, clears ghosting).
     pub async fn display_frame_full(&mut self, frame: &[u8]) -> Result<(), Error> {
         self.check_frame(frame)?;
+        self.send_cmd(0x3C).await?;
+        self.send_data(&[0x05]).await?;
         self.set_window().await?;
         self.set_cursor().await?;
 
@@ -237,14 +255,20 @@ where
     /// Fast differential refresh (about 400 ms, no black/white flash).
     pub async fn display_frame_fast(&mut self, frame: &[u8]) -> Result<(), Error> {
         self.check_frame(frame)?;
+        // HiZ border waveform avoids accumulating a 1-px edge residue across
+        // repeated partial updates.
+        self.send_cmd(0x3C).await?;
+        self.send_data(&[0x80]).await?;
         self.set_window().await?;
         self.set_cursor().await?;
 
         self.send_cmd(0x24).await?;
         self.send_data(frame).await?;
 
+        // 0xFF = Mode 2 differential update + disable analog charge pump and
+        // clock afterward (unlike 0xFC which leaves HV analog and osc powered).
         self.send_cmd(0x22).await?;
-        self.send_data(&[0xFC]).await?;
+        self.send_data(&[0xFF]).await?;
         self.send_cmd(0x20).await?;
         self.wait_idle().await?;
 
@@ -260,7 +284,10 @@ where
         self.display_frame_fast(frame).await
     }
 
-    /// Enter deep sleep.
+    /// Enter deep sleep mode 1 (`0x10, 0x01`).
+    ///
+    /// Both `display_frame_full` (`0xF7`) and `display_frame_fast` (`0xFF`)
+    /// already power down the analog charge pump and oscillator on completion.
     pub async fn sleep(&mut self) -> Result<(), Error> {
         self.send_cmd(0x10).await?;
         self.send_data(&[0x01]).await?;

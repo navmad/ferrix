@@ -624,6 +624,36 @@ pub async fn handle_text_cli<W: TextSink>(
                 let _ = sender.send(msg).await;
             }
         }
+        "get refresh.interval" | "get display.refresh" => {
+            let secs = crate::state::display_refresh_interval_secs();
+            let mut s: heapless::String<48> = heapless::String::new();
+            if secs == 0 {
+                let _ = write!(s, "  -> 0 (on update)\r\n");
+            } else {
+                let _ = write!(s, "  -> {} s\r\n", secs);
+            }
+            let _ = sender.send(s.as_bytes()).await;
+        }
+        s if s.starts_with("set refresh.interval ") || s.starts_with("set display.refresh ") => {
+            let val = s.rsplit_once(' ').map(|(_, v)| v.trim()).unwrap_or("");
+            match val.parse::<u16>() {
+                Ok(secs) if crate::state::set_display_refresh_interval_secs(secs) => {
+                    host.request_save_config();
+                    let mut resp: heapless::String<64> = heapless::String::new();
+                    if secs == 0 {
+                        let _ = write!(resp, "  -> OK (refresh on update)\r\n");
+                    } else {
+                        let _ = write!(resp, "  -> OK (refresh every {} s)\r\n", secs);
+                    }
+                    let _ = sender.send(resp.as_bytes()).await;
+                }
+                _ => {
+                    let _ = sender
+                        .send(b"  -> Error: expected 0 (on update) or 300..=3600 seconds\r\n")
+                        .await;
+                }
+            }
+        }
         "get multiacks" | "get multi.acks" => {
             let val = crate::state::prefs().multi_acks.min(1);
             node.multi_acks = val;
@@ -1538,7 +1568,7 @@ pub async fn handle_text_cli<W: TextSink>(
             let _ = sender.send( b"  -> OK (Config saved to flash)\r\n").await;
         }
         "help" => {
-            let _ = sender.send( b"  -> Commands:\r\n  ->   Identity: get/set name, get/set prv.key, get public.key\r\n  ->   Radio:    get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq/tx/sf/bw/cr, get/set repeat, get/set rxduty, get/set af, get/set dutycycle, get/set hash-mode, stats-radio\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, get/set autoadd, get/set multiacks, advert, time, channels\r\n  ->   System:   save, ver, board, get/set leds, stats-core, stats-packets, clear stats/contacts/messages, reboot\r\n").await;
+            let _ = sender.send( b"  -> Commands:\r\n  ->   Identity: get/set name, get/set prv.key, get public.key\r\n  ->   Radio:    get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq/tx/sf/bw/cr, get/set repeat, get/set rxduty, get/set af, get/set dutycycle, get/set hash-mode, stats-radio\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, get/set autoadd, get/set multiacks, advert, time, channels\r\n  ->   System:   save, ver, board, get/set leds, get/set sound, get/set refresh.interval, stats-core, stats-packets, clear stats/contacts/messages, reboot\r\n").await;
         }
         _ => {
             let _ = sender.send( b"  -> Unknown command\r\n").await;

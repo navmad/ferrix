@@ -21,9 +21,6 @@ use ferrix_hal::radio::LoraRadio;
 use heapless::Vec;
 use meshcore_wire::packet::Packet;
 
-/// E-ink pages between full refreshes.
-const CLICKS_PER_FULL_REFRESH: u32 = 10;
-
 /// Semantic events from the input task.
 pub static INPUT_EVENT_CHANNEL: Channel<CriticalSectionRawMutex, InputEvent, 4> = Channel::new();
 
@@ -270,6 +267,158 @@ fn sync_gps(node: &mut CompanionNode<'_>) {
     node.longitude = gps.longitude;
 }
 
+/// Snapshot of displayed state used to decide whether an active page has a
+/// meaningful update when `display_refresh_interval_secs() == 0` (excluding
+/// 1-minute wall-clock and uptime ticks).
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct UiSnapshot {
+    page: u8,
+    battery_pct: u8,
+    time_synced: bool,
+    msg_len: usize,
+    msg_epoch: u32,
+    ble_connected: bool,
+    forwarding: bool,
+    advert_epoch: u32,
+    radio_freq_hz: u32,
+    radio_bw_khz: u32,
+    radio_sf: u8,
+    radio_cr: u8,
+    radio_tx_dbm: i8,
+    radio_rx_duty: bool,
+    radio_af_tenths: u8,
+    client_repeat: bool,
+    path_hash_mode: u8,
+    rx_packets: u32,
+    tx_beacons: u32,
+    gps_enabled: bool,
+    gps_fix: bool,
+    gps_lat_e4: i32,
+    gps_lon_e4: i32,
+    advert_loc_policy: u8,
+    leds_disabled: bool,
+    buzzer_enabled: bool,
+}
+
+impl UiSnapshot {
+    fn capture<B: AppBoard>(
+        board: &B,
+        node: &CompanionNode<'_>,
+        msg_epoch: u32,
+        advert_epoch: u32,
+    ) -> Self {
+        let msg_len = MESSAGE_LOG.lock(|m| m.borrow().len());
+        let (
+            radio_freq_hz,
+            radio_bw_khz,
+            radio_sf,
+            radio_cr,
+            radio_tx_dbm,
+            radio_rx_duty,
+            radio_af_tenths,
+            client_repeat,
+            path_hash_mode,
+        ) = RADIO_SETTINGS.lock(|r| {
+            let s = r.borrow();
+            (
+                s.frequency_hz,
+                s.bw_khz,
+                s.sf,
+                s.cr,
+                s.tx_power_dbm,
+                s.rx_duty_cycle,
+                s.airtime_factor_tenths,
+                s.client_repeat,
+                s.path_hash_mode,
+            )
+        });
+        let (rx_packets, tx_beacons) = RADIO_TELEMETRY.lock(|t| {
+            let tel = t.borrow();
+            (tel.rx_packets, tel.tx_beacons.max(node.tx_beacons))
+        });
+
+        Self {
+            page: node.current_page,
+            battery_pct: node.battery_percentage,
+            time_synced: node.epoch_time > 1_700_000_000,
+            msg_len,
+            msg_epoch,
+            ble_connected: BLE_CONNECTED.load(core::sync::atomic::Ordering::Relaxed),
+            forwarding: forwarding_enabled(),
+            advert_epoch,
+            radio_freq_hz,
+            radio_bw_khz,
+            radio_sf,
+            radio_cr,
+            radio_tx_dbm,
+            radio_rx_duty,
+            radio_af_tenths,
+            client_repeat,
+            path_hash_mode,
+            rx_packets,
+            tx_beacons,
+            gps_enabled: board.gps_enabled(),
+            gps_fix: node.gps_fix,
+            gps_lat_e4: (node.latitude * 10_000.0) as i32,
+            gps_lon_e4: (node.longitude * 10_000.0) as i32,
+            advert_loc_policy: prefs().advert_loc_policy,
+            leds_disabled: leds_disabled(),
+            buzzer_enabled: buzzer_enabled(),
+        }
+    }
+
+    fn message_changed(&self, prev: &Self) -> bool {
+        self.msg_len != prev.msg_len || self.msg_epoch != prev.msg_epoch
+    }
+
+    fn differs_on_visible_page(&self, prev: &Self) -> bool {
+        if self.page != prev.page
+            || self.battery_pct != prev.battery_pct
+            || self.time_synced != prev.time_synced
+        {
+            return true;
+        }
+        match self.page {
+            // Page 0: MESH
+            0 => {
+                self.forwarding != prev.forwarding
+                    || self.message_changed(prev)
+                    || self.ble_connected != prev.ble_connected
+            }
+            // Page 1: INBOX
+            1 => self.message_changed(prev),
+            // Page 2: RADAR
+            2 => self.advert_epoch != prev.advert_epoch,
+            // Page 3: RADIO
+            3 => {
+                self.radio_freq_hz != prev.radio_freq_hz
+                    || self.radio_bw_khz != prev.radio_bw_khz
+                    || self.radio_sf != prev.radio_sf
+                    || self.radio_cr != prev.radio_cr
+                    || self.radio_tx_dbm != prev.radio_tx_dbm
+                    || self.radio_rx_duty != prev.radio_rx_duty
+                    || self.radio_af_tenths != prev.radio_af_tenths
+            }
+            // Page 4: SIGNAL
+            4 => self.rx_packets != prev.rx_packets || self.tx_beacons != prev.tx_beacons,
+            // Page 5: POSITION
+            5 => {
+                self.gps_enabled != prev.gps_enabled
+                    || self.gps_fix != prev.gps_fix
+                    || self.gps_lat_e4 != prev.gps_lat_e4
+                    || self.gps_lon_e4 != prev.gps_lon_e4
+                    || self.advert_loc_policy != prev.advert_loc_policy
+            }
+            // Page 6: OFF-GRID
+            6 => self.client_repeat != prev.client_repeat || self.radio_freq_hz != prev.radio_freq_hz,
+            // Page 7: SETTINGS
+            7 => self.leds_disabled != prev.leds_disabled || self.buzzer_enabled != prev.buzzer_enabled,
+            // Page 8: SYSTEM
+            _ => self.radio_rx_duty != prev.radio_rx_duty || self.path_hash_mode != prev.path_hash_mode,
+        }
+    }
+}
+
 pub async fn run<B: AppBoard, R: LoraRadio>(
     board: &mut B,
     mesh: &mut MeshEngine<'_>,
@@ -281,8 +430,9 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
     let mut ticker = Ticker::every(Duration::from_secs(2));
     let mut tick: u32 = 0;
     let mut ui = UiState::default();
-    let mut clicks_since_full: u32 = 0;
-    let mut pending_messages = MESSAGE_LOG.lock(|m| m.borrow().len());
+    let mut msg_epoch: u32 = 0;
+    let mut advert_epoch: u32 = 0;
+    let mut last_snapshot = UiSnapshot::capture(board, node, msg_epoch, advert_epoch);
 
     loop {
         // Keep the app node aligned with shared state changed by a transport
@@ -487,6 +637,7 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                             storage::contacts::queue_remove(key).await;
                         }
                         storage::request_contacts();
+                        advert_epoch = advert_epoch.wrapping_add(1);
                     }
                     InboundAction::ReceivedGroupText { channel_idx, path_len, packet: grp } => {
                         info!("MeshCore Group Text [ch {}]: <{}> {}", channel_idx, grp.sender.as_str(), grp.message.as_str());
@@ -522,6 +673,7 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                             storage::messages::queue_consume().await;
                         }
                         storage::messages::queue_append(message).await;
+                        msg_epoch = msg_epoch.wrapping_add(1);
                         board.beep(UiSound::Notify).await;
 
                         // Prompt companion app with PUSH_CODE_MSG_WAITING (0x83)
@@ -556,6 +708,7 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                             storage::messages::queue_consume().await;
                         }
                         storage::messages::queue_append_channel_data(item).await;
+                        msg_epoch = msg_epoch.wrapping_add(1);
 
                         let mut msg_wait = heapless::Vec::<u8, 256>::new();
                         let _ = msg_wait.push(protocol::PUSH_CODE_MSG_WAITING);
@@ -636,6 +789,7 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                             storage::messages::queue_consume().await;
                         }
                         storage::messages::queue_append(message).await;
+                        msg_epoch = msg_epoch.wrapping_add(1);
                         board.beep(UiSound::Notify).await;
 
                         // Prompt companion app with PUSH_CODE_MSG_WAITING (0x83)
@@ -801,6 +955,7 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                     mesh.set_callsign(new_name.as_str());
                     node.callsign = new_name;
                     board.render(node, &ui, false).await;
+                    last_snapshot = UiSnapshot::capture(board, node, msg_epoch, advert_epoch);
                 }
                 UsbCommand::SetPrivateKey(priv_key) => {
                     info!("Updating node private & public keys");
@@ -1070,23 +1225,11 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
             };
             board.beep(sound).await;
 
-            let clicks = match event {
-                InputEvent::NextPage | InputEvent::ActionPrimary => 1,
-                InputEvent::PrevPage | InputEvent::ActionSecondary => 2,
-                _ => 0,
-            };
-            clicks_since_full += clicks;
-            let full = if clicks_since_full >= CLICKS_PER_FULL_REFRESH {
-                clicks_since_full -= CLICKS_PER_FULL_REFRESH;
-                true
-            } else {
-                false
-            };
-
             match event {
                 InputEvent::NextPage => {
                     node.current_page = (node.current_page + 1) % board.page_count();
-                    board.render(node, &ui, full).await;
+                    board.render(node, &ui, false).await;
+                    last_snapshot = UiSnapshot::capture(board, node, msg_epoch, advert_epoch);
                 }
                 InputEvent::PrevPage => {
                     let count = board.page_count().max(1);
@@ -1095,7 +1238,8 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                     } else {
                         node.current_page - 1
                     };
-                    board.render(node, &ui, full).await;
+                    board.render(node, &ui, false).await;
+                    last_snapshot = UiSnapshot::capture(board, node, msg_epoch, advert_epoch);
                 }
                 InputEvent::ActionPrimary | InputEvent::ActionSecondary => {
                     let action = if matches!(event, InputEvent::ActionPrimary) {
@@ -1255,7 +1399,8 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                         (_, _) => {}
                     }
 
-                    board.render(node, &ui, full).await;
+                    board.render(node, &ui, false).await;
+                    last_snapshot = UiSnapshot::capture(board, node, msg_epoch, advert_epoch);
                 }
                 _ => {}
             }
@@ -1265,24 +1410,28 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
             protocol::keepalive_tick();
             sync_gps(node);
 
-            // The companion transport drains MESSAGE_LOG when the app syncs.
-            // Redraw when the pending set changes so the badge and inbox do
-            // not stay stale between the slower board-driven refreshes.
-            let pending = MESSAGE_LOG.lock(|m| m.borrow().len());
-            if pending != pending_messages {
-                pending_messages = pending;
-                board.render(node, &ui, false).await;
-            }
-
-            board.tick(node, &ui, tick).await;
-
-            // Sample the battery every 10 s (5 ticks).
+            // Sample the battery every 10 s (5 ticks) before checking for UI
+            // updates so a 1% drop is reflected immediately when interval == 0.
             if tick % 5 == 0 {
                 if let Some(mv) = board.sample_battery().await {
                     node.battery_millivolts = mv;
                     node.battery_percentage = ferrix_core::battery::millivolts_to_percentage(mv);
                 }
             }
+
+            let snapshot = UiSnapshot::capture(board, node, msg_epoch, advert_epoch);
+            let needs_render = if display_refresh_interval_secs() == 0 {
+                snapshot.differs_on_visible_page(&last_snapshot)
+            } else {
+                // Keep unread/inbox responsive between longer periodic intervals.
+                snapshot.page <= 1 && snapshot.message_changed(&last_snapshot)
+            };
+            if needs_render {
+                board.render(node, &ui, false).await;
+                last_snapshot = snapshot;
+            }
+
+            board.tick(node, &ui, tick).await;
 
             // Heartbeat LED flash every 2 s (each tick), unless disabled.
             if !leds_disabled() {
@@ -1293,5 +1442,96 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
         }
         }
 
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::UiSnapshot;
+
+    fn base_snapshot() -> UiSnapshot {
+        UiSnapshot {
+            page: 0,
+            battery_pct: 85,
+            time_synced: true,
+            msg_len: 0,
+            msg_epoch: 0,
+            ble_connected: false,
+            forwarding: false,
+            advert_epoch: 0,
+            radio_freq_hz: 910_525_000,
+            radio_bw_khz: 62_500,
+            radio_sf: 7,
+            radio_cr: 5,
+            radio_tx_dbm: 22,
+            radio_rx_duty: false,
+            radio_af_tenths: 10,
+            client_repeat: false,
+            path_hash_mode: 0,
+            rx_packets: 0,
+            tx_beacons: 0,
+            gps_enabled: false,
+            gps_fix: false,
+            gps_lat_e4: 0,
+            gps_lon_e4: 0,
+            advert_loc_policy: 0,
+            leds_disabled: false,
+            buzzer_enabled: true,
+        }
+    }
+
+    #[test]
+    fn snapshot_ignores_unrelated_changes_per_page() {
+        let base = base_snapshot();
+
+        // Battery change affects every page (top bar).
+        let mut bat = base;
+        bat.battery_pct = 84;
+        assert!(bat.differs_on_visible_page(&base));
+
+        // BLE connect triggers on page 0 (MESH), ignored on page 3 (RADIO).
+        let mut ble = base;
+        ble.ble_connected = true;
+        assert!(ble.differs_on_visible_page(&base));
+        let mut radio = base;
+        radio.page = 3;
+        let mut radio_ble = radio;
+        radio_ble.ble_connected = true;
+        assert!(!radio_ble.differs_on_visible_page(&radio));
+
+        // New message triggers on page 0 and page 1, ignored on page 3.
+        let mut msg = base;
+        msg.msg_len = 1;
+        msg.msg_epoch = 1;
+        assert!(msg.differs_on_visible_page(&base));
+        let mut inbox = base;
+        inbox.page = 1;
+        let mut inbox_msg = inbox;
+        inbox_msg.msg_epoch = 1;
+        assert!(inbox_msg.differs_on_visible_page(&inbox));
+        let mut radio_msg = radio;
+        radio_msg.msg_len = 1;
+        radio_msg.msg_epoch = 1;
+        assert!(!radio_msg.differs_on_visible_page(&radio));
+
+        // Advert triggers on page 2 (RADAR), packet RX on page 4 (SIGNAL), GPS on page 5.
+        let mut radar = base;
+        radar.page = 2;
+        let mut radar_adv = radar;
+        radar_adv.advert_epoch = 1;
+        assert!(radar_adv.differs_on_visible_page(&radar));
+
+        let mut sig = base;
+        sig.page = 4;
+        let mut sig_rx = sig;
+        sig_rx.rx_packets = 1;
+        assert!(sig_rx.differs_on_visible_page(&sig));
+
+        let mut pos = base;
+        pos.page = 5;
+        let mut pos_fix = pos;
+        pos_fix.gps_fix = true;
+        pos_fix.gps_lat_e4 = 377_749;
+        assert!(pos_fix.differs_on_visible_page(&pos));
     }
 }

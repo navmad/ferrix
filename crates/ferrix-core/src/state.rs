@@ -286,6 +286,43 @@ pub fn init_buzzer_enabled(enabled: bool) {
     BUZZER_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
+/// Minimum non-zero periodic display refresh interval in seconds.
+pub const DISPLAY_REFRESH_INTERVAL_MIN_SECS: u16 = 300;
+/// Maximum non-zero periodic display refresh interval in seconds.
+pub const DISPLAY_REFRESH_INTERVAL_MAX_SECS: u16 = 3600;
+
+/// Periodic display refresh interval in seconds (`0` = refresh on update;
+/// otherwise `300..=3600` seconds).
+pub static DISPLAY_REFRESH_INTERVAL_SECS: core::sync::atomic::AtomicU16 =
+    core::sync::atomic::AtomicU16::new(0);
+
+/// Whether `secs` is valid (`0` or within `300..=3600`).
+pub fn is_valid_display_refresh_interval(secs: u16) -> bool {
+    secs == 0
+        || (DISPLAY_REFRESH_INTERVAL_MIN_SECS..=DISPLAY_REFRESH_INTERVAL_MAX_SECS).contains(&secs)
+}
+
+pub fn display_refresh_interval_secs() -> u16 {
+    DISPLAY_REFRESH_INTERVAL_SECS.load(Ordering::Relaxed)
+}
+
+pub fn set_display_refresh_interval_secs(secs: u16) -> bool {
+    if !is_valid_display_refresh_interval(secs) {
+        return false;
+    }
+    DISPLAY_REFRESH_INTERVAL_SECS.store(secs, Ordering::Relaxed);
+    true
+}
+
+pub fn init_display_refresh_interval_secs(secs: u16) {
+    let valid = if is_valid_display_refresh_interval(secs) {
+        secs
+    } else {
+        0
+    };
+    DISPLAY_REFRESH_INTERVAL_SECS.store(valid, Ordering::Relaxed);
+}
+
 pub const DEFAULT_PUBLIC_SECRET: [u8; 16] = [
     0x8b, 0x33, 0x87, 0xe9, 0xc5, 0xcd, 0xea, 0x6a, 0xc9, 0xe5, 0xed, 0xba, 0xa1, 0x15, 0xcd, 0x72,
 ];
@@ -567,5 +604,24 @@ mod tests {
         assert_eq!(MAX_CHANNELS, 40);
         assert_eq!(MAX_CONTACTS, 350);
         assert_eq!(MAX_CONNECTIONS, 4);
+    }
+
+    #[test]
+    fn display_refresh_interval_validation() {
+        assert!(is_valid_display_refresh_interval(0));
+        assert!(!is_valid_display_refresh_interval(1));
+        assert!(!is_valid_display_refresh_interval(299));
+        assert!(is_valid_display_refresh_interval(300));
+        assert!(is_valid_display_refresh_interval(600));
+        assert!(is_valid_display_refresh_interval(3600));
+        assert!(!is_valid_display_refresh_interval(3601));
+
+        init_display_refresh_interval_secs(42);
+        assert_eq!(display_refresh_interval_secs(), 0);
+        assert!(!set_display_refresh_interval_secs(120));
+        assert_eq!(display_refresh_interval_secs(), 0);
+        assert!(set_display_refresh_interval_secs(900));
+        assert_eq!(display_refresh_interval_secs(), 900);
+        init_display_refresh_interval_secs(0);
     }
 }

@@ -69,6 +69,7 @@ pub const STARTUP_CONFIG: ferrix_nrf52::startup::StartupConfig =
 pub use ferrix_nrf52::seed::hardware_seed;
 
 static EPD_FRAMEBUFFER: StaticCell<EpdFrameBuffer> = StaticCell::new();
+static EPD_PREV_FRAMEBUFFER: StaticCell<EpdFrameBuffer> = StaticCell::new();
 
 // ---------------------------------------------------------------------------
 // Battery telemetry
@@ -231,7 +232,8 @@ impl ThinkNodeBoard {
             PanelConfig::THINKNODE_M1,
         );
         let fb = EPD_FRAMEBUFFER.init(EpdFrameBuffer::new());
-        self.display = Some(ThinkNodeDisplay::new(epd, fb));
+        let prev_fb = EPD_PREV_FRAMEBUFFER.init(EpdFrameBuffer::new());
+        self.display = Some(ThinkNodeDisplay::new(epd, fb, prev_fb));
     }
 }
 

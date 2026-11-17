@@ -96,19 +96,33 @@ pub type ThinkNodeEpd = Ssd1681<
     Delay,
 >;
 
+/// Maximum number of consecutive fast partial updates before forcing a full
+/// clearing refresh to remove DC bias and ghosting.
+const FULL_REFRESH_INTERVAL: u32 = 16;
+
 /// ThinkNode M1 display wrapper.
 pub struct ThinkNodeDisplay {
     epd: ThinkNodeEpd,
     fb: &'static mut EpdFrameBuffer,
+    prev_fb: &'static mut EpdFrameBuffer,
     sleeping: bool,
+    has_frame: bool,
+    partial_count: u32,
 }
 
 impl ThinkNodeDisplay {
-    pub fn new(epd: ThinkNodeEpd, fb: &'static mut EpdFrameBuffer) -> Self {
+    pub fn new(
+        epd: ThinkNodeEpd,
+        fb: &'static mut EpdFrameBuffer,
+        prev_fb: &'static mut EpdFrameBuffer,
+    ) -> Self {
         Self {
             epd,
             fb,
+            prev_fb,
             sleeping: false,
+            has_frame: false,
+            partial_count: 0,
         }
     }
 
@@ -132,15 +146,38 @@ impl ThinkNodeDisplay {
         Ok(())
     }
 
-    /// Render and flush the dashboard with a fast differential refresh.
+    /// Render and flush the dashboard, skipping identical frames and forcing a
+    /// full clearing refresh every [`FULL_REFRESH_INTERVAL`] partial updates.
     pub async fn render_dashboard(
         &mut self,
         node: &CompanionNode<'_>,
         ui: &UiState,
     ) -> Result<(), ferrix_ssd1681::Error> {
-        self.wake().await?;
         ui::render_dashboard(node, ui, self.fb);
-        self.epd.display_frame_fast(&self.fb.buffer).await
+        if self.has_frame && self.fb.buffer == self.prev_fb.buffer {
+            return Ok(());
+        }
+
+        if !self.has_frame || self.partial_count >= FULL_REFRESH_INTERVAL {
+            self.wake().await?;
+            self.epd.display_frame_full(&self.fb.buffer).await?;
+            self.partial_count = 0;
+        } else {
+            if self.sleeping {
+                self.epd.init().await?;
+                // `prev_fb` holds the exact image currently on the panel;
+                // restore it to `0x26` so Mode 2 differential refresh has an
+                // intact baseline even if deep sleep / reset wiped RAM.
+                self.epd.sync_previous(&self.prev_fb.buffer).await?;
+                self.sleeping = false;
+            }
+            self.epd.display_frame_fast(&self.fb.buffer).await?;
+            self.partial_count += 1;
+        }
+
+        self.prev_fb.buffer.copy_from_slice(&self.fb.buffer);
+        self.has_frame = true;
+        Ok(())
     }
 
     /// Render the dashboard with a full OTP clearing refresh.
@@ -151,7 +188,11 @@ impl ThinkNodeDisplay {
     ) -> Result<(), ferrix_ssd1681::Error> {
         self.wake().await?;
         ui::render_dashboard(node, ui, self.fb);
-        self.epd.display_frame_full(&self.fb.buffer).await
+        self.epd.display_frame_full(&self.fb.buffer).await?;
+        self.prev_fb.buffer.copy_from_slice(&self.fb.buffer);
+        self.has_frame = true;
+        self.partial_count = 0;
+        Ok(())
     }
 
     /// Render the boot splash.
@@ -161,7 +202,11 @@ impl ThinkNodeDisplay {
     ) -> Result<(), ferrix_ssd1681::Error> {
         self.wake().await?;
         ui::render_boot(node, self.fb);
-        self.epd.display_frame_full(&self.fb.buffer).await
+        self.epd.display_frame_full(&self.fb.buffer).await?;
+        self.prev_fb.buffer.copy_from_slice(&self.fb.buffer);
+        self.has_frame = true;
+        self.partial_count = 0;
+        Ok(())
     }
 
     /// Put the panel into deep sleep.

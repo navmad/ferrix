@@ -73,6 +73,8 @@ struct SettingsRecord {
     ble_pin: u32,
     radio_freq_hz: u32,
     radio_bw_khz: u32,
+    display_refresh_interval_secs: u16,
+    _pad_after_refresh: u16,
 }
 
 #[repr(C, align(4))]
@@ -84,10 +86,13 @@ struct ChannelRecord {
     _pad: [u8; 3],
 }
 
+const LEGACY_SETTINGS_V1_SIZE: usize = 188;
+
 const _: () = assert!(core::mem::size_of::<SettingsRecord>() <= SCRATCH_SIZE);
 const _: () = assert!(core::mem::offset_of!(SettingsRecord, offgrid_home_freq) == 108);
 const _: () = assert!(core::mem::offset_of!(SettingsRecord, ble_pin) == 176);
-const _: () = assert!(core::mem::size_of::<SettingsRecord>() == 188);
+const _: () = assert!(core::mem::offset_of!(SettingsRecord, display_refresh_interval_secs) == 188);
+const _: () = assert!(core::mem::size_of::<SettingsRecord>() == 192);
 const _: () = assert!(core::mem::size_of::<ChannelRecord>() <= SCRATCH_SIZE);
 
 pub use crate::state::{BLE_PIN, CUSTOM_PRIV_KEY, NODE_CALLSIGN};
@@ -273,9 +278,17 @@ pub fn init_config(
     let (settings, channels, found) = util::block_on(async {
         let mut map = open(&mut flash, &region);
         let settings = match map.fetch_item::<&[u8]>(&mut sbuf.0, &SETTINGS_KEY).await {
-            Ok(Some(value)) if value.len() >= core::mem::size_of::<SettingsRecord>() => {
-                let rec =
-                    unsafe { core::ptr::read_unaligned(value.as_ptr() as *const SettingsRecord) };
+            Ok(Some(value)) if value.len() >= LEGACY_SETTINGS_V1_SIZE => {
+                let mut rec = core::mem::MaybeUninit::<SettingsRecord>::zeroed();
+                let copy_len = value.len().min(core::mem::size_of::<SettingsRecord>());
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        value.as_ptr(),
+                        rec.as_mut_ptr() as *mut u8,
+                        copy_len,
+                    );
+                }
+                let rec = unsafe { rec.assume_init() };
                 if rec.magic == CONFIG_MAGIC && rec.version == CONFIG_VERSION {
                     Some(rec)
                 } else {
@@ -361,6 +374,7 @@ pub fn init_config(
 
         crate::state::init_leds_disabled(cfg.ui_disabled_flags & 1 != 0);
         crate::state::init_buzzer_enabled(cfg.ui_disabled_flags & 2 == 0);
+        crate::state::init_display_refresh_interval_secs(cfg.display_refresh_interval_secs);
 
         crate::state::update_prefs(|p| {
             p.scope_name = cfg.flood_scope_name;
@@ -396,6 +410,7 @@ pub fn init_config(
         (name, priv_key)
     } else {
         info!("Storage: No persistent config found; initializing defaults");
+        crate::state::init_display_refresh_interval_secs(0);
         BLE_PIN.store(DEFAULT_BLE_PIN, core::sync::atomic::Ordering::Relaxed);
         let mut name = String::<32>::new();
         let _ = name.push_str(default_name);
@@ -472,6 +487,8 @@ fn assemble_settings() -> SettingsRecord {
         ble_pin: BLE_PIN.load(core::sync::atomic::Ordering::Relaxed),
         radio_freq_hz: freq,
         radio_bw_khz: bw,
+        display_refresh_interval_secs: crate::state::display_refresh_interval_secs(),
+        _pad_after_refresh: 0,
     }
 }
 

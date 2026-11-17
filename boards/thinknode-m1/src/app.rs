@@ -14,8 +14,6 @@ use crate::gps;
 
 /// Seconds the display frontlight stays on after the last button press.
 const BACKLIGHT_IDLE_SECS: u64 = 15;
-/// 2 s ticks between idle EPD fast refreshes (300 * 2 s = 10 minutes).
-const IDLE_REFRESH_TICKS: u32 = 300;
 
 /// Board-side devices used by the application loop.
 pub struct ThinkNodeApp {
@@ -26,6 +24,7 @@ pub struct ThinkNodeApp {
     buzzer: PassiveBuzzer<'static>,
     backlight_on: bool,
     backlight_deadline: Instant,
+    last_periodic_refresh: Instant,
 }
 
 impl ThinkNodeApp {
@@ -35,6 +34,7 @@ impl ThinkNodeApp {
         battery_adc: saadc::Saadc<'static, 1>,
         buzzer: PassiveBuzzer<'static>,
     ) -> Self {
+        let now = Instant::now();
         Self {
             led,
             display,
@@ -42,9 +42,10 @@ impl ThinkNodeApp {
             battery_buf: [0i16; 1],
             buzzer,
             backlight_on: false,
-            backlight_deadline: Instant::now()
+            backlight_deadline: now
                 .checked_add(Duration::from_secs(BACKLIGHT_IDLE_SECS))
                 .unwrap(),
+            last_periodic_refresh: now,
         }
     }
 }
@@ -98,6 +99,7 @@ impl AppBoard for ThinkNodeApp {
     }
 
     async fn render(&mut self, node: &CompanionNode<'_>, ui: &UiState, full: bool) {
+        self.last_periodic_refresh = Instant::now();
         if let Some(d) = &mut self.display {
             if full {
                 d.render_dashboard_full(node, ui).await.ok();
@@ -120,7 +122,7 @@ impl AppBoard for ThinkNodeApp {
         }
     }
 
-    async fn tick(&mut self, node: &CompanionNode<'_>, ui: &UiState, tick: u32) {
+    async fn tick(&mut self, node: &CompanionNode<'_>, ui: &UiState, _tick: u32) {
         if self.backlight_on && Instant::now() >= self.backlight_deadline {
             if let Some(d) = &mut self.display {
                 d.set_backlight(false);
@@ -129,7 +131,10 @@ impl AppBoard for ThinkNodeApp {
             self.backlight_on = false;
         }
 
-        if tick % IDLE_REFRESH_TICKS == 0 {
+        let interval_secs = ferrix_core::state::display_refresh_interval_secs();
+        if interval_secs > 0
+            && self.last_periodic_refresh.elapsed() >= Duration::from_secs(interval_secs as u64)
+        {
             self.render(node, ui, false).await;
         }
     }
