@@ -17,7 +17,7 @@ members = [
 default-members = ["firmware/thinknode-m1-companion"]
 
 [workspace.package]
-version = "1.18.0"
+version = "1.18.1"
 
 # Local patch: nrf-softdevice panics when a GAP/GATTS event arrives after the
 # peer disconnected (e.g. a late CONN_PARAM_UPDATE). See the patch notes in

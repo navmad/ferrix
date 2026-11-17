@@ -5,7 +5,7 @@ Elecrow **ThinkNode M1**: nRF52840, SX1262 LoRa, 1.54" e-paper, two buttons,
 battery monitoring, USB CDC and BLE. It targets **MeshCore v1.18** companion
 apps and the v1.18 over-the-air protocol.
 
-- Firmware version: `1.18.0-ferrix` (from root `Cargo.toml` `[workspace.package]`; overridable at build time via `FERRIX_VERSION` and `FERRIX_BUILD_DATE` / `SOURCE_DATE_EPOCH`)
+- Firmware version: `1.18.1-ferrix` (from root `Cargo.toml` `[workspace.package]`; overridable at build time via `FERRIX_VERSION` and `FERRIX_BUILD_DATE` / `SOURCE_DATE_EPOCH`)
 - USB product/vendor: `ThinkNode M1 Companion` / `MeshCore`
 - Board identity: `ThinkNode M1`
 - Configuration layout: version 1
