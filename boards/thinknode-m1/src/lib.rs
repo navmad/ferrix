@@ -436,6 +436,7 @@ impl CompanionBoard for ThinkNodeBoard {
                 .render_dashboard(node, &ferrix_runtime::app::UiState::default())
                 .await
                 .ok();
+            display.sleep().await.ok();
             defmt::info!("Dashboard rendered successfully!");
         }
     }

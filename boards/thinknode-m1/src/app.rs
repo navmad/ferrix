@@ -14,6 +14,8 @@ use crate::gps;
 
 /// Seconds the display frontlight stays on after the last button press.
 const BACKLIGHT_IDLE_SECS: u64 = 15;
+/// 2 s ticks between idle EPD fast refreshes (300 * 2 s = 10 minutes).
+const IDLE_REFRESH_TICKS: u32 = 300;
 
 /// Board-side devices used by the application loop.
 pub struct ThinkNodeApp {
@@ -102,6 +104,9 @@ impl AppBoard for ThinkNodeApp {
             } else {
                 d.render_dashboard(node, ui).await.ok();
             }
+            if !self.backlight_on {
+                d.sleep().await.ok();
+            }
         }
     }
 
@@ -119,11 +124,12 @@ impl AppBoard for ThinkNodeApp {
         if self.backlight_on && Instant::now() >= self.backlight_deadline {
             if let Some(d) = &mut self.display {
                 d.set_backlight(false);
+                d.sleep().await.ok();
             }
             self.backlight_on = false;
         }
 
-        if tick % 30 == 0 {
+        if tick % IDLE_REFRESH_TICKS == 0 {
             self.render(node, ui, false).await;
         }
     }

@@ -100,11 +100,24 @@ pub type ThinkNodeEpd = Ssd1681<
 pub struct ThinkNodeDisplay {
     epd: ThinkNodeEpd,
     fb: &'static mut EpdFrameBuffer,
+    sleeping: bool,
 }
 
 impl ThinkNodeDisplay {
     pub fn new(epd: ThinkNodeEpd, fb: &'static mut EpdFrameBuffer) -> Self {
-        Self { epd, fb }
+        Self {
+            epd,
+            fb,
+            sleeping: false,
+        }
+    }
+
+    async fn wake(&mut self) -> Result<(), ferrix_ssd1681::Error> {
+        if self.sleeping {
+            self.epd.init().await?;
+            self.sleeping = false;
+        }
+        Ok(())
     }
 
     /// Turn the frontlight/backlight on or off.
@@ -114,7 +127,9 @@ impl ThinkNodeDisplay {
 
     /// Initialise the panel controller.
     pub async fn init(&mut self) -> Result<(), ferrix_ssd1681::Error> {
-        self.epd.init().await
+        self.epd.init().await?;
+        self.sleeping = false;
+        Ok(())
     }
 
     /// Render and flush the dashboard with a fast differential refresh.
@@ -123,6 +138,7 @@ impl ThinkNodeDisplay {
         node: &CompanionNode<'_>,
         ui: &UiState,
     ) -> Result<(), ferrix_ssd1681::Error> {
+        self.wake().await?;
         ui::render_dashboard(node, ui, self.fb);
         self.epd.display_frame_fast(&self.fb.buffer).await
     }
@@ -133,6 +149,7 @@ impl ThinkNodeDisplay {
         node: &CompanionNode<'_>,
         ui: &UiState,
     ) -> Result<(), ferrix_ssd1681::Error> {
+        self.wake().await?;
         ui::render_dashboard(node, ui, self.fb);
         self.epd.display_frame_full(&self.fb.buffer).await
     }
@@ -142,12 +159,17 @@ impl ThinkNodeDisplay {
         &mut self,
         node: &CompanionNode<'_>,
     ) -> Result<(), ferrix_ssd1681::Error> {
+        self.wake().await?;
         ui::render_boot(node, self.fb);
         self.epd.display_frame_full(&self.fb.buffer).await
     }
 
     /// Put the panel into deep sleep.
     pub async fn sleep(&mut self) -> Result<(), ferrix_ssd1681::Error> {
-        self.epd.sleep().await
+        if !self.sleeping {
+            self.epd.sleep().await?;
+            self.sleeping = true;
+        }
+        Ok(())
     }
 }
