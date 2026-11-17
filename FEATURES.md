@@ -303,7 +303,8 @@ Set `FERRIX_VERSION` (e.g. `v1.18.0`) and optionally `FERRIX_BUILD_DATE` /
 `SOURCE_DATE_EPOCH` to override the compiled version/date metadata. Pushing a
 `v*` tag triggers [`.github/workflows/release.yml`](.github/workflows/release.yml),
 which runs the host test suite and publishes `ferrix-thinknode-m1-companion.uf2`
-to GitHub Releases.
+and `ferrix-thinknode-m1-companion.zip` (webflasher/DFU package) to GitHub
+Releases.
 
 To enter the bootloader from the CLI, run `dfu`, or double-click reset. A
 1200-baud touch also triggers DFU when the CDC port is responsive.

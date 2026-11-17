@@ -38,15 +38,21 @@ jobs:
             pkg: ferrix-thinknode-m1-companion
             target: thumbv7em-none-eabihf
             uf2_base: "0x26000"
+            dfu_dev_type: "0x0052"
+            dfu_sd_req: "0x00B6"
           # Future firmware targets can be appended here, e.g.:
           # - firmware: thinknode-m1-repeater
           #   pkg: ferrix-thinknode-m1-repeater
           #   target: thumbv7em-none-eabihf
           #   uf2_base: "0x26000"
+          #   dfu_dev_type: "0x0052"
+          #   dfu_sd_req: "0x00B6"
           # - firmware: wio-tracker-l1-pro-companion
           #   pkg: ferrix-wio-tracker-l1-pro-companion
           #   target: thumbv7em-none-eabihf
           #   uf2_base: "0x26000"
+          #   dfu_dev_type: "0x0052"
+          #   dfu_sd_req: "0x00B6"
     steps:
       - uses: actions/checkout@v4
 
@@ -54,6 +60,13 @@ jobs:
         with:
           targets: ${{ matrix.target }}
           components: llvm-tools
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install adafruit-nrfutil
+        run: pip install adafruit-nrfutil
 
       - name: Resolve firmware version
         env:
@@ -67,7 +80,7 @@ jobs:
             echo "FERRIX_VERSION=$REF_NAME" >> "$GITHUB_ENV"
           fi
 
-      - name: Build ${{ matrix.firmware }} UF2
+      - name: Build ${{ matrix.firmware }} UF2 and DFU ZIP
         run: |
           cargo build -p "${{ matrix.pkg }}" --target "${{ matrix.target }}" --release
           OBJCOPY="$(find "$(rustc --print sysroot)" -name llvm-objcopy | head -n 1)"
@@ -83,12 +96,22 @@ jobs:
             "dist/ferrix-${{ matrix.firmware }}.bin" \
             -o "dist/ferrix-${{ matrix.firmware }}.uf2" \
             -b "${{ matrix.uf2_base }}"
+          "$OBJCOPY" -O ihex \
+            "target/${{ matrix.target }}/release/ferrix" \
+            "dist/ferrix-${{ matrix.firmware }}.hex"
+          adafruit-nrfutil dfu genpkg \
+            --dev-type "${{ matrix.dfu_dev_type }}" \
+            --sd-req "${{ matrix.dfu_sd_req }}" \
+            --application "dist/ferrix-${{ matrix.firmware }}.hex" \
+            "dist/ferrix-${{ matrix.firmware }}.zip"
 
-      - name: Upload firmware artifact
+      - name: Upload firmware artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ferrix-${{ matrix.firmware }}
-          path: dist/ferrix-${{ matrix.firmware }}.uf2
+          path: |
+            dist/ferrix-${{ matrix.firmware }}.uf2
+            dist/ferrix-${{ matrix.firmware }}.zip
           if-no-files-found: error
 
   release:
@@ -109,4 +132,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: artifacts/*.uf2
+          files: |
+            artifacts/*.uf2
+            artifacts/*.zip
