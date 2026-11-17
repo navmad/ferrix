@@ -373,7 +373,7 @@ pub fn init_config(
             p.telemetry_mode_base = cfg.telemetry_mode_base.min(2);
             p.telemetry_mode_loc = cfg.telemetry_mode_loc.min(2);
             p.telemetry_mode_env = cfg.telemetry_mode_env.min(2);
-            p.multi_acks = cfg.multi_acks;
+            p.multi_acks = cfg.multi_acks.min(1);
         });
 
         BLE_PIN.store(

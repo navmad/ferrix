@@ -82,6 +82,18 @@ impl LoraRadio for ChannelRadio {
         queued_at_ms: u64,
         hash: [u8; 8],
     ) -> Result<(), Self::Error> {
+        self.transmit_lane_at(payload, lane, queued_at_ms, queued_at_ms, hash)
+            .await
+    }
+
+    async fn transmit_lane_at(
+        &mut self,
+        payload: &[u8],
+        lane: TxLane,
+        queued_at_ms: u64,
+        due_at_ms: u64,
+        hash: [u8; 8],
+    ) -> Result<(), Self::Error> {
         if payload.is_empty() || payload.len() > 256 {
             return Ok(());
         }
@@ -90,6 +102,7 @@ impl LoraRadio for ChannelRadio {
             data: [0u8; 256],
             lane,
             queued_at_ms,
+            due_at_ms,
             hash,
             attempts: 0,
         };
@@ -134,7 +147,7 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
     // yielding: the executor is cooperative, and a tight loop here starves the
     // main loop, USB and BLE tasks.
     let mut rx_backoff_ms = 50u64;
-    let mut control: Deque<TxPacket, CONTROL_QUEUE> = Deque::new();
+    let mut control: Vec<TxPacket, CONTROL_QUEUE> = Vec::new();
     let mut background: Deque<TxPacket, 2> = Deque::new();
     let mut floods: [Option<FloodSlot>; FLOOD_SLOTS] = [None; FLOOD_SLOTS];
     let mut cancelled: Vec<([u8; 8], u64), 16> = Vec::new();
@@ -296,13 +309,17 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
         };
 
         if now >= next_tx_allowed_ms && !rx_busy {
-            // Control lane first.
-            if let Some(req) = control.front() {
+            // Control lane first (earliest queued packet whose due_at_ms has arrived).
+            if let Some(idx) = control.iter().position(|req| req.due_at_ms <= now) {
                 let airtime = ferrix_core::airtime::estimate_airtime_ms(
-                    req.len, current_cfg.2, current_cfg.3, current_cfg.4, preamble,
+                    control[idx].len,
+                    current_cfg.2,
+                    current_cfg.3,
+                    current_cfg.4,
+                    preamble,
                 );
                 if duty_pct >= 100 || control_budget_ms >= airtime as i64 {
-                    let req = control.pop_front().unwrap();
+                    let req = control.remove(idx);
                     pick = Some((req, TxLane::Control, airtime));
                 } else if duty_pct > 0 {
                     let deficit = airtime as i64 - control_budget_ms;
@@ -414,7 +431,7 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
                         )
                         .is_ok(),
                         TxLane::Background => background.push_back(retry).is_ok(),
-                        TxLane::Control => control.push_back(retry).is_ok(),
+                        TxLane::Control => control.push(retry).is_ok(),
                     };
                     if !requeued {
                         add_telemetry(|tel| {
@@ -429,6 +446,14 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
         if now < next_tx_allowed_ms {
             wake_at = wake_at.min(next_tx_allowed_ms);
         }
+        if let Some(due) = control
+            .iter()
+            .filter(|req| req.due_at_ms > now)
+            .map(|req| req.due_at_ms)
+            .min()
+        {
+            wake_at = wake_at.min(due);
+        }
         if let Some(due) = next_flood_due(&floods, base_ms, slot_ms) {
             if due > now {
                 wake_at = wake_at.min(due);
@@ -437,9 +462,10 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
         if budget_wait_ms > 0 {
             wake_at = wake_at.min(now.saturating_add(budget_wait_ms));
         }
+        let control_ready = control.iter().any(|req| req.due_at_ms <= now);
         if now >= next_tx_allowed_ms
             && !rx_busy
-            && (!control.is_empty() || !background.is_empty())
+            && (control_ready || !background.is_empty())
             && budget_wait_ms == 0
         {
             wake_at = now;
@@ -535,7 +561,7 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
                         )
                         .is_ok(),
                         TxLane::Background => background.push_back(req).is_ok(),
-                        TxLane::Control => control.push_back(req).is_ok(),
+                        TxLane::Control => control.push(req).is_ok(),
                     };
                     if !queued {
                         add_telemetry(|tel| {

@@ -18,6 +18,8 @@ pub const SLOT_MIN_MS: u64 = 100;
 pub const SLOT_MAX_MS: u64 = 1500;
 /// Quiet gap after a successful transmit.
 pub const TX_GAP_MS: u64 = 30;
+/// Delay between consecutive direct multi-ACK copies and the trailing ACK.
+pub const MULTI_ACK_SPACING_MS: u64 = 300;
 pub const TX_MAX_ATTEMPTS: u8 = 4;
 /// A flood older than this many slot widths is dropped.
 pub const FLOOD_MAX_AGE_SLOTS: u64 = 8;
@@ -29,6 +31,7 @@ pub struct TxPacket {
     pub data: [u8; 256],
     pub lane: TxLane,
     pub queued_at_ms: u64,
+    pub due_at_ms: u64,
     pub hash: [u8; 8],
     pub attempts: u8,
 }
@@ -232,6 +235,7 @@ mod tests {
             data: [0u8; 256],
             lane: TxLane::Flood,
             queued_at_ms: 0,
+            due_at_ms: 0,
             hash: [hash; 8],
             attempts: 0,
         }

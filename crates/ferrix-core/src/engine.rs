@@ -22,6 +22,7 @@ use meshcore_wire::packets::{
 use meshcore_wire::queue::{PacketQueue, SeenPacketFilter};
 use meshcore_wire::tx::TxLane;
 
+use crate::scheduler::MULTI_ACK_SPACING_MS;
 use crate::state::default_channels;
 use crate::types::{ChannelData, MAX_CHANNELS};
 
@@ -33,6 +34,9 @@ use crate::types::{ChannelData, MAX_CHANNELS};
 pub trait EngineContext: Send + Sync {
     /// Current path hash width mode (0 = 1 byte, 1 = 2 bytes, 2 = 3 bytes).
     fn path_hash_mode(&self) -> u8 { 0 }
+
+    /// Extra `PAYLOAD_TYPE_MULTIPART` ACK copies to send before a direct ACK.
+    fn extra_ack_count(&self) -> u8 { 0 }
 
     /// Contact public keys whose first byte matches `hash`.
     fn peers_by_hash(&self, _hash: u8) -> heapless::Vec<[u8; 32], 32> {
@@ -380,18 +384,77 @@ impl<'a> MeshEngine<'a> {
                 let size = pkt.path_hash_size();
                 if pkt.path[..size] == self.identity.pub_key()[..size] {
                     if self.allow_forward {
-                        let mut fwd = pkt.clone();
-                        if fwd.pop_front_hop() {
-                            let ack = if fwd.payload_type() == PAYLOAD_TYPE_ACK {
-                                AckPacket::decode(&fwd.payload[..fwd.payload_len]).ok()
-                            } else {
-                                None
-                            };
-                            self.queue_forward(fwd);
-                            if let Some(ack) = ack {
-                                return InboundAction::ReceivedAck(ack);
+                        match pkt.payload_type() {
+                            PAYLOAD_TYPE_ACK => {
+                                if is_dupe {
+                                    return InboundAction::DropDuplicate;
+                                }
+                                let mut fwd = pkt.clone();
+                                if fwd.pop_front_hop() {
+                                    if let Ok(ack) =
+                                        AckPacket::decode(&fwd.payload[..fwd.payload_len])
+                                    {
+                                        let _ = self.emit_direct_ack_burst(
+                                            &fwd.payload[..fwd.payload_len],
+                                            fwd.path_len,
+                                            &fwd.path,
+                                            0,
+                                        );
+                                        return InboundAction::ReceivedAck(ack);
+                                    }
+                                    self.queue_forward(fwd);
+                                    return InboundAction::Forwarded;
+                                }
                             }
-                            return InboundAction::Forwarded;
+                            PAYLOAD_TYPE_MULTIPART => {
+                                if let Ok(mp) =
+                                    MultipartPacket::decode(&pkt.payload[..pkt.payload_len])
+                                {
+                                    if mp.inner_type == PAYLOAD_TYPE_ACK && mp.body.len() >= 4 {
+                                        if let Ok(ack) = AckPacket::decode(&mp.body) {
+                                            let mut inner_pkt = Packet::new(
+                                                ROUTE_TYPE_DIRECT,
+                                                PAYLOAD_TYPE_ACK,
+                                            );
+                                            if inner_pkt.set_payload(&mp.body).is_ok() {
+                                                let inner_dupe =
+                                                    self.seen_filter.check_and_mark(&inner_pkt);
+                                                if is_dupe || inner_dupe {
+                                                    return InboundAction::DropDuplicate;
+                                                }
+                                                let mut fwd = pkt.clone();
+                                                if fwd.pop_front_hop() {
+                                                    let delay_ms = (mp.remaining as u64 + 1)
+                                                        * MULTI_ACK_SPACING_MS;
+                                                    let _ = self.emit_direct_ack_burst(
+                                                        &mp.body,
+                                                        fwd.path_len,
+                                                        &fwd.path,
+                                                        delay_ms,
+                                                    );
+                                                    return InboundAction::ReceivedAck(ack);
+                                                }
+                                            }
+                                        }
+                                        return InboundAction::Unhandled;
+                                    }
+                                }
+                                if is_dupe {
+                                    return InboundAction::DropDuplicate;
+                                }
+                                let mut fwd = pkt.clone();
+                                if fwd.pop_front_hop() {
+                                    self.queue_forward(fwd);
+                                    return InboundAction::Forwarded;
+                                }
+                            }
+                            _ => {
+                                let mut fwd = pkt.clone();
+                                if fwd.pop_front_hop() {
+                                    self.queue_forward(fwd);
+                                    return InboundAction::Forwarded;
+                                }
+                            }
                         }
                     }
                 }
@@ -591,11 +654,18 @@ impl<'a> MeshEngine<'a> {
                 }
                 // v1.18 uses MULTIPART for batched ACKs: the first byte is
                 // (remaining << 4 | inner_type), followed by the inner payload.
-                // Only the ACK form exists today; feed it to the normal ACK
-                // path so delivery confirmations are not lost.
+                // Check and mark the unwrapped ACK hash so subsequent copies
+                // and the trailing ACK deduplicate cleanly.
                 if let Ok(mp) = MultipartPacket::decode(&pkt.payload[..pkt.payload_len]) {
                     if mp.inner_type == PAYLOAD_TYPE_ACK && mp.body.len() >= 4 {
                         if let Ok(ack) = AckPacket::decode(&mp.body) {
+                            let mut inner_pkt =
+                                Packet::new(pkt.route_type(), PAYLOAD_TYPE_ACK);
+                            if inner_pkt.set_payload(&mp.body).is_ok()
+                                && self.seen_filter.check_and_mark(&inner_pkt)
+                            {
+                                return InboundAction::DropDuplicate;
+                            }
                             return InboundAction::ReceivedAck(ack);
                         }
                     }
@@ -842,9 +912,56 @@ impl<'a> MeshEngine<'a> {
         out_path_len: u8,
         out_path: &[u8; 64],
     ) -> Result<Packet, ()> {
-        let pkt = ack.to_packet(ROUTE_TYPE_FLOOD)?;
         let (route, path_len) = route_for(out_path_len);
-        Ok(self.finish_outbound(pkt, route, path_len, out_path))
+        if route == ROUTE_TYPE_DIRECT {
+            let mut ack_bytes = [0u8; 6];
+            let alen = ack.encode(&mut ack_bytes)?;
+            self.emit_direct_ack_burst(&ack_bytes[..alen], path_len, out_path, 0)
+        } else {
+            let pkt = ack.to_packet(ROUTE_TYPE_FLOOD)?;
+            Ok(self.finish_outbound(pkt, route, path_len, out_path))
+        }
+    }
+
+    fn emit_direct_ack_burst(
+        &mut self,
+        ack_bytes: &[u8],
+        out_path_len: u8,
+        out_path: &[u8; 64],
+        initial_delay_ms: u64,
+    ) -> Result<Packet, ()> {
+        let extra = self.context.extra_ack_count().min(15);
+        let now = now_ms();
+
+        let mut ack_pkt = Packet::new(ROUTE_TYPE_DIRECT, PAYLOAD_TYPE_ACK);
+        ack_pkt.set_payload(ack_bytes)?;
+        if Packet::is_valid_path_len(out_path_len) {
+            ack_pkt.path_len = out_path_len;
+            let n = ack_pkt.path_byte_len();
+            ack_pkt.path[..n].copy_from_slice(&out_path[..n]);
+        } else {
+            ack_pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
+        }
+        self.seen_filter.mark_seen(ack_pkt.calculate_packet_hash());
+
+        let mut offset = initial_delay_ms;
+        for rem in (1..=extra).rev() {
+            let mp = MultipartPacket::new(rem, PAYLOAD_TYPE_ACK, ack_bytes)?;
+            let mut mp_pkt = mp.to_packet(ROUTE_TYPE_DIRECT)?;
+            mp_pkt.path_len = ack_pkt.path_len;
+            let n = mp_pkt.path_byte_len();
+            mp_pkt.path[..n].copy_from_slice(&ack_pkt.path[..n]);
+            self.seen_filter.mark_seen(mp_pkt.calculate_packet_hash());
+            let _ = self
+                .tx_queue
+                .push_control_at(mp_pkt, now, now.saturating_add(offset));
+            offset = offset.saturating_add(MULTI_ACK_SPACING_MS);
+        }
+
+        let _ = self
+            .tx_queue
+            .push_control_at(ack_pkt.clone(), now, now.saturating_add(offset));
+        Ok(ack_pkt)
     }
 
     fn queue_path_return(
@@ -1077,5 +1194,225 @@ mod tests {
             .iter()
             .any(|q| q.lane == TxLane::Flood
                 && q.packet.payload_type() == PAYLOAD_TYPE_GRP_TXT));
+    }
+
+    struct MultiAckContext {
+        extra_acks: u8,
+        out_path_len: u8,
+        out_path: [u8; 64],
+    }
+
+    impl EngineContext for MultiAckContext {
+        fn extra_ack_count(&self) -> u8 {
+            self.extra_acks
+        }
+
+        fn peers_by_hash(&self, hash: u8) -> heapless::Vec<[u8; 32], 32> {
+            let mut peers = heapless::Vec::new();
+            let _ = peers.push([hash; 32]);
+            peers
+        }
+
+        fn peer_path(&self, _pub_key: &[u8; 32]) -> (u8, [u8; 64]) {
+            (self.out_path_len, self.out_path)
+        }
+    }
+
+    fn make_direct_txt_to(id: &LocalIdentity, src: u8, text: &str) -> Packet {
+        let peer = [src; 32];
+        let secret = id.shared_secret(&peer).unwrap();
+        let msg = TxtMsgPacket::new(
+            id.pub_key()[0],
+            src,
+            1234,
+            meshcore_wire::packets::txtmsg::TXT_TYPE_PLAIN,
+            0,
+            text,
+            &peer,
+        )
+        .unwrap();
+        let mut pkt = msg.to_packet(ROUTE_TYPE_DIRECT, &secret).unwrap();
+        pkt.set_path_hash_size_and_count(1, 0);
+        pkt
+    }
+
+    #[test]
+    fn direct_dm_ack_without_multi_acks_emits_single_ack() {
+        let id = identity();
+        let pkt = make_direct_txt_to(&id, 0x33, "hi");
+        let mut out_path = [0u8; 64];
+        out_path[0] = 0xAA;
+        let ctx = MultiAckContext {
+            extra_acks: 0,
+            out_path_len: 1,
+            out_path,
+        };
+        let mut engine = MeshEngine::new(id, ADV_TYPE_REPEATER, &ctx);
+
+        assert!(matches!(
+            engine.handle_inbound_packet(pkt, 6),
+            InboundAction::ReceivedDirectText { .. }
+        ));
+        assert_eq!(engine.tx_queue.len(), 1);
+        let q0 = engine.tx_queue.pop().unwrap();
+        assert_eq!(q0.lane, TxLane::Control);
+        assert_eq!(q0.packet.route_type(), ROUTE_TYPE_DIRECT);
+        assert_eq!(q0.packet.payload_type(), PAYLOAD_TYPE_ACK);
+        assert_eq!(q0.packet.path_len, 1);
+        assert_eq!(q0.packet.path[0], 0xAA);
+        assert_eq!(q0.due_at_ms, q0.queued_at_ms);
+    }
+
+    #[test]
+    fn direct_dm_ack_with_multi_acks_emits_multipart_and_spaced_ack() {
+        let id = identity();
+        let pkt = make_direct_txt_to(&id, 0x33, "hi");
+        let mut out_path = [0u8; 64];
+        out_path[0] = 0xAA;
+        out_path[1] = 0xBB;
+        let ctx = MultiAckContext {
+            extra_acks: 1,
+            out_path_len: 0x41, // 2-byte hash, 1 hop
+            out_path,
+        };
+        let mut engine = MeshEngine::new(id, ADV_TYPE_REPEATER, &ctx);
+
+        assert!(matches!(
+            engine.handle_inbound_packet(pkt, 6),
+            InboundAction::ReceivedDirectText { .. }
+        ));
+        assert_eq!(engine.tx_queue.len(), 2);
+
+        let q0 = engine.tx_queue.pop().unwrap();
+        assert_eq!(q0.lane, TxLane::Control);
+        assert_eq!(q0.packet.route_type(), ROUTE_TYPE_DIRECT);
+        assert_eq!(q0.packet.payload_type(), PAYLOAD_TYPE_MULTIPART);
+        assert_eq!(q0.packet.path_len, 0x41);
+        assert_eq!(&q0.packet.path[..2], &[0xAA, 0xBB]);
+        assert_eq!(q0.due_at_ms, q0.queued_at_ms);
+        let mp = MultipartPacket::decode(&q0.packet.payload[..q0.packet.payload_len]).unwrap();
+        assert_eq!(mp.remaining, 1);
+        assert_eq!(mp.inner_type, PAYLOAD_TYPE_ACK);
+
+        let q1 = engine.tx_queue.pop().unwrap();
+        assert_eq!(q1.lane, TxLane::Control);
+        assert_eq!(q1.packet.route_type(), ROUTE_TYPE_DIRECT);
+        assert_eq!(q1.packet.payload_type(), PAYLOAD_TYPE_ACK);
+        assert_eq!(q1.packet.path_len, 0x41);
+        assert_eq!(&q1.packet.path[..2], &[0xAA, 0xBB]);
+        assert_eq!(q1.due_at_ms, q1.queued_at_ms + MULTI_ACK_SPACING_MS);
+        assert_eq!(&q1.packet.payload[..q1.packet.payload_len], &mp.body[..]);
+    }
+
+    #[test]
+    fn flooded_dm_still_emits_path_return_even_with_multi_acks() {
+        let id = identity();
+        let src = 0x33u8;
+        let peer = [src; 32];
+        let secret = id.shared_secret(&peer).unwrap();
+        let msg = TxtMsgPacket::new(
+            id.pub_key()[0],
+            src,
+            1234,
+            meshcore_wire::packets::txtmsg::TXT_TYPE_PLAIN,
+            0,
+            "flooded",
+            &peer,
+        )
+        .unwrap();
+        let pkt = flood(msg.to_packet(ROUTE_TYPE_FLOOD, &secret).unwrap());
+        let ctx = MultiAckContext {
+            extra_acks: 1,
+            out_path_len: 1,
+            out_path: [0xAA; 64],
+        };
+        let mut engine = MeshEngine::new(id, ADV_TYPE_REPEATER, &ctx);
+
+        assert!(matches!(
+            engine.handle_inbound_packet(pkt, 6),
+            InboundAction::ReceivedDirectText { .. }
+        ));
+        assert_eq!(engine.tx_queue.len(), 1);
+        let q0 = engine.tx_queue.pop().unwrap();
+        assert_eq!(q0.packet.payload_type(), PAYLOAD_TYPE_PATH);
+    }
+
+    #[test]
+    fn inbound_multipart_ack_and_trailing_ack_deduplicate() {
+        let id = identity();
+        let mut engine = MeshEngine::new(id, ADV_TYPE_REPEATER, &TestContext);
+
+        let ack = AckPacket::with_extended(0xDEADBEEF, 1, 2);
+        let mut ack_bytes = [0u8; 6];
+        let alen = ack.encode(&mut ack_bytes).unwrap();
+        let mp = MultipartPacket::new(1, PAYLOAD_TYPE_ACK, &ack_bytes[..alen]).unwrap();
+        let mut mp_pkt = mp.to_packet(ROUTE_TYPE_DIRECT).unwrap();
+        mp_pkt.set_path_hash_size_and_count(1, 0);
+
+        let mut ack_pkt = ack.to_packet(ROUTE_TYPE_DIRECT).unwrap();
+        ack_pkt.set_path_hash_size_and_count(1, 0);
+
+        match engine.handle_inbound_packet(mp_pkt, 5) {
+            InboundAction::ReceivedAck(got) => assert_eq!(got.crc, 0xDEADBEEF),
+            _ => panic!("expected ReceivedAck on first MULTIPART copy"),
+        }
+        assert!(matches!(
+            engine.handle_inbound_packet(ack_pkt, 5),
+            InboundAction::DropDuplicate
+        ));
+    }
+
+    #[test]
+    fn direct_forward_multipart_ack_delays_and_deduplicates() {
+        let id = identity();
+        let self_hash = id.pub_key()[0];
+        let ctx = MultiAckContext {
+            extra_acks: 1,
+            out_path_len: 0xFF,
+            out_path: [0u8; 64],
+        };
+        let mut engine = MeshEngine::new(id, ADV_TYPE_REPEATER, &ctx);
+        engine.allow_forward = true;
+
+        let ack = AckPacket::with_extended(0xCAFEBABE, 0, 1);
+        let mut ack_bytes = [0u8; 6];
+        let alen = ack.encode(&mut ack_bytes).unwrap();
+        let mp = MultipartPacket::new(1, PAYLOAD_TYPE_ACK, &ack_bytes[..alen]).unwrap();
+        let mut mp_pkt = mp.to_packet(ROUTE_TYPE_DIRECT).unwrap();
+        mp_pkt.set_path_hash_size_and_count(1, 2);
+        mp_pkt.path[0] = self_hash;
+        mp_pkt.path[1] = 0x55;
+
+        match engine.handle_inbound_packet(mp_pkt, 5) {
+            InboundAction::ReceivedAck(got) => assert_eq!(got.crc, 0xCAFEBABE),
+            _ => panic!("expected ReceivedAck when forwarding direct MULTIPART ACK"),
+        }
+        assert_eq!(engine.tx_queue.len(), 2);
+
+        let q0 = engine.tx_queue.pop().unwrap();
+        assert_eq!(q0.lane, TxLane::Control);
+        assert_eq!(q0.packet.payload_type(), PAYLOAD_TYPE_MULTIPART);
+        assert_eq!(q0.packet.path_hash_count(), 1);
+        assert_eq!(q0.packet.path[0], 0x55);
+        // remaining = 1 => initial delay = (1 + 1) * 300ms = 600ms
+        assert_eq!(q0.due_at_ms, q0.queued_at_ms + 2 * MULTI_ACK_SPACING_MS);
+
+        let q1 = engine.tx_queue.pop().unwrap();
+        assert_eq!(q1.lane, TxLane::Control);
+        assert_eq!(q1.packet.payload_type(), PAYLOAD_TYPE_ACK);
+        assert_eq!(q1.packet.path_hash_count(), 1);
+        assert_eq!(q1.packet.path[0], 0x55);
+        assert_eq!(q1.due_at_ms, q1.queued_at_ms + 3 * MULTI_ACK_SPACING_MS);
+
+        // Trailing standard ACK from previous hop must not be re-forwarded.
+        let mut ack_pkt = ack.to_packet(ROUTE_TYPE_DIRECT).unwrap();
+        ack_pkt.set_path_hash_size_and_count(1, 2);
+        ack_pkt.path[0] = self_hash;
+        ack_pkt.path[1] = 0x55;
+        assert!(matches!(
+            engine.handle_inbound_packet(ack_pkt, 5),
+            InboundAction::DropDuplicate
+        ));
+        assert!(engine.tx_queue.is_empty());
     }
 }

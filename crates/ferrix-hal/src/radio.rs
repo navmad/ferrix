@@ -109,6 +109,17 @@ pub trait LoraRadio {
         hash: [u8; 8],
     ) -> Result<(), Self::Error>;
 
+    async fn transmit_lane_at(
+        &mut self,
+        payload: &[u8],
+        lane: TxLane,
+        queued_at_ms: u64,
+        _due_at_ms: u64,
+        hash: [u8; 8],
+    ) -> Result<(), Self::Error> {
+        self.transmit_lane(payload, lane, queued_at_ms, hash).await
+    }
+
     async fn start_receive(&mut self);
 
     async fn poll_receive(&mut self, buf: &mut [u8]) -> Option<(usize, i16, i8)>;

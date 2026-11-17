@@ -61,12 +61,13 @@ impl SeenPacketFilter {
     }
 }
 
-/// An outbound packet with its lane and enqueue time.
+/// An outbound packet with its lane, enqueue time, and earliest send time.
 #[derive(Clone, Debug)]
 pub struct QueuedPacket {
     pub packet: Packet,
     pub lane: TxLane,
     pub queued_at_ms: u64,
+    pub due_at_ms: u64,
 }
 
 /// Outbound Transmit FIFO Queue
@@ -82,16 +83,37 @@ impl PacketQueue {
     }
 
     pub fn push(&mut self, pkt: Packet, now_ms: u64, lane: TxLane) -> Result<(), QueuedPacket> {
+        self.push_at(pkt, now_ms, now_ms, lane)
+    }
+
+    pub fn push_at(
+        &mut self,
+        pkt: Packet,
+        now_ms: u64,
+        due_at_ms: u64,
+        lane: TxLane,
+    ) -> Result<(), QueuedPacket> {
         self.queue.push_back(QueuedPacket {
             packet: pkt,
             lane,
             queued_at_ms: now_ms,
+            due_at_ms,
         })
     }
 
     /// ACKs, path returns, admin replies and locally originated sends.
     pub fn push_control(&mut self, pkt: Packet, now_ms: u64) -> Result<(), QueuedPacket> {
         self.push(pkt, now_ms, TxLane::Control)
+    }
+
+    /// Control-lane packet scheduled to transmit at or after `due_at_ms`.
+    pub fn push_control_at(
+        &mut self,
+        pkt: Packet,
+        now_ms: u64,
+        due_at_ms: u64,
+    ) -> Result<(), QueuedPacket> {
+        self.push_at(pkt, now_ms, due_at_ms, TxLane::Control)
     }
 
     /// Forwarded floods, scheduled by the radio's flood calendar.

@@ -148,6 +148,10 @@ impl EngineContext for BoardEngineContext {
         crate::storage::get_path_hash_mode()
     }
 
+    fn extra_ack_count(&self) -> u8 {
+        ferrix_core::state::prefs().multi_acks.min(1)
+    }
+
     fn peers_by_hash(&self, hash: u8) -> heapless::Vec<[u8; 32], 32> {
         let mut peers = heapless::Vec::new();
         ferrix_core::state::DISCOVERED_CONTACTS.lock(|c| {

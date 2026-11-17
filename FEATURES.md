@@ -72,7 +72,9 @@ for ThinkNode M1 pinouts and memory mapping.
   logins, so rooms do not replay their entire backlog.
 - Channel datagrams (`GRP_DATA`): send with `CMD_SEND_CHANNEL_DATA`, receive as
   `PACKET_CHANNEL_DATA_RECV`, and persist in the same FIFO as text.
-- Multipart batched ACKs are parsed and fed to the delivery-confirmation path.
+- Multipart batched ACKs (`multi_acks`, `0` or `1` extra copy spaced 300 ms apart)
+  are sent for direct ACKs, forwarded along direct hops with collision-avoidance
+  delay, parsed, and deduplicated into the delivery-confirmation path.
 - Direct and channel ACKs, path returns, and companion retry support.
 
 ### Adverts and contacts
@@ -240,7 +242,7 @@ get/set name, get public.key, get/set prv.key
 get radio, get/set freq, tx, sf, bw, cr
 get/set path.hash.mode, get/set repeat (off-grid), get/set sound
 get/set leds, rxduty, af, dutycycle
-get/set autoadd, get companion
+get/set autoadd, get/set multiacks, get companion
 contacts, clear contacts
 messages, clear messages, channels
 advert, time, clock sync
@@ -313,7 +315,6 @@ To enter the bootloader from the CLI, run `dfu`, or double-click reset. A
 |---|---|
 | Repeater/room server role | No separate repeater/room firmware yet (`roles/repeater` is a placeholder). The companion forwards only in off-grid client-repeat mode on the reserved frequencies; it is not a remotely managed repeater or room server. |
 | Older app protocol | Message frames are always V3; apps that report protocol < 3 are not supported. |
-| Multipart | Batched ACKs are received; multi-ACK sending is not implemented. |
 | Signed channel text | Signed direct/room posts are supported; signed group-channel text is passed through as a channel message. |
 | Region allow/deny lists | Only flood-scope keys and the default scope are implemented; repeater region ACLs are not. |
 | Factory reset | Handler implemented; the destructive path has not been exercised on hardware. |

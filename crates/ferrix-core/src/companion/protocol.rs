@@ -946,43 +946,7 @@ impl<'a> CompanionNode<'a> {
             }
 
             CMD_APP_START => {
-                // RESP_CODE_SELF_INFO (5)
-                // Layout:
-                // [code(5), type, tx_power, max_tx_power, pubkey(32), adv_lat(i32_le), adv_lon(i32_le),
-                //  reserved(0), advert_loc_policy(0), telemetry_modes(0), manual_add_contacts(0),
-                //  radio_freq(u32_le_khz), radio_bw(u32_le_hz), radio_sf(u8), radio_cr(u8), name(str)]
-                let mut resp = Vec::<u8, 128>::new();
-                let _ = resp.push(RESP_CODE_SELF_INFO);
-                let (f, tx, sf, bw, cr) = crate::state::RADIO_SETTINGS.lock(|r| {
-                    let s = r.borrow();
-                    (s.frequency_hz, s.tx_power_dbm, s.sf, s.bw_khz, s.cr)
-                });
-                let _ = resp.push(self.advert_type); // 1 = client, 2 = repeater
-                let _ = resp.push(tx as u8); // current tx power
-                let _ = resp.push(22); // max tx power
-                let public_key = crate::state::current_public_key();
-                let _ = resp.extend_from_slice(&public_key);
-                let _ = resp.extend_from_slice(&0i32.to_le_bytes()); // adv_lat
-                let _ = resp.extend_from_slice(&0i32.to_le_bytes()); // adv_lon
-                let _ = resp.push(0); // reserved
-                let _ = resp.push(self.advert_loc_policy);
-                let _ = resp.push(
-                    (self.telemetry_mode_env << 4)
-                        | (self.telemetry_mode_loc << 2)
-                        | self.telemetry_mode_base,
-                );
-                let _ = resp.push(self.manual_add_contacts);
-                // MeshCore SELF_INFO carries frequency in kHz and bandwidth in
-                // Hz (the app divides freq by 1000 to show MHz).
-                let _ = resp.extend_from_slice(&(f / 1000).to_le_bytes()); // radio_freq in kHz
-                let bw_hz = crate::airtime::bw_khz_to_hz(bw);
-                let _ = resp.extend_from_slice(&bw_hz.to_le_bytes()); // radio_bw in Hz
-                let _ = resp.push(sf);
-                let _ = resp.push(cr);
-                let active_name = crate::state::NODE_CALLSIGN.lock(|c| c.borrow().clone());
-                let _ = resp.extend_from_slice(active_name.as_bytes());
-
-                emit(&resp);
+                emit(&self.build_self_info());
             }
 
             CMD_GET_BATT_AND_STORAGE => {
@@ -2258,54 +2222,7 @@ impl<'a> CompanionNode<'a> {
             }
 
             CMD_SET_OTHER_PARAMS => {
-                let mut ok = false;
-                if payload.len() >= 2 {
-                    let manual = payload[1];
-                    let auto_changed = manual != self.manual_add_contacts;
-                    self.manual_add_contacts = manual;
-                    crate::state::AUTOADD_SETTINGS.lock(|a| {
-                        a.borrow_mut().manual_add_contacts = manual;
-                    });
-                    if auto_changed {
-                        self.host.request_save_config();
-                    }
-                    if payload.len() >= 3 {
-                        let new_base = payload[2] & 0x03;
-                        let new_loc = (payload[2] >> 2) & 0x03;
-                        let new_env = (payload[2] >> 4) & 0x03;
-                        let new_policy = if payload.len() >= 4 {
-                            payload[3]
-                        } else {
-                            self.advert_loc_policy
-                        };
-                        let new_multi = if payload.len() >= 5 {
-                            payload[4]
-                        } else {
-                            self.multi_acks
-                        };
-                        let changed = new_base != self.telemetry_mode_base
-                            || new_loc != self.telemetry_mode_loc
-                            || new_env != self.telemetry_mode_env
-                            || new_policy != self.advert_loc_policy
-                            || new_multi != self.multi_acks;
-                        self.telemetry_mode_base = new_base;
-                        self.telemetry_mode_loc = new_loc;
-                        self.telemetry_mode_env = new_env;
-                        self.advert_loc_policy = new_policy;
-                        self.multi_acks = new_multi;
-                        update_prefs(|p| {
-                            p.telemetry_mode_base = new_base;
-                            p.telemetry_mode_loc = new_loc;
-                            p.telemetry_mode_env = new_env;
-                            p.advert_loc_policy = new_policy;
-                            p.multi_acks = new_multi;
-                        });
-                        if changed {
-                            self.host.request_save_config();
-                        }
-                    }
-                    ok = true;
-                }
+                let ok = self.apply_other_params(payload);
                 let mut resp = Vec::<u8, 4>::new();
                 let _ = resp.push(if ok { RESP_CODE_OK } else { RESP_CODE_ERR });
                 emit(&resp);
@@ -3209,6 +3126,96 @@ impl<'a> CompanionNode<'a> {
             }
         }
     }
+
+    fn build_self_info(&self) -> Vec<u8, 128> {
+        // RESP_CODE_SELF_INFO (5)
+        // Layout:
+        // [code(5), type, tx_power, max_tx_power, pubkey(32), adv_lat(i32_le), adv_lon(i32_le),
+        //  multi_acks(0..=1), advert_loc_policy(0), telemetry_modes(0), manual_add_contacts(0),
+        //  radio_freq(u32_le_khz), radio_bw(u32_le_hz), radio_sf(u8), radio_cr(u8), name(str)]
+        let mut resp = Vec::<u8, 128>::new();
+        let _ = resp.push(RESP_CODE_SELF_INFO);
+        let (f, tx, sf, bw, cr) = crate::state::RADIO_SETTINGS.lock(|r| {
+            let s = r.borrow();
+            (s.frequency_hz, s.tx_power_dbm, s.sf, s.bw_khz, s.cr)
+        });
+        let _ = resp.push(self.advert_type); // 1 = client, 2 = repeater
+        let _ = resp.push(tx as u8); // current tx power
+        let _ = resp.push(22); // max tx power
+        let public_key = crate::state::current_public_key();
+        let _ = resp.extend_from_slice(&public_key);
+        let _ = resp.extend_from_slice(&0i32.to_le_bytes()); // adv_lat
+        let _ = resp.extend_from_slice(&0i32.to_le_bytes()); // adv_lon
+        let _ = resp.push(self.multi_acks.min(1)); // multi_acks (v7+: 0 or 1)
+        let _ = resp.push(self.advert_loc_policy);
+        let _ = resp.push(
+            (self.telemetry_mode_env << 4)
+                | (self.telemetry_mode_loc << 2)
+                | self.telemetry_mode_base,
+        );
+        let _ = resp.push(self.manual_add_contacts);
+        // MeshCore SELF_INFO carries frequency in kHz and bandwidth in
+        // Hz (the app divides freq by 1000 to show MHz).
+        let _ = resp.extend_from_slice(&(f / 1000).to_le_bytes()); // radio_freq in kHz
+        let bw_hz = crate::airtime::bw_khz_to_hz(bw);
+        let _ = resp.extend_from_slice(&bw_hz.to_le_bytes()); // radio_bw in Hz
+        let _ = resp.push(sf);
+        let _ = resp.push(cr);
+        let active_name = crate::state::NODE_CALLSIGN.lock(|c| c.borrow().clone());
+        let _ = resp.extend_from_slice(active_name.as_bytes());
+        resp
+    }
+
+    fn apply_other_params(&mut self, payload: &[u8]) -> bool {
+        if payload.len() < 2 {
+            return false;
+        }
+        let manual = payload[1];
+        let auto_changed = manual != self.manual_add_contacts;
+        self.manual_add_contacts = manual;
+        crate::state::AUTOADD_SETTINGS.lock(|a| {
+            a.borrow_mut().manual_add_contacts = manual;
+        });
+        if auto_changed {
+            self.host.request_save_config();
+        }
+        if payload.len() >= 3 {
+            let new_base = payload[2] & 0x03;
+            let new_loc = (payload[2] >> 2) & 0x03;
+            let new_env = (payload[2] >> 4) & 0x03;
+            let new_policy = if payload.len() >= 4 {
+                payload[3]
+            } else {
+                self.advert_loc_policy
+            };
+            let new_multi = if payload.len() >= 5 {
+                payload[4].min(1)
+            } else {
+                self.multi_acks.min(1)
+            };
+            let changed = new_base != self.telemetry_mode_base
+                || new_loc != self.telemetry_mode_loc
+                || new_env != self.telemetry_mode_env
+                || new_policy != self.advert_loc_policy
+                || new_multi != self.multi_acks;
+            self.telemetry_mode_base = new_base;
+            self.telemetry_mode_loc = new_loc;
+            self.telemetry_mode_env = new_env;
+            self.advert_loc_policy = new_policy;
+            self.multi_acks = new_multi;
+            update_prefs(|p| {
+                p.telemetry_mode_base = new_base;
+                p.telemetry_mode_loc = new_loc;
+                p.telemetry_mode_env = new_env;
+                p.advert_loc_policy = new_policy;
+                p.multi_acks = new_multi;
+            });
+            if changed {
+                self.host.request_save_config();
+            }
+        }
+        true
+    }
 }
 
 
@@ -3258,6 +3265,31 @@ mod tests {
         );
         assert_eq!(node.battery_millivolts, 4_000);
         assert_eq!(node.battery_percentage, 77);
+    }
+
+    #[test]
+    fn multi_acks_clamped_in_set_other_params_and_reported_in_self_info() {
+        let mut node = CompanionNode::new(
+            "test",
+            "test-board",
+            0,
+            [1u8; 32],
+            [2u8; 64],
+            &TestHost,
+        );
+
+        assert!(node.apply_other_params(&[CMD_SET_OTHER_PARAMS, 0, 0, 0, 7]));
+        assert_eq!(node.multi_acks, 1);
+        assert_eq!(crate::state::prefs().multi_acks, 1);
+
+        let self_info = node.build_self_info();
+        assert_eq!(self_info[0], RESP_CODE_SELF_INFO);
+        assert_eq!(self_info[44], 1);
+
+        assert!(node.apply_other_params(&[CMD_SET_OTHER_PARAMS, 0, 0, 0, 0]));
+        assert_eq!(node.multi_acks, 0);
+        assert_eq!(crate::state::prefs().multi_acks, 0);
+        assert_eq!(node.build_self_info()[44], 0);
     }
 }
 

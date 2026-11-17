@@ -234,10 +234,11 @@ pub async fn flush_tx_queue<R: LoraRadio>(mesh: &mut MeshEngine<'_>, radio: &mut
             continue;
         };
         if radio
-            .transmit_lane(
+            .transmit_lane_at(
                 &buf[..len],
                 queued.lane,
                 queued.queued_at_ms,
+                queued.due_at_ms,
                 queued.packet.calculate_packet_hash(),
             )
             .await

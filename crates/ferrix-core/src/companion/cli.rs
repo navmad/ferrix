@@ -624,6 +624,39 @@ pub async fn handle_text_cli<W: TextSink>(
                 let _ = sender.send(msg).await;
             }
         }
+        "get multiacks" | "get multi.acks" => {
+            let val = crate::state::prefs().multi_acks.min(1);
+            node.multi_acks = val;
+            let mut s: heapless::String<16> = heapless::String::new();
+            let _ = write!(s, "> {}\r\n", val);
+            let _ = sender.send(s.as_bytes()).await;
+        }
+        s if s.starts_with("set multiacks ") || s.starts_with("set multi.acks ") => {
+            let val = s.rsplit_once(' ').map(|(_, v)| v.trim()).unwrap_or("");
+            let parsed = if matches!(val, "on" | "1" | "true") {
+                Some(1u8)
+            } else if matches!(val, "off" | "0" | "false") {
+                Some(0u8)
+            } else {
+                None
+            };
+            match parsed {
+                Some(v) => {
+                    node.multi_acks = v;
+                    crate::state::update_prefs(|p| p.multi_acks = v);
+                    host.request_save_config();
+                    let msg: &[u8] = if v != 0 {
+                        b"OK - multiacks is now ON\r\n"
+                    } else {
+                        b"OK - multiacks is now OFF\r\n"
+                    };
+                    let _ = sender.send(msg).await;
+                }
+                None => {
+                    let _ = sender.send(b"Error: must be 0/1 or on/off\r\n").await;
+                }
+            }
+        }
         "get repeat" => {
             // For a companion this reflects off-grid mode.
             let on = crate::state::offgrid_active();
@@ -1505,7 +1538,7 @@ pub async fn handle_text_cli<W: TextSink>(
             let _ = sender.send( b"  -> OK (Config saved to flash)\r\n").await;
         }
         "help" => {
-            let _ = sender.send( b"  -> Commands:\r\n  ->   Identity: get/set name, get/set prv.key, get public.key\r\n  ->   Radio:    get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq/tx/sf/bw/cr, get/set repeat, get/set rxduty, get/set af, get/set dutycycle, get/set hash-mode, stats-radio\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, get/set autoadd, advert, time, channels\r\n  ->   System:   save, ver, board, get/set leds, stats-core, stats-packets, clear stats/contacts/messages, reboot\r\n").await;
+            let _ = sender.send( b"  -> Commands:\r\n  ->   Identity: get/set name, get/set prv.key, get public.key\r\n  ->   Radio:    get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq/tx/sf/bw/cr, get/set repeat, get/set rxduty, get/set af, get/set dutycycle, get/set hash-mode, stats-radio\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, get/set autoadd, get/set multiacks, advert, time, channels\r\n  ->   System:   save, ver, board, get/set leds, stats-core, stats-packets, clear stats/contacts/messages, reboot\r\n").await;
         }
         _ => {
             let _ = sender.send( b"  -> Unknown command\r\n").await;
