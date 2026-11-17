@@ -695,13 +695,39 @@ pub async fn ble_companion_supervisor_task(
     BLE_STATUS.store(1, Ordering::Relaxed);
     info!("BLE: Initializing SoftDevice S140 subsystem...");
 
-    let sd_config = nrf_softdevice::Config {
-        clock: Some(nrf_softdevice::raw::nrf_clock_lf_cfg_t {
+    let clock_cfg = match crate::startup::lfclk_config() {
+        crate::startup::Lfclk::InternalRc => nrf_softdevice::raw::nrf_clock_lf_cfg_t {
             source: nrf_softdevice::raw::NRF_CLOCK_LF_SRC_RC as u8,
             rc_ctiv: 16,
             rc_temp_ctiv: 2,
             accuracy: nrf_softdevice::raw::NRF_CLOCK_LF_ACCURACY_500_PPM as u8,
-        }),
+        },
+        crate::startup::Lfclk::ExternalXtal(acc) => {
+            let accuracy = match acc {
+                crate::startup::LfclkAccuracy::Ppm20 => {
+                    nrf_softdevice::raw::NRF_CLOCK_LF_ACCURACY_20_PPM
+                }
+                crate::startup::LfclkAccuracy::Ppm50 => {
+                    nrf_softdevice::raw::NRF_CLOCK_LF_ACCURACY_50_PPM
+                }
+                crate::startup::LfclkAccuracy::Ppm100 => {
+                    nrf_softdevice::raw::NRF_CLOCK_LF_ACCURACY_100_PPM
+                }
+                crate::startup::LfclkAccuracy::Ppm250 => {
+                    nrf_softdevice::raw::NRF_CLOCK_LF_ACCURACY_250_PPM
+                }
+            } as u8;
+            nrf_softdevice::raw::nrf_clock_lf_cfg_t {
+                source: nrf_softdevice::raw::NRF_CLOCK_LF_SRC_XTAL as u8,
+                rc_ctiv: 0,
+                rc_temp_ctiv: 0,
+                accuracy,
+            }
+        }
+    };
+
+    let sd_config = nrf_softdevice::Config {
+        clock: Some(clock_cfg),
         common_vs_uuid: Some(nrf_softdevice::raw::ble_common_cfg_vs_uuid_t {
             vs_uuid_count: 2,
         }),

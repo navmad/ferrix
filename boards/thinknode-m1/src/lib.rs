@@ -57,10 +57,13 @@ pub const CAPABILITIES: u32 = CAP_CLIENT | CAP_GPS | CAP_EPD | CAP_BLE;
 /// Board startup configuration for ThinkNode M1.
 ///
 /// ThinkNode M1 populates the `REG1` (`VDD -> DEC4`) buck inductor (while
-/// `REG0` stays in normal/LDO mode).
+/// `REG0` stays in normal/LDO mode) and a `32.768 kHz` LFXO crystal (`XL1`/`XL2`).
 pub const STARTUP_CONFIG: ferrix_nrf52::startup::StartupConfig =
     ferrix_nrf52::startup::StartupConfig {
         dcdc_reg1: true,
+        lfclk: ferrix_nrf52::startup::Lfclk::ExternalXtal(
+            ferrix_nrf52::startup::LfclkAccuracy::Ppm50,
+        ),
     };
 
 pub use ferrix_nrf52::seed::hardware_seed;
