@@ -72,6 +72,7 @@ pub enum UsbCommand {
     SetBandwidth(u32),
     SetCodingRate(u8),
     SetPathHashMode(u8),
+    RebootToOtaDfu,
 }
 
 pub static USB_COMMAND_CHANNEL: Channel<CriticalSectionRawMutex, UsbCommand, 4> = Channel::new();

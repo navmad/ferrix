@@ -131,6 +131,7 @@ pub fn init() -> embassy_nrf::Peripherals {
 /// The S140 stack reserves priorities 0, 1 and 4, so Embassy system and
 /// peripheral interrupts are placed on 2 and 3.
 pub fn init_with(opts: StartupConfig) -> embassy_nrf::Peripherals {
+    crate::reset::clear_bootloader_magic();
     DCDC_REG1_ENABLED.store(opts.dcdc_reg1, Ordering::Relaxed);
     LFCLK_MODE.store(opts.lfclk.to_u8(), Ordering::Relaxed);
 

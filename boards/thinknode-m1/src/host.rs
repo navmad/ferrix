@@ -161,6 +161,14 @@ impl CliHost for BoardCompanionHost {
         ferrix_nrf52::reset::reboot_to_bootloader(sd_active)
     }
 
+    fn reboot_to_ota_dfu(&self) -> ! {
+        let sd_active = ferrix_core::state::BLE_STATUS.load(Ordering::Relaxed) >= 3;
+        ferrix_nrf52::reset::reboot_to_bootloader_mode(
+            sd_active,
+            ferrix_nrf52::reset::BootloaderMode::BleOta,
+        )
+    }
+
     fn board_line(&self) -> &'static str {
         "ThinkNode M1 (nRF52840, SX1262 LoRa)"
     }

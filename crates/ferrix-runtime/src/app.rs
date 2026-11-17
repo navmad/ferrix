@@ -149,6 +149,14 @@ pub trait AppBoard {
     fn set_leds_disabled(&mut self, disabled: bool);
     /// Play a UI sound. Boards without a buzzer keep the default no-op.
     async fn beep(&mut self, _sound: UiSound) {}
+    /// Prepare the board (e.g., show OTA notice and sleep display) before BLE OTA DFU reboot.
+    async fn prepare_ota_dfu(&mut self, _node: &CompanionNode<'_>, _ui: &UiState) {}
+    /// Reboot into BLE OTA DFU bootloader mode (`GPREGRET = 0xA8`).
+    fn reboot_to_ota_dfu(&mut self) -> ! {
+        loop {
+            core::hint::spin_loop();
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1233,6 +1241,14 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                     mesh.set_path_hash_mode(mode);
                     node.path_hash_mode = mode;
                 }
+                UsbCommand::RebootToOtaDfu => {
+                    info!("Entering BLE OTA DFU bootloader...");
+                    // Let pending BLE ATT write responses, PACKET_CLI_REPLY, or USB text drain.
+                    Timer::after_millis(250).await;
+                    let _ = storage::flush_pending().await;
+                    board.prepare_ota_dfu(node, &ui).await;
+                    board.reboot_to_ota_dfu();
+                }
             }
         }
         Either4::Third(event) => {
@@ -1416,6 +1432,13 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                             mesh.set_path_hash_mode(next);
                             node.path_hash_mode = next;
                             info!("Input: path hash {} byte(s)/hop", next + 1);
+                        }
+                        (8, 2) => {
+                            info!("Input: entering BLE OTA DFU bootloader");
+                            Timer::after_millis(100).await;
+                            let _ = storage::flush_pending().await;
+                            board.prepare_ota_dfu(node, &ui).await;
+                            board.reboot_to_ota_dfu();
                         }
                         (_, _) => {}
                     }

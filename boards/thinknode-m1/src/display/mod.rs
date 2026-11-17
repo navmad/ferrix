@@ -209,6 +209,20 @@ impl ThinkNodeDisplay {
         Ok(())
     }
 
+    /// Render the BLE OTA DFU notice with a full clearing refresh.
+    pub async fn render_ota_dfu(
+        &mut self,
+        node: &CompanionNode<'_>,
+    ) -> Result<(), ferrix_ssd1681::Error> {
+        self.wake().await?;
+        ui::render_ota_dfu(node, self.fb);
+        self.epd.display_frame_full(&self.fb.buffer).await?;
+        self.prev_fb.buffer.copy_from_slice(&self.fb.buffer);
+        self.has_frame = true;
+        self.partial_count = 0;
+        Ok(())
+    }
+
     /// Put the panel into deep sleep.
     pub async fn sleep(&mut self) -> Result<(), ferrix_ssd1681::Error> {
         if !self.sleeping {

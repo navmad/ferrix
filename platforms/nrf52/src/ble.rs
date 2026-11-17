@@ -5,7 +5,7 @@
 
 use core::cell::{RefCell, UnsafeCell};
 use core::future::poll_fn;
-use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 use core::task::Poll;
 
 use defmt::{debug, error, info, warn};
@@ -45,10 +45,28 @@ pub struct NordicUartService {
     pub tx: Vec<u8, 256>,
 }
 
+/// Legacy Nordic/Adafruit buttonless DFU service (`00001530-...`).
+///
+/// Registered after `dis` and `nus` so bonded phones' cached NUS attribute
+/// handles never shift. Writing `0x01` to `control_point` reboots into the
+/// bootloader's BLE OTA mode (`GPREGRET = 0xA8`).
+#[nrf_softdevice::gatt_service(uuid = "00001530-1212-efde-1523-785feabcd123")]
+pub struct LegacyDfuService {
+    #[characteristic(uuid = "00001531-1212-efde-1523-785feabcd123", write, notify, security = "mitm")]
+    pub control_point: Vec<u8, 20>,
+
+    #[characteristic(uuid = "00001532-1212-efde-1523-785feabcd123", write_without_response, security = "mitm")]
+    pub packet: Vec<u8, 20>,
+
+    #[characteristic(uuid = "00001534-1212-efde-1523-785feabcd123", read, security = "mitm")]
+    pub revision: Vec<u8, 2>,
+}
+
 #[nrf_softdevice::gatt_server]
 pub struct MeshCoreGattServer {
     pub dis: DeviceInformationService,
     pub nus: NordicUartService,
+    pub dfu: LegacyDfuService,
 }
 
 /// Responses are queued here and drained by `push_fut`, never notified from
@@ -160,6 +178,7 @@ impl CmdRing {
 
 static BLE_CMD_RING: CmdRing = CmdRing::new();
 static BLE_CMD_WAKER: AtomicWaker = AtomicWaker::new();
+static BLE_DFU_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 pub use ferrix_core::command::{ContactOperation, CONTACT_OP_CHANNEL};
 
@@ -487,6 +506,11 @@ pub async fn ble_companion_task(
     let _ = mfg.extend_from_slice(b"Elecrow");
     let _ = server.dis.manufacturer_name_set(&mfg);
 
+    let mut dfu_rev = Vec::<u8, 2>::new();
+    // DFU_REV_APPMODE (0x0001, little-endian) signals Nordic/Adafruit DFU support.
+    let _ = dfu_rev.extend_from_slice(&[0x01, 0x00]);
+    let _ = server.dfu.revision_set(&dfu_rev);
+
     loop {
         info!("BLE: Waiting for pairable connection from MeshCore companion app...");
         // Pick up a PIN or callsign changed since the last advertising cycle.
@@ -548,6 +572,7 @@ pub async fn ble_companion_task(
             }
         };
 
+        BLE_DFU_REQUESTED.store(false, Ordering::Relaxed);
         session.reset();
         while BLE_PUSH_CHANNEL.try_receive().is_ok() {}
 
@@ -573,6 +598,13 @@ pub async fn ble_companion_task(
             }) => {
                 // Never log from a SoftDevice callback.
             }
+            MeshCoreGattServerEvent::Dfu(LegacyDfuServiceEvent::ControlPointWrite(data)) => {
+                // Opcode 0x01: Start DFU (optional second byte selects image type).
+                if data.first() == Some(&0x01) {
+                    BLE_DFU_REQUESTED.store(true, Ordering::Release);
+                    BLE_CMD_WAKER.wake();
+                }
+            }
             _ => {}
         });
 
@@ -582,7 +614,10 @@ pub async fn ble_companion_task(
         let mut cmd_buf = [0u8; CMD_MAX_LEN];
         let command_fut = async {
             loop {
-                if let Some(len) = BLE_CMD_RING.pop(&mut cmd_buf) {
+                if BLE_DFU_REQUESTED.swap(false, Ordering::AcqRel) {
+                    let _ = ferrix_core::command::USB_COMMAND_CHANNEL
+                        .try_send(ferrix_core::command::UsbCommand::RebootToOtaDfu);
+                } else if let Some(len) = BLE_CMD_RING.pop(&mut cmd_buf) {
                     let drops = BLE_CMD_DROPS.swap(0, Ordering::Relaxed);
                     if drops != 0 {
                         debug!("BLE: dropped {} command(s) because the ring was full", drops);
@@ -593,7 +628,7 @@ pub async fn ble_companion_task(
                     // Register before the emptiness check to avoid a lost wake.
                     poll_fn(|cx| {
                         BLE_CMD_WAKER.register(cx.waker());
-                        if BLE_CMD_RING.is_empty() {
+                        if BLE_CMD_RING.is_empty() && !BLE_DFU_REQUESTED.load(Ordering::Acquire) {
                             Poll::Pending
                         } else {
                             Poll::Ready(())
@@ -729,7 +764,7 @@ pub async fn ble_companion_supervisor_task(
     let sd_config = nrf_softdevice::Config {
         clock: Some(clock_cfg),
         common_vs_uuid: Some(nrf_softdevice::raw::ble_common_cfg_vs_uuid_t {
-            vs_uuid_count: 2,
+            vs_uuid_count: 3,
         }),
         conn_gap: Some(nrf_softdevice::raw::ble_gap_conn_cfg_t {
             conn_count: 1,
@@ -742,7 +777,7 @@ pub async fn ble_companion_supervisor_task(
             att_mtu: 247,
         }),
         gatts_attr_tab_size: Some(nrf_softdevice::raw::ble_gatts_cfg_attr_tab_size_t {
-            attr_tab_size: 1408,
+            attr_tab_size: 2048,
         }),
         gap_role_count: Some(nrf_softdevice::raw::ble_gap_cfg_role_count_t {
             adv_set_count: 1,

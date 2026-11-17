@@ -88,6 +88,7 @@ pub trait CliHost: CompanionHost {
     fn gps_enabled(&self) -> bool;
     fn set_gps_enabled(&self, on: bool);
     fn reboot_to_bootloader(&self) -> !;
+    fn reboot_to_ota_dfu(&self) -> !;
     /// One-line board description for the `board` command.
     fn board_line(&self) -> &'static str;
 }
@@ -1591,6 +1592,14 @@ pub async fn handle_text_cli<W: TextSink>(
         "clock sync" | "sync_time" => {
             let _ = sender.send( b"  -> OK\r\n").await;
         }
+        "start ota" | "dfu ota" => {
+            let _ = crate::storage::flush_pending().await;
+            let _ = sender.send(b"  -> OK - rebooting to BLE OTA DFU\r\n").await;
+            if USB_COMMAND_CHANNEL.try_send(UsbCommand::RebootToOtaDfu).is_err() {
+                embassy_time::Timer::after_millis(100).await;
+                host.reboot_to_ota_dfu();
+            }
+        }
         "dfu" | "bootloader" => {
             let _ = crate::storage::flush_pending().await;
             let _ = sender.send( b"  -> Entering DFU bootloader...\r\n").await;
@@ -1609,7 +1618,7 @@ pub async fn handle_text_cli<W: TextSink>(
             let _ = sender.send( b"  -> OK (Config saved to flash)\r\n").await;
         }
         "help" => {
-            let _ = sender.send( b"  -> Commands:\r\n  ->   Identity: get/set name, get/set prv.key, get public.key\r\n  ->   Radio:    get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq/tx/sf/bw/cr, get/set repeat, get/set rxduty, get/set af, get/set dutycycle, get/set hash-mode, stats-radio\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, get/set autoadd, get/set multiacks, advert, time, channels\r\n  ->   System:   save, ver, board, get/set leds, get/set sound, get/set refresh.interval, stats-core, stats-power, stats-packets, clear stats/contacts/messages, reboot\r\n").await;
+            let _ = sender.send( b"  -> Commands:\r\n  ->   Identity: get/set name, get/set prv.key, get public.key\r\n  ->   Radio:    get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq/tx/sf/bw/cr, get/set repeat, get/set rxduty, get/set af, get/set dutycycle, get/set hash-mode, stats-radio\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, get/set autoadd, get/set multiacks, advert, time, channels\r\n  ->   System:   save, ver, board, get/set leds, get/set sound, get/set refresh.interval, stats-core, stats-power, stats-packets, clear stats/contacts/messages, dfu, start ota, reboot\r\n").await;
         }
         _ => {
             let _ = sender.send( b"  -> Unknown command\r\n").await;

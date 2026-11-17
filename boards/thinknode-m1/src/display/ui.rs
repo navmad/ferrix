@@ -618,7 +618,7 @@ fn actions(page: u8) -> (&'static str, &'static str) {
         5 => ("TOGGLE GPS", "TOGGLE LOCATION"),
         6 => ("TOGGLE OFF-GRID", ""),
         7 => ("TOGGLE LEDs", "TOGGLE SOUND"),
-        _ => ("PATH HASH 1B/2B/3B", ""),
+        _ => ("PATH HASH 1B/2B/3B", "BLE OTA DFU"),
     }
 }
 
@@ -749,6 +749,28 @@ pub fn render_boot(node: &CompanionNode<'_>, fb: &mut EpdFrameBuffer) {
 
     draw_mesh_glyph(fb, 100, 172, 14);
     draw_centered(fb, "starting mesh ....", 194, small);
+}
+
+/// Full-screen BLE OTA DFU notice shown before resetting into `TNM1_DFU`.
+pub fn render_ota_dfu(node: &CompanionNode<'_>, fb: &mut EpdFrameBuffer) {
+    use embedded_graphics::mono_font::ascii::{FONT_6X10, FONT_9X15_BOLD};
+    let small = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
+    let title = MonoTextStyle::new(&FONT_9X15_BOLD, BinaryColor::On);
+
+    fb.clear();
+    draw_top_bar(node, fb, small, title);
+    draw_separator(fb, SEPARATOR_Y);
+
+    let heading = "BLE OTA DFU";
+    let hx = ((DISP_W - text_width(heading, TITLE_W)) / 2).max(0);
+    draw_text(fb, heading, hx, 58, title);
+    draw_separator(fb, 70);
+
+    draw_centered(fb, "Advertising TNM1_DFU", 98, small);
+    draw_centered(fb, "Flash .zip via nRF DFU", 118, small);
+    draw_centered(fb, "Reset button to cancel", 142, small);
+
+    draw_mesh_glyph(fb, 100, 174, 12);
 }
 
 /// Backward-compatible page render entry point.

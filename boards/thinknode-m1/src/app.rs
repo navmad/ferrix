@@ -166,4 +166,21 @@ impl AppBoard for ThinkNodeApp {
             }
         }
     }
+
+    async fn prepare_ota_dfu(&mut self, node: &CompanionNode<'_>, _ui: &UiState) {
+        self.backlight_on = false;
+        if let Some(d) = &mut self.display {
+            d.set_backlight(false);
+            d.render_ota_dfu(node).await.ok();
+            d.sleep().await.ok();
+        }
+    }
+
+    fn reboot_to_ota_dfu(&mut self) -> ! {
+        let sd_active = ferrix_core::state::BLE_STATUS.load(core::sync::atomic::Ordering::Relaxed) >= 3;
+        ferrix_nrf52::reset::reboot_to_bootloader_mode(
+            sd_active,
+            ferrix_nrf52::reset::BootloaderMode::BleOta,
+        )
+    }
 }
