@@ -122,6 +122,11 @@ where
             Ok(())
         }
     }
+
+    /// Read up to `buf.len()` bytes from the module.
+    pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
+        self.uart.read(buf).await.map_err(|_| Error::Uart)
+    }
 }
 
 fn output_is_high(active: bool, active_high: bool) -> bool {

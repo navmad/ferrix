@@ -43,6 +43,9 @@ pub struct GpsPins {
     pub rx: peripherals::P1_09,
     pub standby: Output<'static>,
     pub reinit: Output<'static>,
+    pub timer1: peripherals::TIMER1,
+    pub ppi_ch0: peripherals::PPI_CH0,
+    pub ppi_ch1: peripherals::PPI_CH1,
 }
 
 /// Physical user controls mapped to semantic input events.
@@ -195,6 +198,9 @@ pub fn init(p: embassy_nrf::Peripherals) -> Pins {
         rx: p.P1_09,
         standby: gps_standby,
         reinit: gps_reinit,
+        timer1: p.TIMER1,
+        ppi_ch0: p.PPI_CH0,
+        ppi_ch1: p.PPI_CH1,
     };
 
     // --- Buttons & User Inputs ---
