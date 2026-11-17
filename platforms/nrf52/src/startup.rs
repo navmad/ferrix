@@ -10,6 +10,8 @@ use embassy_nrf::interrupt::{InterruptExt, Priority};
 
 static DCDC_REG1_ENABLED: AtomicBool = AtomicBool::new(false);
 static LFCLK_MODE: AtomicU8 = AtomicU8::new(0);
+static SD_DCDC_RESULT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(u32::MAX);
 
 /// Sleep-clock accuracy for an external 32.768 kHz crystal (`LFXO`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -69,6 +71,24 @@ pub struct StartupConfig {
     pub lfclk: Lfclk,
 }
 
+/// Live hardware status read from `CLOCK.LFCLKSTAT` and `POWER.DCDCEN*`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HardwarePowerClockStatus {
+    pub configured_lfclk: Lfclk,
+    pub lfclk_running: bool,
+    pub lfclk_src: u8,
+    pub lfclkstat_raw: u32,
+    pub configured_dcdc_reg1: bool,
+    pub dcdc_reg1_active: bool,
+    pub dcdc_reg0_active: bool,
+    /// Return code from `sd_power_dcdc_mode_set` (`u32::MAX` if not called).
+    pub sd_dcdc_result: u32,
+}
+
+pub(crate) fn record_sd_dcdc_result(ret: u32) {
+    SD_DCDC_RESULT.store(ret, Ordering::Relaxed);
+}
+
 /// Returns whether [`init_with`] enabled the `REG1` buck DC-DC regulator.
 pub fn dcdc_reg1_enabled() -> bool {
     DCDC_REG1_ENABLED.load(Ordering::Relaxed)
@@ -77,6 +97,26 @@ pub fn dcdc_reg1_enabled() -> bool {
 /// Returns the `32.768 kHz` LFCLK configuration chosen at startup.
 pub fn lfclk_config() -> Lfclk {
     Lfclk::from_u8(LFCLK_MODE.load(Ordering::Relaxed))
+}
+
+/// Read live LFCLK and DC-DC hardware registers for diagnostics.
+pub fn hardware_power_clock_status() -> HardwarePowerClockStatus {
+    // CLOCK.LFCLKSTAT (0x4000_0418): bits [1:0] = SRC, bit 16 = STATE.
+    // POWER.DCDCEN (0x4000_0578): bit 0 = REG1 enable.
+    // POWER.DCDCEN0 (0x4000_0580): bit 0 = REG0 enable.
+    let lfclkstat_raw = unsafe { core::ptr::read_volatile(0x4000_0418 as *const u32) };
+    let dcdc1_raw = unsafe { core::ptr::read_volatile(0x4000_0578 as *const u32) };
+    let dcdc0_raw = unsafe { core::ptr::read_volatile(0x4000_0580 as *const u32) };
+    HardwarePowerClockStatus {
+        configured_lfclk: lfclk_config(),
+        lfclk_running: (lfclkstat_raw & (1 << 16)) != 0,
+        lfclk_src: (lfclkstat_raw & 0x3) as u8,
+        lfclkstat_raw,
+        configured_dcdc_reg1: dcdc_reg1_enabled(),
+        dcdc_reg1_active: (dcdc1_raw & 1) != 0,
+        dcdc_reg0_active: (dcdc0_raw & 1) != 0,
+        sd_dcdc_result: SD_DCDC_RESULT.load(Ordering::Relaxed),
+    }
 }
 
 /// Initialise the nRF peripherals with SoftDevice-safe interrupt priorities

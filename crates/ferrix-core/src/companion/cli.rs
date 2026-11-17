@@ -60,12 +60,27 @@ pub struct RadioStats {
     pub duplicate_deltas: [u32; 6],
 }
 
+/// Live power regulator and low-frequency clock telemetry.
+pub struct PowerClockStats {
+    pub lfclk_config: &'static str,
+    pub lfclk_running: bool,
+    pub lfclk_src: &'static str,
+    pub lfclkstat_raw: u32,
+    pub dcdc_reg1_configured: bool,
+    pub dcdc_reg1_active: bool,
+    pub dcdc_reg0_active: bool,
+    pub sd_dcdc_result: u32,
+}
+
 /// Board services used by the text CLI.
 pub trait CliHost: CompanionHost {
     fn leds_disabled(&self) -> bool;
     fn set_leds_disabled(&self, disabled: bool);
     fn storage_stats(&self) -> StorageStats;
     fn radio_stats(&self) -> RadioStats;
+    fn power_clock_stats(&self) -> Option<PowerClockStats> {
+        None
+    }
     fn set_tx_slot_override(&self, ms: u32);
     fn clear_radio_stats(&self);
     fn advert_stats(&self) -> (usize, usize, bool);
@@ -1457,6 +1472,32 @@ pub async fn handle_text_cli<W: TextSink>(
             }
             let _ = sender.send( s.as_bytes()).await;
         }
+        "stats-power" => {
+            if let Some(pw) = host.power_clock_stats() {
+                let mut s: heapless::String<256> = heapless::String::new();
+                let mut sd_ret = heapless::String::<16>::new();
+                if pw.sd_dcdc_result == u32::MAX {
+                    let _ = write!(sd_ret, "null");
+                } else {
+                    let _ = write!(sd_ret, "{}", pw.sd_dcdc_result);
+                }
+                let _ = write!(
+                    s,
+                    "  -> {{\"lfclk_cfg\":\"{}\",\"lfclk_running\":{},\"lfclk_src\":\"{}\",\"lfclkstat\":\"0x{:08x}\",\"dcdc_reg1_cfg\":{},\"dcdc_reg1\":{},\"dcdc_reg0\":{},\"sd_dcdc_ret\":{}}}\r\n",
+                    pw.lfclk_config,
+                    pw.lfclk_running,
+                    pw.lfclk_src,
+                    pw.lfclkstat_raw,
+                    pw.dcdc_reg1_configured,
+                    pw.dcdc_reg1_active,
+                    pw.dcdc_reg0_active,
+                    sd_ret.as_str()
+                );
+                let _ = sender.send(s.as_bytes()).await;
+            } else {
+                let _ = sender.send(b"  -> {\"error\":\"unsupported\"}\r\n").await;
+            }
+        }
         "stats-core" => {
             let uptime = embassy_time::Instant::now().as_secs();
             let mv = host.battery_millivolts();
@@ -1568,7 +1609,7 @@ pub async fn handle_text_cli<W: TextSink>(
             let _ = sender.send( b"  -> OK (Config saved to flash)\r\n").await;
         }
         "help" => {
-            let _ = sender.send( b"  -> Commands:\r\n  ->   Identity: get/set name, get/set prv.key, get public.key\r\n  ->   Radio:    get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq/tx/sf/bw/cr, get/set repeat, get/set rxduty, get/set af, get/set dutycycle, get/set hash-mode, stats-radio\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, get/set autoadd, get/set multiacks, advert, time, channels\r\n  ->   System:   save, ver, board, get/set leds, get/set sound, get/set refresh.interval, stats-core, stats-packets, clear stats/contacts/messages, reboot\r\n").await;
+            let _ = sender.send( b"  -> Commands:\r\n  ->   Identity: get/set name, get/set prv.key, get public.key\r\n  ->   Radio:    get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq/tx/sf/bw/cr, get/set repeat, get/set rxduty, get/set af, get/set dutycycle, get/set hash-mode, stats-radio\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, get/set autoadd, get/set multiacks, advert, time, channels\r\n  ->   System:   save, ver, board, get/set leds, get/set sound, get/set refresh.interval, stats-core, stats-power, stats-packets, clear stats/contacts/messages, reboot\r\n").await;
         }
         _ => {
             let _ = sender.send( b"  -> Unknown command\r\n").await;

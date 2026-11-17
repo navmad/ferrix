@@ -776,6 +776,7 @@ pub async fn ble_companion_supervisor_task(
                 nrf_softdevice::raw::NRF_POWER_DCDC_MODES_NRF_POWER_DCDC_ENABLE as u8,
             )
         };
+        crate::startup::record_sd_dcdc_result(ret);
         if ret != 0 {
             warn!("BLE: sd_power_dcdc_mode_set returned {=u32:#x}", ret);
         } else {

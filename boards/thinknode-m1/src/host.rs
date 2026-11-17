@@ -5,7 +5,7 @@
 
 use core::sync::atomic::Ordering;
 
-use ferrix_core::companion::cli::{CliHost, RadioStats, StorageStats};
+use ferrix_core::companion::cli::{CliHost, PowerClockStats, RadioStats, StorageStats};
 use ferrix_core::companion::protocol::CompanionHost;
 use ferrix_core::engine::EngineContext;
 use ferrix_core::types::{ChannelData, MAX_CHANNELS};
@@ -100,6 +100,34 @@ impl CliHost for BoardCompanionHost {
             forward_sent: ferrix_core::state::FORWARD_SENT.load(Ordering::Relaxed),
             duplicate_deltas: ferrix_core::state::duplicate_deltas(),
         }
+    }
+
+    fn power_clock_stats(&self) -> Option<PowerClockStats> {
+        use ferrix_nrf52::startup::{Lfclk, LfclkAccuracy};
+        let hw = ferrix_nrf52::startup::hardware_power_clock_status();
+        let lfclk_config = match hw.configured_lfclk {
+            Lfclk::InternalRc => "rc(500ppm)",
+            Lfclk::ExternalXtal(LfclkAccuracy::Ppm20) => "xtal(20ppm)",
+            Lfclk::ExternalXtal(LfclkAccuracy::Ppm50) => "xtal(50ppm)",
+            Lfclk::ExternalXtal(LfclkAccuracy::Ppm100) => "xtal(100ppm)",
+            Lfclk::ExternalXtal(LfclkAccuracy::Ppm250) => "xtal(250ppm)",
+        };
+        let lfclk_src = match hw.lfclk_src {
+            0 => "rc",
+            1 => "xtal",
+            2 => "synth",
+            _ => "reserved",
+        };
+        Some(PowerClockStats {
+            lfclk_config,
+            lfclk_running: hw.lfclk_running,
+            lfclk_src,
+            lfclkstat_raw: hw.lfclkstat_raw,
+            dcdc_reg1_configured: hw.configured_dcdc_reg1,
+            dcdc_reg1_active: hw.dcdc_reg1_active,
+            dcdc_reg0_active: hw.dcdc_reg0_active,
+            sd_dcdc_result: hw.sd_dcdc_result,
+        })
     }
 
     fn set_tx_slot_override(&self, ms: u32) {
