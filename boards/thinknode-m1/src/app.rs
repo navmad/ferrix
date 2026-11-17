@@ -1,7 +1,6 @@
 //! ThinkNode M1 implementation of the runtime application board interface.
 
 use defmt::info;
-use embassy_futures::select::{select, Either};
 use embassy_nrf::gpio::Output;
 use embassy_nrf::saadc;
 use embassy_time::{Duration, Instant, Timer};
@@ -20,7 +19,7 @@ pub struct ThinkNodeApp {
     led: Output<'static>,
     display: Option<ThinkNodeDisplay>,
     battery_adc: saadc::Saadc<'static, 1>,
-    battery_buf: [i16; 1],
+    battery_filter: ferrix_core::battery::BatteryMvFilter,
     buzzer: PassiveBuzzer<'static>,
     backlight_on: bool,
     backlight_deadline: Instant,
@@ -35,11 +34,16 @@ impl ThinkNodeApp {
         buzzer: PassiveBuzzer<'static>,
     ) -> Self {
         let now = Instant::now();
+        let mut battery_filter = ferrix_core::battery::BatteryMvFilter::new();
+        let initial_mv = crate::battery_millivolts();
+        if initial_mv >= crate::MIN_PLAUSIBLE_BATTERY_MV {
+            battery_filter.update(initial_mv);
+        }
         Self {
             led,
             display,
             battery_adc,
-            battery_buf: [0i16; 1],
+            battery_filter,
             buzzer,
             backlight_on: false,
             backlight_deadline: now
@@ -140,26 +144,10 @@ impl AppBoard for ThinkNodeApp {
     }
 
     async fn sample_battery(&mut self) -> Option<u16> {
-        if !crate::HAS_BATTERY_ADC {
-            return None;
-        }
-        match select(
-            self.battery_adc.sample(&mut self.battery_buf),
-            Timer::after_millis(100),
-        )
-        .await
-        {
-            Either::First(_) => {}
-            Either::Second(_) => return None,
-        }
-        let raw = self.battery_buf[0].max(0) as u16;
-        let mv = crate::adc_raw_to_battery_millivolts(raw);
-        if mv >= crate::MIN_PLAUSIBLE_BATTERY_MV {
-            crate::set_battery_millivolts(mv);
-            Some(mv)
-        } else {
-            None
-        }
+        let raw_mv = crate::sample_battery_adc_mv(&mut self.battery_adc).await?;
+        let mv = self.battery_filter.update(raw_mv);
+        crate::set_battery_millivolts(mv);
+        Some(mv)
     }
 
     fn set_leds_disabled(&mut self, disabled: bool) {

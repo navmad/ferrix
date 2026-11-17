@@ -804,7 +804,10 @@ impl<'a> CompanionNode<'a> {
         let mv = self.host.battery_millivolts();
         if mv >= crate::battery::MIN_PLAUSIBLE_BATTERY_MV {
             self.battery_millivolts = mv;
-            self.battery_percentage = crate::battery::millivolts_to_percentage(mv);
+            self.battery_percentage = crate::battery::apply_percentage_hysteresis(
+                self.battery_percentage,
+                crate::battery::millivolts_to_percentage(mv),
+            );
         }
 
         let epoch = crate::state::get_device_time();

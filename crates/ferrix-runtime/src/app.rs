@@ -1411,11 +1411,14 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
             sync_gps(node);
 
             // Sample the battery every 10 s (5 ticks) before checking for UI
-            // updates so a 1% drop is reflected immediately when interval == 0.
+            // updates so sustained changes are reflected when interval == 0.
             if tick % 5 == 0 {
                 if let Some(mv) = board.sample_battery().await {
                     node.battery_millivolts = mv;
-                    node.battery_percentage = ferrix_core::battery::millivolts_to_percentage(mv);
+                    node.battery_percentage = ferrix_core::battery::apply_percentage_hysteresis(
+                        node.battery_percentage,
+                        ferrix_core::battery::millivolts_to_percentage(mv),
+                    );
                 }
             }
 

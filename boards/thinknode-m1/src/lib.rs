@@ -104,6 +104,34 @@ pub fn adc_raw_to_battery_millivolts(raw: u16) -> u16 {
     mv.min(u16::MAX as u32) as u16
 }
 
+const BATTERY_ADC_SAMPLES: usize = 8;
+
+/// Average [`BATTERY_ADC_SAMPLES`] SAADC conversions (within 100 ms) to
+/// suppress single-conversion ADC noise before smoothing.
+pub async fn sample_battery_adc_mv(adc: &mut saadc::Saadc<'static, 1>) -> Option<u16> {
+    if !HAS_BATTERY_ADC {
+        return None;
+    }
+    let mut buf = [0i16; 1];
+    let mut sum: u32 = 0;
+    for _ in 0..BATTERY_ADC_SAMPLES {
+        match embassy_futures::select::select(
+            adc.sample(&mut buf),
+            Timer::after_millis(100),
+        )
+        .await
+        {
+            embassy_futures::select::Either::First(_) => {
+                sum += buf[0].max(0) as u32;
+            }
+            embassy_futures::select::Either::Second(_) => return None,
+        }
+    }
+    let avg_raw = (sum / BATTERY_ADC_SAMPLES as u32) as u16;
+    let mv = adc_raw_to_battery_millivolts(avg_raw);
+    (mv >= MIN_PLAUSIBLE_BATTERY_MV).then_some(mv)
+}
+
 // ---------------------------------------------------------------------------
 // Fatal-error indicators
 //
@@ -331,22 +359,10 @@ impl CompanionBoard for ThinkNodeBoard {
             [saadc::ChannelConfig::single_ended(bat_adc_pin)],
         );
 
-        // Take one sample before the companion/display start so a freshly
-        // booted device never reports 0 mV to the app.
-        let mut battery_buf = [0i16; 1];
-        if HAS_BATTERY_ADC {
-            match embassy_futures::select::select(
-                battery_adc.sample(&mut battery_buf),
-                Timer::after_millis(100),
-            )
-            .await
-            {
-                embassy_futures::select::Either::First(_) => {
-                    let raw = battery_buf[0].max(0) as u16;
-                    set_battery_millivolts(adc_raw_to_battery_millivolts(raw));
-                }
-                embassy_futures::select::Either::Second(_) => {}
-            }
+        // Take an averaged sample before the companion/display start so a
+        // freshly booted device never reports 0 mV or single-sample ADC noise.
+        if let Some(mv) = sample_battery_adc_mv(&mut battery_adc).await {
+            set_battery_millivolts(mv);
         }
 
         let (node_name, custom_key) = crate::storage::init_config();
