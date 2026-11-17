@@ -267,6 +267,11 @@ fn sync_gps(node: &mut CompanionNode<'_>) {
     node.longitude = gps.longitude;
 }
 
+/// Minimum interval between automatic EPD refreshes for continuous telemetry
+/// pages (`RADAR`, `SIGNAL`, and `POSITION` coordinate drift) when
+/// `display_refresh_interval_secs() == 0`.
+const LIVE_PAGE_REFRESH_COOLDOWN_SECS: u64 = 30;
+
 /// Snapshot of displayed state used to decide whether an active page has a
 /// meaningful update when `display_refresh_interval_secs() == 0` (excluding
 /// 1-minute wall-clock and uptime ticks).
@@ -371,7 +376,7 @@ impl UiSnapshot {
         self.msg_len != prev.msg_len || self.msg_epoch != prev.msg_epoch
     }
 
-    fn differs_on_visible_page(&self, prev: &Self) -> bool {
+    fn immediate_change_on_visible_page(&self, prev: &Self) -> bool {
         if self.page != prev.page
             || self.battery_pct != prev.battery_pct
             || self.time_synced != prev.time_synced
@@ -387,8 +392,6 @@ impl UiSnapshot {
             }
             // Page 1: INBOX
             1 => self.message_changed(prev),
-            // Page 2: RADAR
-            2 => self.advert_epoch != prev.advert_epoch,
             // Page 3: RADIO
             3 => {
                 self.radio_freq_hz != prev.radio_freq_hz
@@ -399,14 +402,10 @@ impl UiSnapshot {
                     || self.radio_rx_duty != prev.radio_rx_duty
                     || self.radio_af_tenths != prev.radio_af_tenths
             }
-            // Page 4: SIGNAL
-            4 => self.rx_packets != prev.rx_packets || self.tx_beacons != prev.tx_beacons,
-            // Page 5: POSITION
+            // Page 5: POSITION (power/fix/policy transitions stay immediate; lat/lon drift is rate-limited)
             5 => {
                 self.gps_enabled != prev.gps_enabled
                     || self.gps_fix != prev.gps_fix
-                    || self.gps_lat_e4 != prev.gps_lat_e4
-                    || self.gps_lon_e4 != prev.gps_lon_e4
                     || self.advert_loc_policy != prev.advert_loc_policy
             }
             // Page 6: OFF-GRID
@@ -414,8 +413,26 @@ impl UiSnapshot {
             // Page 7: SETTINGS
             7 => self.leds_disabled != prev.leds_disabled || self.buzzer_enabled != prev.buzzer_enabled,
             // Page 8: SYSTEM
-            _ => self.radio_rx_duty != prev.radio_rx_duty || self.path_hash_mode != prev.path_hash_mode,
+            8 => self.radio_rx_duty != prev.radio_rx_duty || self.path_hash_mode != prev.path_hash_mode,
+            _ => false,
         }
+    }
+
+    fn throttled_change_on_visible_page(&self, prev: &Self) -> bool {
+        match self.page {
+            // Page 2: RADAR
+            2 => self.advert_epoch != prev.advert_epoch,
+            // Page 4: SIGNAL
+            4 => self.rx_packets != prev.rx_packets || self.tx_beacons != prev.tx_beacons,
+            // Page 5: POSITION coordinate drift
+            5 => self.gps_lat_e4 != prev.gps_lat_e4 || self.gps_lon_e4 != prev.gps_lon_e4,
+            _ => false,
+        }
+    }
+
+    fn differs_on_visible_page(&self, prev: &Self, cooldown_elapsed: bool) -> bool {
+        self.immediate_change_on_visible_page(prev)
+            || (cooldown_elapsed && self.throttled_change_on_visible_page(prev))
     }
 }
 
@@ -433,6 +450,7 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
     let mut msg_epoch: u32 = 0;
     let mut advert_epoch: u32 = 0;
     let mut last_snapshot = UiSnapshot::capture(board, node, msg_epoch, advert_epoch);
+    let mut last_render_at = Instant::now();
 
     loop {
         // Keep the app node aligned with shared state changed by a transport
@@ -956,6 +974,7 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                     node.callsign = new_name;
                     board.render(node, &ui, false).await;
                     last_snapshot = UiSnapshot::capture(board, node, msg_epoch, advert_epoch);
+                    last_render_at = Instant::now();
                 }
                 UsbCommand::SetPrivateKey(priv_key) => {
                     info!("Updating node private & public keys");
@@ -1230,6 +1249,7 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                     node.current_page = (node.current_page + 1) % board.page_count();
                     board.render(node, &ui, false).await;
                     last_snapshot = UiSnapshot::capture(board, node, msg_epoch, advert_epoch);
+                    last_render_at = Instant::now();
                 }
                 InputEvent::PrevPage => {
                     let count = board.page_count().max(1);
@@ -1240,6 +1260,7 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                     };
                     board.render(node, &ui, false).await;
                     last_snapshot = UiSnapshot::capture(board, node, msg_epoch, advert_epoch);
+                    last_render_at = Instant::now();
                 }
                 InputEvent::ActionPrimary | InputEvent::ActionSecondary => {
                     let action = if matches!(event, InputEvent::ActionPrimary) {
@@ -1401,6 +1422,7 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
 
                     board.render(node, &ui, false).await;
                     last_snapshot = UiSnapshot::capture(board, node, msg_epoch, advert_epoch);
+                    last_render_at = Instant::now();
                 }
                 _ => {}
             }
@@ -1424,7 +1446,9 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
 
             let snapshot = UiSnapshot::capture(board, node, msg_epoch, advert_epoch);
             let needs_render = if display_refresh_interval_secs() == 0 {
-                snapshot.differs_on_visible_page(&last_snapshot)
+                let cooldown_elapsed =
+                    last_render_at.elapsed() >= Duration::from_secs(LIVE_PAGE_REFRESH_COOLDOWN_SECS);
+                snapshot.differs_on_visible_page(&last_snapshot, cooldown_elapsed)
             } else {
                 // Keep unread/inbox responsive between longer periodic intervals.
                 snapshot.page <= 1 && snapshot.message_changed(&last_snapshot)
@@ -1432,6 +1456,7 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
             if needs_render {
                 board.render(node, &ui, false).await;
                 last_snapshot = snapshot;
+                last_render_at = Instant::now();
             }
 
             board.tick(node, &ui, tick).await;
@@ -1487,54 +1512,61 @@ mod tests {
     fn snapshot_ignores_unrelated_changes_per_page() {
         let base = base_snapshot();
 
-        // Battery change affects every page (top bar).
+        // Battery change affects every page (top bar) immediately.
         let mut bat = base;
         bat.battery_pct = 84;
-        assert!(bat.differs_on_visible_page(&base));
+        assert!(bat.differs_on_visible_page(&base, false));
 
         // BLE connect triggers on page 0 (MESH), ignored on page 3 (RADIO).
         let mut ble = base;
         ble.ble_connected = true;
-        assert!(ble.differs_on_visible_page(&base));
+        assert!(ble.differs_on_visible_page(&base, false));
         let mut radio = base;
         radio.page = 3;
         let mut radio_ble = radio;
         radio_ble.ble_connected = true;
-        assert!(!radio_ble.differs_on_visible_page(&radio));
+        assert!(!radio_ble.differs_on_visible_page(&radio, true));
 
-        // New message triggers on page 0 and page 1, ignored on page 3.
+        // New message triggers immediately on page 0 and page 1, ignored on page 3.
         let mut msg = base;
         msg.msg_len = 1;
         msg.msg_epoch = 1;
-        assert!(msg.differs_on_visible_page(&base));
+        assert!(msg.differs_on_visible_page(&base, false));
         let mut inbox = base;
         inbox.page = 1;
         let mut inbox_msg = inbox;
         inbox_msg.msg_epoch = 1;
-        assert!(inbox_msg.differs_on_visible_page(&inbox));
+        assert!(inbox_msg.differs_on_visible_page(&inbox, false));
         let mut radio_msg = radio;
         radio_msg.msg_len = 1;
         radio_msg.msg_epoch = 1;
-        assert!(!radio_msg.differs_on_visible_page(&radio));
+        assert!(!radio_msg.differs_on_visible_page(&radio, true));
 
-        // Advert triggers on page 2 (RADAR), packet RX on page 4 (SIGNAL), GPS on page 5.
+        // Continuous telemetry pages (RADAR, SIGNAL, POSITION drift) wait for cooldown.
         let mut radar = base;
         radar.page = 2;
         let mut radar_adv = radar;
         radar_adv.advert_epoch = 1;
-        assert!(radar_adv.differs_on_visible_page(&radar));
+        assert!(!radar_adv.differs_on_visible_page(&radar, false));
+        assert!(radar_adv.differs_on_visible_page(&radar, true));
 
         let mut sig = base;
         sig.page = 4;
         let mut sig_rx = sig;
         sig_rx.rx_packets = 1;
-        assert!(sig_rx.differs_on_visible_page(&sig));
+        assert!(!sig_rx.differs_on_visible_page(&sig, false));
+        assert!(sig_rx.differs_on_visible_page(&sig, true));
 
         let mut pos = base;
         pos.page = 5;
-        let mut pos_fix = pos;
+        let mut pos_drift = pos;
+        pos_drift.gps_lat_e4 = 377_749;
+        assert!(!pos_drift.differs_on_visible_page(&pos, false));
+        assert!(pos_drift.differs_on_visible_page(&pos, true));
+
+        // GPS fix transition stays immediate even before cooldown elapses.
+        let mut pos_fix = pos_drift;
         pos_fix.gps_fix = true;
-        pos_fix.gps_lat_e4 = 377_749;
-        assert!(pos_fix.differs_on_visible_page(&pos));
+        assert!(pos_fix.differs_on_visible_page(&pos, false));
     }
 }
