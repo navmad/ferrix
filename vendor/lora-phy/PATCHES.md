@@ -27,6 +27,12 @@ did not interoperate with MeshCore nodes.
 - `src/lib.rs`, `LoRa::start_rx()` / `LoRa::handle_rx_irq()`:
   - Split `rx()` into arming (`start_rx`), cancel-safe IRQ wait
     (`wait_for_irq`), and uninterruptible IRQ handling (`handle_rx_irq`).
+- `src/mod_traits.rs`, `src/lib.rs`, `src/sx126x/mod.rs`:
+  - Distinguish `HeaderValid` (`IrqState::HeaderValid` / `RxIrqEvent::HeaderValid`)
+    from `PreambleDetected` so false noise preambles do not look like
+    in-flight packets.
+  - Clear latched IRQ flags (`ClrIrqStatus`) in `do_tx()` and `do_rx()` before
+    entering TX or RX.
 
 ## Upstreaming
 

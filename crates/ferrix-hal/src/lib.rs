@@ -4,4 +4,4 @@
 
 pub mod radio;
 
-pub use radio::{LoraConfig, LoraRadio, RadioDevice, RxOutcome, TxOutcome};
+pub use radio::{LoraConfig, LoraRadio, RadioDevice, RxOutcome, RxState, TxOutcome};

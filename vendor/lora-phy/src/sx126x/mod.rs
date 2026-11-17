@@ -612,6 +612,11 @@ where
     }
 
     async fn do_tx(&mut self) -> Result<(), RadioError> {
+        // Clear any stale IRQ flags (e.g. an unserviced RX timeout) so DIO1
+        // cannot immediately re-trigger before TX finishes.
+        let clr = [OpCode::ClrIrqStatus.value(), 0xFF, 0xFF];
+        self.intf.write(&clr, false).await?;
+
         self.intf.iv.enable_rf_switch_tx().await?;
 
         // Disable timeout
@@ -625,6 +630,9 @@ where
     }
 
     async fn do_rx(&mut self, rx_mode: RxMode) -> Result<(), RadioError> {
+        let clr = [OpCode::ClrIrqStatus.value(), 0xFF, 0xFF];
+        self.intf.write(&clr, false).await?;
+
         self.intf.iv.enable_rf_switch_rx().await?;
 
         // Stop the Rx timer on preamble detection
@@ -929,7 +937,10 @@ where
                     }
                     return Ok(Some(IrqState::Done));
                 }
-                if IrqMask::PreambleDetected.is_set_in(irq_flags) || IrqMask::HeaderValid.is_set_in(irq_flags) {
+                if IrqMask::HeaderValid.is_set_in(irq_flags) {
+                    return Ok(Some(IrqState::HeaderValid));
+                }
+                if IrqMask::PreambleDetected.is_set_in(irq_flags) {
                     return Ok(Some(IrqState::PreambleReceived));
                 }
                 if (irq_flags & IrqMask::RxTxTimeout.value()) == IrqMask::RxTxTimeout.value() {

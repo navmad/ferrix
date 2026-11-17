@@ -56,6 +56,15 @@ pub enum RxOutcome {
     Error,
 }
 
+/// Progress of an active reception used to bound TX deferrals and clear stale
+/// preamble latches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RxState {
+    Idle,
+    Preamble,
+    Header,
+}
+
 /// Result of one transmit attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TxOutcome {
@@ -86,6 +95,15 @@ pub trait RadioDevice {
     /// True while a preamble/header was detected and the frame has not finished yet.
     fn is_receiving(&self) -> bool {
         false
+    }
+
+    /// Current reception progress (idle, preamble-only, or valid header).
+    fn rx_state(&self) -> RxState {
+        if self.is_receiving() {
+            RxState::Header
+        } else {
+            RxState::Idle
+        }
     }
 
     /// Re-arm reception after a watchdog timeout or error.

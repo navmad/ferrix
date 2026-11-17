@@ -70,6 +70,23 @@ pub fn slot_width_ms(sf: u8, bw_khz: u32, cr: u8, preamble: u16) -> u64 {
     (airtime + SLOT_GUARD_MS).clamp(SLOT_MIN_MS, SLOT_MAX_MS)
 }
 
+/// Maximum time to wait for `HeaderValid` after a `PreambleDetected` IRQ before
+/// treating it as a false noise preamble and re-arming RX.
+pub fn preamble_wait_ms(sf: u8, bw_khz: u32, preamble: u16) -> u64 {
+    let bw_hz = ferrix_hal::radio::bw_khz_to_hz(bw_khz) as u64;
+    if bw_hz == 0 {
+        return 200;
+    }
+    let sym_us = ((1u64 << sf.min(12)) * 1_000_000) / bw_hz;
+    let wait_ms = (preamble as u64 + 24) * sym_us / 1_000;
+    wait_ms.clamp(80, 2_500)
+}
+
+/// Maximum time to wait for `RxDone` after `HeaderValid` before recovering RX.
+pub fn packet_wait_ms(sf: u8, bw_khz: u32, cr: u8, preamble: u16) -> u64 {
+    (estimate_airtime_ms(255, sf, bw_khz, cr, preamble) as u64 + 150).clamp(250, 4_000)
+}
+
 /// Place a flood in the first free slot at or after its hash-derived slot.
 pub fn assign_flood(
     floods: &mut [Option<FloodSlot>; FLOOD_SLOTS],
@@ -342,5 +359,18 @@ mod tests {
         remember_cancel(&mut cancelled, [6u8; 8], 10_000);
         assert_eq!(cancelled.len(), 1);
         assert_eq!(cancelled[0].0, [6u8; 8]);
+    }
+
+    #[test]
+    fn rx_wait_bounds_scale_with_modem_and_stay_bounded() {
+        let sf7_preamble = preamble_wait_ms(7, 62, 32);
+        let sf7_pkt = packet_wait_ms(7, 62, 5, 32);
+        assert!(sf7_preamble >= 80 && sf7_preamble <= 150);
+        assert!(sf7_pkt > sf7_preamble && sf7_pkt < 1_500);
+
+        let sf12_preamble = preamble_wait_ms(12, 62, 16);
+        let sf12_pkt = packet_wait_ms(12, 62, 5, 16);
+        assert!(sf12_preamble <= 2_500);
+        assert!(sf12_pkt <= 4_000);
     }
 }

@@ -22,7 +22,7 @@ use lora_phy::mod_params::{
 use lora_phy::sx126x::{Config as Sx126xConfig, Sx1262, Sx126x};
 use lora_phy::{LoRa, RxIrqEvent};
 
-use ferrix_hal::radio::{bw_khz_to_hz, LoraConfig, RadioDevice, RxOutcome, TxOutcome};
+use ferrix_hal::radio::{bw_khz_to_hz, LoraConfig, RadioDevice, RxOutcome, RxState, TxOutcome};
 
 pub use lora_phy::mod_params::RadioError;
 pub use lora_phy::sx126x::TcxoCtrlVoltage;
@@ -87,14 +87,14 @@ fn cr_from_u8(cr: u8) -> CodingRate {
 
 /// Estimate SX126x RX duty-cycle timings. The RX window only needs to catch
 /// a preamble (`SetStopRxTimerOnPreamble` keeps the radio listening once it
-/// does).
+/// does), while leaving margin for low-SNR correlation and TCXO wakeup.
 fn duty_cycle_params(sf: u8, bw_khz: u32, preamble: u16) -> Option<DutyCycleParams> {
     let bw_hz = bw_khz_to_hz(bw_khz) as u64;
     if bw_hz == 0 {
         return None;
     }
     let sym_us = ((1u64 << sf) * 1_000_000) / bw_hz;
-    let detect = if sf >= 7 { 4u64 } else { 8u64 };
+    let detect = if sf >= 7 { 6u64 } else { 10u64 };
     let p = preamble as u64;
 
     if p <= 2 * detect + 1 {
@@ -103,13 +103,15 @@ fn duty_cycle_params(sf: u8, bw_khz: u32, preamble: u16) -> Option<DutyCyclePara
 
     let deaf_budget = (p - 2 * detect - 1) * sym_us;
     let deaf_us = deaf_budget * 90 / 100; // 10% margin for RC timer drift
-    let wake_us = 3_000u64;
+    // Match lora-phy's 10 ms TCXO wakeup delay (`BRD_TCXO_WAKEUP_TIME`) plus
+    // ~1 ms RC/PLL/RX settling so the real deaf window never exceeds `deaf_us`.
+    let wake_us = 11_000u64;
     if deaf_us <= wake_us + 2_000 {
         return None;
     }
 
     let sleep_us = deaf_us - wake_us;
-    let rx_us = (detect + 1) * sym_us;
+    let rx_us = (detect + 2) * sym_us;
 
     // SetRxDutyCycle units are 15.625 us.
     let units = |us: u64| ((us * 64 + 500) / 1000).min(0xFF_FFFF) as u32;
@@ -147,7 +149,7 @@ where
     preamble: u16,
     tx_power_dbm: i8,
     rx_armed: bool,
-    rx_active: bool,
+    rx_state: RxState,
 }
 
 impl<Spi, Reset, Pin, Dly> Sx1262Radio<Spi, Reset, Pin, Dly>
@@ -216,13 +218,13 @@ where
             preamble,
             tx_power_dbm: initial.tx_power_dbm,
             rx_armed: false,
-            rx_active: false,
+            rx_state: RxState::Idle,
         })
     }
 
     async fn reenter_rx(&mut self) {
         self.rx_armed = false;
-        self.rx_active = false;
+        self.rx_state = RxState::Idle;
         match embassy_time::with_timeout(
             Duration::from_secs(1),
             self.lora
@@ -350,11 +352,17 @@ where
     async fn handle_rx_irq(&mut self, buf: &mut [u8]) -> Option<RxOutcome> {
         match self.lora.handle_rx_irq(&self.rx_pkt, buf).await {
             Ok(RxIrqEvent::PreambleReceived) => {
-                self.rx_active = true;
+                if self.rx_state != RxState::Header {
+                    self.rx_state = RxState::Preamble;
+                }
+                None
+            }
+            Ok(RxIrqEvent::HeaderValid) => {
+                self.rx_state = RxState::Header;
                 None
             }
             Ok(RxIrqEvent::Packet(len, status)) => {
-                self.rx_active = false;
+                self.rx_state = RxState::Idle;
                 if matches!(self.rx_mode, RxMode::DutyCycle(_)) {
                     self.rx_armed = false;
                 }
@@ -365,19 +373,19 @@ where
                 })
             }
             Ok(RxIrqEvent::None) => {
-                self.rx_active = false;
+                self.rx_state = RxState::Idle;
                 if matches!(self.rx_mode, RxMode::DutyCycle(_)) {
                     self.rx_armed = false;
                 }
                 None
             }
             Err(RadioError::ReceiveTimeout) if matches!(self.rx_mode, RxMode::DutyCycle(_)) => {
-                self.rx_active = false;
+                self.rx_state = RxState::Idle;
                 self.reenter_rx().await;
                 Some(RxOutcome::DutyCycleEnd)
             }
             Err(e) => {
-                self.rx_active = false;
+                self.rx_state = RxState::Idle;
                 self.rx_armed = false;
                 debug!("sx1262: RX error or timeout: {:?}", e);
                 Some(RxOutcome::Error)
@@ -386,7 +394,11 @@ where
     }
 
     fn is_receiving(&self) -> bool {
-        self.rx_active
+        self.rx_state != RxState::Idle
+    }
+
+    fn rx_state(&self) -> RxState {
+        self.rx_state
     }
 
     async fn recover_receive(&mut self) {
@@ -426,12 +438,12 @@ mod tests {
 
     #[test]
     fn duty_cycle_rejects_short_preambles() {
-        // 2 * detect + 1 symbols (9 for SF >= 7) is the minimum detectable preamble.
-        assert!(duty_cycle_params(7, 62, 9).is_none());
-        assert!(duty_cycle_params(8, 62, 9).is_none());
-        // Just above it, or at fast bandwidths, the deaf window is <= wake cost.
-        assert!(duty_cycle_params(8, 62, 10).is_none());
-        assert!(duty_cycle_params(7, 500, 16).is_none());
+        // 2 * detect + 1 symbols (13 for SF >= 7) is the minimum detectable preamble.
+        assert!(duty_cycle_params(7, 62, 13).is_none());
+        assert!(duty_cycle_params(8, 62, 13).is_none());
+        // Just above it, or at fast bandwidths, the deaf window is <= wake cost (11 ms + 2 ms).
+        assert!(duty_cycle_params(8, 62, 16).is_none());
+        assert!(duty_cycle_params(7, 500, 32).is_none());
         assert!(duty_cycle_params(7, 0, 32).is_none());
     }
 
@@ -442,6 +454,9 @@ mod tests {
         assert!(sf7.sleep_time > 0);
         // SetStopRxTimerOnPreamble extends RX on preamble detection, so rx_time < sleep_time.
         assert!(sf7.rx_time < sf7.sleep_time);
+        // 8 symbols (~16.4 ms) RX and ~24.0 ms sleep keeps ~30 ms margin on 32-symbol preambles.
+        assert!(sf7.rx_time >= 1_000);
+        assert!(sf7.sleep_time <= 1_600);
 
         // SF9-12 MeshCore preambles (16 symbols) also fit duty cycle.
         let sf9 = duty_cycle_params(9, 62, 16).expect("SF9 duty cycle params");

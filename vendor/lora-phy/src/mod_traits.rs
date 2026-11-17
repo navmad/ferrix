@@ -24,6 +24,8 @@ pub trait InterfaceVariant {
 pub enum IrqState {
     /// Runs the loop until after the preamble has been received
     PreambleReceived,
+    /// Runs the loop until a valid LoRa header has been decoded
+    HeaderValid,
     /// Runs the loop until the operation is fully complete
     Done,
 }

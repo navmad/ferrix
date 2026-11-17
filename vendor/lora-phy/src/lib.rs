@@ -31,8 +31,10 @@ use mod_traits::*;
 
 /// Outcome of processing one receive IRQ via [`LoRa::handle_rx_irq`].
 pub enum RxIrqEvent {
-    /// Preamble or valid header detected; packet reception is still in progress.
+    /// Preamble detected; packet reception may be starting.
     PreambleReceived,
+    /// Valid LoRa header decoded; packet reception is in progress.
+    HeaderValid,
     /// A complete packet was read into the caller's buffer.
     Packet(u8, PacketStatus),
     /// An intermediate or ignored error IRQ occurred; keep listening.
@@ -209,7 +211,7 @@ where
             loop {
                 self.wait_for_irq().await?;
                 match self.radio_kind.process_irq_event(self.radio_mode, None, true).await {
-                    Ok(Some(IrqState::Done | IrqState::PreambleReceived)) => {
+                    Ok(Some(IrqState::Done | IrqState::PreambleReceived | IrqState::HeaderValid)) => {
                         self.radio_mode = RadioMode::Standby;
                         return Ok(());
                     }
@@ -260,7 +262,7 @@ where
         loop {
             self.wait_for_irq().await?;
             match self.handle_rx_irq(packet_params, receiving_buffer).await? {
-                RxIrqEvent::PreambleReceived | RxIrqEvent::None => continue,
+                RxIrqEvent::PreambleReceived | RxIrqEvent::HeaderValid | RxIrqEvent::None => continue,
                 RxIrqEvent::Packet(received_len, rx_pkt_status) => {
                     return Ok((received_len, rx_pkt_status));
                 }
@@ -291,6 +293,7 @@ where
             match self.radio_kind.process_irq_event(self.radio_mode, None, true).await {
                 Ok(Some(actual_state)) => match actual_state {
                     IrqState::PreambleReceived => Ok(RxIrqEvent::PreambleReceived),
+                    IrqState::HeaderValid => Ok(RxIrqEvent::HeaderValid),
                     IrqState::Done => {
                         let received_len = self.radio_kind.get_rx_payload(packet_params, receiving_buffer).await?;
                         let rx_pkt_status = self.radio_kind.get_rx_packet_status().await?;

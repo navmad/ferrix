@@ -9,15 +9,16 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Instant, Timer};
 use ferrix_core::scheduler::{
-    assign_flood, cancel_slot, due_flood, next_flood_due, preamble_for, rebase_floods,
-    refill_budgets, remember_cancel, slot_width_ms, take_cancelled, FloodSlot, TxPacket,
-    CONTROL_QUEUE, FLOOD_MAX_AGE_SLOTS, FLOOD_SLOTS, SLOT_MIN_MS, TX_GAP_MS, TX_MAX_ATTEMPTS,
+    assign_flood, cancel_slot, due_flood, next_flood_due, packet_wait_ms, preamble_for,
+    preamble_wait_ms, rebase_floods, refill_budgets, remember_cancel, slot_width_ms,
+    take_cancelled, FloodSlot, TxPacket, CONTROL_QUEUE, FLOOD_MAX_AGE_SLOTS, FLOOD_SLOTS,
+    SLOT_MIN_MS, TX_GAP_MS, TX_MAX_ATTEMPTS,
 };
 use ferrix_core::state::{
     current_public_key, RADIO_SETTINGS, RADIO_TELEMETRY, TX_SLOT_MS_LAST, TX_SLOT_MS_OVERRIDE,
     TX_SLOT_USED, FORWARD_SENT,
 };
-use ferrix_hal::radio::{LoraConfig, LoraRadio, RadioDevice, RxOutcome, TxOutcome};
+use ferrix_hal::radio::{LoraConfig, LoraRadio, RadioDevice, RxOutcome, RxState, TxOutcome};
 use heapless::{Deque, Vec};
 use meshcore_wire::tx::TxLane;
 
@@ -162,7 +163,7 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
     let mut next_tx_allowed_ms: u64 = 0;
     let mut base_ms = start_ms;
     let mut last_rx_activity_ms = start_ms;
-    let mut rx_active_since: Option<u64> = None;
+    let mut rx_active_since: Option<(RxState, u64)> = None;
 
     let mut current_cfg = (
         initial.frequency_hz,
@@ -292,20 +293,42 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
         let mut budget_wait_ms = 0u64;
         let mut pick: Option<(TxPacket, TxLane, u32)> = None;
 
-        // Avoid transmitting on top of an inbound frame after preamble detection,
-        // bounded to 2.5 s so false noise preambles cannot stall TX forever.
-        let rx_busy = if device.is_receiving() {
-            let since = *rx_active_since.get_or_insert(now);
-            let until = since.saturating_add(2_500);
-            if now < until {
-                wake_at = wake_at.min(until);
-                true
-            } else {
+        // Avoid transmitting on top of an inbound frame, distinguishing brief
+        // false-preamble detections from confirmed headers so noise cannot stall
+        // TX or wedge duty-cycle RX out of sleep.
+        let current_rx_state = device.rx_state();
+        let rx_busy = match current_rx_state {
+            RxState::Idle => {
+                rx_active_since = None;
                 false
             }
-        } else {
-            rx_active_since = None;
-            false
+            RxState::Preamble | RxState::Header => {
+                let (tracked_state, since) = match rx_active_since {
+                    Some((st, ts)) if st == current_rx_state => (st, ts),
+                    _ => {
+                        rx_active_since = Some((current_rx_state, now));
+                        (current_rx_state, now)
+                    }
+                };
+                let limit_ms = match tracked_state {
+                    RxState::Preamble => preamble_wait_ms(current_cfg.2, current_cfg.3, preamble),
+                    RxState::Header => {
+                        packet_wait_ms(current_cfg.2, current_cfg.3, current_cfg.4, preamble)
+                    }
+                    RxState::Idle => 0,
+                };
+                let until = since.saturating_add(limit_ms);
+                if now < until {
+                    wake_at = wake_at.min(until);
+                    true
+                } else {
+                    device.recover_receive().await;
+                    rx_active_since = None;
+                    now = Instant::now().as_millis() as u64;
+                    last_rx_activity_ms = now;
+                    false
+                }
+            }
         };
 
         if now >= next_tx_allowed_ms && !rx_busy {
@@ -533,10 +556,13 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
                         }
                         None => {
                             let now_irq = Instant::now().as_millis() as u64;
-                            if device.is_receiving() {
-                                rx_active_since.get_or_insert(now_irq);
-                            } else {
-                                rx_active_since = None;
+                            match device.rx_state() {
+                                RxState::Idle => rx_active_since = None,
+                                st => {
+                                    if !matches!(rx_active_since, Some((prev, _)) if prev == st) {
+                                        rx_active_since = Some((st, now_irq));
+                                    }
+                                }
                             }
                             last_rx_activity_ms = now_irq;
                         }
