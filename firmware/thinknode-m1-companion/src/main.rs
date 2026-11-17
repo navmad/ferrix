@@ -11,7 +11,7 @@ use embassy_executor::Spawner;
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    let peripherals = ferrix_nrf52::startup::init();
+    let peripherals = ferrix_nrf52::startup::init_with(ferrix_thinknode_m1::STARTUP_CONFIG);
     let board = ferrix_thinknode_m1::ThinkNodeBoard::new(peripherals);
     ferrix_role_companion::run(board, spawner).await;
 }

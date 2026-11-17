@@ -8,7 +8,7 @@ use core::future::poll_fn;
 use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 use core::task::Poll;
 
-use defmt::{debug, error, info};
+use defmt::{debug, error, info, warn};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::channel::Channel;
@@ -744,6 +744,18 @@ pub async fn ble_companion_supervisor_task(
     unsafe { nrf_softdevice::raw::sd_softdevice_disable() };
 
     let sd = Softdevice::enable(&sd_config);
+    if crate::startup::dcdc_reg1_enabled() {
+        let ret = unsafe {
+            nrf_softdevice::raw::sd_power_dcdc_mode_set(
+                nrf_softdevice::raw::NRF_POWER_DCDC_MODES_NRF_POWER_DCDC_ENABLE as u8,
+            )
+        };
+        if ret != 0 {
+            warn!("BLE: sd_power_dcdc_mode_set returned {=u32:#x}", ret);
+        } else {
+            info!("BLE: REG1 DC-DC regulator enabled");
+        }
+    }
     set_static_passkey(BLE_PIN.load(Ordering::Relaxed));
 
     let server = MeshCoreGattServer::new(sd);

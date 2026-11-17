@@ -54,6 +54,15 @@ pub const HAS_BATTERY_ADC: bool = true;
 /// Protocol capability bits.
 pub const CAPABILITIES: u32 = CAP_CLIENT | CAP_GPS | CAP_EPD | CAP_BLE;
 
+/// Board startup configuration for ThinkNode M1.
+///
+/// ThinkNode M1 populates the `REG1` (`VDD -> DEC4`) buck inductor (while
+/// `REG0` stays in normal/LDO mode).
+pub const STARTUP_CONFIG: ferrix_nrf52::startup::StartupConfig =
+    ferrix_nrf52::startup::StartupConfig {
+        dcdc_reg1: true,
+    };
+
 pub use ferrix_nrf52::seed::hardware_seed;
 
 static EPD_FRAMEBUFFER: StaticCell<EpdFrameBuffer> = StaticCell::new();
