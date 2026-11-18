@@ -126,7 +126,12 @@ impl<'a> CompanionSession<'a> {
     pub async fn handle_frame<L: CompanionLink>(&mut self, payload: &[u8], link: &mut L) {
         self.node.sync_from_shared();
         if payload.first() == Some(&protocol::CMD_GET_CONTACTS) {
-            self.stream_contacts(link).await;
+            let since = if payload.len() >= 5 {
+                u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]])
+            } else {
+                0
+            };
+            self.stream_contacts(link, since).await;
             return;
         }
 
@@ -141,10 +146,16 @@ impl<'a> CompanionSession<'a> {
         for response in responses.iter() {
             link.write_frame(response).await;
         }
+
+        if protocol::take_pending_reboot() {
+            embassy_time::Timer::after_millis(150).await;
+            self.host.reboot();
+        }
     }
 
-    /// Stream the contact list through the link.
-    pub async fn stream_contacts<L: CompanionLink>(&mut self, link: &mut L) {
+    /// Stream the contact list through the link, optionally filtering to contacts
+    /// modified strictly after `since` (when `since > 0`).
+    pub async fn stream_contacts<L: CompanionLink>(&mut self, link: &mut L, since: u32) {
         let count = protocol::contacts_count();
         link.write_frame(&protocol::encode_contacts_start(count)).await;
 
@@ -153,6 +164,9 @@ impl<'a> CompanionSession<'a> {
             let Some(c) = protocol::contact_at(idx) else {
                 continue;
             };
+            if since > 0 && c.last_seen_epoch <= since {
+                continue;
+            }
             if c.last_seen_epoch > max_lastmod {
                 max_lastmod = c.last_seen_epoch;
             }
@@ -179,6 +193,154 @@ impl<L: CompanionLink> TextSink for LinkText<'_, L> {
     async fn send(&mut self, data: &[u8]) -> Result<(), ()> {
         self.0.write_text(data).await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::companion::cli::{PowerClockStats, RadioStats, StorageStats};
+    use crate::companion::protocol::CompanionHost;
+    use crate::types::DiscoveredContact;
+
+    struct DummyHost;
+
+    impl CompanionHost for DummyHost {
+        fn battery_millivolts(&self) -> u16 {
+            4000
+        }
+        fn set_callsign(&self, _name: &str) {}
+        fn set_custom_priv_key(&self, _key: [u8; 64]) {}
+        fn set_path_hash_mode(&self, _mode: u8) {}
+        fn request_save_config(&self) {}
+        fn request_radio_config(&self) {}
+        fn request_factory_reset(&self) {}
+        fn queue_consume_now(&self) {}
+        fn advert_remember(&self, _pub_key: &[u8; 32], _payload: &[u8]) {}
+        fn reboot(&self) -> ! {
+            panic!("reboot in test")
+        }
+    }
+
+    impl CliHost for DummyHost {
+        fn leds_disabled(&self) -> bool { false }
+        fn set_leds_disabled(&self, _disabled: bool) {}
+        fn storage_stats(&self) -> StorageStats {
+            StorageStats {
+                contact_saves: 0,
+                contact_erases: 0,
+                message_records: 0,
+                message_page_erases: 0,
+                message_queued: 0,
+                advert_records: 0,
+                advert_erases: 0,
+                config_saves: 0,
+                config_erases: 0,
+                external_profile: false,
+                external_unavailable: false,
+                external_drops: 0,
+            }
+        }
+        fn radio_stats(&self) -> RadioStats {
+            RadioStats {
+                override_ms: 0,
+                slot_ms: 0,
+                used: 0,
+                forward_scheduled: 0,
+                forward_sent: 0,
+                duplicate_deltas: [0; 6],
+            }
+        }
+        fn power_clock_stats(&self) -> Option<PowerClockStats> { None }
+        fn set_tx_slot_override(&self, _ms: u32) {}
+        fn clear_radio_stats(&self) {}
+        fn advert_stats(&self) -> (usize, usize, bool) { (0, 0, false) }
+        fn advert_slots(&self) -> usize { 0 }
+        fn gps_enabled(&self) -> bool { false }
+        fn set_gps_enabled(&self, _on: bool) {}
+        fn reboot_to_bootloader(&self) -> ! { panic!("bootloader") }
+        fn reboot_to_ota_dfu(&self) -> ! { panic!("ota") }
+        fn board_line(&self) -> &'static str { "test" }
+    }
+
+    struct CaptureLink {
+        frames: std::vec::Vec<std::vec::Vec<u8>>,
+    }
+
+    impl CompanionLink for CaptureLink {
+        async fn write_frame(&mut self, frame: &[u8]) {
+            self.frames.push(frame.to_vec());
+        }
+        async fn write_text(&mut self, _text: &[u8]) {}
+    }
+
+    fn poll_ready<F: core::future::Future>(fut: F) -> F::Output {
+        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        const VTABLE: RawWakerVTable = RawWakerVTable::new(
+            |p| RawWaker::new(p, &VTABLE),
+            |_| {},
+            |_| {},
+            |_| {},
+        );
+        let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = core::pin::pin!(fut);
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(out) => out,
+            Poll::Pending => panic!("unexpected Pending"),
+        }
+    }
+
+    fn make_contact(byte: u8, lastmod: u32) -> DiscoveredContact {
+        DiscoveredContact {
+            pub_key: [byte; 32],
+            callsign: String::new(),
+            node_id: [byte; 4],
+            last_seen_epoch: lastmod,
+            rssi: 0,
+            snr: 0,
+            latitude: 0,
+            longitude: 0,
+            flags: 0,
+            contact_type: 1,
+            out_path: [0u8; 64],
+            out_path_len: 0xFF,
+            last_advert_ts: 0,
+            saved_hash: 0,
+            sync_since: 0,
+        }
+    }
+
+    #[test]
+    fn get_contacts_since_filters_older_records_but_reports_total_count() {
+        crate::state::DISCOVERED_CONTACTS.lock(|c| {
+            let mut list = c.borrow_mut();
+            list.clear();
+            let _ = list.push(make_contact(1, 0));
+            let _ = list.push(make_contact(2, 100));
+            let _ = list.push(make_contact(3, 250));
+        });
+
+        let mut session = CompanionSession::new("n", "b", 0, [1; 32], [2; 64], &DummyHost);
+        let mut link = CaptureLink { frames: std::vec::Vec::new() };
+
+        // since == 0 returns all 3 contacts.
+        poll_ready(session.handle_frame(&[protocol::CMD_GET_CONTACTS], &mut link));
+        assert_eq!(link.frames.len(), 5);
+        assert_eq!(link.frames[0][0], contacts::RESP_CODE_CONTACTS_START);
+        assert_eq!(u32::from_le_bytes(link.frames[0][1..5].try_into().unwrap()), 3);
+        assert_eq!(link.frames[4][0], contacts::RESP_CODE_END_OF_CONTACTS);
+        assert_eq!(u32::from_le_bytes(link.frames[4][1..5].try_into().unwrap()), 250);
+
+        // since == 100 returns only contact 3 (lastmod 250 > 100), while start carries total count 3.
+        link.frames.clear();
+        let mut req = [protocol::CMD_GET_CONTACTS, 0, 0, 0, 0];
+        req[1..5].copy_from_slice(&100u32.to_le_bytes());
+        poll_ready(session.handle_frame(&req, &mut link));
+        assert_eq!(link.frames.len(), 3);
+        assert_eq!(u32::from_le_bytes(link.frames[0][1..5].try_into().unwrap()), 3);
+        assert_eq!(link.frames[1][1], 3);
+        assert_eq!(u32::from_le_bytes(link.frames[2][1..5].try_into().unwrap()), 250);
     }
 }
 

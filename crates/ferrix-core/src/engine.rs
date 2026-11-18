@@ -9,10 +9,9 @@
 use meshcore_wire::identity::LocalIdentity;
 use meshcore_wire::packet::{
     Packet, PAYLOAD_TYPE_ACK, PAYLOAD_TYPE_ADVERT, PAYLOAD_TYPE_ANON_REQ,
-    PAYLOAD_TYPE_GRP_DATA, PAYLOAD_TYPE_MULTIPART,
-    PAYLOAD_TYPE_GRP_TXT, PAYLOAD_TYPE_PATH, PAYLOAD_TYPE_REQ, PAYLOAD_TYPE_RESPONSE,
-    PAYLOAD_TYPE_CONTROL, PAYLOAD_TYPE_TRACE, PAYLOAD_TYPE_TXT_MSG, ROUTE_TYPE_DIRECT,
-    ROUTE_TYPE_FLOOD,
+    PAYLOAD_TYPE_CONTROL, PAYLOAD_TYPE_GRP_DATA, PAYLOAD_TYPE_GRP_TXT, PAYLOAD_TYPE_MULTIPART,
+    PAYLOAD_TYPE_PATH, PAYLOAD_TYPE_RAW_CUSTOM, PAYLOAD_TYPE_REQ, PAYLOAD_TYPE_RESPONSE,
+    PAYLOAD_TYPE_TRACE, PAYLOAD_TYPE_TXT_MSG, ROUTE_TYPE_DIRECT, ROUTE_TYPE_FLOOD,
 };
 use meshcore_wire::packets::{
     AckPacket, AddressedPacket, AdvertPacket, AnonReqPacket, GrpDataPacket, GrpTextPacket,
@@ -42,6 +41,9 @@ pub trait EngineContext: Send + Sync {
     fn peers_by_hash(&self, _hash: u8) -> heapless::Vec<[u8; 32], 32> {
         heapless::Vec::new()
     }
+
+    /// Pending anonymous/binary request target matching `hash` when not in contacts.
+    fn anon_peer_key(&self, _hash: u8) -> Option<[u8; 32]> { None }
 
     /// Snapshot of the group channel table.
     fn channels(&self) -> [ChannelData; MAX_CHANNELS] { default_channels() }
@@ -120,16 +122,28 @@ pub enum InboundAction {
     ReceivedDirectText {
         msg: TxtMsgPacket,
         sender_pub: [u8; 32],
+        /// Encoded flood arrival path length, or `0xFF` when received direct.
+        path_len: u8,
     },
     /// Received message delivery acknowledgment
-    ReceivedAck(AckPacket),
+    ReceivedAck {
+        ack: AckPacket,
+        is_flood: bool,
+        arrival_path_len: u8,
+        arrival_path: heapless::Vec<u8, 64>,
+    },
     /// Received path discovery reply
     ReceivedPath {
         packet: PathPacket,
         sender_pub: [u8; 32],
+        is_flood: bool,
         /// Path the reply travelled to reach us (packed length + bytes).
         arrival_path_len: u8,
         arrival_path: heapless::Vec<u8, 64>,
+    },
+    /// Received custom raw payload (`PAYLOAD_TYPE_RAW_CUSTOM`).
+    ReceivedRawCustom {
+        data: heapless::Vec<u8, 184>,
     },
     /// Received channel datagram
     ReceivedGroupData {
@@ -403,7 +417,12 @@ impl<'a> MeshEngine<'a> {
                                             &fwd.path,
                                             0,
                                         );
-                                        return InboundAction::ReceivedAck(ack);
+                                        return InboundAction::ReceivedAck {
+                                            ack,
+                                            is_flood: false,
+                                            arrival_path_len: 0,
+                                            arrival_path: heapless::Vec::new(),
+                                        };
                                     }
                                     self.queue_forward(fwd);
                                     return InboundAction::Forwarded;
@@ -435,7 +454,12 @@ impl<'a> MeshEngine<'a> {
                                                         &fwd.path,
                                                         delay_ms,
                                                     );
-                                                    return InboundAction::ReceivedAck(ack);
+                                                    return InboundAction::ReceivedAck {
+                                                        ack,
+                                                        is_flood: false,
+                                                        arrival_path_len: 0,
+                                                        arrival_path: heapless::Vec::new(),
+                                                    };
                                                 }
                                             }
                                         }
@@ -607,6 +631,7 @@ impl<'a> MeshEngine<'a> {
                         return InboundAction::ReceivedDirectText {
                             msg,
                             sender_pub: *peer,
+                            path_len: if pkt.is_flood() { pkt.path_len } else { 0xFF },
                         };
                     }
                 }
@@ -617,7 +642,15 @@ impl<'a> MeshEngine<'a> {
                     return InboundAction::DropDuplicate;
                 }
                 if let Ok(ack) = AckPacket::decode(&pkt.payload[..pkt.payload_len]) {
-                    InboundAction::ReceivedAck(ack)
+                    let mut arrival_path = heapless::Vec::<u8, 64>::new();
+                    let an = pkt.path_byte_len();
+                    let _ = arrival_path.extend_from_slice(&pkt.path[..an]);
+                    InboundAction::ReceivedAck {
+                        ack,
+                        is_flood: pkt.is_flood(),
+                        arrival_path_len: pkt.path_len,
+                        arrival_path,
+                    }
                 } else {
                     InboundAction::Unhandled
                 }
@@ -643,6 +676,7 @@ impl<'a> MeshEngine<'a> {
                             return InboundAction::ReceivedPath {
                                 packet: path,
                                 sender_pub: *peer,
+                                is_flood: pkt.is_flood(),
                                 arrival_path_len: pkt.path_len,
                                 arrival_path,
                             };
@@ -669,7 +703,15 @@ impl<'a> MeshEngine<'a> {
                             {
                                 return InboundAction::DropDuplicate;
                             }
-                            return InboundAction::ReceivedAck(ack);
+                            let mut arrival_path = heapless::Vec::<u8, 64>::new();
+                            let an = pkt.path_byte_len();
+                            let _ = arrival_path.extend_from_slice(&pkt.path[..an]);
+                            return InboundAction::ReceivedAck {
+                                ack,
+                                is_flood: pkt.is_flood(),
+                                arrival_path_len: pkt.path_len,
+                                arrival_path,
+                            };
                         }
                     }
                 }
@@ -738,6 +780,19 @@ impl<'a> MeshEngine<'a> {
                         }
                     }
                 }
+                if pkt.payload_type() == PAYLOAD_TYPE_RESPONSE {
+                    if let Some(peer) = self.context.anon_peer_key(src) {
+                        if let Some(secret) = self.identity.shared_secret(&peer) {
+                            if let Ok(ap) = AddressedPacket::decode(payload, &secret) {
+                                consumed = true;
+                                return InboundAction::ReceivedResponse {
+                                    plain: ap.plain,
+                                    sender_pub: peer,
+                                };
+                            }
+                        }
+                    }
+                }
                 InboundAction::Unhandled
             }
             PAYLOAD_TYPE_ANON_REQ => {
@@ -760,6 +815,14 @@ impl<'a> MeshEngine<'a> {
                     }
                 }
                 InboundAction::Unhandled
+            }
+            PAYLOAD_TYPE_RAW_CUSTOM => {
+                if is_dupe {
+                    return InboundAction::DropDuplicate;
+                }
+                let mut data = heapless::Vec::<u8, 184>::new();
+                let _ = data.extend_from_slice(&pkt.payload[..pkt.payload_len]);
+                InboundAction::ReceivedRawCustom { data }
             }
             _ => InboundAction::Unhandled,
             }
@@ -981,12 +1044,35 @@ impl<'a> MeshEngine<'a> {
         arrival: &Packet,
         ack: &[u8],
     ) -> Result<Packet, ()> {
+        const TXT_ACK_DELAY_MS: u64 = 200;
         let plen = arrival.path_byte_len();
         let mut path = [0u8; 64];
         path[..plen].copy_from_slice(&arrival.path[..plen]);
         let pp = PathPacket::new(dest, src, arrival.path_len, &path[..plen], 3, ack)?;
         let pkt = pp.to_packet(ROUTE_TYPE_FLOOD, secret, &[0u8; 4])?;
-        Ok(self.finish_outbound(pkt, ROUTE_TYPE_FLOOD, 0, &[0u8; 64]))
+        Ok(self.finish_outbound_at(pkt, ROUTE_TYPE_FLOOD, 0, &[0u8; 64], TXT_ACK_DELAY_MS))
+    }
+
+    /// Queue a standalone reciprocal `PAYLOAD_TYPE_PATH` (no extra payload)
+    /// telling `dest_pub` the return path it should use to reach us.
+    pub fn queue_path_return_only(
+        &mut self,
+        dest_pub: &[u8; 32],
+        send_path_len: u8,
+        send_path: &[u8; 64],
+        returned_path_len: u8,
+        returned_path: &[u8],
+        delay_ms: u64,
+    ) -> Result<Packet, ()> {
+        let secret = self.identity.shared_secret(dest_pub).ok_or(())?;
+        let dest = dest_pub[0];
+        let src = self.identity.pub_key()[0];
+        let mut rand4 = [0u8; 4];
+        rand4.copy_from_slice(&now_ms().to_le_bytes()[..4]);
+        let pp = PathPacket::new(dest, src, returned_path_len, returned_path, 0xFF, &[])?;
+        let (route, path_len) = route_for(send_path_len);
+        let pkt = pp.to_packet(route, &secret, &rand4)?;
+        Ok(self.finish_outbound_at(pkt, route, path_len, send_path, delay_ms))
     }
 
     /// Construct and queue a response to an inbound `PAYLOAD_TYPE_REQ`.
@@ -1036,10 +1122,21 @@ impl<'a> MeshEngine<'a> {
 
     fn finish_outbound(
         &mut self,
+        pkt: Packet,
+        route: u8,
+        path_len: u8,
+        path: &[u8; 64],
+    ) -> Packet {
+        self.finish_outbound_at(pkt, route, path_len, path, 0)
+    }
+
+    fn finish_outbound_at(
+        &mut self,
         mut pkt: Packet,
         route: u8,
         path_len: u8,
         path: &[u8; 64],
+        delay_ms: u64,
     ) -> Packet {
         pkt.header = (pkt.header & 0xFC) | (route & 0x03);
         if route == ROUTE_TYPE_FLOOD {
@@ -1053,7 +1150,10 @@ impl<'a> MeshEngine<'a> {
             pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
         }
         self.seen_filter.mark_seen(pkt.calculate_packet_hash());
-        let _ = self.tx_queue.push_control(pkt.clone(), now_ms());
+        let now = now_ms();
+        let _ = self
+            .tx_queue
+            .push_control_at(pkt.clone(), now, now.saturating_add(delay_ms));
         pkt
     }
 }
@@ -1403,7 +1503,7 @@ mod tests {
         ack_pkt.set_path_hash_size_and_count(1, 0);
 
         match engine.handle_inbound_packet(mp_pkt, 5) {
-            InboundAction::ReceivedAck(got) => assert_eq!(got.crc, 0xDEADBEEF),
+            InboundAction::ReceivedAck { ack: got, .. } => assert_eq!(got.crc, 0xDEADBEEF),
             _ => panic!("expected ReceivedAck on first MULTIPART copy"),
         }
         assert!(matches!(
@@ -1434,7 +1534,7 @@ mod tests {
         mp_pkt.path[1] = 0x55;
 
         match engine.handle_inbound_packet(mp_pkt, 5) {
-            InboundAction::ReceivedAck(got) => assert_eq!(got.crc, 0xCAFEBABE),
+            InboundAction::ReceivedAck { ack: got, .. } => assert_eq!(got.crc, 0xCAFEBABE),
             _ => panic!("expected ReceivedAck when forwarding direct MULTIPART ACK"),
         }
         assert_eq!(engine.tx_queue.len(), 2);

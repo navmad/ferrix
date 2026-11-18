@@ -75,7 +75,7 @@ pub enum UsbCommand {
     RebootToOtaDfu,
 }
 
-pub static USB_COMMAND_CHANNEL: Channel<CriticalSectionRawMutex, UsbCommand, 4> = Channel::new();
+pub static USB_COMMAND_CHANNEL: Channel<CriticalSectionRawMutex, UsbCommand, 8> = Channel::new();
 
 /// Contact operation deferred out of the command handler so contact storage
 /// never runs inside the BLE/SoftDevice path.

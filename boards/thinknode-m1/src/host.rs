@@ -205,6 +205,10 @@ impl EngineContext for BoardEngineContext {
         peers
     }
 
+    fn anon_peer_key(&self, hash: u8) -> Option<[u8; 32]> {
+        ferrix_core::companion::protocol::pending_anon_peer(hash)
+    }
+
     fn channels(&self) -> [ChannelData; MAX_CHANNELS] {
         ferrix_core::state::CHANNELS.lock(|chs| *chs.borrow())
     }

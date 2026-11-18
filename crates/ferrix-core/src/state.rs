@@ -5,7 +5,7 @@
 //! board/application coupling without changing behavior.
 
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
@@ -559,6 +559,22 @@ pub fn update_gps_state(state: GpsState) {
 
 pub fn clear_gps_state() {
     update_gps_state(GpsState::default());
+}
+
+/// Shared configured/last-known node position in `1e-6` degrees.
+static NODE_ADVERT_LAT_E6: AtomicI32 = AtomicI32::new(0);
+static NODE_ADVERT_LON_E6: AtomicI32 = AtomicI32::new(0);
+
+pub fn set_advert_lat_lon_e6(lat: i32, lon: i32) {
+    NODE_ADVERT_LAT_E6.store(lat, Ordering::Relaxed);
+    NODE_ADVERT_LON_E6.store(lon, Ordering::Relaxed);
+}
+
+pub fn advert_lat_lon_e6() -> (i32, i32) {
+    (
+        NODE_ADVERT_LAT_E6.load(Ordering::Relaxed),
+        NODE_ADVERT_LON_E6.load(Ordering::Relaxed),
+    )
 }
 
 /// Main application loop heartbeat, checked by the watchdog supervisor.

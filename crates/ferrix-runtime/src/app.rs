@@ -162,12 +162,13 @@ pub trait AppBoard {
 #[derive(Clone, Copy, Debug)]
 pub struct PendingMessageAck {
     pub crc: u32,
+    pub dest_pub: [u8; 32],
     pub send_instant_ms: u64,
 }
 
 static PENDING_MESSAGE_ACKS: Mutex<
     CriticalSectionRawMutex,
-    core::cell::RefCell<Vec<PendingMessageAck, 8>>,
+    core::cell::RefCell<Vec<PendingMessageAck, 16>>,
 > = Mutex::new(core::cell::RefCell::new(Vec::new()));
 
 /// Tell the app that a contact was discovered (full record) or re-advertised.
@@ -193,7 +194,7 @@ fn push_path_updated(pub_key: &[u8; 32]) {
     push_companion(&frame);
 }
 
-fn track_pending_ack(crc: u32) {
+fn track_pending_ack(crc: u32, dest_pub: [u8; 32]) {
     let now = Instant::now().as_millis();
     PENDING_MESSAGE_ACKS.lock(|a| {
         let mut list = a.borrow_mut();
@@ -202,23 +203,22 @@ fn track_pending_ack(crc: u32) {
         }
         let _ = list.push(PendingMessageAck {
             crc,
+            dest_pub,
             send_instant_ms: now,
         });
     });
 }
 
-fn handle_direct_message_confirmed(crc: u32) {
+fn handle_direct_message_confirmed(crc: u32) -> Option<[u8; 32]> {
     let now = Instant::now().as_millis();
-    let rtt_ms = PENDING_MESSAGE_ACKS.lock(|a| {
+    let matched = PENDING_MESSAGE_ACKS.lock(|a| {
         let mut list = a.borrow_mut();
         list.iter().position(|p| p.crc == crc).map(|pos| {
             let item = list.remove(pos);
-            now.saturating_sub(item.send_instant_ms) as u32
+            (item.dest_pub, now.saturating_sub(item.send_instant_ms) as u32)
         })
     });
-    let Some(rtt_ms) = rtt_ms else {
-        return;
-    };
+    let (dest_pub, rtt_ms) = matched?;
     info!(
         "MeshCore Direct Message Delivery ACK Confirmed! (crc {:08x}, RTT: {} ms)",
         crc, rtt_ms
@@ -228,6 +228,7 @@ fn handle_direct_message_confirmed(crc: u32) {
     let _ = frame.extend_from_slice(&crc.to_le_bytes());
     let _ = frame.extend_from_slice(&rtt_ms.to_le_bytes());
     push_companion(&frame);
+    Some(dest_pub)
 }
 
 /// Hand queued packets to the radio task.
@@ -271,7 +272,7 @@ async fn send_advert<B: AppBoard>(
 fn sync_gps(node: &mut CompanionNode<'_>) {
     let gps = gps_state();
     node.gps_fix = gps.fix;
-    if gps.fix {
+    if gps.fix && advert_lat_lon_e6() == (0, 0) {
         node.latitude = gps.latitude;
         node.longitude = gps.longitude;
     }
@@ -742,7 +743,11 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                         let _ = msg_wait.push(protocol::PUSH_CODE_MSG_WAITING);
                         push_companion(&msg_wait);
                     }
-                    InboundAction::ReceivedDirectText { msg, sender_pub } => {
+                    InboundAction::ReceivedDirectText {
+                        msg,
+                        sender_pub,
+                        path_len,
+                    } => {
                         info!(
                             "MeshCore Direct Msg from {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}: {}",
                             sender_pub[0], sender_pub[1], sender_pub[2],
@@ -791,7 +796,7 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                         let _ = s_text.push_str(msg.text.as_str());
                         let message = ReceivedMessage {
                             channel_idx: 0,
-                            path_len: 0,
+                            path_len,
                             sender: s_sender,
                             sender_pub,
                             text: s_text,
@@ -828,10 +833,38 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                     InboundAction::ReceivedRepeaterEcho { pkt_hash, hops } => {
                         info!("MeshCore Message echoed by repeater! ({} hops, pkt_hash: {:?})", hops, pkt_hash);
                     }
-                    InboundAction::ReceivedAck(ack) => {
+                    InboundAction::ReceivedAck {
+                        ack,
+                        is_flood,
+                        arrival_path_len,
+                        arrival_path,
+                    } => {
                         info!("MeshCore ACK received (crc {:08x})", ack.crc);
                         if !protocol::handle_keepalive_ack(ack.crc) {
-                            handle_direct_message_confirmed(ack.crc);
+                            if let Some(dest_pub) = handle_direct_message_confirmed(ack.crc) {
+                                if is_flood {
+                                    let peer = DISCOVERED_CONTACTS.lock(|c| {
+                                        c.borrow()
+                                            .iter()
+                                            .find(|ct| ct.pub_key == dest_pub)
+                                            .map(|ct| (ct.out_path_len, ct.out_path))
+                                    });
+                                    if let Some((out_path_len, out_path)) = peer {
+                                        if out_path_len != 0xFF
+                                            && Packet::is_valid_path_len(out_path_len)
+                                        {
+                                            let _ = mesh.queue_path_return_only(
+                                                &dest_pub,
+                                                out_path_len,
+                                                &out_path,
+                                                arrival_path_len,
+                                                &arrival_path,
+                                                3000,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                     InboundAction::ReceivedResponse { plain, sender_pub } => {
@@ -928,6 +961,7 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                     InboundAction::ReceivedPath {
                         packet: path,
                         sender_pub,
+                        is_flood,
                         arrival_path_len,
                         arrival_path,
                     } => {
@@ -951,6 +985,16 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                             push_path_updated(&sender_pub);
                         }
                         storage::request_contacts();
+                        if is_flood && (path.extra_type & 0x0F) == 3 {
+                            let _ = mesh.queue_path_return_only(
+                                &sender_pub,
+                                path.path_len,
+                                &path.path,
+                                arrival_path_len,
+                                &arrival_path,
+                                200,
+                            );
+                        }
                         // A PATH return can carry an ACK or a RESPONSE as its
                         // extra. Flooded logins/requests use a RESPONSE extra.
                         if path.extra_type & 0x0F == 3 && path.extra.len() >= 4 {
@@ -984,6 +1028,17 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                                     path.extra.len()
                                 );
                             }
+                        }
+                    }
+                    InboundAction::ReceivedRawCustom { data } => {
+                        let mut push = heapless::Vec::<u8, 256>::new();
+                        let _ = push.push(protocol::PUSH_CODE_RAW_DATA);
+                        let _ = push.push((snr.saturating_mul(4)) as u8);
+                        let _ = push.push(rssi as i8 as u8);
+                        let _ = push.push(0xFF);
+                        let _ = push.extend_from_slice(&data);
+                        if push.len() <= 247 {
+                            push_companion(&push);
                         }
                     }
                     InboundAction::DropDuplicate => {
@@ -1040,6 +1095,7 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                     let _ = mesh.queue_advert(time, lat, lon, flood);
                 }
                 UsbCommand::SetAdvertLatLon { lat, lon } => {
+                    set_advert_lat_lon_e6(lat, lon);
                     node.latitude = lat as f32 / 1_000_000.0;
                     node.longitude = lon as f32 / 1_000_000.0;
                 }
@@ -1126,7 +1182,11 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                                 out_path_len,
                                 &out_path,
                             ) {
-                                Ok(crc) => track_pending_ack(crc),
+                                Ok(crc) => {
+                                    if txt_type == meshcore_wire::packets::txtmsg::TXT_TYPE_PLAIN {
+                                        track_pending_ack(crc, dest_pub);
+                                    }
+                                }
                                 Err(_) => info!("Direct message send failed (text or encryption)"),
                             }
                         }

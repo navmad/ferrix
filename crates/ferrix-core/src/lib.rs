@@ -30,5 +30,7 @@ mod defmt_test_stubs {
     extern "C" fn _defmt_panic() -> ! {
         panic!("defmt panic in host test")
     }
+    #[no_mangle]
+    extern "C" fn __pender(_context: *mut ()) {}
 }
 

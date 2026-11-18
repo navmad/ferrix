@@ -179,6 +179,22 @@ pub const LPP_GPS: u8 = 0x88;
 static PENDING_REQ: Mutex<CriticalSectionRawMutex, RefCell<Option<(u32, [u8; 32])>>> =
     Mutex::new(RefCell::new(None));
 
+static REBOOT_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Consume any deferred reboot requested by `CMD_REBOOT`.
+pub fn take_pending_reboot() -> bool {
+    REBOOT_PENDING.swap(false, Ordering::AcqRel)
+}
+
+/// Return the pending request target public key matching `hash`, if any.
+pub fn pending_anon_peer(hash: u8) -> Option<[u8; 32]> {
+    PENDING_REQ.lock(|p| {
+        p.borrow()
+            .as_ref()
+            .and_then(|(_, key)| (key[0] == hash).then_some(*key))
+    })
+}
+
 fn now_ms() -> u64 {
     embassy_time::Instant::now().as_millis()
 }
@@ -411,63 +427,8 @@ pub fn handle_response(plain: &[u8], sender_pub: &[u8; 32]) -> bool {
     }
     let tag = u32::from_le_bytes([plain[0], plain[1], plain[2], plain[3]]);
 
-    // Login reply: the repeater's first 4 bytes are its own clock, so match
-    // the sender and the login-reply shape instead of the tag. A late
-    // status/neighbour response must not be mistaken for a login result.
-    // Login success is `server_time(4) ‖ RESP_SERVER_LOGIN_OK ‖ ...`; newer
-    // firmwares may append extra fields, so allow up to 32 bytes. Status
-    // (60 bytes) and neighbour replies are longer and are not consumed here.
-    let login_shape = plain.len() >= 5
-        && plain.len() <= 32
-        && (plain[4] == RESP_SERVER_LOGIN_OK
-            || (plain.len() >= 6 && &plain[4..6] == b"OK"));
-    let login = PENDING_LOGIN.lock(|p| {
-        let mut pending = p.borrow_mut();
-        if let Some((key, deadline)) = *pending {
-            if key == *sender_pub && login_shape && now_ms() <= deadline {
-                *pending = None;
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        }
-    });
-    if login {
-        LOGIN_RX_COUNT.fetch_add(1, Ordering::Relaxed);
-        LOGIN_RX_TAG.store(tag, Ordering::Relaxed);
-        LOGIN_RX_LEN.store(plain.len() as u32, Ordering::Relaxed);
-        LOGIN_PENDING.store(false, Ordering::Relaxed);
-        let mut push = Vec::<u8, 256>::new();
-        let _ = push.push(PUSH_CODE_LOGIN_SUCCESS);
-        let reply = &plain[4..];
-        if reply.len() >= 2 && &reply[..2] == b"OK" {
-            let _ = push.push(0);
-            let _ = push.extend_from_slice(&sender_pub[..6]);
-            LOGIN_RESULT.store(1, Ordering::Relaxed);
-        } else if !reply.is_empty() && reply[0] == RESP_SERVER_LOGIN_OK {
-            let keep_alive_secs = reply.get(1).copied().unwrap_or(0) as u16 * 16;
-            if keep_alive_secs > 0 {
-                start_connection(*sender_pub, keep_alive_secs);
-            }
-            let _ = push.push(reply.get(2).copied().unwrap_or(0));
-            let _ = push.extend_from_slice(&sender_pub[..6]);
-            let _ = push.extend_from_slice(&tag.to_le_bytes());
-            let _ = push.push(reply.get(3).copied().unwrap_or(0));
-            let _ = push.push(reply.get(8).copied().unwrap_or(0));
-            LOGIN_RESULT.store(1, Ordering::Relaxed);
-        } else {
-            push[0] = PUSH_CODE_LOGIN_FAIL;
-            LOGIN_RESULT.store(2, Ordering::Relaxed);
-            let _ = push.push(0);
-            let _ = push.extend_from_slice(&sender_pub[..6]);
-        }
-        enqueue_delayed_push(push);
-        return true;
-    }
-
-    // Binary / anonymous request response: [tag][data].
+    // Match explicit 4-byte tag + 32-byte key slots first so short status or
+    // telemetry responses are never mistaken for a login reply.
     let req_match = PENDING_REQ.lock(|p| {
         let mut pending = p.borrow_mut();
         if pending.map_or(false, |(t, k)| t == tag && k == *sender_pub) {
@@ -491,7 +452,6 @@ pub fn handle_response(plain: &[u8], sender_pub: &[u8; 32]) -> bool {
         return true;
     }
 
-    // Telemetry response.
     let telem_match = PENDING_TELEMETRY.lock(|p| {
         let mut pending = p.borrow_mut();
         if pending.map_or(false, |(t, k)| t == tag && k == *sender_pub) {
@@ -528,6 +488,56 @@ pub fn handle_response(plain: &[u8], sender_pub: &[u8; 32]) -> bool {
         let _ = push.extend_from_slice(&sender_pub[..6]);
         let data = &plain[4..];
         let _ = push.extend_from_slice(&data[..data.len().min(256 - push.len())]);
+        enqueue_delayed_push(push);
+        return true;
+    }
+
+    // Login reply: the server's first 4 bytes are its own clock, so match the
+    // pending login peer and reply length (<= 32 B) after tag-matched slots.
+    let login = plain.len() >= 5
+        && plain.len() <= 32
+        && PENDING_LOGIN.lock(|p| {
+            let mut pending = p.borrow_mut();
+            if let Some((key, deadline)) = *pending {
+                if key == *sender_pub && now_ms() <= deadline {
+                    *pending = None;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        });
+    if login {
+        LOGIN_RX_COUNT.fetch_add(1, Ordering::Relaxed);
+        LOGIN_RX_TAG.store(tag, Ordering::Relaxed);
+        LOGIN_RX_LEN.store(plain.len() as u32, Ordering::Relaxed);
+        LOGIN_PENDING.store(false, Ordering::Relaxed);
+        let mut push = Vec::<u8, 256>::new();
+        let _ = push.push(PUSH_CODE_LOGIN_SUCCESS);
+        let reply = &plain[4..];
+        if reply.len() >= 2 && &reply[..2] == b"OK" {
+            let _ = push.push(0);
+            let _ = push.extend_from_slice(&sender_pub[..6]);
+            LOGIN_RESULT.store(1, Ordering::Relaxed);
+        } else if !reply.is_empty() && reply[0] == RESP_SERVER_LOGIN_OK {
+            let keep_alive_secs = reply.get(1).copied().unwrap_or(0) as u16 * 16;
+            if keep_alive_secs > 0 {
+                start_connection(*sender_pub, keep_alive_secs);
+            }
+            let _ = push.push(reply.get(2).copied().unwrap_or(0));
+            let _ = push.extend_from_slice(&sender_pub[..6]);
+            let _ = push.extend_from_slice(&tag.to_le_bytes());
+            let _ = push.push(reply.get(3).copied().unwrap_or(0));
+            let _ = push.push(reply.get(8).copied().unwrap_or(0));
+            LOGIN_RESULT.store(1, Ordering::Relaxed);
+        } else {
+            push[0] = PUSH_CODE_LOGIN_FAIL;
+            LOGIN_RESULT.store(2, Ordering::Relaxed);
+            let _ = push.push(0);
+            let _ = push.extend_from_slice(&sender_pub[..6]);
+        }
         enqueue_delayed_push(push);
         return true;
     }
@@ -981,6 +991,12 @@ impl<'a> CompanionNode<'a> {
         self.telemetry_mode_env = prefs.telemetry_mode_env;
         self.advert_loc_policy = prefs.advert_loc_policy;
         self.multi_acks = prefs.multi_acks;
+
+        let (lat_e6, lon_e6) = crate::state::advert_lat_lon_e6();
+        if lat_e6 != 0 || lon_e6 != 0 {
+            self.latitude = lat_e6 as f32 / 1_000_000.0;
+            self.longitude = lon_e6 as f32 / 1_000_000.0;
+        }
     }
 
     /// Determine the contact type from advert flags.
@@ -1218,7 +1234,7 @@ impl<'a> CompanionNode<'a> {
             }
 
             CMD_SET_ADVERT_LATLON => {
-                let mut ok = false;
+                let mut err = None;
                 if payload.len() >= 9 {
                     let lat =
                         i32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
@@ -1229,28 +1245,56 @@ impl<'a> CompanionNode<'a> {
                     {
                         self.latitude = lat as f32 / 1_000_000.0;
                         self.longitude = lon as f32 / 1_000_000.0;
+                        crate::state::set_advert_lat_lon_e6(lat, lon);
                         let _ = crate::command::USB_COMMAND_CHANNEL.try_send(
                             crate::command::UsbCommand::SetAdvertLatLon { lat, lon },
                         );
-                        ok = true;
+                    } else {
+                        err = Some(ERR_ILLEGAL_ARG);
                     }
+                } else {
+                    err = Some(ERR_ILLEGAL_ARG);
                 }
                 let mut resp = Vec::<u8, 4>::new();
-                let _ = resp.push(if ok { RESP_CODE_OK } else { RESP_CODE_ERR });
+                match err {
+                    None => {
+                        let _ = resp.push(RESP_CODE_OK);
+                    }
+                    Some(code) => {
+                        let _ = resp.push(RESP_CODE_ERR);
+                        let _ = resp.push(code);
+                    }
+                }
                 emit(&resp);
             }
 
             CMD_RESET_PATH => {
-                let mut ok = false;
-                if payload.len() >= 33 {
+                let mut resp = Vec::<u8, 4>::new();
+                if payload.len() < 33 {
+                    let _ = resp.push(RESP_CODE_ERR);
+                    let _ = resp.push(ERR_ILLEGAL_ARG);
+                } else {
                     let mut pub_key = [0u8; 32];
                     pub_key.copy_from_slice(&payload[1..33]);
-                    ok = crate::command::CONTACT_OP_CHANNEL
-                        .try_send(crate::command::ContactOperation::ResetPath { pub_key })
-                        .is_ok();
+                    let found = crate::state::DISCOVERED_CONTACTS.lock(|c| {
+                        if let Some(ct) =
+                            c.borrow_mut().iter_mut().find(|ct| ct.pub_key == pub_key)
+                        {
+                            ct.out_path = [0u8; 64];
+                            ct.out_path_len = 0xFF;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    if found {
+                        crate::storage::request_contacts();
+                        let _ = resp.push(RESP_CODE_OK);
+                    } else {
+                        let _ = resp.push(RESP_CODE_ERR);
+                        let _ = resp.push(ERR_NOT_FOUND);
+                    }
                 }
-                let mut resp = Vec::<u8, 4>::new();
-                let _ = resp.push(if ok { RESP_CODE_OK } else { RESP_CODE_ERR });
                 emit(&resp);
             }
 
@@ -1428,11 +1472,30 @@ impl<'a> CompanionNode<'a> {
                         let _ = resp.extend_from_slice(&rx_air_s.to_le_bytes());
                         emit(&resp);
                         handled = true;
+                    } else if kind == 2 {
+                        let (recv, sent, sent_flood, sent_direct) =
+                            crate::state::RADIO_TELEMETRY.lock(|t| {
+                                let tel = t.borrow();
+                                (tel.rx_packets, tel.tx_beacons, tel.tx_flood, tel.tx_control)
+                            });
+                        let mut resp = Vec::<u8, 32>::new();
+                        let _ = resp.push(RESP_CODE_STATS);
+                        let _ = resp.push(2);
+                        let _ = resp.extend_from_slice(&recv.to_le_bytes());
+                        let _ = resp.extend_from_slice(&sent.to_le_bytes());
+                        let _ = resp.extend_from_slice(&sent_flood.to_le_bytes());
+                        let _ = resp.extend_from_slice(&sent_direct.to_le_bytes());
+                        let _ = resp.extend_from_slice(&0u32.to_le_bytes());
+                        let _ = resp.extend_from_slice(&0u32.to_le_bytes());
+                        let _ = resp.extend_from_slice(&0u32.to_le_bytes());
+                        emit(&resp);
+                        handled = true;
                     }
                 }
                 if !handled {
                     let mut resp = Vec::<u8, 4>::new();
                     let _ = resp.push(RESP_CODE_ERR);
+                    let _ = resp.push(ERR_ILLEGAL_ARG);
                     emit(&resp);
                 }
             }
@@ -1445,10 +1508,11 @@ impl<'a> CompanionNode<'a> {
                     let mut resp = Vec::<u8, 4>::new();
                     let _ = resp.push(RESP_CODE_OK);
                     emit(&resp);
-                    self.host.reboot();
+                    REBOOT_PENDING.store(true, Ordering::Release);
                 } else {
                     let mut resp = Vec::<u8, 4>::new();
                     let _ = resp.push(RESP_CODE_ERR);
+                    let _ = resp.push(ERR_ILLEGAL_ARG);
                     emit(&resp);
                 }
             }
@@ -1465,15 +1529,24 @@ impl<'a> CompanionNode<'a> {
 
             CMD_SET_DEVICE_TIME => {
                 // Payload from app: [CMD(6), epoch_seconds_u32_le(4)]
+                let mut ok = false;
                 if payload.len() >= 5 {
                     let mut time_bytes = [0u8; 4];
                     time_bytes.copy_from_slice(&payload[1..5]);
                     let epoch = u32::from_le_bytes(time_bytes);
-                    self.epoch_time = epoch as u64;
-                    crate::state::set_device_time(epoch);
+                    if epoch >= crate::state::get_device_time() {
+                        self.epoch_time = epoch as u64;
+                        crate::state::set_device_time(epoch);
+                        ok = true;
+                    }
                 }
                 let mut resp = Vec::<u8, 4>::new();
-                let _ = resp.push(RESP_CODE_OK);
+                if ok {
+                    let _ = resp.push(RESP_CODE_OK);
+                } else {
+                    let _ = resp.push(RESP_CODE_ERR);
+                    let _ = resp.push(ERR_ILLEGAL_ARG);
+                }
                 emit(&resp);
             }
 
@@ -1851,46 +1924,84 @@ impl<'a> CompanionNode<'a> {
                 // retry timer: [is_flood][expected_ack:4][est_timeout:4].
                 // Retries themselves are app-driven; the node sends one packet
                 // per request, matching MeshCore.
+                use meshcore_wire::packets::txtmsg::{
+                    MAX_TEXT_LEN, TXT_TYPE_CLI_COMMAND, TXT_TYPE_CLI_DATA, TXT_TYPE_PLAIN,
+                };
                 let mut resp = Vec::<u8, 10>::new();
-                let mut reply = None;
-                if payload.len() >= 14 {
+                let mut err = None;
+                let mut sent_info = None;
+
+                if payload.len() < 14 {
+                    err = Some(ERR_ILLEGAL_ARG);
+                } else {
                     let txt_type = payload[1];
                     let attempt = payload[2];
-                    let timestamp = u32::from_le_bytes([
+                    let app_timestamp = u32::from_le_bytes([
                         payload[3], payload[4], payload[5], payload[6],
                     ]);
                     let mut dest_prefix = [0u8; 6];
                     dest_prefix.copy_from_slice(&payload[7..13]);
-                    if let Ok(text_str) = core::str::from_utf8(&payload[13..]) {
-                        let text_str = text_str.trim_end_matches('\0');
-                        let path = crate::state::DISCOVERED_CONTACTS.lock(|c| {
-                            c.borrow()
-                                .iter()
-                                .find(|ct| &ct.pub_key[..6] == &dest_prefix[..])
-                                .map(|ct| ct.out_path_len)
-                        });
-                        if let Some(out_path_len) = path {
-                            let mut s = String::<160>::new();
-                            if s.push_str(text_str).is_ok()
-                                && crate::command::USB_COMMAND_CHANNEL
+
+                    let path = crate::state::DISCOVERED_CONTACTS.lock(|c| {
+                        c.borrow()
+                            .iter()
+                            .find(|ct| &ct.pub_key[..6] == &dest_prefix[..])
+                            .map(|ct| ct.out_path_len)
+                    });
+
+                    if let Some(out_path_len) = path {
+                        if txt_type != TXT_TYPE_PLAIN
+                            && txt_type != TXT_TYPE_CLI_DATA
+                            && txt_type != TXT_TYPE_CLI_COMMAND
+                        {
+                            err = Some(ERR_UNSUPPORTED);
+                        } else if let Ok(text_str) = core::str::from_utf8(&payload[13..]) {
+                            let text_str = text_str.trim_end_matches('\0');
+                            if text_str.contains('\0')
+                                || text_str.len() > MAX_TEXT_LEN
+                                || (attempt > 3 && text_str.len() > MAX_TEXT_LEN - 2)
+                            {
+                                err = Some(ERR_ILLEGAL_ARG);
+                            } else {
+                                let is_cli = txt_type == TXT_TYPE_CLI_DATA
+                                    || txt_type == TXT_TYPE_CLI_COMMAND;
+                                let send_ts = if is_cli { next_tag() } else { app_timestamp };
+                                let mut s = String::<MAX_TEXT_LEN>::new();
+                                if s.push_str(text_str).is_err() {
+                                    err = Some(ERR_ILLEGAL_ARG);
+                                } else if crate::command::USB_COMMAND_CHANNEL
                                     .try_send(
                                         crate::command::UsbCommand::SendDirectText {
                                             dest_prefix,
-                                            timestamp,
+                                            timestamp: send_ts,
                                             txt_type,
                                             attempt,
                                             text: s,
                                         },
                                     )
-                                    .is_ok()
-                            {
-                                reply = Some((txt_type, attempt, timestamp, text_str, out_path_len));
+                                    .is_err()
+                                {
+                                    err = Some(ERR_TABLE_FULL);
+                                } else {
+                                    sent_info = Some((
+                                        txt_type,
+                                        attempt,
+                                        send_ts,
+                                        text_str,
+                                        out_path_len,
+                                        is_cli,
+                                    ));
+                                }
                             }
+                        } else {
+                            err = Some(ERR_ILLEGAL_ARG);
                         }
+                    } else {
+                        err = Some(ERR_NOT_FOUND);
                     }
                 }
 
-                if let Some((txt_type, attempt, timestamp, text, out_path_len)) = reply {
+                if let Some((txt_type, attempt, send_ts, text, out_path_len, is_cli)) = sent_info {
                     let is_direct = out_path_len != 0xFF
                         && Packet::is_valid_path_len(out_path_len);
                     let hops = if is_direct {
@@ -1898,23 +2009,28 @@ impl<'a> CompanionNode<'a> {
                     } else {
                         0
                     };
-                    let flags = ((txt_type & 0x3F) << 2) | (attempt & 0x03);
-                    let expected_ack = meshcore_wire::crypto::ack_crc(
-                        timestamp,
-                        flags,
-                        text.as_bytes(),
-                        &self.public_key,
-                    );
+                    let expected_ack = if is_cli {
+                        0
+                    } else {
+                        let flags = ((txt_type & 0x3F) << 2) | (attempt & 0x03);
+                        meshcore_wire::crypto::ack_crc(
+                            send_ts,
+                            flags,
+                            text.as_bytes(),
+                            &self.public_key,
+                        )
+                    };
 
-                    // Estimated on-air time of the complete packet.
+                    // Estimated on-air time of the complete encrypted packet.
                     let plain_len = 5 + text.len() + if attempt > 3 { 2 } else { 0 };
+                    let cipher_len = ((plain_len + 15) / 16) * 16;
                     let path_bytes = if is_direct {
                         (out_path_len & 63) as usize
                             * (((out_path_len >> 6) & 3) as usize + 1)
                     } else {
                         0
                     };
-                    let raw_len = 2 + path_bytes + 4 + plain_len;
+                    let raw_len = 2 + path_bytes + 4 + cipher_len;
                     let (sf, bw_khz, cr) =
                         crate::state::RADIO_SETTINGS.lock(|r| {
                             let s = r.borrow();
@@ -1939,6 +2055,7 @@ impl<'a> CompanionNode<'a> {
                     let _ = resp.extend_from_slice(&est_timeout.to_le_bytes());
                 } else {
                     let _ = resp.push(RESP_CODE_ERR);
+                    let _ = resp.push(err.unwrap_or(ERR_ILLEGAL_ARG));
                 }
                 emit(&resp);
             }
@@ -1979,55 +2096,106 @@ impl<'a> CompanionNode<'a> {
             }
 
             CMD_ADD_UPDATE_CONTACT => {
-                // Inbound: [CMD(9), public_key(32), type(1), flags(1), out_path_len(1), out_path(64), adv_name(32), last_advert(4)]
-                // Optional: gps_lat(4), gps_lon(4), lastmod(4)
-                // Minimum required: 1 + 32 + 1 + 1 + 1 + 64 + 32 + 4 = 136 bytes (matches MeshCore)
-                //
-                // This handler runs in `command_fut` (normal task context), but contact
-                // storage is still deferred to `contact_task` via CONTACT_OP_CHANNEL so
-                // a slow or full contact list cannot back up the BLE task.
-                if payload.len() >= 1 + 32 + 1 + 1 + 1 + 64 + 32 + 4 {
-                    let mut i = 1;
-                    let pub_key: [u8; 32] = payload[i..i+32].try_into().unwrap(); i += 32;
-                    let contact_type = payload[i]; i += 1;
-                    let flags = payload[i]; i += 1;
-                    let out_path_len = payload[i]; i += 1;
-                    let mut out_path = [0u8; 64];
-                    out_path.copy_from_slice(&payload[i..i+64]); i += 64;
-                    let adv_name_bytes = &payload[i..i+32]; i += 32;
-                    let adv_name = core::str::from_utf8(adv_name_bytes).unwrap_or("").trim_end_matches('\0');
-                    let last_advert = u32::from_le_bytes([payload[i], payload[i+1], payload[i+2], payload[i+3]]); i += 4;
+                // Inbound: [CMD(9), public_key(32), type(1), flags(1), out_path_len(1),
+                //           out_path(64)?, adv_name(32)?, last_advert(4)?,
+                //           gps_lat(4)?, gps_lon(4)?, lastmod(4)?]
+                // Minimum required: 1 + 32 + 1 + 1 + 1 = 36 bytes.
+                let mut resp = Vec::<u8, 4>::new();
+                if payload.len() < 36 {
+                    let _ = resp.push(RESP_CODE_ERR);
+                    let _ = resp.push(ERR_ILLEGAL_ARG);
+                    emit(&resp);
+                    return;
+                }
 
-                    // Optional fields after the required 136 bytes
-                    let (adv_lat, adv_lon, lastmod) = if payload.len() >= i + 8 {
-                        let lat = i32::from_le_bytes([payload[i], payload[i+1], payload[i+2], payload[i+3]]); i += 4;
-                        let lon = i32::from_le_bytes([payload[i], payload[i+1], payload[i+2], payload[i+3]]); i += 4;
-                        if payload.len() >= i + 4 {
-                            let lm = u32::from_le_bytes([payload[i], payload[i+1], payload[i+2], payload[i+3]]);
-                            (lat, lon, lm)
-                        } else {
-                            let lm = last_advert;
-                            (lat, lon, lm)
-                        }
-                    } else {
-                        (0, 0, last_advert)
-                    };
+                let pub_key: [u8; 32] = payload[1..33].try_into().unwrap();
+                let contact_type = payload[33];
+                let flags = payload[34];
+                let out_path_len = payload[35];
 
-                    let node_id = [pub_key[0], pub_key[1], pub_key[2], pub_key[3]];
+                let has_out_path = payload.len() >= 100;
+                let mut out_path = [0u8; 64];
+                if has_out_path {
+                    out_path.copy_from_slice(&payload[36..100]);
+                } else if payload.len() > 36 {
+                    let n = payload.len() - 36;
+                    out_path[..n].copy_from_slice(&payload[36..]);
+                }
 
-                    let mut callsign = heapless::String::new();
+                let has_name = payload.len() >= 132;
+                let mut callsign = String::<32>::new();
+                if has_name {
+                    let adv_name = core::str::from_utf8(&payload[100..132])
+                        .unwrap_or("")
+                        .trim_end_matches('\0');
                     let _ = callsign.push_str(adv_name);
+                }
 
-                    // Defer the actual contact storage to the background task to avoid
-                    // locking DISCOVERED_CONTACTS inside the SoftDevice critical section.
-                    // If the channel is full, we drop the operation — this is acceptable
-                    // since the app can retry.
-                    let _ = crate::command::CONTACT_OP_CHANNEL.try_send(
-                        crate::command::ContactOperation::AddOrUpdate {
+                let has_last_advert = payload.len() >= 136;
+                let last_advert = if has_last_advert {
+                    u32::from_le_bytes([
+                        payload[132], payload[133], payload[134], payload[135],
+                    ])
+                } else {
+                    0
+                };
+
+                let has_latlon = payload.len() >= 144;
+                let (adv_lat, adv_lon) = if has_latlon {
+                    (
+                        i32::from_le_bytes([
+                            payload[136], payload[137], payload[138], payload[139],
+                        ]),
+                        i32::from_le_bytes([
+                            payload[140], payload[141], payload[142], payload[143],
+                        ]),
+                    )
+                } else {
+                    (0, 0)
+                };
+
+                let lastmod = if payload.len() >= 148 {
+                    u32::from_le_bytes([
+                        payload[144], payload[145], payload[146], payload[147],
+                    ])
+                } else {
+                    crate::state::get_device_time()
+                };
+
+                let node_id = [pub_key[0], pub_key[1], pub_key[2], pub_key[3]];
+                let overwrite_when_full = self.should_overwrite_when_full();
+                let mut overwritten_key: Option<[u8; 32]> = None;
+
+                let ok = crate::state::DISCOVERED_CONTACTS.lock(|c| {
+                    let mut list = c.borrow_mut();
+                    if let Some(ct) = list.iter_mut().find(|ct| ct.pub_key == pub_key) {
+                        ct.node_id = node_id;
+                        ct.contact_type = contact_type;
+                        ct.flags = flags;
+                        ct.out_path_len = out_path_len;
+                        if payload.len() > 36 {
+                            ct.out_path = out_path;
+                        }
+                        if has_name {
+                            ct.callsign = callsign;
+                        }
+                        if has_last_advert {
+                            ct.last_advert_ts = last_advert;
+                        }
+                        if has_latlon {
+                            ct.latitude = adv_lat;
+                            ct.longitude = adv_lon;
+                        }
+                        ct.last_seen_epoch = lastmod;
+                        true
+                    } else {
+                        let contact = crate::types::DiscoveredContact {
                             pub_key,
                             callsign,
                             node_id,
                             last_seen_epoch: lastmod,
+                            rssi: 0,
+                            snr: 0,
                             latitude: adv_lat,
                             longitude: adv_lon,
                             flags,
@@ -2035,18 +2203,52 @@ impl<'a> CompanionNode<'a> {
                             out_path,
                             out_path_len,
                             last_advert_ts: last_advert,
+                            saved_hash: 0,
+                            sync_since: 0,
+                        };
+                        if list.len() < list.capacity() {
+                            list.push(contact).is_ok()
+                        } else if overwrite_when_full {
+                            let mut oldest_idx = None;
+                            let mut oldest_lastmod = u32::MAX;
+                            for (idx, ct) in list.iter().enumerate() {
+                                if (ct.flags & CONTACT_FLAG_FAVORITE) == 0
+                                    && ct.last_seen_epoch < oldest_lastmod
+                                {
+                                    oldest_lastmod = ct.last_seen_epoch;
+                                    oldest_idx = Some(idx);
+                                }
+                            }
+                            if let Some(idx) = oldest_idx {
+                                overwritten_key = Some(list[idx].pub_key);
+                                list[idx] = contact;
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
                         }
-                    );
+                    }
+                });
 
-                    // Return OK immediately — the actual storage happens asynchronously.
-                    // The companion also returns OK before the contact is fully persisted.
-                    let mut resp = Vec::<u8, 4>::new();
-                    let _ = resp.push(RESP_CODE_OK);
-                    emit(&resp);
-                    return;
+                if let Some(evicted) = overwritten_key {
+                    let mut push = Vec::<u8, 40>::new();
+                    let _ = push.push(PUSH_CODE_CONTACT_DELETED);
+                    let _ = push.extend_from_slice(&evicted);
+                    crate::command::push_companion(&push);
+                    crate::storage::adverts::forget(&evicted);
+                    let _ = crate::storage::contacts::OP_CHANNEL
+                        .try_send(crate::storage::contacts::ContactOp::Remove(evicted));
                 }
-                let mut resp = Vec::<u8, 4>::new();
-                let _ = resp.push(RESP_CODE_ERR);
+
+                if ok {
+                    crate::storage::request_contacts();
+                    let _ = resp.push(RESP_CODE_OK);
+                } else {
+                    let _ = resp.push(RESP_CODE_ERR);
+                    let _ = resp.push(ERR_TABLE_FULL);
+                }
                 emit(&resp);
             }
 
@@ -3289,8 +3491,9 @@ impl<'a> CompanionNode<'a> {
         let _ = resp.push(22); // max tx power
         let public_key = crate::state::current_public_key();
         let _ = resp.extend_from_slice(&public_key);
-        let _ = resp.extend_from_slice(&0i32.to_le_bytes()); // adv_lat
-        let _ = resp.extend_from_slice(&0i32.to_le_bytes()); // adv_lon
+        let (lat_e6, lon_e6) = crate::state::advert_lat_lon_e6();
+        let _ = resp.extend_from_slice(&lat_e6.to_le_bytes()); // adv_lat
+        let _ = resp.extend_from_slice(&lon_e6.to_le_bytes()); // adv_lon
         let _ = resp.push(self.multi_acks.min(1)); // multi_acks (v7+: 0 or 1)
         let _ = resp.push(self.advert_loc_policy);
         let _ = resp.push(
@@ -3560,8 +3763,33 @@ mod tests {
         assert_eq!(&lpp[15..19], &[1, LPP_TEMPERATURE, 0x00, 0xEB]);
     }
 
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn poll_sync<F: core::future::Future>(fut: F) -> F::Output {
+        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        const VTABLE: RawWakerVTable = RawWakerVTable::new(
+            |p| RawWaker::new(p, &VTABLE),
+            |_| {},
+            |_| {},
+            |_| {},
+        );
+        // SAFETY: the raw waker is a no-op stub; we only poll ready futures.
+        let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = core::pin::pin!(fut);
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(out) => out,
+            Poll::Pending => panic!("unexpected Pending in synchronous test"),
+        }
+    }
+
+    fn drain_usb_commands() {
+        while crate::command::USB_COMMAND_CHANNEL.try_receive().is_ok() {}
+    }
+
     #[test]
     fn contact_request_permissions_and_inverse_mask() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         crate::state::clear_gps_state();
         let host = TempHost {
             mv: 3_850, // 385 -> 0x0181
@@ -3645,7 +3873,12 @@ mod tests {
 
     #[test]
     fn unhandled_response_forwards_as_binary_response() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         DELAYED_PUSH.lock(|q| q.borrow_mut().clear());
+        PENDING_REQ.lock(|p| *p.borrow_mut() = None);
+        PENDING_TELEMETRY.lock(|p| *p.borrow_mut() = None);
+        PENDING_STATUS.lock(|p| *p.borrow_mut() = None);
+        PENDING_LOGIN.lock(|p| *p.borrow_mut() = None);
         let sender = [0x99u8; 32];
         let plain = [0x11, 0x22, 0x33, 0x44, 0x01, 0x74, 0x01, 0x90];
         assert!(handle_response(&plain, &sender));
@@ -3656,6 +3889,260 @@ mod tests {
         assert_eq!(pushed[0], PUSH_CODE_BINARY_RESPONSE);
         assert_eq!(pushed[1], 0);
         assert_eq!(&pushed[2..], &plain[..]);
+    }
+
+    #[test]
+    fn login_fail_push_and_response_slot_precedence() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        DELAYED_PUSH.lock(|q| q.borrow_mut().clear());
+        PENDING_REQ.lock(|p| *p.borrow_mut() = None);
+        PENDING_TELEMETRY.lock(|p| *p.borrow_mut() = None);
+        PENDING_STATUS.lock(|p| *p.borrow_mut() = None);
+        PENDING_LOGIN.lock(|p| *p.borrow_mut() = None);
+
+        let peer = [0x7Au8; 32];
+        let req_tag = 0x1234_5678u32;
+        note_pending_login(peer);
+        note_pending_req(req_tag, peer);
+
+        // Even with PENDING_LOGIN active for the same peer, tag-matched
+        // PENDING_REQ wins first and leaves PENDING_LOGIN intact.
+        let mut req_reply = [0u8; 6];
+        req_reply[0..4].copy_from_slice(&req_tag.to_le_bytes());
+        req_reply[4] = 0xAA;
+        req_reply[5] = 0xBB;
+        assert!(handle_response(&req_reply, &peer));
+        let (_, pushed) = DELAYED_PUSH
+            .lock(|q| q.borrow_mut().pop_front())
+            .expect("binary response pushed");
+        assert_eq!(pushed[0], PUSH_CODE_BINARY_RESPONSE);
+        assert_eq!(&pushed[2..6], &req_tag.to_le_bytes());
+        assert_eq!(&pushed[6..8], &[0xAA, 0xBB]);
+
+        // Now deliver a failed server login response (status byte != 0 and != "OK").
+        let login_fail = [0x10, 0x00, 0x00, 0x00, 0x01];
+        assert!(handle_response(&login_fail, &peer));
+        let (_, fail_push) = DELAYED_PUSH
+            .lock(|q| q.borrow_mut().pop_front())
+            .expect("login fail pushed");
+        assert_eq!(fail_push[0], PUSH_CODE_LOGIN_FAIL);
+        assert_eq!(fail_push[1], 0);
+        assert_eq!(&fail_push[2..8], &peer[..6]);
+        assert_eq!(fail_push.len(), 8);
+    }
+
+    #[test]
+    fn pending_anon_peer_matches_hash_prefix() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        PENDING_REQ.lock(|p| *p.borrow_mut() = None);
+        let peer = [0x5Cu8; 32];
+        assert!(pending_anon_peer(0x5C).is_none());
+        note_pending_req(42, peer);
+        assert_eq!(pending_anon_peer(0x5C), Some(peer));
+        assert!(pending_anon_peer(0x5D).is_none());
+        PENDING_REQ.lock(|p| *p.borrow_mut() = None);
+    }
+
+    #[test]
+    fn cmd_send_msg_validation_and_cli_expected_ack_zero() {
+        use meshcore_wire::packets::txtmsg::{TXT_TYPE_CLI_COMMAND, TXT_TYPE_PLAIN};
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        drain_usb_commands();
+
+        let peer = [0x31u8; 32];
+        crate::state::DISCOVERED_CONTACTS.lock(|c| {
+            let mut list = c.borrow_mut();
+            list.clear();
+            let _ = list.push(crate::types::DiscoveredContact {
+                pub_key: peer,
+                callsign: String::new(),
+                node_id: [0x31; 4],
+                last_seen_epoch: 100,
+                rssi: 0,
+                snr: 0,
+                latitude: 0,
+                longitude: 0,
+                flags: 0,
+                contact_type: 1,
+                out_path: [0u8; 64],
+                out_path_len: 0xFF,
+                last_advert_ts: 0,
+                saved_hash: 0,
+                sync_since: 0,
+            });
+        });
+
+        let mut node = CompanionNode::new("n", "b", 0, [1u8; 32], [2u8; 64], &TestHost);
+
+        // 1. Unknown contact -> ERR_NOT_FOUND.
+        let mut frame = Vec::<u8, 64>::new();
+        let _ = frame.push(CMD_SEND_MSG);
+        let _ = frame.push(TXT_TYPE_PLAIN);
+        let _ = frame.push(0);
+        let _ = frame.extend_from_slice(&1000u32.to_le_bytes());
+        let _ = frame.extend_from_slice(&[0x99; 6]);
+        let _ = frame.extend_from_slice(b"hi");
+        let mut resp = Vec::<u8, 32>::new();
+        poll_sync(node.handle_command(&frame, |r| {
+            let _ = resp.extend_from_slice(r);
+        }));
+        assert_eq!(resp.as_slice(), &[RESP_CODE_ERR, ERR_NOT_FOUND]);
+
+        // 2. Unsupported txt_type -> ERR_UNSUPPORTED.
+        frame[1] = 2; // TXT_TYPE_SIGNED_PLAIN not allowed from companion
+        frame[7..13].copy_from_slice(&peer[..6]);
+        resp.clear();
+        poll_sync(node.handle_command(&frame, |r| {
+            let _ = resp.extend_from_slice(r);
+        }));
+        assert_eq!(resp.as_slice(), &[RESP_CODE_ERR, ERR_UNSUPPORTED]);
+
+        // 3. CLI command -> RESP_CODE_SENT with expected_ack == 0 and monotonic tag.
+        crate::state::set_device_time(2_000_000);
+        frame[1] = TXT_TYPE_CLI_COMMAND;
+        resp.clear();
+        poll_sync(node.handle_command(&frame, |r| {
+            let _ = resp.extend_from_slice(r);
+        }));
+        assert_eq!(resp.len(), 10);
+        assert_eq!(resp[0], RESP_CODE_SENT);
+        assert_eq!(resp[1], 1); // flood (out_path_len = 0xFF)
+        assert_eq!(&resp[2..6], &[0, 0, 0, 0]);
+        drain_usb_commands();
+
+        // 4. Plain message -> non-zero expected_ack.
+        frame[1] = TXT_TYPE_PLAIN;
+        resp.clear();
+        poll_sync(node.handle_command(&frame, |r| {
+            let _ = resp.extend_from_slice(r);
+        }));
+        assert_eq!(resp.len(), 10);
+        assert_eq!(resp[0], RESP_CODE_SENT);
+        assert_ne!(&resp[2..6], &[0, 0, 0, 0]);
+        drain_usb_commands();
+    }
+
+    #[test]
+    fn cmd_get_stats_packets_and_set_device_time_monotonic() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut node = CompanionNode::new("n", "b", 0, [1u8; 32], [2u8; 64], &TestHost);
+
+        crate::state::RADIO_TELEMETRY.lock(|t| {
+            let mut tel = t.borrow_mut();
+            tel.rx_packets = 11;
+            tel.tx_beacons = 22;
+            tel.tx_flood = 7;
+            tel.tx_control = 15;
+        });
+
+        let mut resp = Vec::<u8, 64>::new();
+        poll_sync(node.handle_command(&[CMD_GET_STATS, 2], |r| {
+            let _ = resp.extend_from_slice(r);
+        }));
+        assert_eq!(resp.len(), 30);
+        assert_eq!(resp[0], RESP_CODE_STATS);
+        assert_eq!(resp[1], 2);
+        assert_eq!(u32::from_le_bytes(resp[2..6].try_into().unwrap()), 11);
+        assert_eq!(u32::from_le_bytes(resp[6..10].try_into().unwrap()), 22);
+        assert_eq!(u32::from_le_bytes(resp[10..14].try_into().unwrap()), 7);
+        assert_eq!(u32::from_le_bytes(resp[14..18].try_into().unwrap()), 15);
+        assert_eq!(&resp[18..30], &[0u8; 12]);
+
+        resp.clear();
+        poll_sync(node.handle_command(&[CMD_GET_STATS, 99], |r| {
+            let _ = resp.extend_from_slice(r);
+        }));
+        assert_eq!(resp.as_slice(), &[RESP_CODE_ERR, ERR_ILLEGAL_ARG]);
+
+        crate::state::set_device_time(1_700_000_100);
+        let mut set_time = [CMD_SET_DEVICE_TIME, 0, 0, 0, 0];
+        set_time[1..5].copy_from_slice(&1_700_000_050u32.to_le_bytes());
+        resp.clear();
+        poll_sync(node.handle_command(&set_time, |r| {
+            let _ = resp.extend_from_slice(r);
+        }));
+        assert_eq!(resp.as_slice(), &[RESP_CODE_ERR, ERR_ILLEGAL_ARG]);
+
+        set_time[1..5].copy_from_slice(&1_700_000_200u32.to_le_bytes());
+        resp.clear();
+        poll_sync(node.handle_command(&set_time, |r| {
+            let _ = resp.extend_from_slice(r);
+        }));
+        assert_eq!(resp.as_slice(), &[RESP_CODE_OK]);
+        assert!(crate::state::get_device_time() >= 1_700_000_200);
+    }
+
+    #[test]
+    fn cmd_add_update_contact_reset_path_and_advert_latlon() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        drain_usb_commands();
+        crate::state::DISCOVERED_CONTACTS.lock(|c| c.borrow_mut().clear());
+        let mut node = CompanionNode::new("n", "b", 0, [1u8; 32], [2u8; 64], &TestHost);
+
+        let key = [0x6Au8; 32];
+        let mut frame = Vec::<u8, 160>::new();
+        let _ = frame.push(CMD_ADD_UPDATE_CONTACT);
+        let _ = frame.extend_from_slice(&key);
+        let _ = frame.push(ADV_TYPE_CHAT);
+        let _ = frame.push(0x01); // favorite
+        let _ = frame.push(0x02); // 2 hops, 1-byte hashes
+        let _ = frame.extend_from_slice(&[0xAA, 0xBB]);
+        let _ = frame.extend_from_slice(&[0u8; 62]);
+        let mut name = [0u8; 32];
+        name[..3].copy_from_slice(b"bob");
+        let _ = frame.extend_from_slice(&name);
+        let _ = frame.extend_from_slice(&1234u32.to_le_bytes());
+        let _ = frame.extend_from_slice(&37_000_000i32.to_le_bytes());
+        let _ = frame.extend_from_slice(&(-122_000_000i32).to_le_bytes());
+        let _ = frame.extend_from_slice(&5678u32.to_le_bytes());
+
+        let mut resp = Vec::<u8, 128>::new();
+        poll_sync(node.handle_command(&frame, |r| {
+            let _ = resp.extend_from_slice(r);
+        }));
+        assert_eq!(resp.as_slice(), &[RESP_CODE_OK]);
+
+        let saved = crate::state::DISCOVERED_CONTACTS.lock(|c| c.borrow()[0].clone());
+        assert_eq!(saved.pub_key, key);
+        assert_eq!(saved.callsign.as_str(), "bob");
+        assert_eq!(saved.out_path_len, 0x02);
+        assert_eq!(&saved.out_path[..2], &[0xAA, 0xBB]);
+        assert_eq!(saved.last_seen_epoch, 5678);
+
+        // CMD_RESET_PATH clears out_path synchronously.
+        let mut reset_frame = Vec::<u8, 40>::new();
+        let _ = reset_frame.push(CMD_RESET_PATH);
+        let _ = reset_frame.extend_from_slice(&key);
+        resp.clear();
+        poll_sync(node.handle_command(&reset_frame, |r| {
+            let _ = resp.extend_from_slice(r);
+        }));
+        assert_eq!(resp.as_slice(), &[RESP_CODE_OK]);
+        let after_reset = crate::state::DISCOVERED_CONTACTS.lock(|c| c.borrow()[0].out_path_len);
+        assert_eq!(after_reset, 0xFF);
+
+        // CMD_SET_ADVERT_LATLON updates shared advert lat/lon reflected in SELF_INFO.
+        let mut latlon_frame = Vec::<u8, 16>::new();
+        let _ = latlon_frame.push(CMD_SET_ADVERT_LATLON);
+        let _ = latlon_frame.extend_from_slice(&51_507_400i32.to_le_bytes());
+        let _ = latlon_frame.extend_from_slice(&(-127_800i32).to_le_bytes());
+        resp.clear();
+        poll_sync(node.handle_command(&latlon_frame, |r| {
+            let _ = resp.extend_from_slice(r);
+        }));
+        assert_eq!(resp.as_slice(), &[RESP_CODE_OK]);
+        drain_usb_commands();
+
+        let self_info = node.build_self_info();
+        assert_eq!(
+            i32::from_le_bytes(self_info[36..40].try_into().unwrap()),
+            51_507_400
+        );
+        assert_eq!(
+            i32::from_le_bytes(self_info[40..44].try_into().unwrap()),
+            -127_800
+        );
+        crate::state::set_advert_lat_lon_e6(0, 0);
     }
 }
 

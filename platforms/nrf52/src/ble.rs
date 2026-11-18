@@ -647,11 +647,11 @@ pub async fn ble_companion_task(
                 let _ = vec.extend_from_slice(&msg[..copy_len]);
                 // The SoftDevice HVX queue can be momentarily full during a
                 // contact sync burst. Retry briefly instead of dropping.
-                for attempt in 0..8 {
+                for attempt in 0..40 {
                     match server.nus.tx_notify(&conn, &vec) {
                         Ok(()) => break,
                         Err(e) => {
-                            if attempt == 7 {
+                            if attempt == 39 {
                                 debug!("BLE NUS tx_notify push failed: {:?}", e);
                             } else {
                                 embassy_time::Timer::after_millis(5).await;
