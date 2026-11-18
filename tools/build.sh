@@ -35,9 +35,35 @@ case "$board" in
         ;;
 esac
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 if [[ "$action" == "test" ]]; then
     host="$(rustc -vV | sed -n 's/host: //p')"
+    python3 "$script_dir/check_task_arena.py" --self-test
     exec cargo test -p meshcore-wire -p ferrix-hal -p ferrix-core -p ferrix-runtime -p ferrix-sx1262 -p ferrix-ssd1681 -p ferrix-l76k --target "$host" "$@"
+fi
+
+if [[ "$action" == "build" ]]; then
+    cargo build -p "$pkg" --target "$target" "$@"
+    profile="debug"
+    prev=""
+    for arg in "$@"; do
+        if [[ "$prev" == "--profile" ]]; then
+            profile="$arg"
+            prev=""
+        elif [[ "$arg" == "--release" || "$arg" == "-r" ]]; then
+            profile="release"
+        elif [[ "$arg" == --profile=* ]]; then
+            profile="${arg#--profile=}"
+        elif [[ "$arg" == "--profile" ]]; then
+            prev="--profile"
+        fi
+    done
+    elf="$script_dir/../target/$target/$profile/ferrix"
+    if [[ -f "$elf" ]]; then
+        python3 "$script_dir/check_task_arena.py" "$elf"
+    fi
+    exit 0
 fi
 
 exec cargo "$action" -p "$pkg" --target "$target" "$@"

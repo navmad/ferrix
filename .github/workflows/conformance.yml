@@ -30,3 +30,17 @@ jobs:
         run: |
           python tools/oracle/gen.py --emit --output /tmp/oracle_vectors.toml
           diff -u crates/meshcore-wire/testdata/oracle_vectors.toml /tmp/oracle_vectors.toml
+
+  firmware:
+    name: Firmware build and Embassy task arena check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabihf
+          components: llvm-tools
+      - name: Run workspace host tests and arena verifier self-test
+        run: ./tools/build.sh thinknode-m1 test
+      - name: Build ThinkNode M1 release firmware and verify task arena fit
+        run: ./tools/build.sh thinknode-m1 build --release

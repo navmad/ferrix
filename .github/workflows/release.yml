@@ -83,6 +83,7 @@ jobs:
       - name: Build ${{ matrix.firmware }} UF2 and DFU ZIP
         run: |
           cargo build -p "${{ matrix.pkg }}" --target "${{ matrix.target }}" --release
+          python3 tools/check_task_arena.py "target/${{ matrix.target }}/release/ferrix"
           OBJCOPY="$(find "$(rustc --print sysroot)" -name llvm-objcopy | head -n 1)"
           if [ -z "$OBJCOPY" ]; then
             echo "ERROR: llvm-objcopy not found in rust sysroot" >&2

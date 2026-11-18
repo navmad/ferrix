@@ -97,6 +97,8 @@ ELF="${ROOT_DIR}/target/${TARGET}/${PROFILE}/ferrix"
 HEX="${ROOT_DIR}/target/${TARGET}/${PROFILE}/ferrix-${BOARD}.hex"
 ZIP="${ROOT_DIR}/target/${TARGET}/${PROFILE}/ferrix-${BOARD}-dfu.zip"
 
+python3 "${SCRIPT_DIR}/check_task_arena.py" "${ELF}"
+
 echo "==> Converting ELF to Intel HEX format..."
 "${OBJCOPY}" -O ihex "${ELF}" "${HEX}"
 

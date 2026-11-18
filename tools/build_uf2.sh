@@ -36,6 +36,8 @@ cargo build -p "${pkg}" "${CARGO_FLAGS[@]}"
 
 ELF="${ROOT_DIR}/target/${TARGET}/${PROFILE}/ferrix"
 
+python3 "${SCRIPT_DIR}/check_task_arena.py" "${ELF}"
+
 SYSROOT="$(rustc --print sysroot)"
 OBJCOPY="$(find "${SYSROOT}" -name llvm-objcopy | head -n 1)"
 
