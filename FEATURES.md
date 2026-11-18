@@ -5,7 +5,7 @@ Elecrow **ThinkNode M1**: nRF52840, SX1262 LoRa, 1.54" e-paper, two buttons,
 battery monitoring, USB CDC and BLE. It targets **MeshCore v1.18** companion
 apps and the v1.18 over-the-air protocol.
 
-- Firmware version: `1.18.1-ferrix` (from root `Cargo.toml` `[workspace.package]`; overridable at build time via `FERRIX_VERSION` and `FERRIX_BUILD_DATE` / `SOURCE_DATE_EPOCH`)
+- Firmware version: `1.18.2-ferrix` (from root `Cargo.toml` `[workspace.package]`; overridable at build time via `FERRIX_VERSION` and `FERRIX_BUILD_DATE` / `SOURCE_DATE_EPOCH`)
 - USB product/vendor: `ThinkNode M1 Companion` / `MeshCore`
 - Board identity: `ThinkNode M1`
 - Configuration layout: version 1
@@ -16,16 +16,16 @@ apps and the v1.18 over-the-air protocol.
 
 | Feature | Status |
 |---|---|
-| nRF52840 + SX1262 (SPI, DIO1, BUSY, TCXO 1.8 V, DCDC, RX boost) | Yes |
-| 1.54" 200x200 e-paper (SSD1681) | Yes |
+| nRF52840 + SX1262 (SPI, DIO1, BUSY, TCXO 1.8 V, REG1 DC-DC, 32.768 kHz LFXO, RX boost) | Yes |
+| 1.54" 200x200 e-paper (SSD1681, idle sleep, configurable refresh interval) | Yes |
 | Two buttons + frontlight idle timeout | Yes |
 | Passive buzzer on P0.06 (GPIO square wave, UI/CLI toggle) | Yes |
 | MX25R1635F 2 MB external QSPI flash (or `--features internal-storage` profile) | Yes |
-| Battery voltage/percentage (SAADC) | Yes |
+| Battery voltage/percentage (averaged SAADC reads, EMA smoothing, 11-point LiPo curve) | Yes |
 | USB CDC-ACM (text CLI + binary companion framing) | Yes |
 | BLE Nordic UART Service companion | Yes |
-| Quectel L76K GNSS | Yes |
-| 1200-baud DFU touch & UF2 bootloader drag-and-drop | Yes |
+| Quectel L76K GNSS (idle-delimited UART DMA + event-driven wake) | Yes |
+| 1200-baud DFU touch, UF2 drag-and-drop, and Legacy Buttonless BLE DFU OTA (OTAFIX bootloader) | Yes |
 
 Radio parameters (frequency, bandwidth, spreading factor, coding rate, TX
 power) are configurable from the app or CLI, persisted, and applied without a
@@ -106,10 +106,15 @@ for ThinkNode M1 pinouts and memory mapping.
 
 ### Transports
 
-- USB CDC binary framing: `'<'` + u16 LE length in, `'>'` + u16 LE length out.
-- BLE Nordic UART Service, same command set and framing.
-- USB text CLI runs alongside the binary protocol; a text session does not
-  receive binary pushes.
+- **BLE (Nordic UART Service)**, same command set as USB:
+  - Service UUID: `6E400001-B5A3-F393-E0A9-E50E24DCCA9E`
+  - RX (App -> Device): `6E400002-B5A3-F393-E0A9-E50E24DCCA9E`
+  - TX (Device -> App): `6E400003-B5A3-F393-E0A9-E50E24DCCA9E`
+- **USB CDC-ACM**:
+  - Inbound frame (App -> Radio): `'<'` (`0x3C`) + `u16` LE length + payload
+  - Outbound frame (Radio -> App): `'>'` (`0x3E`) + `u16` LE length + payload
+  - USB text CLI runs alongside the binary protocol; a text session does not
+    receive binary pushes.
 
 ### Commands
 
@@ -129,7 +134,7 @@ including:
 - flood scopes: set key, set/get default scope
 - auto-add config, stats, custom vars, device PIN
 - trace, path discovery, control data, raw packet/data
-- local CLI command (`0x42`) and its reply (`0x1D`)
+- local CLI command (`0x42`) and its reply (`0x1D`), echoing optional `XX|` tag prefixes and stripping USB serial prompt markers
 - factory reset and reboot
 
 Errors are returned as `[0x01, code]` with codes for unsupported, not found,
@@ -203,7 +208,11 @@ Storage is selected at compile time between two statically dispatched profiles:
   config write.
 - `stats-flash` reports the active profile, QSPI availability/outage drops, and
   per-store writes, erases, and queued messages.
-- Legacy snapshot banks from older firmware are detected and cleared once.
+- Ferrix uses its own `sequential-storage` layout rather than standard
+  MeshCore's LittleFS filesystem. Switching between stock MeshCore and Ferrix
+  requires a full flash erase (back up your private key and contacts first);
+  normal upgrades between Ferrix releases preserve identity and settings.
+- Legacy snapshot banks from older Ferrix firmware are detected and cleared once.
 
 ---
 
@@ -222,7 +231,11 @@ page action:
 7. Settings (LEDs and sound)
 8. System (battery, RX duty, path hash, firmware)
 
-The frontlight turns off after an idle period and wakes on any input.
+The frontlight turns off after an idle period and wakes on any input. The
+e-paper panel enters deep sleep when idle, performs a full clear every 16
+partial updates to prevent ghosting, and refreshes periodically according to
+`refresh.interval` (default 10 minutes; idle telemetry updates are rate-limited
+when set to `0`).
 
 ### LED patterns
 
@@ -235,24 +248,26 @@ The frontlight turns off after an idle period and wakes on any input.
 
 ## 7. CLI
 
-USB text CLI commands include:
+USB text CLI and `CMD_RUN_CLI_COMMAND` (`0x42`) commands include:
 
 ```
 ver, board, help
-get/set name, get public.key, get/set prv.key
-get radio, get/set freq, tx, sf, bw, cr
-get/set path.hash.mode, get/set repeat (off-grid), get/set sound
-get/set leds, rxduty, af, dutycycle
+get/set name, get role, get/set lat, get/set lon
+get public.key, get/set prv.key
+get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq, tx, sf, bw, cr
+get/set path.hash.mode (or hash-mode), get/set repeat (off-grid), get/set sound
+get/set leds, get/set refresh.interval, rxduty, af, dutycycle
 get/set autoadd, get/set multiacks, get companion
 contacts, clear contacts
 messages, clear messages, channels
-advert, time, clock sync
+advert, advert.zerohop, gps advert, clock / time, clock sync
 battery
-stats-radio, stats-flash, stats-tx, stats-packets, stats-ble, stats-login,
-stats-scope, stats-trace, stats-adverts, stats-disc, stats-binary, stats-core
+stats-radio, stats-flash, stats-qspi, stats-tx, stats-packets, stats-ble,
+stats-login, stats-scope, stats-trace, stats-adverts, stats-disc, stats-binary,
+stats-core, stats-gps, stats-wdt, stats-power
 clear stats
 get/set tx.slot
-save, reboot, dfu
+save, reboot, dfu (or start dfu), start ota
 ```
 
 Examples:
@@ -262,18 +277,26 @@ set name d1nk4n
 set prv.key <128 hex chars>
 set tx.slot 400
 stats-tx
+stats-power
 ```
 
 ---
 
 ## 8. Diagnostics
 
+All `stats-*` commands return compact single-line JSON designed to fit within
+the 175-byte `PACKET_CLI_REPLY` (`0x1D`) binary companion frame limit:
+
 - `stats-radio` — airtime, RSSI/SNR, transmit wait, lane counts, retries/drops.
 - `stats-flash` — active storage profile, QSPI availability/skipped ops,
   per-store saves/erases, queued messages.
+- `stats-qspi` (or `qspi`) — QSPI JEDEC ID, status, and flash health.
 - `stats-tx` — slot width/occupancy, control/flood/background counts,
   cancelled/stale floods, duplicate-delay histogram.
 - `stats-packets` — received/sent flood/direct counters.
+- `stats-power` — LFCLK source (`LFXO` vs `LFRC`) and REG1 DC-DC regulator status.
+- `stats-gps` (or `gps`) — fix status, satellites, coordinates, and UART activity.
+- `stats-wdt` (or `watchdog`) — watchdog feed/timeout telemetry.
 - `stats-ble`, `stats-login`, `stats-scope`, `stats-trace`, `stats-adverts`,
   `stats-disc`, `stats-binary`, `stats-core`.
 - `clear stats` resets the runtime counters.
@@ -283,7 +306,7 @@ stats-tx
 ## 9. Build, test, flash
 
 ```sh
-# Release build (external QSPI + internal flash profile)
+# Release build (external QSPI + internal flash profile; runs task arena check)
 ./tools/build.sh thinknode-m1 build --release
 
 # Internal-flash-only release build (no QSPI)
@@ -292,6 +315,9 @@ stats-tx
 # Package UF2 image for drag-and-drop flashing
 ./tools/build_uf2.sh thinknode-m1 release
 
+# Package Nordic/Adafruit DFU .zip for BLE OTA or web/serial flashing
+./tools/build_ota.sh thinknode-m1 release
+
 # Host tests (wire codecs, message queue, contact map, scheduler, vectors)
 ./tools/build.sh thinknode-m1 test
 
@@ -299,15 +325,21 @@ stats-tx
 ./tools/flash_serial.sh
 ```
 
-Set `FERRIX_VERSION` (e.g. `v1.18.0`) and optionally `FERRIX_BUILD_DATE` /
+Every firmware build and release script runs `tools/check_task_arena.py` against
+the compiled ELF to ensure all Embassy `TaskPool` allocations fit inside the
+static task arena before flashing.
+
+Set `FERRIX_VERSION` (e.g. `v1.18.2`) and optionally `FERRIX_BUILD_DATE` /
 `SOURCE_DATE_EPOCH` to override the compiled version/date metadata. Pushing a
 `v*` tag triggers [`.github/workflows/release.yml`](.github/workflows/release.yml),
-which runs the host test suite and publishes `ferrix-thinknode-m1-companion.uf2`
-and `ferrix-thinknode-m1-companion.zip` (webflasher/DFU package) to GitHub
-Releases.
+which runs the host test suite, verifies the task arena, and publishes
+`ferrix-thinknode-m1-companion.uf2` and `ferrix-thinknode-m1-companion.zip`
+(BLE OTA / webflasher / serial DFU package) to GitHub Releases.
 
-To enter the bootloader from the CLI, run `dfu`, or double-click reset. A
-1200-baud touch also triggers DFU when the CDC port is responsive.
+To enter the USB bootloader from the CLI, run `dfu` (`start dfu`), double-click
+reset, or trigger a 1200-baud touch on the CDC port. To enter BLE OTA DFU mode
+on boards with an OTAFIX bootloader, run `start ota` or trigger Legacy
+Buttonless DFU from an nRF DFU app.
 
 ---
 
@@ -316,9 +348,10 @@ To enter the bootloader from the CLI, run `dfu`, or double-click reset. A
 | Area | Limitation |
 |---|---|
 | Node roles | Only the `companion` role is implemented; repeater, room server, and sensor node roles are not implemented (`roles/repeater` is a placeholder). Off-grid client-repeat forwarding is supported on allowed frequencies. |
+| Storage format | Uses Ferrix's own `sequential-storage` layout rather than standard MeshCore's LittleFS layout; switching to or from stock MeshCore requires a full flash erase. |
 | Older app protocol | Message frames are always V3; apps that report protocol < 3 are not supported. |
 | Factory reset | Handler implemented; the destructive path has not been exercised on hardware. |
-| OTA | USB UF2 drag-and-drop and Serial DFU only; no BLE OTA. |
+| BLE OTA | Legacy Buttonless BLE DFU requires an OTAFIX-compatible bootloader; boards with a stock non-OTAFIX bootloader must use USB UF2 drag-and-drop or Serial DFU. |
 
 ---
 
