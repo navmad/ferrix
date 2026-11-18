@@ -116,6 +116,24 @@ pub(crate) fn format_cli_reply(tag_prefix: &str, raw: &str, out: &mut String<512
     let _ = out.push_str(body);
 }
 
+/// Write a string slice escaped for embedding inside a JSON string literal.
+pub(crate) fn write_json_escaped<W: Write>(out: &mut W, s: &str) {
+    for ch in s.chars() {
+        match ch {
+            '"' => {
+                let _ = out.write_str("\\\"");
+            }
+            '\\' => {
+                let _ = out.write_str("\\\\");
+            }
+            c if (c as u32) < 0x20 => {}
+            c => {
+                let _ = out.write_char(c);
+            }
+        }
+    }
+}
+
 /// Run one local CLI line and collect its reply for `PACKET_CLI_REPLY`.
 ///
 /// Supports the optional 2-character tag prefix (`"XX|<cmd>"`) used by
@@ -1198,9 +1216,9 @@ pub async fn handle_text_cli<W: TextSink>(
             let mut s: heapless::String<256> = heapless::String::new();
             let _ = write!(
                 s,
-                "  -> slot {} ms (auto={}), used {}/4, control {} / flood {} / bg {} sent, stale {}, cancelled {}\r\n  -> forwards {} scheduled / {} sent, duplicate deltas <20:{} 20-40:{} 40-80:{} 80-160:{} 160-320:{} >320:{}\r\n",
+                "  -> {{\"slot_ms\":{},\"auto\":{},\"used\":{},\"ctrl\":{},\"flood\":{},\"bg\":{},\"stale\":{},\"cancel\":{},\"fwd_sched\":{},\"fwd_sent\":{},\"dup\":[{},{},{},{},{},{}]}}\r\n",
                 slot_ms,
-                if override_ms == 0 { 1 } else { 0 },
+                override_ms == 0,
                 used,
                 control,
                 flood,
@@ -1214,7 +1232,7 @@ pub async fn handle_text_cli<W: TextSink>(
             let _ = sender.send(s.as_bytes()).await;
         }
         "stats-radio" => {
-            let (tx_ms, rx_ms, rssi, snr, wait_ms, control, flood, stale, retries, dropped, sent) =
+            let (tx_ms, rx_ms, rssi, snr, wait_ms, retries, dropped, sent) =
                 RADIO_TELEMETRY.lock(|t| {
                     let tel = t.borrow();
                     (
@@ -1223,9 +1241,6 @@ pub async fn handle_text_cli<W: TextSink>(
                         tel.last_rssi,
                         tel.last_snr,
                         tel.tx_wait_max_ms,
-                        tel.tx_control,
-                        tel.tx_flood,
-                        tel.tx_stale,
                         tel.tx_retries,
                         tel.tx_dropped,
                         tel.tx_beacons,
@@ -1234,48 +1249,19 @@ pub async fn handle_text_cli<W: TextSink>(
             let mut s: heapless::String<256> = heapless::String::new();
             let _ = write!(
                 s,
-                "  -> {{\"noise_floor\":-118,\"last_rssi\":{},\"last_snr\":{:.2},\"tx_air_secs\":{},\"rx_air_secs\":{},\"tx_sent\":{},\"tx_wait_max_ms\":{},\"tx_control\":{},\"tx_flood\":{},\"tx_stale\":{},\"tx_retries\":{},\"tx_dropped\":{}}}\r\n",
+                "  -> {{\"noise_floor\":-118,\"last_rssi\":{},\"last_snr\":{:.2},\"tx_air_secs\":{},\"rx_air_secs\":{},\"tx_sent\":{},\"tx_wait_ms\":{},\"retries\":{},\"dropped\":{}}}\r\n",
                 rssi,
                 snr as f32,
                 tx_ms / 1000,
                 rx_ms / 1000,
                 sent,
                 wait_ms,
-                control,
-                flood,
-                stale,
                 retries,
                 dropped
             );
-            let _ = sender.send( s.as_bytes()).await;
+            let _ = sender.send(s.as_bytes()).await;
         }
         "stats-flash" => {
-            let mut s: heapless::String<384> = heapless::String::new();
-            let _ = write!(
-                s,
-                "  -> contacts: {} saves / {} erases\r\n",
-                storage.contact_saves,
-                storage.contact_erases
-            );
-            let _ = write!(
-                s,
-                "  -> messages: {} records / {} page erases / {} queued\r\n",
-                storage.message_records,
-                storage.message_page_erases,
-                storage.message_queued
-            );
-            let _ = write!(
-                s,
-                "  -> adverts: {} records / {} erases\r\n",
-                storage.advert_records,
-                storage.advert_erases
-            );
-            let _ = write!(
-                s,
-                "  -> config: {} saves / {} erases\r\n",
-                storage.config_saves,
-                storage.config_erases
-            );
             let external = if !storage.external_profile {
                 "internal"
             } else if storage.external_unavailable {
@@ -1283,151 +1269,149 @@ pub async fn handle_text_cli<W: TextSink>(
             } else {
                 "ready"
             };
+            let mut s: heapless::String<256> = heapless::String::new();
             let _ = write!(
                 s,
-                "  -> external: {} ({} ops skipped)\r\n",
-                external, storage.external_drops
+                "  -> {{\"contacts\":{{\"s\":{},\"e\":{}}},\"messages\":{{\"r\":{},\"e\":{},\"q\":{}}},\"adverts\":{{\"r\":{},\"e\":{}}},\"config\":{{\"s\":{},\"e\":{}}},\"ext\":\"{}\",\"ext_drops\":{}}}\r\n",
+                storage.contact_saves,
+                storage.contact_erases,
+                storage.message_records,
+                storage.message_page_erases,
+                storage.message_queued,
+                storage.advert_records,
+                storage.advert_erases,
+                storage.config_saves,
+                storage.config_erases,
+                external,
+                storage.external_drops
             );
-            let _ = sender.send( s.as_bytes()).await;
+            let _ = sender.send(s.as_bytes()).await;
         }
         "qspi" | "stats-qspi" => {
             use core::sync::atomic::Ordering;
             let status = crate::state::QSPI_STATUS.load(Ordering::Relaxed);
             let id = crate::state::QSPI_ID.load(Ordering::Relaxed);
             let status_s = match status {
-                0 => "not initialized",
+                0 => "not_initialized",
                 1 => "ready",
-                2 => "id mismatch",
-                _ => "io error",
+                2 => "id_mismatch",
+                _ => "io_error",
             };
-            let mut s: heapless::String<160> = heapless::String::new();
-            let _ = write!(s, "  -> QSPI: {} id={:06x}\r\n", status_s, id);
-            let _ = sender.send( s.as_bytes()).await;
+            let mut s: heapless::String<96> = heapless::String::new();
+            let _ = write!(
+                s,
+                "  -> {{\"status\":\"{}\",\"id\":\"{:06x}\"}}\r\n",
+                status_s, id
+            );
+            let _ = sender.send(s.as_bytes()).await;
         }
         "stats-disc" => {
-            let mut s: heapless::String<160> = heapless::String::new();
+            use core::sync::atomic::Ordering;
+            let mut s: heapless::String<192> = heapless::String::new();
             let _ = write!(
                 s,
-                "  -> tx {} tag {:08x} pending {}\r\n",
-                crate::companion::protocol::DISC_TX_COUNT.load(core::sync::atomic::Ordering::Relaxed),
-                crate::companion::protocol::DISC_TX_TAG.load(core::sync::atomic::Ordering::Relaxed),
-                crate::companion::protocol::DISC_PENDING.load(core::sync::atomic::Ordering::Relaxed)
+                "  -> {{\"tx\":{},\"tx_tag\":\"{:08x}\",\"pending\":{},\"rx\":{},\"rx_tag\":\"{:08x}\",\"out\":\"0x{:02x}\",\"in\":\"0x{:02x}\",\"rtt_ms\":{}}}\r\n",
+                crate::companion::protocol::DISC_TX_COUNT.load(Ordering::Relaxed),
+                crate::companion::protocol::DISC_TX_TAG.load(Ordering::Relaxed),
+                crate::companion::protocol::DISC_PENDING.load(Ordering::Relaxed),
+                crate::companion::protocol::DISC_RX_COUNT.load(Ordering::Relaxed),
+                crate::companion::protocol::DISC_RX_TAG.load(Ordering::Relaxed),
+                crate::companion::protocol::DISC_RX_OUT.load(Ordering::Relaxed),
+                crate::companion::protocol::DISC_RX_IN.load(Ordering::Relaxed),
+                crate::companion::protocol::DISC_RX_RTT_MS.load(Ordering::Relaxed)
             );
-            let _ = write!(
-                s,
-                "  -> rx {} tag {:08x} out {:#04x} in {:#04x} rtt {}ms\r\n",
-                crate::companion::protocol::DISC_RX_COUNT.load(core::sync::atomic::Ordering::Relaxed),
-                crate::companion::protocol::DISC_RX_TAG.load(core::sync::atomic::Ordering::Relaxed),
-                crate::companion::protocol::DISC_RX_OUT.load(core::sync::atomic::Ordering::Relaxed),
-                crate::companion::protocol::DISC_RX_IN.load(core::sync::atomic::Ordering::Relaxed),
-                crate::companion::protocol::DISC_RX_RTT_MS.load(core::sync::atomic::Ordering::Relaxed)
-            );
-            let _ = sender.send( s.as_bytes()).await;
+            let _ = sender.send(s.as_bytes()).await;
         }
         "stats-binary" => {
+            use core::sync::atomic::Ordering;
             let mut s: heapless::String<160> = heapless::String::new();
             let _ = write!(
                 s,
-                "  -> tx {} tag {:08x} type {:#04x}\r\n",
-                crate::companion::protocol::REQ_TX_COUNT.load(core::sync::atomic::Ordering::Relaxed),
-                crate::companion::protocol::REQ_TX_TAG.load(core::sync::atomic::Ordering::Relaxed),
-                crate::companion::protocol::REQ_TX_TYPE.load(core::sync::atomic::Ordering::Relaxed)
+                "  -> {{\"tx\":{},\"tx_tag\":\"{:08x}\",\"type\":\"0x{:02x}\",\"rx\":{},\"rx_tag\":\"{:08x}\",\"len\":{}}}\r\n",
+                crate::companion::protocol::REQ_TX_COUNT.load(Ordering::Relaxed),
+                crate::companion::protocol::REQ_TX_TAG.load(Ordering::Relaxed),
+                crate::companion::protocol::REQ_TX_TYPE.load(Ordering::Relaxed),
+                crate::companion::protocol::REQ_RX_COUNT.load(Ordering::Relaxed),
+                crate::companion::protocol::REQ_RX_TAG.load(Ordering::Relaxed),
+                crate::companion::protocol::REQ_RX_LEN.load(Ordering::Relaxed)
             );
-            let _ = write!(
-                s,
-                "  -> rx {} tag {:08x} len {}\r\n",
-                crate::companion::protocol::REQ_RX_COUNT.load(core::sync::atomic::Ordering::Relaxed),
-                crate::companion::protocol::REQ_RX_TAG.load(core::sync::atomic::Ordering::Relaxed),
-                crate::companion::protocol::REQ_RX_LEN.load(core::sync::atomic::Ordering::Relaxed)
-            );
-            let _ = sender.send( s.as_bytes()).await;
+            let _ = sender.send(s.as_bytes()).await;
         }
         "stats-login" => {
-            let mut s: heapless::String<160> = heapless::String::new();
+            use core::sync::atomic::Ordering;
+            let mut s: heapless::String<192> = heapless::String::new();
             let _ = write!(
                 s,
-                "  -> tx {} key {:08x} tag {:08x} flood {} pending {}\r\n",
-                crate::companion::protocol::LOGIN_TX_COUNT.load(core::sync::atomic::Ordering::Relaxed),
-                crate::companion::protocol::LOGIN_TX_KEY.load(core::sync::atomic::Ordering::Relaxed),
-                crate::companion::protocol::LOGIN_TX_TAG.load(core::sync::atomic::Ordering::Relaxed),
-                crate::companion::protocol::LOGIN_TX_FLOOD.load(core::sync::atomic::Ordering::Relaxed),
-                crate::companion::protocol::LOGIN_PENDING.load(core::sync::atomic::Ordering::Relaxed)
+                "  -> {{\"tx\":{},\"key\":\"{:08x}\",\"tx_tag\":\"{:08x}\",\"flood\":{},\"pending\":{},\"rx\":{},\"rx_tag\":\"{:08x}\",\"len\":{},\"result\":{}}}\r\n",
+                crate::companion::protocol::LOGIN_TX_COUNT.load(Ordering::Relaxed),
+                crate::companion::protocol::LOGIN_TX_KEY.load(Ordering::Relaxed),
+                crate::companion::protocol::LOGIN_TX_TAG.load(Ordering::Relaxed),
+                crate::companion::protocol::LOGIN_TX_FLOOD.load(Ordering::Relaxed),
+                crate::companion::protocol::LOGIN_PENDING.load(Ordering::Relaxed),
+                crate::companion::protocol::LOGIN_RX_COUNT.load(Ordering::Relaxed),
+                crate::companion::protocol::LOGIN_RX_TAG.load(Ordering::Relaxed),
+                crate::companion::protocol::LOGIN_RX_LEN.load(Ordering::Relaxed),
+                crate::companion::protocol::LOGIN_RESULT.load(Ordering::Relaxed)
             );
-            let _ = write!(
-                s,
-                "  -> rx {} tag {:08x} len {} result {}\r\n",
-                crate::companion::protocol::LOGIN_RX_COUNT.load(core::sync::atomic::Ordering::Relaxed),
-                crate::companion::protocol::LOGIN_RX_TAG.load(core::sync::atomic::Ordering::Relaxed),
-                crate::companion::protocol::LOGIN_RX_LEN.load(core::sync::atomic::Ordering::Relaxed),
-                crate::companion::protocol::LOGIN_RESULT.load(core::sync::atomic::Ordering::Relaxed)
-            );
-            let _ = sender.send( s.as_bytes()).await;
+            let _ = sender.send(s.as_bytes()).await;
         }
         "stats-scope" => {
             let p = crate::companion::protocol::prefs();
             let over = crate::companion::protocol::scope_override();
-            let mut s: heapless::String<160> = heapless::String::new();
+            let scope_name = core::str::from_utf8(
+                &p.scope_name[..p.scope_name.iter().position(|&b| b == 0).unwrap_or(31)],
+            )
+            .unwrap_or("");
+            let mut s: heapless::String<192> = heapless::String::new();
+            let _ = write!(s, "  -> {{\"default\":\"");
+            write_json_escaped(&mut s, scope_name);
             let _ = write!(
                 s,
-                "  -> default '{}' key {:02x}{:02x}.. scoped {}\r\n",
-                core::str::from_utf8(
-                    &p.scope_name[..p.scope_name.iter().position(|&b| b == 0).unwrap_or(31)]
-                )
-                .unwrap_or(""),
+                "\",\"key\":\"{:02x}{:02x}\",\"scoped\":{},\"override\":{},\"force_unscoped\":{}}}\r\n",
                 p.scope_key[0],
                 p.scope_key[1],
                 crate::companion::protocol::SCOPED_FLOODS
-                    .load(core::sync::atomic::Ordering::Relaxed)
-            );
-            let _ = write!(
-                s,
-                "  -> override {} force_unscoped {}\r\n",
-                if over.0 { "set" } else { "none" },
+                    .load(core::sync::atomic::Ordering::Relaxed),
+                over.0,
                 over.1
             );
-            let _ = sender.send( s.as_bytes()).await;
+            let _ = sender.send(s.as_bytes()).await;
         }
         "stats-trace" => {
-            let mut s: heapless::String<160> = heapless::String::new();
+            use core::sync::atomic::Ordering;
+            let mut s: heapless::String<192> = heapless::String::new();
             let _ = write!(
                 s,
-                "  -> tx {} tag {:08x} flags {} path_len {} path0 {:08x}\r\n",
-                crate::companion::protocol::TRACE_TX_COUNT.load(core::sync::atomic::Ordering::Relaxed),
-                crate::companion::protocol::TRACE_TX_TAG.load(core::sync::atomic::Ordering::Relaxed),
-                crate::companion::protocol::TRACE_TX_FLAGS.load(core::sync::atomic::Ordering::Relaxed),
-                crate::companion::protocol::TRACE_TX_PATH_LEN.load(core::sync::atomic::Ordering::Relaxed),
-                crate::companion::protocol::TRACE_TX_PATH.load(core::sync::atomic::Ordering::Relaxed)
+                "  -> {{\"tx\":{},\"tx_tag\":\"{:08x}\",\"tx_flags\":{},\"path_len\":{},\"path0\":\"{:08x}\",\"rx\":{},\"rx_tag\":\"{:08x}\",\"rx_flags\":{},\"hashes\":{},\"snrs\":{}}}\r\n",
+                crate::companion::protocol::TRACE_TX_COUNT.load(Ordering::Relaxed),
+                crate::companion::protocol::TRACE_TX_TAG.load(Ordering::Relaxed),
+                crate::companion::protocol::TRACE_TX_FLAGS.load(Ordering::Relaxed),
+                crate::companion::protocol::TRACE_TX_PATH_LEN.load(Ordering::Relaxed),
+                crate::companion::protocol::TRACE_TX_PATH.load(Ordering::Relaxed),
+                crate::companion::protocol::TRACE_RX_COUNT.load(Ordering::Relaxed),
+                crate::companion::protocol::TRACE_RX_TAG.load(Ordering::Relaxed),
+                crate::companion::protocol::TRACE_RX_FLAGS.load(Ordering::Relaxed),
+                crate::companion::protocol::TRACE_RX_HASHES.load(Ordering::Relaxed),
+                crate::companion::protocol::TRACE_RX_SNRS.load(Ordering::Relaxed)
             );
-            let _ = write!(
-                s,
-                "  -> rx {} tag {:08x} flags {} hashes {} snrs {}\r\n",
-                crate::companion::protocol::TRACE_RX_COUNT.load(core::sync::atomic::Ordering::Relaxed),
-                crate::companion::protocol::TRACE_RX_TAG.load(core::sync::atomic::Ordering::Relaxed),
-                crate::companion::protocol::TRACE_RX_FLAGS.load(core::sync::atomic::Ordering::Relaxed),
-                crate::companion::protocol::TRACE_RX_HASHES.load(core::sync::atomic::Ordering::Relaxed),
-                crate::companion::protocol::TRACE_RX_SNRS.load(core::sync::atomic::Ordering::Relaxed)
-            );
-            let _ = sender.send( s.as_bytes()).await;
+            let _ = sender.send(s.as_bytes()).await;
         }
         "stats-adverts" => {
+            use core::sync::atomic::Ordering;
             let (saved, pending, erase_pending) = host.advert_stats();
-            let mut s: heapless::String<96> = heapless::String::new();
+            let mut s: heapless::String<192> = heapless::String::new();
             let _ = write!(
                 s,
-                "  -> blobs {} saved, pending {}{}\r\n",
+                "  -> {{\"saved\":{},\"pending\":{},\"erase_pending\":{},\"adverts\":{},\"last_key\":\"{:08x}\",\"last_ts\":{},\"blob\":{}}}\r\n",
                 saved,
                 pending,
-                if erase_pending { " erase-pending" } else { "" }
+                erase_pending,
+                crate::companion::protocol::ADVERT_COUNT.load(Ordering::Relaxed),
+                crate::companion::protocol::ADVERT_LAST_KEY.load(Ordering::Relaxed),
+                crate::companion::protocol::ADVERT_LAST_TS.load(Ordering::Relaxed),
+                crate::companion::protocol::ADVERT_LAST_HAD_BLOB.load(Ordering::Relaxed)
             );
-            let _ = write!(
-                s,
-                "  -> adverts {} last {:08x} ts {} blob {}\r\n",
-                crate::companion::protocol::ADVERT_COUNT.load(core::sync::atomic::Ordering::Relaxed),
-                crate::companion::protocol::ADVERT_LAST_KEY.load(core::sync::atomic::Ordering::Relaxed),
-                crate::companion::protocol::ADVERT_LAST_TS.load(core::sync::atomic::Ordering::Relaxed),
-                if crate::companion::protocol::ADVERT_LAST_HAD_BLOB.load(core::sync::atomic::Ordering::Relaxed) { "yes" } else { "no" }
-            );
-            let _ = sender.send( s.as_bytes()).await;
+            let _ = sender.send(s.as_bytes()).await;
         }
         "gps on" => {
             host.set_gps_enabled(true);
@@ -1443,17 +1427,17 @@ pub async fn handle_text_cli<W: TextSink>(
             let storage = crate::state::STORAGE_HEARTBEAT.load(Ordering::Relaxed);
             let pets = crate::state::WDT_PETS.load(Ordering::Relaxed);
             let reason = crate::state::RESET_REASON.load(Ordering::Relaxed);
-            let mut s: heapless::String<192> = heapless::String::new();
+            let mut s: heapless::String<160> = heapless::String::new();
             let _ = write!(
                 s,
-                "  -> WDT: app={} storage={} pets={} reset=0x{:08x} dog={}\r\n",
+                "  -> {{\"app\":{},\"storage\":{},\"pets\":{},\"reset\":\"0x{:08x}\",\"dog\":{}}}\r\n",
                 app,
                 storage,
                 pets,
                 reason,
                 (reason & 0x2) != 0
             );
-            let _ = sender.send( s.as_bytes()).await;
+            let _ = sender.send(s.as_bytes()).await;
         }
         "stats-gps" | "gps" => {
             let g = crate::state::gps_state();
@@ -1461,49 +1445,72 @@ pub async fn handle_text_cli<W: TextSink>(
             let age = now.saturating_sub(g.last_update_ms);
             let bytes = crate::state::GPS_BYTES.load(core::sync::atomic::Ordering::Relaxed);
             let sentences = crate::state::GPS_SENTENCES.load(core::sync::atomic::Ordering::Relaxed);
+            let lat = if g.latitude.is_finite() { g.latitude } else { 0.0 };
+            let lon = if g.longitude.is_finite() { g.longitude } else { 0.0 };
+            let alt = if g.altitude_m.is_finite() { g.altitude_m } else { 0.0 };
+            let hdop = if g.hdop.is_finite() { g.hdop } else { 0.0 };
             let mut s: heapless::String<224> = heapless::String::new();
             let _ = write!(
                 s,
-                "  -> GPS: power={} fix={} sats={} lat={:.6} lon={:.6} alt={:.1}m hdop={:.1} age={}ms bytes={} lines={}\r\n",
-                if host.gps_enabled() { "on" } else { "off" },
-                g.fix, g.satellites, g.latitude, g.longitude, g.altitude_m, g.hdop, age, bytes, sentences
+                "  -> {{\"power\":{},\"fix\":{},\"sats\":{},\"lat\":{:.6},\"lon\":{:.6},\"alt_m\":{:.1},\"hdop\":{:.1},\"age_ms\":{},\"bytes\":{},\"lines\":{}}}\r\n",
+                host.gps_enabled(),
+                g.fix,
+                g.satellites,
+                lat,
+                lon,
+                alt,
+                hdop,
+                age,
+                bytes,
+                sentences
             );
-            let _ = sender.send( s.as_bytes()).await;
+            let _ = sender.send(s.as_bytes()).await;
         }
         "stats-ble" | "get ble" => {
-            let st = crate::state::BLE_STATUS.load(core::sync::atomic::Ordering::Relaxed);
+            use core::sync::atomic::Ordering;
+            let st = crate::state::BLE_STATUS.load(Ordering::Relaxed);
             let mut s: heapless::String<224> = heapless::String::new();
             match st {
-                0 => { let _ = write!(s, "  -> BLE: Not started\r\n"); }
-                1 => { let _ = write!(s, "  -> BLE: Probing SoftDevice...\r\n"); }
-                2 => { let _ = write!(s, "  -> BLE: SoftDevice enabled, setting vector table...\r\n"); }
+                0 => {
+                    let _ = write!(s, "  -> {{\"state\":\"stopped\"}}\r\n");
+                }
+                1 => {
+                    let _ = write!(s, "  -> {{\"state\":\"probing\"}}\r\n");
+                }
+                2 => {
+                    let _ = write!(s, "  -> {{\"state\":\"starting\"}}\r\n");
+                }
                 3 => {
-                    let connected = crate::state::BLE_CONNECTED
-                        .load(core::sync::atomic::Ordering::Relaxed);
+                    let connected = crate::state::BLE_CONNECTED.load(Ordering::Relaxed);
                     let callsign = crate::storage::get_callsign();
+                    let _ = write!(s, "  -> {{\"state\":\"active\",\"name\":\"MeshCore-");
+                    write_json_escaped(&mut s, callsign.as_str());
                     let _ = write!(
                         s,
-                        "  -> BLE: Active (MeshCore-{} NUS), connected: {}, bonds: {} (loaded {}, saved {}, errors {}, err {}, recov {})\r\n",
-                        callsign.as_str(),
+                        "\",\"connected\":{},\"bonds\":{},\"loaded\":{},\"saved\":{},\"errors\":{},\"last_err\":{},\"recov\":{}}}\r\n",
                         connected,
                         crate::storage::bonds::count(),
-                        crate::storage::bonds::BOND_LOADED.load(core::sync::atomic::Ordering::Relaxed),
-                        crate::storage::bonds::BOND_SAVES.load(core::sync::atomic::Ordering::Relaxed),
-                        crate::storage::bonds::BOND_SAVE_ERRORS.load(core::sync::atomic::Ordering::Relaxed),
-                        crate::storage::bonds::BOND_LAST_ERROR.load(core::sync::atomic::Ordering::Relaxed),
-                        crate::storage::bonds::BOND_RECOVERIES.load(core::sync::atomic::Ordering::Relaxed)
+                        crate::storage::bonds::BOND_LOADED.load(Ordering::Relaxed),
+                        crate::storage::bonds::BOND_SAVES.load(Ordering::Relaxed),
+                        crate::storage::bonds::BOND_SAVE_ERRORS.load(Ordering::Relaxed),
+                        crate::storage::bonds::BOND_LAST_ERROR.load(Ordering::Relaxed),
+                        crate::storage::bonds::BOND_RECOVERIES.load(Ordering::Relaxed)
                     );
                 }
                 code if code >= 0x1000 => {
                     let w0 = unsafe { *(0x1000 as *const u32) };
                     let w1 = unsafe { *(0x1004 as *const u32) };
-                    let _ = write!(s, "  -> BLE: sd_softdevice_enable failed (code 0x{:04x}, flash@0x1000: 0x{:08x} 0x{:08x})\r\n", code & 0xFFF, w0, w1);
+                    let _ = write!(
+                        s,
+                        "  -> {{\"state\":\"sd_enable_err\",\"code\":\"0x{:04x}\",\"w0\":\"0x{:08x}\",\"w1\":\"0x{:08x}\"}}\r\n",
+                        code & 0xFFF, w0, w1
+                    );
                 }
                 code => {
-                    let _ = write!(s, "  -> BLE: Error state {}\r\n", code);
+                    let _ = write!(s, "  -> {{\"state\":\"error\",\"code\":{}}}\r\n", code);
                 }
             }
-            let _ = sender.send( s.as_bytes()).await;
+            let _ = sender.send(s.as_bytes()).await;
         }
         "stats-power" => {
             if let Some(pw) = host.power_clock_stats() {
@@ -1689,5 +1696,12 @@ mod tests {
         out.clear();
         format_cli_reply("", "> 910.525,62.5,7,5\r\n", &mut out);
         assert_eq!(out.as_str(), "> 910.525,62.5,7,5");
+    }
+
+    #[test]
+    fn json_escaping_handles_quotes_backslashes_and_control_chars() {
+        let mut out = String::<64>::new();
+        write_json_escaped(&mut out, "a\"b\\c\n\rd");
+        assert_eq!(out.as_str(), "a\\\"b\\\\cd");
     }
 }
