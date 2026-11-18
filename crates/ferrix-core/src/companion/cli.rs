@@ -93,15 +93,47 @@ pub trait CliHost: CompanionHost {
     fn board_line(&self) -> &'static str;
 }
 
+/// Split an optional 2-character companion CLI tag prefix (`"XX|<cmd>"`) from
+/// the command body.
+pub(crate) fn split_cli_tag_prefix(line: &str) -> (&str, &str) {
+    let trimmed = line.trim_start_matches(' ');
+    if trimmed.len() > 4 && trimmed.as_bytes().get(2) == Some(&b'|') {
+        (&trimmed[..3], &trimmed[3..])
+    } else {
+        ("", trimmed)
+    }
+}
+
+/// Format a raw USB CLI output buffer into a `PACKET_CLI_REPLY` body by
+/// stripping the USB `"  -> "` prompt and trailing `\r\n` and prepending any
+/// echoed `"XX|"` tag.
+pub(crate) fn format_cli_reply(tag_prefix: &str, raw: &str, out: &mut String<512>) {
+    let mut body = raw.trim_end_matches(&['\r', '\n'][..]);
+    if let Some(stripped) = body.strip_prefix("  -> ") {
+        body = stripped;
+    }
+    let _ = out.push_str(tag_prefix);
+    let _ = out.push_str(body);
+}
+
 /// Run one local CLI line and collect its reply for `PACKET_CLI_REPLY`.
+///
+/// Supports the optional 2-character tag prefix (`"XX|<cmd>"`) used by
+/// companion apps and strips the USB serial `"  -> "` prompt and trailing
+/// `\r\n` so binary protocol parsers receive clean JSON / `> <value>` strings.
 pub async fn reply(
     line: &str,
     node: &mut CompanionNode<'_>,
     host: &dyn CliHost,
     out: &mut String<512>,
 ) {
-    let mut sink = TextBuffer(out);
-    handle_text_cli(&mut sink, line, node, host, false).await;
+    let (tag_prefix, cmd) = split_cli_tag_prefix(line);
+
+    let mut raw = String::<512>::new();
+    let mut sink = TextBuffer(&mut raw);
+    handle_text_cli(&mut sink, cmd, node, host, false).await;
+
+    format_cli_reply(tag_prefix, raw.as_str(), out);
 }
 
 /// - `910.525` (MHz, decimal)
@@ -260,7 +292,7 @@ pub async fn handle_text_cli<W: TextSink>(
         }
         "get public.key" | "get public_key" | "public.key" | "get pubkey" => {
             let mut s: heapless::String<128> = heapless::String::new();
-            let _ = write!(s, "  -> ");
+            let _ = write!(s, "  -> > ");
             for b in &node.public_key {
                 let _ = write!(s, "{:02x}", b);
             }
@@ -269,7 +301,7 @@ pub async fn handle_text_cli<W: TextSink>(
         }
         "get prv.key" | "get private_key" | "prv.key" => {
             let mut s: heapless::String<256> = heapless::String::new();
-            let _ = write!(s, "  -> ");
+            let _ = write!(s, "  -> > ");
             for b in &node.private_key {
                 let _ = write!(s, "{:02x}", b);
             }
@@ -644,9 +676,9 @@ pub async fn handle_text_cli<W: TextSink>(
             let secs = crate::state::display_refresh_interval_secs();
             let mut s: heapless::String<48> = heapless::String::new();
             if secs == 0 {
-                let _ = write!(s, "  -> 0 (on update)\r\n");
+                let _ = write!(s, "  -> > 0 (on update)\r\n");
             } else {
-                let _ = write!(s, "  -> {} s\r\n", secs);
+                let _ = write!(s, "  -> > {} s\r\n", secs);
             }
             let _ = sender.send(s.as_bytes()).await;
         }
@@ -873,7 +905,7 @@ pub async fn handle_text_cli<W: TextSink>(
         }
         "get leds" => {
             let mut s: heapless::String<32> = heapless::String::new();
-            let _ = write!(s, "  -> {}\r\n", if host.leds_disabled() { "off" } else { "on" });
+            let _ = write!(s, "  -> > {}\r\n", if host.leds_disabled() { "off" } else { "on" });
             let _ = sender.send( s.as_bytes()).await;
         }
         "set leds on" | "set leds off" => {
@@ -891,7 +923,7 @@ pub async fn handle_text_cli<W: TextSink>(
         "get rxduty" | "get rx.duty" => {
             let on = RADIO_SETTINGS.lock(|r| r.borrow().rx_duty_cycle);
             let mut s: heapless::String<32> = heapless::String::new();
-            let _ = write!(s, "  -> {}\r\n", if on { "on" } else { "off" });
+            let _ = write!(s, "  -> > {}\r\n", if on { "on" } else { "off" });
             let _ = sender.send( s.as_bytes()).await;
         }
         "set rxduty on" | "set rxduty off" => {
@@ -911,7 +943,7 @@ pub async fn handle_text_cli<W: TextSink>(
         "get af" => {
             let af = RADIO_SETTINGS.lock(|r| r.borrow().airtime_factor_tenths);
             let mut s: heapless::String<32> = heapless::String::new();
-            let _ = write!(s, "  -> {}.{:02}\r\n", af / 10, af % 10);
+            let _ = write!(s, "  -> > {}.{:02}\r\n", af / 10, af % 10);
             let _ = sender.send( s.as_bytes()).await;
         }
         s if s.starts_with("set af ") => {
@@ -929,7 +961,7 @@ pub async fn handle_text_cli<W: TextSink>(
             let af = RADIO_SETTINGS.lock(|r| r.borrow().airtime_factor_tenths) as u32;
             let duty_x10 = 10_000 / (af + 10);
             let mut s: heapless::String<32> = heapless::String::new();
-            let _ = write!(s, "  -> {}.{}%\r\n", duty_x10 / 10, duty_x10 % 10);
+            let _ = write!(s, "  -> > {}.{}%\r\n", duty_x10 / 10, duty_x10 % 10);
             let _ = sender.send( s.as_bytes()).await;
         }
         s if s.starts_with("set dutycycle ") || s.starts_with("set duty ") => {
@@ -1623,5 +1655,39 @@ pub async fn handle_text_cli<W: TextSink>(
         _ => {
             let _ = sender.send( b"  -> Unknown command\r\n").await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_reply_strips_usb_prompt_and_echoes_pipe_tag() {
+        assert_eq!(split_cli_tag_prefix("stats-core"), ("", "stats-core"));
+        assert_eq!(split_cli_tag_prefix("  01|stats-core"), ("01|", "stats-core"));
+        assert_eq!(split_cli_tag_prefix("ab|get leds"), ("ab|", "get leds"));
+        // Too short to have a command after `XX|`: treated as plain text.
+        assert_eq!(split_cli_tag_prefix("ab|x"), ("", "ab|x"));
+
+        let mut out = String::<512>::new();
+        format_cli_reply(
+            "",
+            "  -> {\"battery_mv\":4170,\"uptime_secs\":58}\r\n",
+            &mut out,
+        );
+        assert_eq!(out.as_str(), "{\"battery_mv\":4170,\"uptime_secs\":58}");
+
+        out.clear();
+        format_cli_reply("01|", "  -> 1.18.1-ferrix\r\n", &mut out);
+        assert_eq!(out.as_str(), "01|1.18.1-ferrix");
+
+        out.clear();
+        format_cli_reply("ab|", "  -> > on\r\n", &mut out);
+        assert_eq!(out.as_str(), "ab|> on");
+
+        out.clear();
+        format_cli_reply("", "> 910.525,62.5,7,5\r\n", &mut out);
+        assert_eq!(out.as_str(), "> 910.525,62.5,7,5");
     }
 }
