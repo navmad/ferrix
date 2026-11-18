@@ -10,7 +10,7 @@
 pub const USB_INBOUND_DELIMITER: u8 = 0x3C;  // '<'
 pub const USB_OUTBOUND_DELIMITER: u8 = 0x3E; // '>'
 
-pub const MAX_FRAME_PAYLOAD_SIZE: usize = 176;
+pub const MAX_FRAME_PAYLOAD_SIZE: usize = 256;
 pub const MAX_USB_FRAME_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE + 3; // Delimiter + 2 bytes length
 
 /// Reader for assembling streaming USB frames into complete packets.
@@ -136,6 +136,60 @@ mod tests {
         }
 
         assert_eq!(&received[..received_len], payload);
+    }
+
+    #[test]
+    fn test_usb_framing_large_frames_above_176_bytes() {
+        for size in [185usize, 205usize, MAX_FRAME_PAYLOAD_SIZE] {
+            let mut payload = [0u8; MAX_FRAME_PAYLOAD_SIZE];
+            for (i, byte) in payload[..size].iter_mut().enumerate() {
+                *byte = (i as u8).wrapping_mul(31).wrapping_add(7);
+            }
+
+            let mut framed = [0u8; MAX_USB_FRAME_SIZE];
+            let frame_len = encode_usb_frame(&payload[..size], &mut framed).unwrap();
+            assert_eq!(frame_len, size + 3);
+            assert_eq!(framed[0], USB_OUTBOUND_DELIMITER);
+
+            framed[0] = USB_INBOUND_DELIMITER;
+            let mut reader = UsbFrameReader::new();
+            let mut received = [0u8; MAX_FRAME_PAYLOAD_SIZE];
+            let mut received_len = 0;
+            for &b in &framed[..frame_len] {
+                if let Some(p) = reader.push_byte(b) {
+                    received[..p.len()].copy_from_slice(p);
+                    received_len = p.len();
+                }
+            }
+            assert_eq!(received_len, size);
+            assert_eq!(&received[..size], &payload[..size]);
+        }
+    }
+
+    #[test]
+    fn test_usb_framing_rejects_oversized_payload() {
+        let oversized = [0xAAu8; MAX_FRAME_PAYLOAD_SIZE + 1];
+        let mut framed = [0u8; MAX_USB_FRAME_SIZE + 1];
+        assert!(encode_usb_frame(&oversized, &mut framed).is_err());
+
+        let mut reader = UsbFrameReader::new();
+        let bad_len = (MAX_FRAME_PAYLOAD_SIZE + 1) as u16;
+        let [lo, hi] = bad_len.to_le_bytes();
+        assert!(reader.push_byte(USB_INBOUND_DELIMITER).is_none());
+        assert!(reader.push_byte(lo).is_none());
+        assert!(reader.push_byte(hi).is_none());
+
+        // Reader must recover cleanly on the next valid frame.
+        let mut valid_framed = [0u8; 32];
+        let valid_len = encode_usb_frame(b"OK", &mut valid_framed).unwrap();
+        valid_framed[0] = USB_INBOUND_DELIMITER;
+        let mut got = None;
+        for &b in &valid_framed[..valid_len] {
+            if let Some(p) = reader.push_byte(b) {
+                got = Some(p.len());
+            }
+        }
+        assert_eq!(got, Some(2));
     }
 }
 

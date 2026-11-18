@@ -918,7 +918,7 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                         let _ = push.push(rssi as i8 as u8);
                         let _ = push.push(path_len);
                         let _ = push.extend_from_slice(&data);
-                        if push.len() <= 176 {
+                        if push.len() <= ferrix_core::companion::framing::MAX_FRAME_PAYLOAD_SIZE {
                             push_companion(&push);
                         }
                     }
@@ -954,7 +954,7 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                         let _ = push.extend_from_slice(&hashes);
                         let _ = push.extend_from_slice(&snrs);
                         let _ = push.push((final_snr.saturating_mul(4)) as u8);
-                        if push.len() <= 176 {
+                        if push.len() <= ferrix_core::companion::framing::MAX_FRAME_PAYLOAD_SIZE {
                             push_companion(&push);
                         }
                     }

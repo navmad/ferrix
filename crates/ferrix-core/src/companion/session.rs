@@ -23,7 +23,11 @@ pub trait CompanionLink {
     async fn write_text(&mut self, text: &[u8]);
 }
 
-const MAX_RESPONSES: usize = 10;
+// `protocol::handle_command` emits at most 1 response frame per command
+// (`CMD_GET_CONTACTS` streams directly via `stream_contacts`). Keeping this
+// small lets each frame hold full `MAX_FRAME_PAYLOAD_SIZE` bytes without
+// inflating the Embassy task arena.
+const MAX_RESPONSES: usize = 2;
 const TEXT_LINE: usize = 256;
 
 /// One companion connection's protocol state.
@@ -135,10 +139,10 @@ impl<'a> CompanionSession<'a> {
             return;
         }
 
-        let mut responses: Vec<Vec<u8, 200>, MAX_RESPONSES> = Vec::new();
+        let mut responses: Vec<Vec<u8, MAX_FRAME_PAYLOAD_SIZE>, MAX_RESPONSES> = Vec::new();
         protocol::handle_command(&mut self.node, payload, self.host, |resp| {
             let mut out = Vec::new();
-            let _ = out.extend_from_slice(&resp[..resp.len().min(200)]);
+            let _ = out.extend_from_slice(&resp[..resp.len().min(MAX_FRAME_PAYLOAD_SIZE)]);
             let _ = responses.push(out);
         })
         .await;
@@ -341,6 +345,84 @@ mod tests {
         assert_eq!(u32::from_le_bytes(link.frames[0][1..5].try_into().unwrap()), 3);
         assert_eq!(link.frames[1][1], 3);
         assert_eq!(u32::from_le_bytes(link.frames[2][1..5].try_into().unwrap()), 250);
+    }
+
+    #[test]
+    fn sync_next_message_preserves_frames_above_200_bytes() {
+        let mut sender = String::<32>::new();
+        for _ in 0..32 {
+            let _ = sender.push('S');
+        }
+        let mut text = String::<160>::new();
+        for _ in 0..160 {
+            let _ = text.push('M');
+        }
+        let msg = crate::types::ReceivedMessage {
+            channel_idx: 1,
+            path_len: 0xFF,
+            sender,
+            sender_pub: [0u8; 32],
+            text,
+            timestamp: 1_700_000_000,
+            rssi: -80,
+            snr: 7,
+            is_direct: false,
+            txt_type: 0,
+            signed_prefix: [0u8; 4],
+        };
+
+        crate::state::MESSAGE_LOG.lock(|m| {
+            let mut list = m.borrow_mut();
+            list.clear();
+            let _ = list.push(crate::types::InboxItem::Text(msg));
+        });
+
+        let mut session = CompanionSession::new("n", "b", 0, [1; 32], [2; 64], &DummyHost);
+        let mut link = CaptureLink {
+            frames: std::vec::Vec::new(),
+        };
+
+        poll_ready(session.handle_frame(&[protocol::CMD_SYNC_NEXT_MESSAGE], &mut link));
+        assert_eq!(link.frames.len(), 1);
+        let frame = &link.frames[0];
+        // 11-byte V3 header + 32-byte sender + ": " + 160-byte text = 205 bytes.
+        assert_eq!(frame.len(), 205);
+        assert_eq!(frame[0], protocol::RESP_CODE_CHANNEL_MSG_V3);
+        assert!(frame.ends_with(b": ".as_slice()) == false);
+        assert_eq!(&frame[11..43], &[b'S'; 32]);
+        assert_eq!(&frame[43..45], b": ");
+        assert_eq!(&frame[45..205], &[b'M'; 160]);
+
+        let mut usb_out = [0u8; crate::companion::framing::MAX_USB_FRAME_SIZE];
+        let usb_len = crate::companion::framing::encode_usb_frame(frame, &mut usb_out).unwrap();
+        assert_eq!(usb_len, 208);
+    }
+
+    #[test]
+    fn feed_byte_accepts_usb_frame_above_176_bytes() {
+        let mut session = CompanionSession::new("n", "b", 0, [1; 32], [2; 64], &DummyHost);
+        let mut link = CaptureLink {
+            frames: std::vec::Vec::new(),
+        };
+
+        // Start signing session, then feed a 200-byte CMD_SIGN_DATA USB frame (>176 B).
+        poll_ready(session.handle_frame(&[protocol::CMD_SIGN_START], &mut link));
+        assert_eq!(link.frames.len(), 1);
+        assert_eq!(link.frames[0][0], protocol::RESP_CODE_SIGN_START);
+        link.frames.clear();
+
+        let mut payload = [0x5Au8; 200];
+        payload[0] = protocol::CMD_SIGN_DATA;
+        let mut framed = [0u8; crate::companion::framing::MAX_USB_FRAME_SIZE];
+        let frame_len = crate::companion::framing::encode_usb_frame(&payload, &mut framed).unwrap();
+        framed[0] = USB_INBOUND_DELIMITER;
+
+        for &b in &framed[..frame_len] {
+            poll_ready(session.feed_byte(b, &mut link));
+        }
+
+        assert_eq!(link.frames.len(), 1);
+        assert_eq!(link.frames[0], &[protocol::RESP_CODE_OK]);
     }
 }
 

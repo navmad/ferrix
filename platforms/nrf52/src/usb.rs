@@ -21,7 +21,7 @@ use static_cell::StaticCell;
 
 use ferrix_core::command::PushSink;
 use ferrix_core::companion::cli::CliHost;
-use ferrix_core::companion::framing::encode_usb_frame;
+use ferrix_core::companion::framing::{encode_usb_frame, MAX_USB_FRAME_SIZE};
 use ferrix_core::companion::session::{CompanionLink, CompanionSession};
 use ferrix_core::storage::get_callsign;
 
@@ -96,7 +96,7 @@ struct CdcLink<'a>(&'a mut Sender<'static, UsbDriver>);
 
 impl CompanionLink for CdcLink<'_> {
     async fn write_frame(&mut self, frame: &[u8]) {
-        let mut out = [0u8; 300];
+        let mut out = [0u8; MAX_USB_FRAME_SIZE];
         if let Ok(len) = encode_usb_frame(frame, &mut out) {
             let _ = write_all(self.0, &out[..len]).await;
         }
