@@ -134,6 +134,16 @@ pub(crate) fn write_json_escaped<W: Write>(out: &mut W, s: &str) {
     }
 }
 
+/// Parse a finite signed coordinate in `[-max_abs, max_abs]`.
+pub(crate) fn parse_signed_coord(val: &str, max_abs: f32) -> Option<f32> {
+    let v = val.trim().parse::<f32>().ok()?;
+    if v.is_finite() && v >= -max_abs && v <= max_abs {
+        Some(v)
+    } else {
+        None
+    }
+}
+
 /// Run one local CLI line and collect its reply for `PACKET_CLI_REPLY`.
 ///
 /// Supports the optional 2-character tag prefix (`"XX|<cmd>"`) used by
@@ -307,6 +317,9 @@ pub async fn handle_text_cli<W: TextSink>(
             let callsign = crate::state::NODE_CALLSIGN.lock(|c| c.borrow().clone());
             let _ = write!(s, "  -> > {}\r\n", callsign.as_str());
             let _ = sender.send( s.as_bytes()).await;
+        }
+        "get role" | "role" => {
+            let _ = sender.send(b"  -> > companion\r\n").await;
         }
         "get public.key" | "get public_key" | "public.key" | "get pubkey" => {
             let mut s: heapless::String<128> = heapless::String::new();
@@ -1421,6 +1434,78 @@ pub async fn handle_text_cli<W: TextSink>(
             host.set_gps_enabled(false);
             let _ = sender.send( b"  -> GPS power off\r\n").await;
         }
+        "gps advert" => {
+            let mode = match crate::state::prefs().advert_loc_policy {
+                1 => "share",
+                2 => "prefs",
+                _ => "none",
+            };
+            let mut s: heapless::String<32> = heapless::String::new();
+            let _ = write!(s, "  -> > {}\r\n", mode);
+            let _ = sender.send(s.as_bytes()).await;
+        }
+        s if s.starts_with("gps advert ") => {
+            let arg = s["gps advert ".len()..].trim();
+            let policy = if arg.eq_ignore_ascii_case("none") {
+                Some((0u8, "none"))
+            } else if arg.eq_ignore_ascii_case("share") {
+                Some((1u8, "share"))
+            } else if arg.eq_ignore_ascii_case("prefs") {
+                Some((2u8, "prefs"))
+            } else {
+                None
+            };
+            if let Some((val, label)) = policy {
+                node.advert_loc_policy = val;
+                crate::state::update_prefs(|p| p.advert_loc_policy = val);
+                host.request_save_config();
+                let mut s: heapless::String<48> = heapless::String::new();
+                let _ = write!(s, "  -> OK - gps advert {}\r\n", label);
+                let _ = sender.send(s.as_bytes()).await;
+            } else {
+                let _ = sender
+                    .send(b"  -> Error: use gps advert none|share|prefs\r\n")
+                    .await;
+            }
+        }
+        "get lat" => {
+            let mut s: heapless::String<32> = heapless::String::new();
+            let _ = write!(s, "  -> > {:.6}\r\n", node.latitude);
+            let _ = sender.send(s.as_bytes()).await;
+        }
+        s if s.starts_with("set lat ") => {
+            if let Some(lat) = parse_signed_coord(&s[8..], 90.0) {
+                node.latitude = lat;
+                let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetAdvertLatLon {
+                    lat: (lat * 1_000_000.0) as i32,
+                    lon: (node.longitude * 1_000_000.0) as i32,
+                });
+                let _ = sender.send(b"  -> OK\r\n").await;
+            } else {
+                let _ = sender
+                    .send(b"  -> Error: lat must be between -90 and 90\r\n")
+                    .await;
+            }
+        }
+        "get lon" => {
+            let mut s: heapless::String<32> = heapless::String::new();
+            let _ = write!(s, "  -> > {:.6}\r\n", node.longitude);
+            let _ = sender.send(s.as_bytes()).await;
+        }
+        s if s.starts_with("set lon ") => {
+            if let Some(lon) = parse_signed_coord(&s[8..], 180.0) {
+                node.longitude = lon;
+                let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::SetAdvertLatLon {
+                    lat: (node.latitude * 1_000_000.0) as i32,
+                    lon: (lon * 1_000_000.0) as i32,
+                });
+                let _ = sender.send(b"  -> OK\r\n").await;
+            } else {
+                let _ = sender
+                    .send(b"  -> Error: lon must be between -180 and 180\r\n")
+                    .await;
+            }
+        }
         "stats-wdt" | "watchdog" => {
             use core::sync::atomic::Ordering;
             let app = crate::state::APP_HEARTBEAT.load(Ordering::Relaxed);
@@ -1594,7 +1679,15 @@ pub async fn handle_text_cli<W: TextSink>(
             let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::TriggerAdvert { flood: true });
             let _ = sender.send( b"  -> OK (MeshCore Advert broadcast queued)\r\n").await;
         }
-        "time" | "get time" => {
+        "advert.zerohop" => {
+            RADIO_TELEMETRY.lock(|t| {
+                let mut tel = t.borrow_mut();
+                tel.tx_beacons = tel.tx_beacons.saturating_add(1);
+            });
+            let _ = USB_COMMAND_CHANNEL.try_send(UsbCommand::TriggerAdvert { flood: false });
+            let _ = sender.send(b"  -> OK - zerohop advert sent\r\n").await;
+        }
+        "time" | "get time" | "clock" => {
             let mut s: heapless::String<32> = heapless::String::new();
             let epoch = get_device_time();
             let _ = write!(s, "  -> {}\r\n", epoch);
@@ -1639,7 +1732,7 @@ pub async fn handle_text_cli<W: TextSink>(
                 host.reboot_to_ota_dfu();
             }
         }
-        "dfu" | "bootloader" => {
+        "start dfu" | "dfu" | "bootloader" => {
             let _ = crate::storage::flush_pending().await;
             let _ = sender.send( b"  -> Entering DFU bootloader...\r\n").await;
             embassy_time::Timer::after_millis(50).await;
@@ -1657,7 +1750,7 @@ pub async fn handle_text_cli<W: TextSink>(
             let _ = sender.send( b"  -> OK (Config saved to flash)\r\n").await;
         }
         "help" => {
-            let _ = sender.send( b"  -> Commands:\r\n  ->   Identity: get/set name, get/set prv.key, get public.key\r\n  ->   Radio:    get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq/tx/sf/bw/cr, get/set repeat, get/set rxduty, get/set af, get/set dutycycle, get/set hash-mode, stats-radio\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, get/set autoadd, get/set multiacks, advert, time, channels\r\n  ->   System:   save, ver, board, get/set leds, get/set sound, get/set refresh.interval, stats-core, stats-power, stats-packets, clear stats/contacts/messages, dfu, start ota, reboot\r\n").await;
+            let _ = sender.send( b"  -> Commands:\r\n  ->   Identity: get/set name, get role, get/set lat/lon, get/set prv.key, get public.key\r\n  ->   Radio:    get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq/tx/sf/bw/cr, get/set repeat, get/set rxduty, get/set af, get/set dutycycle, get/set hash-mode, stats-radio\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, get/set autoadd, get/set multiacks, advert, advert.zerohop, gps advert, clock/time, channels\r\n  ->   System:   save, ver, board, get/set leds, get/set sound, get/set refresh.interval, stats-core, stats-ble, stats-gps, stats-power, stats-packets, clear stats/contacts/messages, start dfu, start ota, reboot\r\n").await;
         }
         _ => {
             let _ = sender.send( b"  -> Unknown command\r\n").await;
@@ -1703,5 +1796,16 @@ mod tests {
         let mut out = String::<64>::new();
         write_json_escaped(&mut out, "a\"b\\c\n\rd");
         assert_eq!(out.as_str(), "a\\\"b\\\\cd");
+    }
+
+    #[test]
+    fn signed_coord_parser_validates_bounds() {
+        assert_eq!(parse_signed_coord("37.7749", 90.0), Some(37.7749));
+        assert_eq!(parse_signed_coord(" -122.4194 ", 180.0), Some(-122.4194));
+        assert_eq!(parse_signed_coord("90.0", 90.0), Some(90.0));
+        assert_eq!(parse_signed_coord("-90.1", 90.0), None);
+        assert_eq!(parse_signed_coord("180.1", 180.0), None);
+        assert_eq!(parse_signed_coord("NaN", 90.0), None);
+        assert_eq!(parse_signed_coord("abc", 90.0), None);
     }
 }
