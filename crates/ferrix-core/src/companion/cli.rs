@@ -22,12 +22,22 @@ pub trait TextSink {
 }
 
 /// Collect CLI output into a bounded string for `PACKET_CLI_REPLY`.
-pub struct TextBuffer<'a>(pub &'a mut String<512>);
+pub struct TextBuffer<'a>(pub &'a mut String<256>);
 
 impl TextSink for TextBuffer<'_> {
     async fn send(&mut self, data: &[u8]) -> Result<(), ()> {
         let text = core::str::from_utf8(data).map_err(|_| ())?;
-        self.0.push_str(text).map_err(|_| ())
+        let avail = self.0.capacity() - self.0.len();
+        if text.len() <= avail {
+            let _ = self.0.push_str(text);
+        } else {
+            let mut end = avail;
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            let _ = self.0.push_str(&text[..end]);
+        }
+        Ok(())
     }
 }
 
@@ -104,16 +114,33 @@ pub(crate) fn split_cli_tag_prefix(line: &str) -> (&str, &str) {
     }
 }
 
-/// Format a raw USB CLI output buffer into a `PACKET_CLI_REPLY` body by
-/// stripping the USB `"  -> "` prompt and trailing `\r\n` and prepending any
-/// echoed `"XX|"` tag.
-pub(crate) fn format_cli_reply(tag_prefix: &str, raw: &str, out: &mut String<512>) {
-    let mut body = raw.trim_end_matches(&['\r', '\n'][..]);
-    if let Some(stripped) = body.strip_prefix("  -> ") {
-        body = stripped;
+/// Normalize a `PACKET_CLI_REPLY` buffer in place so `reply` does not hold a
+/// second buffer across `.await` inside the Embassy task arena.
+///
+/// `body_start` is the byte offset immediately after any echoed `"XX|"` tag
+/// prefix. Strips trailing `\r`/`\n` bytes and a leading `"  -> "` USB prompt.
+pub(crate) fn normalize_cli_reply_in_place<const N: usize>(
+    out: &mut String<N>,
+    body_start: usize,
+) {
+    while out.len() > body_start && matches!(out.as_bytes().last(), Some(b'\r' | b'\n')) {
+        out.pop();
     }
-    let _ = out.push_str(tag_prefix);
-    let _ = out.push_str(body);
+    const PROMPT: &[u8] = b"  -> ";
+    if out
+        .as_bytes()
+        .get(body_start..)
+        .is_some_and(|rest| rest.starts_with(PROMPT))
+    {
+        let new_len = out.len() - PROMPT.len();
+        // SAFETY: `body_start` and `body_start + PROMPT.len()` are ASCII
+        // boundaries within valid UTF-8, so shifting left preserves UTF-8.
+        unsafe {
+            let v = out.as_mut_vec();
+            v.copy_within(body_start + PROMPT.len().., body_start);
+            v.truncate(new_len);
+        }
+    }
 }
 
 /// Write a string slice escaped for embedding inside a JSON string literal.
@@ -153,15 +180,16 @@ pub async fn reply(
     line: &str,
     node: &mut CompanionNode<'_>,
     host: &dyn CliHost,
-    out: &mut String<512>,
+    out: &mut String<256>,
 ) {
     let (tag_prefix, cmd) = split_cli_tag_prefix(line);
+    let _ = out.push_str(tag_prefix);
+    let body_start = out.len();
 
-    let mut raw = String::<512>::new();
-    let mut sink = TextBuffer(&mut raw);
+    let mut sink = TextBuffer(out);
     handle_text_cli(&mut sink, cmd, node, host, false).await;
 
-    format_cli_reply(tag_prefix, raw.as_str(), out);
+    normalize_cli_reply_in_place(out, body_start);
 }
 
 /// - `910.525` (MHz, decimal)
@@ -1770,24 +1798,28 @@ mod tests {
         // Too short to have a command after `XX|`: treated as plain text.
         assert_eq!(split_cli_tag_prefix("ab|x"), ("", "ab|x"));
 
-        let mut out = String::<512>::new();
-        format_cli_reply(
-            "",
-            "  -> {\"battery_mv\":4170,\"uptime_secs\":58}\r\n",
-            &mut out,
-        );
+        let mut out = String::<256>::new();
+        let _ = out.push_str("  -> {\"battery_mv\":4170,\"uptime_secs\":58}\r\n");
+        normalize_cli_reply_in_place(&mut out, 0);
         assert_eq!(out.as_str(), "{\"battery_mv\":4170,\"uptime_secs\":58}");
 
         out.clear();
-        format_cli_reply("01|", "  -> 1.18.1-ferrix\r\n", &mut out);
+        let _ = out.push_str("01|");
+        let start = out.len();
+        let _ = out.push_str("  -> 1.18.1-ferrix\r\n");
+        normalize_cli_reply_in_place(&mut out, start);
         assert_eq!(out.as_str(), "01|1.18.1-ferrix");
 
         out.clear();
-        format_cli_reply("ab|", "  -> > on\r\n", &mut out);
+        let _ = out.push_str("ab|");
+        let start = out.len();
+        let _ = out.push_str("  -> > on\r\n");
+        normalize_cli_reply_in_place(&mut out, start);
         assert_eq!(out.as_str(), "ab|> on");
 
         out.clear();
-        format_cli_reply("", "> 910.525,62.5,7,5\r\n", &mut out);
+        let _ = out.push_str("> 910.525,62.5,7,5\r\n");
+        normalize_cli_reply_in_place(&mut out, 0);
         assert_eq!(out.as_str(), "> 910.525,62.5,7,5");
     }
 

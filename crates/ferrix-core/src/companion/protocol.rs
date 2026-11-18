@@ -3310,7 +3310,7 @@ pub async fn handle_command<F: FnMut(&[u8])>(
         let line = core::str::from_utf8(&payload[1..])
             .unwrap_or("")
             .trim_end_matches('\0');
-        let mut out = String::<512>::new();
+        let mut out = String::<256>::new();
         crate::companion::cli::reply(line, node, host, &mut out).await;
         let mut resp =
             Vec::<u8, { crate::companion::framing::MAX_FRAME_PAYLOAD_SIZE }>::new();
