@@ -271,8 +271,10 @@ async fn send_advert<B: AppBoard>(
 fn sync_gps(node: &mut CompanionNode<'_>) {
     let gps = gps_state();
     node.gps_fix = gps.fix;
-    node.latitude = gps.latitude;
-    node.longitude = gps.longitude;
+    if gps.fix {
+        node.latitude = gps.latitude;
+        node.longitude = gps.longitude;
+    }
 }
 
 /// Minimum interval between automatic EPD refreshes for continuous telemetry
@@ -840,13 +842,38 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                             );
                         }
                     }
-                    InboundAction::ReceivedRequest { plain, sender_pub } => {
-                        info!(
-                            "MeshCore REQ from {:02x}{:02x} ({} bytes, ignored)",
-                            sender_pub[0],
-                            sender_pub[1],
-                            plain.len()
-                        );
+                    InboundAction::ReceivedRequest {
+                        plain,
+                        sender_pub,
+                        is_flood,
+                        arrival_path_len,
+                        arrival_path,
+                    } => {
+                        if let Some(reply) =
+                            protocol::handle_contact_request(node, &plain, &sender_pub)
+                        {
+                            info!(
+                                "MeshCore REQ from {:02x}{:02x}: queuing {}B telemetry reply (flood={})",
+                                sender_pub[0],
+                                sender_pub[1],
+                                reply.len(),
+                                is_flood
+                            );
+                            let _ = mesh.queue_request_reply(
+                                &sender_pub,
+                                is_flood,
+                                arrival_path_len,
+                                &arrival_path,
+                                &reply,
+                            );
+                        } else {
+                            info!(
+                                "MeshCore REQ from {:02x}{:02x} ({} bytes, denied/ignored)",
+                                sender_pub[0],
+                                sender_pub[1],
+                                plain.len()
+                            );
+                        }
                     }
                     InboundAction::ReceivedControl { data, path_len } => {
                         info!("MeshCore CONTROL data ({} bytes)", data.len());

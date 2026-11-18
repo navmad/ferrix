@@ -28,6 +28,11 @@ impl CompanionHost for BoardCompanionHost {
         crate::battery_millivolts()
     }
 
+    fn mcu_temperature_tenths_c(&self) -> Option<i16> {
+        let sd_active = ferrix_core::state::BLE_STATUS.load(Ordering::Relaxed) >= 3;
+        ferrix_nrf52::startup::mcu_temperature_tenths_c(sd_active)
+    }
+
     fn set_callsign(&self, name: &str) {
         crate::storage::set_callsign(name);
     }

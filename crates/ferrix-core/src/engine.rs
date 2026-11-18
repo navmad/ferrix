@@ -143,6 +143,9 @@ pub enum InboundAction {
     ReceivedRequest {
         plain: heapless::Vec<u8, 167>,
         sender_pub: [u8; 32],
+        is_flood: bool,
+        arrival_path_len: u8,
+        arrival_path: heapless::Vec<u8, 64>,
     },
     /// Received addressed response (RESPONSE) for this node
     ReceivedResponse {
@@ -721,9 +724,15 @@ impl<'a> MeshEngine<'a> {
                                     sender_pub: *peer,
                                 }
                             } else {
+                                let mut arrival_path = heapless::Vec::<u8, 64>::new();
+                                let an = pkt.path_byte_len();
+                                let _ = arrival_path.extend_from_slice(&pkt.path[..an]);
                                 InboundAction::ReceivedRequest {
                                     plain: ap.plain,
                                     sender_pub: *peer,
+                                    is_flood: pkt.is_flood(),
+                                    arrival_path_len: pkt.path_len,
+                                    arrival_path,
                                 }
                             };
                         }
@@ -978,6 +987,47 @@ impl<'a> MeshEngine<'a> {
         let pp = PathPacket::new(dest, src, arrival.path_len, &path[..plen], 3, ack)?;
         let pkt = pp.to_packet(ROUTE_TYPE_FLOOD, secret, &[0u8; 4])?;
         Ok(self.finish_outbound(pkt, ROUTE_TYPE_FLOOD, 0, &[0u8; 64]))
+    }
+
+    /// Construct and queue a response to an inbound `PAYLOAD_TYPE_REQ`.
+    ///
+    /// - When the request arrived via flood (`is_flood`), return the arrival
+    ///   path in a flooded `PAYLOAD_TYPE_PATH` packet with
+    ///   `extra_type = PAYLOAD_TYPE_RESPONSE` so the requester learns the
+    ///   direct route to us (including for Path Discovery) and receives the
+    ///   response payload in a single packet.
+    /// - When the request arrived direct, send a `PAYLOAD_TYPE_RESPONSE`
+    ///   datagram (direct along the contact's known `out_path`, or flooded if
+    ///   unknown).
+    pub fn queue_request_reply(
+        &mut self,
+        sender_pub: &[u8; 32],
+        is_flood: bool,
+        arrival_path_len: u8,
+        arrival_path: &[u8],
+        reply_plain: &[u8],
+    ) -> Result<Packet, ()> {
+        let secret = self.identity.shared_secret(sender_pub).ok_or(())?;
+        let dest = sender_pub[0];
+        let src = self.identity.pub_key()[0];
+        if is_flood {
+            let pp = PathPacket::new(
+                dest,
+                src,
+                arrival_path_len,
+                arrival_path,
+                PAYLOAD_TYPE_RESPONSE,
+                reply_plain,
+            )?;
+            let pkt = pp.to_packet(ROUTE_TYPE_FLOOD, &secret, &[0u8; 4])?;
+            Ok(self.finish_outbound(pkt, ROUTE_TYPE_FLOOD, 0, &[0u8; 64]))
+        } else {
+            let (out_path_len, out_path) = self.peer_path(sender_pub);
+            let (route, path_len) = route_for(out_path_len);
+            let addressed = AddressedPacket::new(dest, src, reply_plain)?;
+            let pkt = addressed.to_packet(PAYLOAD_TYPE_RESPONSE, route, &secret)?;
+            Ok(self.finish_outbound(pkt, route, path_len, &out_path))
+        }
     }
 
     fn peer_path(&self, pub_key: &[u8; 32]) -> (u8, [u8; 64]) {
@@ -1414,5 +1464,124 @@ mod tests {
             InboundAction::DropDuplicate
         ));
         assert!(engine.tx_queue.is_empty());
+    }
+
+    #[test]
+    fn flooded_req_returns_path_packet_with_response_extra() {
+        let id = identity();
+        let src = 0x33u8;
+        let peer = [src; 32];
+        let secret = id.shared_secret(&peer).unwrap();
+
+        let req_plain = [0x01, 0x02, 0x03, 0x04, 0x03, 0x00];
+        let req = AddressedPacket::new(id.pub_key()[0], src, &req_plain).unwrap();
+        let mut pkt = req.to_packet(PAYLOAD_TYPE_REQ, ROUTE_TYPE_FLOOD, &secret).unwrap();
+        pkt.set_path_hash_size_and_count(1, 2);
+        pkt.path[0] = 0xAA;
+        pkt.path[1] = 0xBB;
+
+        let mut engine = MeshEngine::new(id, ADV_TYPE_REPEATER, &TestContext);
+        let (sender_pub, is_flood, arrival_path_len, arrival_path) =
+            match engine.handle_inbound_packet(pkt, 5) {
+                InboundAction::ReceivedRequest {
+                    plain,
+                    sender_pub,
+                    is_flood,
+                    arrival_path_len,
+                    arrival_path,
+                } => {
+                    assert_eq!(&plain[..req_plain.len()], &req_plain);
+                    assert!(plain[req_plain.len()..].iter().all(|&b| b == 0));
+                    (sender_pub, is_flood, arrival_path_len, arrival_path)
+                }
+                _ => panic!("expected ReceivedRequest"),
+            };
+        assert!(is_flood);
+        assert_eq!(arrival_path_len, 2);
+        assert_eq!(arrival_path.as_slice(), &[0xAA, 0xBB]);
+
+        let reply_plain = [0x01, 0x02, 0x03, 0x04, 0x01, 0x74, 0x01, 0x90];
+        engine
+            .queue_request_reply(
+                &sender_pub,
+                is_flood,
+                arrival_path_len,
+                &arrival_path,
+                &reply_plain,
+            )
+            .unwrap();
+
+        let queued = engine.tx_queue.pop().unwrap();
+        assert_eq!(queued.packet.route_type(), ROUTE_TYPE_FLOOD);
+        assert_eq!(queued.packet.payload_type(), PAYLOAD_TYPE_PATH);
+        let decoded = PathPacket::decode(
+            &queued.packet.payload[..queued.packet.payload_len],
+            &secret,
+        )
+        .unwrap();
+        assert_eq!(decoded.dest, src);
+        assert_eq!(decoded.path_len, 2);
+        assert_eq!(&decoded.path[..2], &[0xAA, 0xBB]);
+        assert_eq!(decoded.extra_type & 0x0F, PAYLOAD_TYPE_RESPONSE);
+        assert_eq!(&decoded.extra[..reply_plain.len()], &reply_plain);
+        assert!(decoded.extra[reply_plain.len()..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn direct_req_returns_addressed_response_along_peer_path() {
+        let id = identity();
+        let src = 0x33u8;
+        let peer = [src; 32];
+        let secret = id.shared_secret(&peer).unwrap();
+
+        let req_plain = [0x01, 0x02, 0x03, 0x04, 0x03, 0x00];
+        let req = AddressedPacket::new(id.pub_key()[0], src, &req_plain).unwrap();
+        let mut pkt = req.to_packet(PAYLOAD_TYPE_REQ, ROUTE_TYPE_DIRECT, &secret).unwrap();
+        pkt.set_path_hash_size_and_count(1, 0);
+
+        let mut out_path = [0u8; 64];
+        out_path[0] = 0xCC;
+        let ctx = MultiAckContext {
+            extra_acks: 0,
+            out_path_len: 1,
+            out_path,
+        };
+        let mut engine = MeshEngine::new(id, ADV_TYPE_REPEATER, &ctx);
+        let (sender_pub, is_flood, arrival_path_len, arrival_path) =
+            match engine.handle_inbound_packet(pkt, 5) {
+                InboundAction::ReceivedRequest {
+                    sender_pub,
+                    is_flood,
+                    arrival_path_len,
+                    arrival_path,
+                    ..
+                } => (sender_pub, is_flood, arrival_path_len, arrival_path),
+                _ => panic!("expected ReceivedRequest"),
+            };
+        assert!(!is_flood);
+
+        let reply_plain = [0x01, 0x02, 0x03, 0x04, 0x01, 0x74, 0x01, 0x90];
+        engine
+            .queue_request_reply(
+                &sender_pub,
+                is_flood,
+                arrival_path_len,
+                &arrival_path,
+                &reply_plain,
+            )
+            .unwrap();
+
+        let queued = engine.tx_queue.pop().unwrap();
+        assert_eq!(queued.packet.route_type(), ROUTE_TYPE_DIRECT);
+        assert_eq!(queued.packet.payload_type(), PAYLOAD_TYPE_RESPONSE);
+        assert_eq!(queued.packet.path_len, 1);
+        assert_eq!(queued.packet.path[0], 0xCC);
+        let decoded = AddressedPacket::decode(
+            &queued.packet.payload[..queued.packet.payload_len],
+            &secret,
+        )
+        .unwrap();
+        assert_eq!(&decoded.plain[..reply_plain.len()], &reply_plain);
+        assert!(decoded.plain[reply_plain.len()..].iter().all(|&b| b == 0));
     }
 }

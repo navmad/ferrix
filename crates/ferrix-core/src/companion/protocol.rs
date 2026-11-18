@@ -8,8 +8,8 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
-use embassy_sync::channel::Channel;
-use heapless::{String, Vec};
+use embassy_sync::signal::Signal;
+use heapless::{Deque, String, Vec};
 
 use meshcore_wire::packet::{
     Packet, PAYLOAD_TYPE_ADVERT, PAYLOAD_TYPE_REQ, ROUTE_TYPE_DIRECT, ROUTE_TYPE_FLOOD,
@@ -77,15 +77,66 @@ pub static LOGIN_RX_LEN: AtomicU32 = AtomicU32::new(0);
 pub static LOGIN_RESULT: AtomicU8 = AtomicU8::new(0);
 pub static LOGIN_PENDING: AtomicBool = AtomicBool::new(false);
 
-/// Request results are delayed briefly: clients that register their pending
-/// tag/wait after receiving PACKET_SENT (e.g. meshcore-cli) otherwise miss it.
-static DELAYED_PUSH: Channel<CriticalSectionRawMutex, Vec<u8, 256>, 2> = Channel::new();
+/// Settling delay before emitting request responses so clients registering
+/// their pending matcher right after `RESP_CODE_SENT` do not miss them.
+const DELAYED_PUSH_SETTLE_MS: u64 = 800;
+
+static DELAYED_PUSH: Mutex<CriticalSectionRawMutex, RefCell<Deque<(u64, Vec<u8, 256>), 4>>> =
+    Mutex::new(RefCell::new(Deque::new()));
+static DELAYED_PUSH_SIG: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+fn enqueue_delayed_push(frame: Vec<u8, 256>) {
+    let due_ms = now_ms().saturating_add(DELAYED_PUSH_SETTLE_MS);
+    DELAYED_PUSH.lock(|q| {
+        let mut q = q.borrow_mut();
+        if q.is_full() {
+            let _ = q.pop_front();
+        }
+        let _ = q.push_back((due_ms, frame));
+    });
+    DELAYED_PUSH_SIG.signal(());
+}
+
+/// Wait until a deferred push frame's settling delay has elapsed.
+///
+/// Cancel-safe: nothing is removed from the queue until the caller invokes
+/// [`take_ready_delayed_push`].
+pub async fn wait_delayed_push() {
+    loop {
+        let wait_ms = DELAYED_PUSH.lock(|q| {
+            q.borrow()
+                .front()
+                .map(|(due_ms, _)| due_ms.saturating_sub(now_ms()))
+        });
+        match wait_ms {
+            Some(0) => return,
+            Some(ms) => embassy_time::Timer::after_millis(ms).await,
+            None => DELAYED_PUSH_SIG.wait().await,
+        }
+    }
+}
+
+/// Pop the next deferred push frame whose settling delay has elapsed.
+pub fn take_ready_delayed_push() -> Option<Vec<u8, 256>> {
+    let now = now_ms();
+    DELAYED_PUSH.lock(|q| {
+        let mut q = q.borrow_mut();
+        if q.front().is_some_and(|(due_ms, _)| now >= *due_ms) {
+            q.pop_front().map(|(_, frame)| frame)
+        } else {
+            None
+        }
+    })
+}
 
 /// Wait for the next deferred push frame and its settling delay.
 pub async fn next_delayed_push() -> Vec<u8, 256> {
-    let frame = DELAYED_PUSH.receive().await;
-    embassy_time::Timer::after_millis(800).await;
-    frame
+    loop {
+        wait_delayed_push().await;
+        if let Some(frame) = take_ready_delayed_push() {
+            return frame;
+        }
+    }
 }
 // Binary/anonymous request diagnostics.
 pub static REQ_TX_COUNT: AtomicU32 = AtomicU32::new(0);
@@ -112,7 +163,17 @@ static PENDING_DISCOVERY: Mutex<CriticalSectionRawMutex, RefCell<Option<(u32, [u
 /// Outstanding telemetry request: (tag, destination).
 static PENDING_TELEMETRY: Mutex<CriticalSectionRawMutex, RefCell<Option<(u32, [u8; 32])>>> =
     Mutex::new(RefCell::new(None));
-const REQ_TYPE_GET_TELEMETRY_DATA: u8 = 0x03;
+pub const REQ_TYPE_GET_TELEMETRY_DATA: u8 = 0x03;
+pub const TELEM_PERM_BASE: u8 = 0x01;
+pub const TELEM_PERM_LOCATION: u8 = 0x02;
+pub const TELEM_PERM_ENVIRONMENT: u8 = 0x04;
+pub const TELEM_MODE_DENY: u8 = 0;
+pub const TELEM_MODE_ALLOW_FLAGS: u8 = 1;
+pub const TELEM_MODE_ALLOW_ALL: u8 = 2;
+pub const TELEM_CHANNEL_SELF: u8 = 1;
+pub const LPP_TEMPERATURE: u8 = 0x67;
+pub const LPP_VOLTAGE: u8 = 0x74;
+pub const LPP_GPS: u8 = 0x88;
 
 /// Outstanding binary/anon request: (tag, destination).
 static PENDING_REQ: Mutex<CriticalSectionRawMutex, RefCell<Option<(u32, [u8; 32])>>> =
@@ -184,7 +245,7 @@ pub fn handle_path_discovery(
     let _ = push.push(in_path_len);
     let inn = (in_path_len & 63) as usize * (((in_path_len >> 6) & 3) as usize + 1);
     let _ = push.extend_from_slice(&in_path[..inn.min(in_path.len())]);
-    let _ = DELAYED_PUSH.try_send(push);
+    enqueue_delayed_push(push);
     true
 }
 
@@ -402,7 +463,7 @@ pub fn handle_response(plain: &[u8], sender_pub: &[u8; 32]) -> bool {
             let _ = push.push(0);
             let _ = push.extend_from_slice(&sender_pub[..6]);
         }
-        let _ = DELAYED_PUSH.try_send(push);
+        enqueue_delayed_push(push);
         return true;
     }
 
@@ -426,7 +487,7 @@ pub fn handle_response(plain: &[u8], sender_pub: &[u8; 32]) -> bool {
         let _ = push.extend_from_slice(&tag.to_le_bytes());
         let data = &plain[4..];
         let _ = push.extend_from_slice(&data[..data.len().min(256 - push.len())]);
-        let _ = DELAYED_PUSH.try_send(push);
+        enqueue_delayed_push(push);
         return true;
     }
 
@@ -447,7 +508,7 @@ pub fn handle_response(plain: &[u8], sender_pub: &[u8; 32]) -> bool {
         let _ = push.extend_from_slice(&sender_pub[..6]);
         let data = &plain[4..];
         let _ = push.extend_from_slice(&data[..data.len().min(256 - push.len())]);
-        let _ = DELAYED_PUSH.try_send(push);
+        enqueue_delayed_push(push);
         return true;
     }
 
@@ -460,18 +521,100 @@ pub fn handle_response(plain: &[u8], sender_pub: &[u8; 32]) -> bool {
             false
         }
     });
-    if !matched {
-        return false;
+    if matched {
+        let mut push = Vec::<u8, 256>::new();
+        let _ = push.push(PUSH_CODE_STATUS_RESPONSE);
+        let _ = push.push(0);
+        let _ = push.extend_from_slice(&sender_pub[..6]);
+        let data = &plain[4..];
+        let _ = push.extend_from_slice(&data[..data.len().min(256 - push.len())]);
+        enqueue_delayed_push(push);
+        return true;
     }
 
-    let mut push = Vec::<u8, 256>::new();
-    let _ = push.push(PUSH_CODE_STATUS_RESPONSE);
-    let _ = push.push(0);
-    let _ = push.extend_from_slice(&sender_pub[..6]);
-    let data = &plain[4..];
-    let _ = push.extend_from_slice(&data[..data.len().min(256 - push.len())]);
-    let _ = DELAYED_PUSH.try_send(push);
-    true
+    // Forward unknown/unhandled responses (e.g. unsolicited sensor push
+    // telemetry or overlapping binary requests) to the app as
+    // PUSH_CODE_BINARY_RESPONSE.
+    if plain.len() > 4 {
+        let mut push = Vec::<u8, 256>::new();
+        let _ = push.push(PUSH_CODE_BINARY_RESPONSE);
+        let _ = push.push(0);
+        let _ = push.extend_from_slice(&plain[..plain.len().min(256 - push.len())]);
+        enqueue_delayed_push(push);
+        return true;
+    }
+
+    false
+}
+
+#[inline]
+fn round_f32_to_i32(v: f32) -> i32 {
+    if v >= 0.0 {
+        (v + 0.5) as i32
+    } else {
+        (v - 0.5) as i32
+    }
+}
+
+/// Build a response payload (`sender_timestamp(4) ‖ payload`) for an inbound
+/// `PAYLOAD_TYPE_REQ`.
+///
+/// Returns `Some(reply)` when the request is supported and permitted by the
+/// node's telemetry modes and contact flags, or `None` when ignored/denied.
+pub fn handle_contact_request(
+    node: &CompanionNode<'_>,
+    plain: &[u8],
+    sender_pub: &[u8; 32],
+) -> Option<Vec<u8, 64>> {
+    if plain.len() < 5 {
+        return None;
+    }
+    let req_type = plain[4];
+    if req_type != REQ_TYPE_GET_TELEMETRY_DATA {
+        return None;
+    }
+
+    let contact_flags = crate::state::DISCOVERED_CONTACTS
+        .lock(|c| {
+            c.borrow()
+                .iter()
+                .find(|ct| ct.pub_key == *sender_pub)
+                .map(|ct| ct.flags)
+        })
+        .unwrap_or(0);
+    // LSB is CONTACT_FLAG_FAVORITE; upper bits carry per-contact telemetry permissions.
+    let cp = contact_flags >> 1;
+    let p = prefs();
+
+    let mut permissions: u8 = match p.telemetry_mode_base {
+        TELEM_MODE_ALLOW_ALL => TELEM_PERM_BASE,
+        TELEM_MODE_ALLOW_FLAGS => cp & TELEM_PERM_BASE,
+        _ => 0,
+    };
+    permissions |= match p.telemetry_mode_loc {
+        TELEM_MODE_ALLOW_ALL => TELEM_PERM_LOCATION,
+        TELEM_MODE_ALLOW_FLAGS => cp & TELEM_PERM_LOCATION,
+        _ => 0,
+    };
+    permissions |= match p.telemetry_mode_env {
+        TELEM_MODE_ALLOW_ALL => TELEM_PERM_ENVIRONMENT,
+        TELEM_MODE_ALLOW_FLAGS => cp & TELEM_PERM_ENVIRONMENT,
+        _ => 0,
+    };
+
+    // First reserved byte after req_type is the inverse mask of permissions
+    // requested by the sender (e.g. Path Discovery sets `~TELEM_PERM_BASE`).
+    let perm_mask = !plain.get(5).copied().unwrap_or(0);
+    permissions &= perm_mask;
+
+    if (permissions & TELEM_PERM_BASE) == 0 {
+        return None;
+    }
+
+    let mut reply = Vec::<u8, 64>::new();
+    let _ = reply.extend_from_slice(&plain[..4]); // reflect sender_timestamp as tag
+    node.encode_self_telemetry_lpp(permissions, &mut reply);
+    Some(reply)
 }
 pub static ADVERT_LAST_KEY: AtomicU32 = AtomicU32::new(0);
 pub static ADVERT_LAST_TS: AtomicU32 = AtomicU32::new(0);
@@ -666,6 +809,11 @@ pub const CAP_BLE: u32 = 1 << 4;
 /// board side of this trait.
 pub trait CompanionHost: Send + Sync {
     fn battery_millivolts(&self) -> u16;
+    /// Built-in MCU die temperature in `0.1 °C` units (`i16`), or `None` if
+    /// unsupported/unavailable.
+    fn mcu_temperature_tenths_c(&self) -> Option<i16> {
+        None
+    }
     fn set_callsign(&self, name: &str);
     fn set_custom_priv_key(&self, key: [u8; 64]);
     fn set_path_hash_mode(&self, mode: u8);
@@ -2598,17 +2746,11 @@ impl<'a> CompanionNode<'a> {
             CMD_SEND_TELEMETRY_REQ => {
                 // Self: [cmd][0][0][0]; contact: [cmd][3 reserved][pubkey 32]
                 if payload.len() == 4 {
-                    // Cayenne LPP voltage: channel 1, type 0x74, 0.01 V BE.
-                    let mv = self.host.battery_millivolts();
-                    let scaled = ((mv as u32 + 5) / 10) as u16;
                     let mut push = Vec::<u8, 256>::new();
                     let _ = push.push(PUSH_CODE_TELEMETRY_RESPONSE);
                     let _ = push.push(0);
                     let _ = push.extend_from_slice(&self.public_key[..6]);
-                    let _ = push.push(1);
-                    let _ = push.push(0x74);
-                    let _ = push.push((scaled >> 8) as u8);
-                    let _ = push.push(scaled as u8);
+                    self.encode_self_telemetry_lpp(0xFF, &mut push);
                     crate::command::push_companion(&push);
                 } else if payload.len() >= 4 + 32 {
                     let mut dest_key = [0u8; 32];
@@ -3219,6 +3361,63 @@ impl<'a> CompanionNode<'a> {
         }
         true
     }
+
+    /// Encode this node's Cayenne LPP telemetry payload into `out` according
+    /// to `permissions` (`TELEM_PERM_BASE`, `TELEM_PERM_LOCATION`,
+    /// `TELEM_PERM_ENVIRONMENT`) for both self-telemetry and inbound
+    /// `REQ_TYPE_GET_TELEMETRY_DATA` responses.
+    pub fn encode_self_telemetry_lpp<const N: usize>(&self, permissions: u8, out: &mut Vec<u8, N>) {
+        if (permissions & TELEM_PERM_BASE) == 0 {
+            return;
+        }
+        // 1. Battery voltage: channel 1, type 0x74 (LPP_VOLTAGE), 0.01 V BE.
+        let mv = self.host.battery_millivolts();
+        let scaled = ((mv as u32 + 5) / 10) as u16;
+        let _ = out.extend_from_slice(&[
+            TELEM_CHANNEL_SELF,
+            LPP_VOLTAGE,
+            (scaled >> 8) as u8,
+            scaled as u8,
+        ]);
+
+        // 2. GPS location: channel 1, type 0x88 (LPP_GPS), 9 bytes:
+        //    24-bit signed BE lat * 10000, lon * 10000, alt * 100.
+        if (permissions & TELEM_PERM_LOCATION) != 0 {
+            let gps = crate::state::gps_state();
+            let loc = if gps.fix {
+                Some((gps.latitude, gps.longitude, gps.altitude_m))
+            } else if self.latitude != 0.0 || self.longitude != 0.0 {
+                Some((self.latitude, self.longitude, 0.0))
+            } else {
+                None
+            };
+            if let Some((lat, lon, alt)) = loc {
+                let lat_raw = round_f32_to_i32(lat * 10_000.0);
+                let lon_raw = round_f32_to_i32(lon * 10_000.0);
+                let alt_raw = round_f32_to_i32(alt * 100.0);
+                let _ = out.extend_from_slice(&[
+                    TELEM_CHANNEL_SELF,
+                    LPP_GPS,
+                    (lat_raw >> 16) as u8,
+                    (lat_raw >> 8) as u8,
+                    lat_raw as u8,
+                    (lon_raw >> 16) as u8,
+                    (lon_raw >> 8) as u8,
+                    lon_raw as u8,
+                    (alt_raw >> 16) as u8,
+                    (alt_raw >> 8) as u8,
+                    alt_raw as u8,
+                ]);
+            }
+        }
+
+        // 3. Built-in MCU temperature: channel 1, type 0x67 (LPP_TEMPERATURE),
+        //    signed 16-bit BE in 0.1 °C units.
+        if let Some(tenths_c) = self.host.mcu_temperature_tenths_c() {
+            let [hi, lo] = tenths_c.to_be_bytes();
+            let _ = out.extend_from_slice(&[TELEM_CHANNEL_SELF, LPP_TEMPERATURE, hi, lo]);
+        }
+    }
 }
 
 
@@ -3253,6 +3452,40 @@ mod tests {
         fn advert_remember(&self, _pub_key: &[u8; 32], _payload: &[u8]) {}
         fn reboot(&self) -> ! {
             panic!("reboot in host test")
+        }
+    }
+
+    struct TempHost {
+        mv: u16,
+        temp_tenths_c: Option<i16>,
+    }
+
+    impl CompanionHost for TempHost {
+        fn battery_millivolts(&self) -> u16 {
+            self.mv
+        }
+        fn mcu_temperature_tenths_c(&self) -> Option<i16> {
+            self.temp_tenths_c
+        }
+        fn set_callsign(&self, _name: &str) {}
+        fn set_custom_priv_key(&self, _key: [u8; 64]) {}
+        fn set_path_hash_mode(&self, _mode: u8) {}
+        fn request_save_config(&self) {}
+        fn request_radio_config(&self) {}
+        fn request_factory_reset(&self) {}
+        fn queue_consume_now(&self) {}
+        fn advert_remember(&self, _pub_key: &[u8; 32], _payload: &[u8]) {}
+        fn reboot(&self) -> ! {
+            panic!("reboot in host test")
+        }
+    }
+
+    fn decode_i24_be(bytes: &[u8]) -> i32 {
+        let raw = ((bytes[0] as i32) << 16) | ((bytes[1] as i32) << 8) | (bytes[2] as i32);
+        if (raw & 0x80_0000) != 0 {
+            raw | !0xFF_FFFF
+        } else {
+            raw
         }
     }
 
@@ -3293,6 +3526,136 @@ mod tests {
         assert_eq!(node.multi_acks, 0);
         assert_eq!(crate::state::prefs().multi_acks, 0);
         assert_eq!(node.build_self_info()[44], 0);
+    }
+
+    #[test]
+    fn self_telemetry_lpp_encodes_voltage_gps_and_temperature() {
+        crate::state::clear_gps_state();
+        let host = TempHost {
+            mv: 4_123, // rounds to 412 (4.12 V -> 0x019C)
+            temp_tenths_c: Some(235), // 23.5 °C -> 0x00EB
+        };
+        let mut node = CompanionNode::new(
+            "test",
+            "test-board",
+            0,
+            [1u8; 32],
+            [2u8; 64],
+            &host,
+        );
+        node.latitude = 37.7749;
+        node.longitude = -122.4194;
+
+        let mut lpp = Vec::<u8, 64>::new();
+        node.encode_self_telemetry_lpp(0xFF, &mut lpp);
+
+        // Voltage (4B) + GPS (11B) + Temperature (4B) = 19 bytes.
+        assert_eq!(lpp.len(), 19);
+        assert_eq!(&lpp[0..4], &[1, LPP_VOLTAGE, 0x01, 0x9C]);
+        assert_eq!(lpp[4], 1);
+        assert_eq!(lpp[5], LPP_GPS);
+        assert_eq!(decode_i24_be(&lpp[6..9]), 377_749);
+        assert_eq!(decode_i24_be(&lpp[9..12]), -1_224_194);
+        assert_eq!(decode_i24_be(&lpp[12..15]), 0);
+        assert_eq!(&lpp[15..19], &[1, LPP_TEMPERATURE, 0x00, 0xEB]);
+    }
+
+    #[test]
+    fn contact_request_permissions_and_inverse_mask() {
+        crate::state::clear_gps_state();
+        let host = TempHost {
+            mv: 3_850, // 385 -> 0x0181
+            temp_tenths_c: Some(-42), // -4.2 °C -> 0xFFD6
+        };
+        let mut node = CompanionNode::new(
+            "test",
+            "test-board",
+            0,
+            [1u8; 32],
+            [2u8; 64],
+            &host,
+        );
+        node.latitude = 48.8566;
+        node.longitude = 2.3522;
+
+        let sender = [0x44u8; 32];
+        crate::state::DISCOVERED_CONTACTS.lock(|c| {
+            let mut list = c.borrow_mut();
+            list.clear();
+            let mut cs = String::new();
+            let _ = cs.push_str("peer");
+            let _ = list.push(crate::types::DiscoveredContact {
+                pub_key: sender,
+                callsign: cs,
+                node_id: [0x44; 4],
+                last_seen_epoch: 0,
+                rssi: 0,
+                snr: 0,
+                latitude: 0,
+                longitude: 0,
+                // bit 0 = favorite, bit 1 = base perm (cp bit 0), bit 2 = loc perm (cp bit 1)
+                flags: 0b0000_0011,
+                contact_type: 1,
+                out_path: [0u8; 64],
+                out_path_len: 0xFF,
+                last_advert_ts: 0,
+                saved_hash: 0,
+                sync_since: 0,
+            });
+        });
+
+        // 1. Default modes are DENY (0) -> no response.
+        update_prefs(|p| {
+            p.telemetry_mode_base = TELEM_MODE_DENY;
+            p.telemetry_mode_loc = TELEM_MODE_DENY;
+            p.telemetry_mode_env = TELEM_MODE_DENY;
+        });
+        let req = [0x78, 0x56, 0x34, 0x12, REQ_TYPE_GET_TELEMETRY_DATA, 0x00];
+        assert!(handle_contact_request(&node, &req, &sender).is_none());
+
+        // 2. ALLOW_FLAGS: contact has base perm (flags bit 1) but not loc perm (flags bit 2).
+        update_prefs(|p| {
+            p.telemetry_mode_base = TELEM_MODE_ALLOW_FLAGS;
+            p.telemetry_mode_loc = TELEM_MODE_ALLOW_FLAGS;
+        });
+        let reply = handle_contact_request(&node, &req, &sender).expect("base permitted by flags");
+        // Tag (4B) + Voltage (4B) + Temp (4B) = 12B (no GPS since loc flag not set on contact).
+        assert_eq!(reply.len(), 12);
+        assert_eq!(&reply[0..4], &[0x78, 0x56, 0x34, 0x12]);
+        assert_eq!(&reply[4..8], &[1, LPP_VOLTAGE, 0x01, 0x81]);
+        assert_eq!(&reply[8..12], &[1, LPP_TEMPERATURE, 0xFF, 0xD6]);
+
+        // 3. ALLOW_ALL for both base and location -> includes GPS, UNLESS masked out by Path Discovery (~0x01).
+        update_prefs(|p| {
+            p.telemetry_mode_base = TELEM_MODE_ALLOW_ALL;
+            p.telemetry_mode_loc = TELEM_MODE_ALLOW_ALL;
+        });
+        let full_reply = handle_contact_request(&node, &req, &sender).expect("base + loc permitted");
+        assert_eq!(full_reply.len(), 23); // Tag (4B) + Voltage (4B) + GPS (11B) + Temp (4B)
+
+        // Path discovery request sets req[5] = !TELEM_PERM_BASE (0xFE) -> strips location!
+        let disc_req = [0xAA, 0xBB, 0xCC, 0xDD, REQ_TYPE_GET_TELEMETRY_DATA, !TELEM_PERM_BASE];
+        let disc_reply = handle_contact_request(&node, &disc_req, &sender).expect("discovery base reply");
+        assert_eq!(disc_reply.len(), 12);
+        assert_eq!(&disc_reply[0..4], &[0xAA, 0xBB, 0xCC, 0xDD]);
+
+        // Restore default prefs.
+        update_prefs(|p| *p = DEFAULT_PREFS);
+    }
+
+    #[test]
+    fn unhandled_response_forwards_as_binary_response() {
+        DELAYED_PUSH.lock(|q| q.borrow_mut().clear());
+        let sender = [0x99u8; 32];
+        let plain = [0x11, 0x22, 0x33, 0x44, 0x01, 0x74, 0x01, 0x90];
+        assert!(handle_response(&plain, &sender));
+        let (due_ms, pushed) = DELAYED_PUSH
+            .lock(|q| q.borrow_mut().pop_front())
+            .expect("pushed binary response");
+        assert!(due_ms >= now_ms());
+        assert_eq!(pushed[0], PUSH_CODE_BINARY_RESPONSE);
+        assert_eq!(pushed[1], 0);
+        assert_eq!(&pushed[2..], &plain[..]);
     }
 }
 

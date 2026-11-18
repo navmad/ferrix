@@ -165,3 +165,46 @@ pub fn init_with(opts: StartupConfig) -> embassy_nrf::Peripherals {
 pub fn reset_reason() -> u32 {
     unsafe { core::ptr::read_volatile(0x4000_0400 as *const u32) }
 }
+
+/// Read the nRF52840 die temperature in `0.1 °C` units (`i16`) for Cayenne LPP
+/// temperature telemetry (`LPP_TEMPERATURE = 0x67`).
+///
+/// Uses `sd_temp_get` when the S140 SoftDevice is active (`NRF_TEMP` is a
+/// SoftDevice-restricted peripheral), or polls `NRF_TEMP` directly when the
+/// SoftDevice is disabled.
+pub fn mcu_temperature_tenths_c(softdevice_active: bool) -> Option<i16> {
+    let raw_quarters: i32 = if softdevice_active {
+        let mut temp: i32 = 0;
+        let ret = unsafe { nrf_softdevice::raw::sd_temp_get(&mut temp) };
+        if ret != nrf_softdevice::raw::NRF_SUCCESS {
+            return None;
+        }
+        temp
+    } else {
+        const NRF_TEMP_BASE: usize = 0x4000_C000;
+        let tasks_start = (NRF_TEMP_BASE + 0x000) as *mut u32;
+        let tasks_stop = (NRF_TEMP_BASE + 0x004) as *mut u32;
+        let events_datardy = (NRF_TEMP_BASE + 0x100) as *mut u32;
+        let temp_reg = (NRF_TEMP_BASE + 0x508) as *const i32;
+        unsafe {
+            events_datardy.write_volatile(0);
+            tasks_start.write_volatile(1);
+            let mut spins = 10_000u32;
+            while events_datardy.read_volatile() == 0 {
+                spins -= 1;
+                if spins == 0 {
+                    tasks_stop.write_volatile(1);
+                    return None;
+                }
+            }
+            let val = temp_reg.read_volatile();
+            tasks_stop.write_volatile(1);
+            val
+        }
+    };
+    // raw_quarters is in 0.25 °C units; convert to 0.1 °C (tenths):
+    // quarters * 0.25 * 10 = (quarters * 5) / 2.
+    let tenths = (raw_quarters * 5) / 2;
+    i16::try_from(tenths).ok()
+}
+
