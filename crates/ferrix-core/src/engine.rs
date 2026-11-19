@@ -476,6 +476,9 @@ impl<'a> MeshEngine<'a> {
                                 }
                             }
                             _ => {
+                                if is_dupe {
+                                    return InboundAction::DropDuplicate;
+                                }
                                 let mut fwd = pkt.clone();
                                 if fwd.pop_front_hop() {
                                     self.queue_forward(fwd);
@@ -1683,5 +1686,36 @@ mod tests {
         .unwrap();
         assert_eq!(&decoded.plain[..reply_plain.len()], &reply_plain);
         assert!(decoded.plain[reply_plain.len()..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn direct_forward_generic_packet_deduplicates() {
+        let id = identity();
+        let self_hash = id.pub_key()[0];
+        let mut engine = MeshEngine::new(id, ADV_TYPE_REPEATER, &TestContext);
+        engine.allow_forward = true;
+
+        let mut pkt = Packet::new(ROUTE_TYPE_DIRECT, PAYLOAD_TYPE_RAW_CUSTOM);
+        pkt.set_payload(&[0x11, 0x22, 0x33, 0x44]).unwrap();
+        pkt.set_path_hash_size_and_count(1, 2);
+        pkt.path[0] = self_hash;
+        pkt.path[1] = 0x77;
+
+        // First copy is forwarded with our hop popped.
+        assert!(matches!(
+            engine.handle_inbound_packet(pkt.clone(), 4),
+            InboundAction::Forwarded
+        ));
+        assert_eq!(engine.tx_queue.len(), 1);
+        let fwd = engine.tx_queue.pop().unwrap();
+        assert_eq!(fwd.packet.path_hash_count(), 1);
+        assert_eq!(fwd.packet.path[0], 0x77);
+
+        // Duplicate reception must be dropped without re-queueing.
+        assert!(matches!(
+            engine.handle_inbound_packet(pkt, 4),
+            InboundAction::DropDuplicate
+        ));
+        assert!(engine.tx_queue.is_empty());
     }
 }
