@@ -1,5 +1,5 @@
 [package]
-name = "ferrix-wio-tracker-l1"
+name = "ferrix-wio-tracker-l1-pro"
 version.workspace = true
 edition = "2021"
 

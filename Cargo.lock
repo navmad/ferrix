@@ -893,7 +893,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ferrix-wio-tracker-l1"
+name = "ferrix-wio-tracker-l1-pro"
 version = "1.18.2"
 dependencies = [
  "cortex-m",
@@ -923,7 +923,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "ferrix-wio-tracker-l1-companion"
+name = "ferrix-wio-tracker-l1-pro-companion"
 version = "1.18.2"
 dependencies = [
  "cortex-m-rt",
@@ -931,7 +931,7 @@ dependencies = [
  "embassy-executor",
  "ferrix-nrf52",
  "ferrix-role-companion",
- "ferrix-wio-tracker-l1",
+ "ferrix-wio-tracker-l1-pro",
 ]
 
 [[package]]

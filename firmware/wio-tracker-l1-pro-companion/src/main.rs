@@ -11,7 +11,7 @@ use embassy_executor::Spawner;
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    let peripherals = ferrix_nrf52::startup::init_with(ferrix_wio_tracker_l1::STARTUP_CONFIG);
-    let board = ferrix_wio_tracker_l1::WioTrackerBoard::new(peripherals);
+    let peripherals = ferrix_nrf52::startup::init_with(ferrix_wio_tracker_l1_pro::STARTUP_CONFIG);
+    let board = ferrix_wio_tracker_l1_pro::WioTrackerBoard::new(peripherals);
     ferrix_role_companion::run(board, spawner).await;
 }

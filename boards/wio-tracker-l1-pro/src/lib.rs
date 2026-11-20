@@ -3,7 +3,7 @@
 //! This crate wires the nRF52840 peripherals, the SX1262 radio, the SH1106
 //! OLED, the L76K GNSS and the companion transports together. It implements
 //! the role-facing [`CompanionBoard`] trait; the firmware image in
-//! `firmware/wio-tracker-l1-companion` only chooses the role.
+//! `firmware/wio-tracker-l1-pro-companion` only chooses the role.
 
 #![no_std]
 
