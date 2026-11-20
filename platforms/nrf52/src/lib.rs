@@ -9,12 +9,13 @@
 pub mod battery;
 pub mod ble;
 pub mod buzzer;
-pub mod fatal;
+pub mod fault;
 pub mod flash;
 pub mod gnss;
 pub mod host;
 pub mod qspi;
 pub mod reset;
+mod sd_ffi;
 pub mod seed;
 pub mod startup;
 pub mod storage;

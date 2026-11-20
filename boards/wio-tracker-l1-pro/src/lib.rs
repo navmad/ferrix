@@ -28,7 +28,6 @@ use ferrix_core::companion::cli::CliHost;
 use ferrix_core::companion::protocol::{CompanionHost, CompanionNode, CAP_BLE, CAP_CLIENT, CAP_GPS};
 use ferrix_core::engine::EngineContext;
 use ferrix_nrf52::buzzer::PassiveBuzzer;
-use ferrix_nrf52::fatal::{FatalLed, Port};
 use ferrix_role_companion::CompanionBoard;
 use ferrix_runtime::radio::ChannelRadio;
 use ferrix_sh1106::{Framebuffer, Sh1106};
@@ -91,25 +90,22 @@ pub async fn sample_battery_adc_mv(adc: &mut saadc::Saadc<'static, 1>) -> Option
 //   - SoftDevice:  10 quick blinks, repeated forever
 // ---------------------------------------------------------------------------
 
-const FATAL_LED: FatalLed = FatalLed {
-    port: Port::P1,
-    pin: 1,
-    active_high: true,
-};
-
-/// Repeat a burst forever. Used for fatal faults that cannot recover.
-pub(crate) fn fatal_blink_forever(count: u32) -> ! {
-    FATAL_LED.blink_forever(count)
-}
+const STATUS_FAULT_LED: ferrix_nrf52::fault::FaultLed = ferrix_nrf52::fault::FaultLed::p1(1);
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    fatal_blink_forever(ferrix_wio_tracker_l1_pro_logic::config::PANIC_BLINKS)
+    ferrix_nrf52::fault::blink_pin_forever(
+        STATUS_FAULT_LED,
+        ferrix_wio_tracker_l1_pro_logic::config::PANIC_BLINKS,
+    )
 }
 
 #[cortex_m_rt::exception]
 unsafe fn HardFault(_frame: &cortex_m_rt::ExceptionFrame) -> ! {
-    fatal_blink_forever(ferrix_wio_tracker_l1_pro_logic::config::HARDFAULT_BLINKS)
+    ferrix_nrf52::fault::blink_pin_forever(
+        STATUS_FAULT_LED,
+        ferrix_wio_tracker_l1_pro_logic::config::HARDFAULT_BLINKS,
+    )
 }
 
 /// Persistent state the role needs across the startup phases.
@@ -341,7 +337,7 @@ impl CompanionBoard for WioTrackerBoard {
             self.capabilities(),
             self.ble_model(),
             self.cli_host(),
-            crate::fatal_blink_forever,
+            Some(STATUS_FAULT_LED),
             crate::storage::spawn_storage,
         );
     }

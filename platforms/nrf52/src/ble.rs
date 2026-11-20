@@ -5,7 +5,7 @@
 
 use core::cell::RefCell;
 use core::future::poll_fn;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::task::Poll;
 
 use defmt::{debug, error, info, warn};
@@ -207,19 +207,7 @@ fn set_static_passkey(pin: u32) {
             buf[i] = b'0' + (value % 10) as u8;
             value /= 10;
         }
-        let opt = nrf_softdevice::raw::ble_opt_t {
-            gap_opt: nrf_softdevice::raw::ble_gap_opt_t {
-                passkey: nrf_softdevice::raw::ble_gap_opt_passkey_t {
-                    p_passkey: buf.as_ptr(),
-                },
-            },
-        };
-        let ret = unsafe {
-            nrf_softdevice::raw::sd_ble_opt_set(
-                nrf_softdevice::raw::BLE_GAP_OPTS_BLE_GAP_OPT_PASSKEY,
-                &opt,
-            )
-        };
+        let ret = crate::sd_ffi::ble_set_static_passkey(&buf);
         if ret != 0 {
             error!("BLE: static passkey set failed {=u32:#x}", ret);
         }
@@ -300,21 +288,6 @@ impl SecurityHandler for MeshCoreSecurityHandler {
         }
         let _ = reply.reply(Some(&buf));
     }
-}
-
-/// Board-provided fatal-fault indicator (normally an LED blink pattern).
-static FAULT: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
-
-fn fault(count: u32) -> ! {
-    let ptr = FAULT.load(Ordering::Relaxed);
-    if ptr.is_null() {
-        loop {
-            cortex_m::asm::wfi();
-        }
-    }
-    // SAFETY: set once from `init_ble_companion` from a `fn(u32) -> !`.
-    let handler: fn(u32) -> ! = unsafe { core::mem::transmute(ptr) };
-    handler(count)
 }
 
 static SECURITY_HANDLER: MeshCoreSecurityHandler = MeshCoreSecurityHandler;
@@ -647,13 +620,6 @@ pub use ferrix_core::state::{BLE_CONNECTED, BLE_PIN, BLE_STATUS};
 /// Counts commands dropped because the GATT command ring was full.
 static BLE_CMD_DROPS: AtomicU32 = AtomicU32::new(0);
 
-unsafe extern "C" fn sd_fault_handler(id: u32, pc: u32, info: u32) {
-    defmt::error!("Softdevice fault: id={=u32:#x} pc={=u32:#x} info={=u32:#x}", id, pc, info);
-    // A SoftDevice assert is fatal. Signal it with 10 blue blinks so the
-    // failure can be identified without a debugger.
-    fault(10)
-}
-
 #[embassy_executor::task]
 pub async fn ble_companion_supervisor_task(
     spawner: embassy_executor::Spawner,
@@ -663,10 +629,10 @@ pub async fn ble_companion_supervisor_task(
     capabilities: u32,
     model_name: &'static str,
     host: &'static dyn CliHost,
-    fault_handler: fn(u32) -> !,
+    fault_led: Option<crate::fault::FaultLed>,
     storage_spawn: fn(embassy_executor::Spawner, &'static Softdevice),
 ) {
-    FAULT.store(fault_handler as *mut (), Ordering::Relaxed);
+    crate::fault::set_fault_led(fault_led);
     BLE_STATUS.store(1, Ordering::Relaxed);
     info!("BLE: Initializing SoftDevice S140 subsystem...");
 
@@ -730,8 +696,7 @@ pub async fn ble_companion_supervisor_task(
     };
 
     // Safely probe SoftDevice enablement without touching SCB->VTOR
-    let p_clock = sd_config.clock.as_ref().map(|x| x as _).unwrap_or(core::ptr::null());
-    let ret = unsafe { nrf_softdevice::raw::sd_softdevice_enable(p_clock, Some(sd_fault_handler as _)) };
+    let ret = crate::sd_ffi::softdevice_probe_enable(sd_config.clock.as_ref());
     if ret != 0 {
         error!("BLE: sd_softdevice_enable returned status code {=u32:#x}", ret);
         BLE_STATUS.store(0x1000 | ret, Ordering::Relaxed);
@@ -742,15 +707,11 @@ pub async fn ble_companion_supervisor_task(
     BLE_STATUS.store(2, Ordering::Relaxed);
 
     // Disable raw SD so that embassy's Softdevice::enable can manage state cleanly
-    unsafe { nrf_softdevice::raw::sd_softdevice_disable() };
+    crate::sd_ffi::softdevice_disable();
 
     let sd = Softdevice::enable(&sd_config);
     if crate::startup::dcdc_reg1_enabled() {
-        let ret = unsafe {
-            nrf_softdevice::raw::sd_power_dcdc_mode_set(
-                nrf_softdevice::raw::NRF_POWER_DCDC_MODES_NRF_POWER_DCDC_ENABLE as u8,
-            )
-        };
+        let ret = crate::sd_ffi::power_dcdc_enable();
         crate::startup::record_sd_dcdc_result(ret);
         if ret != 0 {
             warn!("BLE: sd_power_dcdc_mode_set returned {=u32:#x}", ret);
@@ -799,7 +760,7 @@ pub fn init_ble_companion(
     capabilities: u32,
     model_name: &'static str,
     host: &'static dyn CliHost,
-    fault_handler: fn(u32) -> !,
+    fault_led: Option<crate::fault::FaultLed>,
     storage_spawn: fn(embassy_executor::Spawner, &'static Softdevice),
 ) -> bool {
     spawner
@@ -811,7 +772,7 @@ pub fn init_ble_companion(
             capabilities,
             model_name,
             host,
-            fault_handler,
+            fault_led,
             storage_spawn,
         ))
         .is_ok()

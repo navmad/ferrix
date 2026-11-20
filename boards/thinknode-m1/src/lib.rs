@@ -29,7 +29,6 @@ use ferrix_core::companion::protocol::{
 };
 use ferrix_core::engine::EngineContext;
 use ferrix_nrf52::buzzer::PassiveBuzzer;
-use ferrix_nrf52::fatal::{FatalLed, Port};
 use ferrix_role_companion::CompanionBoard;
 use ferrix_runtime::radio::ChannelRadio;
 use heapless::String;
@@ -105,26 +104,16 @@ pub async fn sample_battery_adc_mv(adc: &mut saadc::Saadc<'static, 1>) -> Option
 //   - SoftDevice:  10 quick blinks, repeated forever
 // ---------------------------------------------------------------------------
 
-/// The MCU-controlled blue LED (P0.13, active-high).
-const FATAL_LED: FatalLed = FatalLed {
-    port: Port::P0,
-    pin: 13,
-    active_high: true,
-};
-
-/// Repeat a burst forever. Used for fatal faults that cannot recover.
-pub(crate) fn fatal_blink_forever(count: u32) -> ! {
-    FATAL_LED.blink_forever(count)
-}
+const BLUE_FAULT_LED: ferrix_nrf52::fault::FaultLed = ferrix_nrf52::fault::FaultLed::p0(13);
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    fatal_blink_forever(3)
+    ferrix_nrf52::fault::blink_pin_forever(BLUE_FAULT_LED, 3)
 }
 
 #[cortex_m_rt::exception]
 unsafe fn HardFault(_frame: &cortex_m_rt::ExceptionFrame) -> ! {
-    fatal_blink_forever(6)
+    ferrix_nrf52::fault::blink_pin_forever(BLUE_FAULT_LED, 6)
 }
 
 /// Persistent state the role needs across the startup phases.
@@ -372,7 +361,7 @@ impl CompanionBoard for ThinkNodeBoard {
             self.capabilities(),
             self.ble_model(),
             self.cli_host(),
-            crate::fatal_blink_forever,
+            Some(BLUE_FAULT_LED),
             crate::storage::spawn_storage,
         );
     }
