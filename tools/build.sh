@@ -40,7 +40,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ "$action" == "test" ]]; then
     host="$(rustc -vV | sed -n 's/host: //p')"
     python3 "$script_dir/check_task_arena.py" --self-test
-    exec cargo test -p meshcore-wire -p ferrix-hal -p ferrix-core -p ferrix-runtime -p ferrix-sx1262 -p ferrix-ssd1681 -p ferrix-l76k --target "$host" "$@"
+    exec cargo test -p meshcore-wire -p ferrix-hal -p ferrix-core -p ferrix-runtime -p ferrix-sx1262 -p ferrix-ssd1681 -p ferrix-sh1106 -p ferrix-l76k --target "$host" "$@"
 fi
 
 if [[ "$action" == "build" ]]; then

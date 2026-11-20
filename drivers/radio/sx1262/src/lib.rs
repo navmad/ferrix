@@ -162,16 +162,20 @@ where
     /// Initialise the chip and arm reception using `initial`.
     ///
     /// `reset`, `dio1` and `busy` must be the board's SX1262 control pins.
+    /// `rf_switch_rx` is an optional RF-switch RX-enable GPIO, driven high
+    /// while receiving and low otherwise. Boards whose switch is controlled
+    /// only through DIO2 pass `None`.
     pub async fn new(
         spi: Spi,
         reset: Reset,
         dio1: Pin,
         busy: Pin,
+        rf_switch_rx: Option<Reset>,
         delay: Dly,
         board: Sx1262BoardConfig,
         initial: LoraConfig,
     ) -> Result<Self, RadioError> {
-        let iv = InterfaceVariant::new(reset, dio1, busy, None, None)?;
+        let iv = InterfaceVariant::new(reset, dio1, busy, rf_switch_rx, None)?;
         let config = Sx126xConfig {
             chip: Sx1262,
             tcxo_ctrl: board.tcxo_ctrl,

@@ -817,6 +817,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ferrix-sh1106"
+version = "1.18.2"
+dependencies = [
+ "embedded-hal-async",
+]
+
+[[package]]
 name = "ferrix-ssd1681"
 version = "1.18.2"
 dependencies = [

@@ -1,0 +1,8 @@
+[package]
+name = "ferrix-sh1106"
+version.workspace = true
+edition = "2021"
+description = "Reusable SH1106 128x64 OLED controller driver (I2C) for Ferrix boards"
+
+[dependencies]
+embedded-hal-async = "1.0"

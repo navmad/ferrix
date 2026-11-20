@@ -8,6 +8,7 @@ members = [
     "platforms/nrf52",
     "drivers/radio/sx1262",
     "drivers/display/ssd1681",
+    "drivers/display/sh1106",
     "drivers/gnss/l76k",
     "roles/companion",
     "roles/repeater",
