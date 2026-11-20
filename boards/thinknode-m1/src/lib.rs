@@ -134,6 +134,8 @@ pub struct ThinkNodeBoard {
     telemetry: Option<TelemetryPins>,
     battery_adc: Option<saadc::Saadc<'static, 1>>,
     display: Option<ThinkNodeDisplay>,
+    app_fb: Option<&'static mut EpdFrameBuffer>,
+    backlight: Option<Output<'static>>,
     buzzer: Option<PassiveBuzzer<'static>>,
     radio: Option<ChannelRadio>,
     spim0: Option<peripherals::TWISPI0>,
@@ -156,6 +158,8 @@ impl ThinkNodeBoard {
             telemetry: None,
             battery_adc: None,
             display: None,
+            app_fb: None,
+            backlight: None,
             buzzer: None,
             radio: None,
             spim0: None,
@@ -177,13 +181,13 @@ impl ThinkNodeBoard {
             pins.dc,
             pins.reset,
             pins.busy,
-            Some(pins.backlight),
+            None,
             Delay,
             PanelConfig::THINKNODE_M1,
         );
         let fb = EPD_FRAMEBUFFER.init(EpdFrameBuffer::new());
         let prev_fb = EPD_PREV_FRAMEBUFFER.init(EpdFrameBuffer::new());
-        self.display = Some(ThinkNodeDisplay::new(epd, fb, prev_fb));
+        self.display = Some(ThinkNodeDisplay::new(epd, fb, prev_fb, pins.backlight));
     }
 }
 
@@ -235,6 +239,7 @@ impl CompanionBoard for ThinkNodeBoard {
         ferrix_core::state::forwarding_enabled()
     }
 
+    #[inline(never)]
     async fn init(&mut self, spawner: Spawner) -> (String<32>, Option<[u8; 64]>) {
         let pins = self.pins.take().expect("board peripherals already taken");
         let Pins {
@@ -323,6 +328,7 @@ impl CompanionBoard for ThinkNodeBoard {
         ferrix_core::state::set_identity(public_key, private_key);
     }
 
+    #[inline(never)]
     fn start_transports(
         &mut self,
         spawner: Spawner,
@@ -371,6 +377,7 @@ impl CompanionBoard for ThinkNodeBoard {
         );
     }
 
+    #[inline(never)]
     async fn start_ui(&mut self, node: &CompanionNode<'_>) {
         if ferrix_core::state::buzzer_enabled() {
             if let Some(buzzer) = &mut self.buzzer {
@@ -393,6 +400,7 @@ impl CompanionBoard for ThinkNodeBoard {
         }
     }
 
+    #[inline(never)]
     fn start_radio(&mut self, spawner: Spawner) {
         let spim0 = self.spim0.take().expect("SPIM0 already taken");
         let lora = self.lora_pins.take().expect("LoRa pins already taken");
@@ -421,6 +429,18 @@ impl CompanionBoard for ThinkNodeBoard {
             ))
             .unwrap();
 
+        if let Some(buzzer) = self.buzzer.take() {
+            spawner.spawn(crate::app::buzzer_task(buzzer)).unwrap();
+        }
+        if let Some(display) = self.display.take() {
+            let (panel, fb, backlight) = display.into_parts();
+            spawner
+                .spawn(crate::display::display_task(panel))
+                .unwrap();
+            self.app_fb = Some(fb);
+            self.backlight = Some(backlight);
+        }
+
         self.radio = Some(ChannelRadio::new());
     }
 
@@ -428,9 +448,9 @@ impl CompanionBoard for ThinkNodeBoard {
         let telemetry = self.telemetry.take().expect("telemetry already taken");
         ThinkNodeApp::new(
             telemetry.blue_led,
-            self.display.take(),
+            self.app_fb.take(),
+            self.backlight.take(),
             self.battery_adc.take().expect("battery ADC already taken"),
-            self.buzzer.take().expect("buzzer already taken"),
         )
     }
 
