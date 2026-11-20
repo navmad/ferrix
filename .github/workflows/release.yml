@@ -40,19 +40,12 @@ jobs:
             uf2_base: "0x26000"
             dfu_dev_type: "0x0052"
             dfu_sd_req: "0x00B6"
-          # Future firmware targets can be appended here, e.g.:
-          # - firmware: thinknode-m1-repeater
-          #   pkg: ferrix-thinknode-m1-repeater
-          #   target: thumbv7em-none-eabihf
-          #   uf2_base: "0x26000"
-          #   dfu_dev_type: "0x0052"
-          #   dfu_sd_req: "0x00B6"
-          # - firmware: wio-tracker-l1-pro-companion
-          #   pkg: ferrix-wio-tracker-l1-pro-companion
-          #   target: thumbv7em-none-eabihf
-          #   uf2_base: "0x26000"
-          #   dfu_dev_type: "0x0052"
-          #   dfu_sd_req: "0x00B6"
+          - firmware: wio-tracker-l1-pro-companion
+            pkg: ferrix-wio-tracker-l1-pro-companion
+            target: thumbv7em-none-eabihf
+            uf2_base: "0x27000"
+            dfu_dev_type: "0x0052"
+            dfu_sd_req: "0x0123"
     steps:
       - uses: actions/checkout@v4
 

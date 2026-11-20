@@ -1,13 +1,14 @@
 # Ferrix feature guide
 
 Ferrix is a MeshCore-compatible companion firmware for the
-Elecrow **ThinkNode M1**: nRF52840, SX1262 LoRa, 1.54" e-paper, two buttons,
-battery monitoring, USB CDC and BLE. It targets **MeshCore v1.18** companion
+Elecrow **ThinkNode M1** (nRF52840, SX1262 LoRa, 1.54" e-paper, two buttons) and
+the Seeed **Wio Tracker L1 Pro** (nRF52840, SX1262 LoRa, 1.3" OLED, five-way
+joystick), both with battery monitoring, USB CDC and BLE. It targets **MeshCore v1.18** companion
 apps and the v1.18 over-the-air protocol.
 
 - Firmware version: `1.18.2-ferrix` (from root `Cargo.toml` `[workspace.package]`; overridable at build time via `FERRIX_VERSION` and `FERRIX_BUILD_DATE` / `SOURCE_DATE_EPOCH`)
-- USB product/vendor: `ThinkNode M1 Companion` / `MeshCore`
-- Board identity: `ThinkNode M1`
+- USB product/vendor: `ThinkNode M1 Companion` / `MeshCore` (Wio Tracker L1 Pro: `Wio Tracker L1 Companion` / `MeshCore`)
+- Board identity: `ThinkNode M1` or `Wio Tracker L1`
 - Configuration layout: version 1
 
 ---
@@ -32,7 +33,8 @@ power) are configurable from the app or CLI, persisted, and applied without a
 reboot. Cancel-safe RX duty-cycle/sniff mode is supported across SF7-12
 (including SF9-12 16-symbol preambles), backed by a 60 s RX inactivity
 watchdog. See [boards/thinknode-m1/README.md](boards/thinknode-m1/README.md)
-for ThinkNode M1 pinouts and memory mapping.
+for ThinkNode M1 and [boards/wio-tracker-l1-pro/README.md](boards/wio-tracker-l1-pro/README.md)
+for Wio Tracker L1 Pro pinouts and memory mapping.
 
 ---
 
@@ -315,6 +317,9 @@ the 175-byte `PACKET_CLI_REPLY` (`0x1D`) binary companion frame limit:
 # Package UF2 image for drag-and-drop flashing
 ./tools/build_uf2.sh thinknode-m1 release
 
+# Same for the Wio Tracker L1 Pro (board id `wio-tracker-l1-pro`)
+./tools/build_uf2.sh wio-tracker-l1-pro release
+
 # Package Nordic/Adafruit DFU .zip for BLE OTA or web/serial flashing
 ./tools/build_ota.sh thinknode-m1 release
 
@@ -333,8 +338,8 @@ Set `FERRIX_VERSION` (e.g. `v1.18.2`) and optionally `FERRIX_BUILD_DATE` /
 `SOURCE_DATE_EPOCH` to override the compiled version/date metadata. Pushing a
 `v*` tag triggers [`.github/workflows/release.yml`](.github/workflows/release.yml),
 which runs the host test suite, verifies the task arena, and publishes
-`ferrix-thinknode-m1-companion.uf2` and `ferrix-thinknode-m1-companion.zip`
-(BLE OTA / webflasher / serial DFU package) to GitHub Releases.
+`ferrix-thinknode-m1-companion.uf2` / `.zip` and
+`ferrix-wio-tracker-l1-pro-companion.uf2` / `.zip` (BLE OTA / webflasher / serial DFU package) to GitHub Releases.
 
 To enter the USB bootloader from the CLI, run `dfu` (`start dfu`), double-click
 reset, or trigger a 1200-baud touch on the CDC port. To enter BLE OTA DFU mode
@@ -359,4 +364,5 @@ Buttonless DFU from an nRF DFU app.
 
 - [`README.md`](README.md) — workspace overview, architecture, and tooling.
 - [`boards/thinknode-m1/README.md`](boards/thinknode-m1/README.md) — ThinkNode M1 hardware specs, flashing, pinout, and memory map.
+- [`boards/wio-tracker-l1-pro/README.md`](boards/wio-tracker-l1-pro/README.md) — Wio Tracker L1 Pro hardware specs, flashing, pinout, controls, and items to confirm on hardware.
 - [`.github/workflows/release.yml`](.github/workflows/release.yml) — matrix firmware build and GitHub Release workflow.

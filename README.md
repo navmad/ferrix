@@ -19,7 +19,7 @@ For the full protocol matrix, CLI reference, and current limitations, see [FEATU
 - **Wear-Leveled Persistence**: Powered by `sequential-storage` across internal flash (config & BLE bonds) and external QSPI flash (contacts, adverts & message FIFO), with a compile-time `internal-storage` profile for boards without QSPI.
 - **Deterministic TX Scheduler**: Separates control, flood, and background advert lanes with airtime-derived adaptive slot widths, duplicate cancellation, multipart ACK bursts (`multi_acks`), and split duty-cycle budgets.
 - **Power & OTA Support**: Uses the nRF52840 32.768 kHz LFXO crystal, REG1 DC-DC buck regulator, idle e-paper sleep, event-driven GNSS wake, smoothed SAADC battery telemetry, and Legacy Buttonless BLE DFU OTA (for OTAFIX bootloaders) alongside UF2 and serial DFU flashing.
-- **Board Support**: See each board's README for hardware specs, pinouts, and flashing steps (currently [ThinkNode M1](boards/thinknode-m1/README.md): 1.54" SSD1681 e-paper dashboard, L76K GNSS, battery telemetry, and buzzer).
+- **Board Support**: See each board's README for hardware specs, pinouts, and flashing steps ([ThinkNode M1](boards/thinknode-m1/README.md): 1.54" SSD1681 e-paper dashboard, L76K GNSS, battery telemetry, and buzzer; [Wio Tracker L1 Pro](boards/wio-tracker-l1-pro/README.md): 1.3" SH1106 OLED with joystick navigation, L76K GNSS, battery telemetry, and buzzer).
 
 ---
 
@@ -28,6 +28,7 @@ For the full protocol matrix, CLI reference, and current limitations, see [FEATU
 | Board Target | Firmware Package | MCU | Radio | Board Docs |
 | :--- | :--- | :--- | :--- | :--- |
 | **Elecrow ThinkNode M1** | `ferrix-thinknode-m1-companion` | nRF52840 | Semtech SX1262 | [boards/thinknode-m1/README.md](boards/thinknode-m1/README.md) |
+| **Seeed Wio Tracker L1 Pro** | `ferrix-wio-tracker-l1-pro-companion` | nRF52840 | Semtech SX1262 | [boards/wio-tracker-l1-pro/README.md](boards/wio-tracker-l1-pro/README.md) |
 
 ---
 
@@ -36,17 +37,21 @@ For the full protocol matrix, CLI reference, and current limitations, see [FEATU
 ```text
 ferrix/
 ├── firmware/
-│   └── thinknode-m1-companion/  # Binary crate (`ferrix`): binds board + role
+│   ├── thinknode-m1-companion/  # Binary crate (`ferrix`): binds board + role
+│   └── wio-tracker-l1-pro-companion/
 ├── roles/
 │   ├── companion/               # Companion role: identity, transports, app loop
 │   └── repeater/                # Repeater role (placeholder, not built yet)
 ├── boards/
-│   └── thinknode-m1/            # ThinkNode M1 BSP: pins, display UI, storage regions, memory.x
+│   ├── thinknode-m1/            # ThinkNode M1 BSP: pins, display UI, storage regions, memory.x
+│   └── wio-tracker-l1-pro/      # Wio Tracker L1 Pro BSP: pins, OLED UI, joystick, memory.x
 ├── platforms/
-│   └── nrf52/                   # nRF52840 support: SoftDevice BLE, USB CDC, QSPI, flash, WDT
+│   └── nrf52/                   # nRF52840 support: SoftDevice BLE, USB CDC, QSPI, flash, WDT,
+│                                #   shared storage/GNSS/battery/host glue
 ├── drivers/
 │   ├── radio/sx1262/            # Semtech SX1262 driver (`ferrix-sx1262`)
 │   ├── display/ssd1681/         # SSD1681 e-paper driver (`ferrix-ssd1681`)
+│   ├── display/sh1106/          # SH1106 OLED driver (`ferrix-sh1106`)
 │   └── gnss/l76k/               # Quectel L76K NMEA driver (`ferrix-l76k`)
 ├── crates/
 │   ├── meshcore-wire/           # Pure `no_std` MeshCore packet/frame codecs
@@ -85,6 +90,8 @@ Because `.cargo/config.toml` defaults to `thumbv7em-none-eabihf`, use `./tools/b
 ```bash
 # Release build (default external QSPI + internal flash storage profile)
 ./tools/build.sh thinknode-m1 build --release
+# or, for the Wio Tracker L1 Pro:
+./tools/build.sh wio-tracker-l1-pro build --release
 
 # Release build keeping all stores in internal flash (no QSPI)
 ./tools/build.sh thinknode-m1 build --release --features internal-storage
@@ -104,6 +111,7 @@ Because `.cargo/config.toml` defaults to `thumbv7em-none-eabihf`, use `./tools/b
 Prebuilt `.uf2` (drag-and-drop) and `.zip` (Nordic/Adafruit serial & BLE OTA DFU) artifacts are published on GitHub Releases. Detailed flashing steps (UF2 drag-and-drop, serial DFU, or SWD) and board pinouts live in each board's README:
 
 - [Elecrow ThinkNode M1](boards/thinknode-m1/README.md)
+- [Seeed Wio Tracker L1 Pro](boards/wio-tracker-l1-pro/README.md)
 
 ---
 

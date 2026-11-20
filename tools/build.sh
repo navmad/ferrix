@@ -8,6 +8,7 @@
 #   ./tools/build.sh thinknode-m1 build --release
 #   ./tools/build.sh thinknode-m1 run
 #   ./tools/build.sh thinknode-m1 test
+#   ./tools/build.sh wio-tracker-l1-pro build --release
 #
 # The target is always passed explicitly because .cargo/config.toml sets a
 # default embedded target, which must not leak into host tests or other boards.
@@ -18,7 +19,7 @@ board="${1:-}"
 action="${2:-build}"
 [[ -n "$board" ]] || {
     echo "usage: tools/build.sh <board> [build|run|test] [cargo args...]" >&2
-    echo "boards: thinknode-m1" >&2
+    echo "boards: thinknode-m1 wio-tracker-l1-pro" >&2
     exit 2
 }
 shift $(( $# >= 2 ? 2 : $# )) || true
@@ -28,9 +29,13 @@ case "$board" in
         pkg="ferrix-thinknode-m1-companion"
         target="thumbv7em-none-eabihf"
         ;;
+    wio-tracker-l1-pro)
+        pkg="ferrix-wio-tracker-l1-pro-companion"
+        target="thumbv7em-none-eabihf"
+        ;;
     *)
         echo "unknown board: $board" >&2
-        echo "boards: thinknode-m1" >&2
+        echo "boards: thinknode-m1 wio-tracker-l1-pro" >&2
         exit 2
         ;;
 esac
