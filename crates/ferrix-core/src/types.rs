@@ -124,4 +124,5 @@ pub struct RadioTelemetry {
     pub tx_cancelled: u32,
     pub tx_retries: u32,
     pub tx_dropped: u32,
+    pub rx_dropped: u32,
 }

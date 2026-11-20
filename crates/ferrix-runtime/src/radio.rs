@@ -22,7 +22,7 @@ use ferrix_hal::radio::{LoraConfig, LoraRadio, RadioDevice, RxOutcome, RxState, 
 use heapless::{Deque, Vec};
 use meshcore_wire::tx::TxLane;
 
-pub static LORA_RX_CHANNEL: Channel<CriticalSectionRawMutex, (usize, i16, i8, [u8; 256]), 4> =
+pub static LORA_RX_CHANNEL: Channel<CriticalSectionRawMutex, (usize, i16, i8, [u8; 256]), 8> =
     Channel::new();
 pub static LORA_TX_CHANNEL: Channel<CriticalSectionRawMutex, TxPacket, 8> = Channel::new();
 pub static LORA_CFG_CHANNEL: Channel<CriticalSectionRawMutex, LoraConfig, 4> = Channel::new();
@@ -536,7 +536,14 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
                             let copy_len = len.min(256);
                             let mut packet_data = [0u8; 256];
                             packet_data[..copy_len].copy_from_slice(&rx_buf[..copy_len]);
-                            let _ = LORA_RX_CHANNEL.try_send((copy_len, rssi, snr, packet_data));
+                            if LORA_RX_CHANNEL
+                                .try_send((copy_len, rssi, snr, packet_data))
+                                .is_err()
+                            {
+                                add_telemetry(|tel| {
+                                    tel.rx_dropped = tel.rx_dropped.saturating_add(1);
+                                });
+                            }
                         }
                         Some(RxOutcome::DutyCycleEnd) => {
                             rx_active_since = None;

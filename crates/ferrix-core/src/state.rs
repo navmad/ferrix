@@ -519,6 +519,7 @@ pub static RADIO_TELEMETRY: Mutex<SharedRawMutex, RefCell<RadioTelemetry>> =
         tx_cancelled: 0,
         tx_retries: 0,
         tx_dropped: 0,
+        rx_dropped: 0,
     }));
 
 /// Latest GNSS solution shared by the UART task, UI and adverts.
