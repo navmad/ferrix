@@ -31,15 +31,30 @@ use super::util::AlignedBuf;
 pub const MAX_ADVERT_PAYLOAD: usize = 132;
 const PENDING_CAPACITY: usize = 8;
 
-#[repr(C, align(4))]
-#[derive(Clone, Copy)]
-struct BlobRecord {
-    len: u8,
-    payload: [u8; MAX_ADVERT_PAYLOAD],
-    _pad: [u8; 3],
+const BLOB_RECORD_SIZE: usize = 1 + MAX_ADVERT_PAYLOAD + 3;
+
+const _: () = assert!(BLOB_RECORD_SIZE == 136);
+const _: () = assert!(BLOB_RECORD_SIZE <= SCRATCH_SIZE);
+
+fn encode_blob(len: u8, payload: &[u8; MAX_ADVERT_PAYLOAD]) -> [u8; BLOB_RECORD_SIZE] {
+    let mut buf = [0u8; BLOB_RECORD_SIZE];
+    buf[0] = len;
+    buf[1..1 + MAX_ADVERT_PAYLOAD].copy_from_slice(payload);
+    // 133..136: _pad = 0
+    buf
 }
 
-const _: () = assert!(core::mem::size_of::<BlobRecord>() <= SCRATCH_SIZE);
+fn decode_blob(bytes: &[u8]) -> Option<(u8, [u8; MAX_ADVERT_PAYLOAD])> {
+    if bytes.len() < BLOB_RECORD_SIZE {
+        return None;
+    }
+    let len = bytes[0];
+    if len as usize > MAX_ADVERT_PAYLOAD {
+        return None;
+    }
+    let payload: [u8; MAX_ADVERT_PAYLOAD] = bytes[1..1 + MAX_ADVERT_PAYLOAD].try_into().ok()?;
+    Some((len, payload))
+}
 
 #[derive(Clone, Copy)]
 struct PendingBlob {
@@ -183,17 +198,8 @@ where
             continue;
         }
 
-        let record = BlobRecord {
-            len: rec.len,
-            payload: rec.payload,
-            _pad: [0; 3],
-        };
-        let bytes = unsafe {
-            core::slice::from_raw_parts(
-                &record as *const BlobRecord as *const u8,
-                core::mem::size_of::<BlobRecord>(),
-            )
-        };
+        let record = encode_blob(rec.len, &rec.payload);
+        let bytes: &[u8] = &record;
         let key = contact_map::blob_key(&rec.pub_key);
         if let Err(e) = map.store_item(&mut buf.0, &key, &bytes).await {
             error!("Persistence: blob map store failed: {:?}", e);
@@ -214,19 +220,11 @@ where
     let mut map = contact_map::open(flash, region, &ERASES);
     let key = contact_map::blob_key(&req.key);
     let rec = match map.fetch_item::<&[u8]>(&mut buf.0, &key).await {
-        Ok(Some(value)) if value.len() >= core::mem::size_of::<BlobRecord>() => {
-            let record =
-                unsafe { core::ptr::read_unaligned(value.as_ptr() as *const BlobRecord) };
-            if record.len as usize <= MAX_ADVERT_PAYLOAD {
-                Some(PendingBlob {
-                    pub_key: req.key,
-                    len: record.len,
-                    payload: record.payload,
-                })
-            } else {
-                None
-            }
-        }
+        Ok(Some(value)) => decode_blob(value).map(|(len, payload)| PendingBlob {
+            pub_key: req.key,
+            len,
+            payload,
+        }),
         _ => None,
     };
     FETCH_RESPONSE.signal(rec);
@@ -271,5 +269,22 @@ mod tests {
         assert!(has_blob(&[7u8; 32]));
         assert!(!has_blob(&[8u8; 32]));
         forget(&[7u8; 32]);
+    }
+
+    #[test]
+    fn blob_record_roundtrip() {
+        let mut payload = [0u8; MAX_ADVERT_PAYLOAD];
+        payload[0..4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let bytes = encode_blob(100, &payload);
+        assert_eq!(bytes.len(), 136);
+        assert_eq!(bytes[0], 100);
+        assert_eq!(&bytes[1..5], &[0xDE, 0xAD, 0xBE, 0xEF]);
+        let (len, decoded) = decode_blob(&bytes).expect("decode blob");
+        assert_eq!(len, 100);
+        assert_eq!(decoded, payload);
+
+        let mut bad = bytes;
+        bad[0] = (MAX_ADVERT_PAYLOAD + 1) as u8;
+        assert!(decode_blob(&bad).is_none());
     }
 }

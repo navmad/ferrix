@@ -44,27 +44,6 @@ pub struct Bond {
     pub sys_attrs: [u8; MAX_SYS_ATTRS],
 }
 
-#[repr(C, align(4))]
-#[derive(Clone, Copy)]
-struct PersistBond {
-    magic: u32,
-    version: u16,
-    _reserved: u16,
-    master_ediv: u16,
-    master_rand: [u8; 8],
-    ltk: [u8; 16],
-    ltk_flags: u8,
-    peer_addr_flags: u8,
-    peer_addr: [u8; 6],
-    peer_irk: [u8; 16],
-    sys_len: u8,
-    sys_attrs: [u8; MAX_SYS_ATTRS],
-    _pad: [u8; 1],
-    checksum: u32,
-}
-
-const _: () = assert!(core::mem::size_of::<PersistBond>() == RECORD_SIZE);
-
 pub static BOND_ERASES: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 pub static BOND_SAVES: core::sync::atomic::AtomicU32 =
@@ -135,54 +114,50 @@ fn checksum(bytes: &[u8]) -> u32 {
     h
 }
 
-fn encode(bond: &Bond) -> PersistBond {
-    let mut rec = PersistBond {
-        magic: MAGIC,
-        version: VERSION,
-        _reserved: 0,
-        master_ediv: bond.master_ediv,
-        master_rand: bond.master_rand,
-        ltk: bond.ltk,
-        ltk_flags: bond.ltk_flags,
-        peer_addr_flags: bond.peer_addr_flags,
-        peer_addr: bond.peer_addr,
-        peer_irk: bond.peer_irk,
-        sys_len: bond.sys_len.min(MAX_SYS_ATTRS as u8),
-        sys_attrs: bond.sys_attrs,
-        _pad: [0],
-        checksum: 0,
-    };
-    let bytes = unsafe {
-        core::slice::from_raw_parts(&rec as *const PersistBond as *const u8, RECORD_PAYLOAD)
-    };
-    rec.checksum = checksum(bytes);
-    rec
+fn encode(bond: &Bond) -> [u8; RECORD_SIZE] {
+    let mut buf = [0u8; RECORD_SIZE];
+    buf[0..4].copy_from_slice(&MAGIC.to_le_bytes());
+    buf[4..6].copy_from_slice(&VERSION.to_le_bytes());
+    // 6..8: _reserved = 0
+    buf[8..10].copy_from_slice(&bond.master_ediv.to_le_bytes());
+    buf[10..18].copy_from_slice(&bond.master_rand);
+    buf[18..34].copy_from_slice(&bond.ltk);
+    buf[34] = bond.ltk_flags;
+    buf[35] = bond.peer_addr_flags;
+    buf[36..42].copy_from_slice(&bond.peer_addr);
+    buf[42..58].copy_from_slice(&bond.peer_irk);
+    buf[58] = bond.sys_len.min(MAX_SYS_ATTRS as u8);
+    buf[59..123].copy_from_slice(&bond.sys_attrs);
+    // 123: _pad = 0
+    let csum = checksum(&buf[..RECORD_PAYLOAD]);
+    buf[124..128].copy_from_slice(&csum.to_le_bytes());
+    buf
 }
 
 fn decode(bytes: &[u8]) -> Option<Bond> {
     if bytes.len() < RECORD_SIZE {
         return None;
     }
-    let rec = unsafe { core::ptr::read_unaligned(bytes.as_ptr() as *const PersistBond) };
-    if rec.magic != MAGIC || rec.version != VERSION || rec.sys_len as usize > MAX_SYS_ATTRS {
+    let magic = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
+    let version = u16::from_le_bytes(bytes[4..6].try_into().ok()?);
+    let sys_len = bytes[58];
+    if magic != MAGIC || version != VERSION || sys_len as usize > MAX_SYS_ATTRS {
         return None;
     }
-    let payload = unsafe {
-        core::slice::from_raw_parts(&rec as *const PersistBond as *const u8, RECORD_PAYLOAD)
-    };
-    if checksum(payload) != rec.checksum {
+    let stored_checksum = u32::from_le_bytes(bytes[124..128].try_into().ok()?);
+    if checksum(&bytes[..RECORD_PAYLOAD]) != stored_checksum {
         return None;
     }
     Some(Bond {
-        master_ediv: rec.master_ediv,
-        master_rand: rec.master_rand,
-        ltk: rec.ltk,
-        ltk_flags: rec.ltk_flags,
-        peer_addr_flags: rec.peer_addr_flags,
-        peer_addr: rec.peer_addr,
-        peer_irk: rec.peer_irk,
-        sys_len: rec.sys_len,
-        sys_attrs: rec.sys_attrs,
+        master_ediv: u16::from_le_bytes(bytes[8..10].try_into().ok()?),
+        master_rand: bytes[10..18].try_into().ok()?,
+        ltk: bytes[18..34].try_into().ok()?,
+        ltk_flags: bytes[34],
+        peer_addr_flags: bytes[35],
+        peer_addr: bytes[36..42].try_into().ok()?,
+        peer_irk: bytes[42..58].try_into().ok()?,
+        sys_len,
+        sys_attrs: bytes[59..123].try_into().ok()?,
     })
 }
 
@@ -498,9 +473,7 @@ where
             continue;
         };
         let rec = encode(bond);
-        let bytes = unsafe {
-            core::slice::from_raw_parts(&rec as *const PersistBond as *const u8, RECORD_SIZE)
-        };
+        let bytes: &[u8] = &rec;
         let key = bond_key(bond);
         map.store_item(&mut buf.0, &key, &bytes).await?;
     }
@@ -629,13 +602,22 @@ mod tests {
         assert_eq!(&attrs[..len], b"attrs");
 
         let rec = encode(&bond);
-        let bytes = unsafe {
-            core::slice::from_raw_parts(&rec as *const PersistBond as *const u8, RECORD_SIZE)
-        };
-        let decoded = decode(bytes).expect("decode");
+        assert_eq!(rec.len(), RECORD_SIZE);
+        assert_eq!(&rec[0..4], &MAGIC.to_le_bytes());
+        assert_eq!(&rec[8..10], &bond.master_ediv.to_le_bytes());
+        assert_eq!(rec[34], bond.ltk_flags);
+        assert_eq!(rec[58], bond.sys_len);
+        let decoded = decode(&rec).expect("decode");
         assert_eq!(decoded.master_ediv, bond.master_ediv);
         assert_eq!(decoded.master_rand, bond.master_rand);
         assert_eq!(decoded.ltk, bond.ltk);
+        assert_eq!(decoded.peer_addr, bond.peer_addr);
+        assert_eq!(decoded.peer_irk, bond.peer_irk);
+
+        // Corrupted checksum is rejected.
+        let mut bad = rec;
+        bad[124] ^= 0xFF;
+        assert!(decode(&bad).is_none());
 
         clear();
         assert_eq!(count(), 0);

@@ -27,34 +27,9 @@ const LEGACY_CONTACT_RECORD_SIZE: usize = 156;
 pub static SAVES: AtomicU32 = AtomicU32::new(0);
 pub static ERASES: AtomicU32 = AtomicU32::new(0);
 
-#[repr(C, align(4))]
-#[derive(Clone, Copy)]
-struct PersistContact {
-    pub_key: [u8; 32],
-    node_id: [u8; 4],
-    callsign: [u8; 32],
-    out_path: [u8; 64],
-    latitude: i32,
-    longitude: i32,
-    last_seen_epoch: u32,
-    last_advert_ts: u32,
-    rssi: i16,
-    snr: i8,
-    flags: u8,
-    contact_type: u8,
-    out_path_len: u8,
-    /// Explicit padding: `sync_since` must be 4-byte aligned.
-    _pad_before_sync: [u8; 2],
-    sync_since: u32,
-    /// Explicit tail padding: records are written as raw bytes, so every byte
-    /// up to `CONTACT_RECORD_SIZE` must be initialized.
-    _pad_tail: [u8; 4],
-}
-
-const _: () = assert!(core::mem::size_of::<PersistContact>() == CONTACT_RECORD_SIZE);
-const _: () = assert!(core::mem::offset_of!(PersistContact, sync_since) == 156);
-const _: () = assert!(core::mem::offset_of!(PersistContact, _pad_tail) == 160);
-const _: () = assert!(core::mem::size_of::<PersistContact>() == 164);
+const _: () = assert!(CONTACT_RECORD_SIZE == 164);
+const _: () = assert!(LEGACY_CONTACT_RECORD_SIZE == 156);
+const _: () = assert!(CONTACT_RECORD_SIZE <= SCRATCH_SIZE);
 
 #[repr(C, align(4))]
 struct Scratch([u8; SCRATCH_SIZE]);
@@ -110,47 +85,56 @@ pub async fn queue_clear() {
     let _ = OP_CHANNEL.send(ContactOp::Clear).await;
 }
 
-fn contact_to_record(c: &DiscoveredContact) -> PersistContact {
-    PersistContact {
-        pub_key: c.pub_key,
-        node_id: c.node_id,
-        callsign: fixed_str(c.callsign.as_str()),
-        out_path: c.out_path,
-        latitude: c.latitude,
-        longitude: c.longitude,
-        last_seen_epoch: c.last_seen_epoch,
-        last_advert_ts: c.last_advert_ts,
-        rssi: c.rssi,
-        snr: c.snr,
-        flags: c.flags,
-        contact_type: c.contact_type,
-        out_path_len: c.out_path_len,
-        _pad_before_sync: [0; 2],
-        sync_since: c.sync_since,
-        _pad_tail: [0; 4],
-    }
+fn encode_contact(c: &DiscoveredContact) -> [u8; CONTACT_RECORD_SIZE] {
+    let mut buf = [0u8; CONTACT_RECORD_SIZE];
+    buf[0..32].copy_from_slice(&c.pub_key);
+    buf[32..36].copy_from_slice(&c.node_id);
+    buf[36..68].copy_from_slice(&fixed_str::<32>(c.callsign.as_str()));
+    buf[68..132].copy_from_slice(&c.out_path);
+    buf[132..136].copy_from_slice(&c.latitude.to_le_bytes());
+    buf[136..140].copy_from_slice(&c.longitude.to_le_bytes());
+    buf[140..144].copy_from_slice(&c.last_seen_epoch.to_le_bytes());
+    buf[144..148].copy_from_slice(&c.last_advert_ts.to_le_bytes());
+    buf[148..150].copy_from_slice(&c.rssi.to_le_bytes());
+    buf[150] = c.snr as u8;
+    buf[151] = c.flags;
+    buf[152] = c.contact_type;
+    buf[153] = c.out_path_len;
+    // 154..156: _pad_before_sync = 0
+    buf[156..160].copy_from_slice(&c.sync_since.to_le_bytes());
+    // 160..164: _pad_tail = 0
+    buf
 }
 
-fn record_to_contact(r: &PersistContact) -> DiscoveredContact {
-    let mut callsign = String::<32>::new();
-    let _ = callsign.push_str(str_from_fixed(&r.callsign));
-    DiscoveredContact {
-        pub_key: r.pub_key,
-        callsign,
-        node_id: r.node_id,
-        last_seen_epoch: r.last_seen_epoch,
-        rssi: r.rssi,
-        snr: r.snr,
-        latitude: r.latitude,
-        longitude: r.longitude,
-        flags: r.flags,
-        contact_type: r.contact_type,
-        out_path: r.out_path,
-        out_path_len: r.out_path_len,
-        last_advert_ts: r.last_advert_ts,
-        saved_hash: 0,
-        sync_since: r.sync_since,
+fn decode_contact(bytes: &[u8]) -> Option<DiscoveredContact> {
+    if bytes.len() < LEGACY_CONTACT_RECORD_SIZE {
+        return None;
     }
+    // Older records are shorter (no sync_since); copy only what is present
+    // into a zeroed buffer.
+    let mut raw = [0u8; CONTACT_RECORD_SIZE];
+    let n = bytes.len().min(CONTACT_RECORD_SIZE);
+    raw[..n].copy_from_slice(&bytes[..n]);
+
+    let mut callsign = String::<32>::new();
+    let _ = callsign.push_str(str_from_fixed(&raw[36..68]));
+    Some(DiscoveredContact {
+        pub_key: raw[0..32].try_into().ok()?,
+        callsign,
+        node_id: raw[32..36].try_into().ok()?,
+        last_seen_epoch: u32::from_le_bytes(raw[140..144].try_into().ok()?),
+        rssi: i16::from_le_bytes(raw[148..150].try_into().ok()?),
+        snr: raw[150] as i8,
+        latitude: i32::from_le_bytes(raw[132..136].try_into().ok()?),
+        longitude: i32::from_le_bytes(raw[136..140].try_into().ok()?),
+        flags: raw[151],
+        contact_type: raw[152],
+        out_path: raw[68..132].try_into().ok()?,
+        out_path_len: raw[153],
+        last_advert_ts: u32::from_le_bytes(raw[144..148].try_into().ok()?),
+        saved_hash: 0,
+        sync_since: u32::from_le_bytes(raw[156..160].try_into().ok()?),
+    })
 }
 
 /// Hash of the fields that are worth persisting. Volatile fields (RSSI, SNR,
@@ -207,22 +191,10 @@ where
                 if contact_map::key_tag(&key) != contact_map::CONTACT_TAG {
                     continue;
                 }
-                if value.len() < LEGACY_CONTACT_RECORD_SIZE {
+                let Some(mut ct) = decode_contact(value) else {
                     continue;
-                }
+                };
                 let pub_key = contact_map::key_pub_key(&key);
-                // Older records are shorter (no sync_since); copy only what is
-                // present into a zeroed struct.
-                let mut rec: PersistContact = unsafe { core::mem::zeroed() };
-                let n = value.len().min(CONTACT_RECORD_SIZE);
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        value.as_ptr(),
-                        &mut rec as *mut PersistContact as *mut u8,
-                        n,
-                    );
-                }
-                let mut ct = record_to_contact(&rec);
                 ct.saved_hash = structural_hash_of(&ct);
                 DISCOVERED_CONTACTS.lock(|c| {
                     let mut list = c.borrow_mut();
@@ -263,14 +235,8 @@ where
             continue;
         }
 
-        let rec = contact_to_record(&ct);
-        let bytes = unsafe {
-            core::slice::from_raw_parts(
-                &rec as *const PersistContact as *const u8,
-                CONTACT_RECORD_SIZE,
-            )
-        };
-        let value: &[u8] = bytes;
+        let rec = encode_contact(&ct);
+        let value: &[u8] = &rec;
         match map
             .store_item(&mut buf.0, &contact_map::contact_key(&ct.pub_key), &value)
             .await
@@ -327,5 +293,55 @@ where
     let mut map = open(flash, region);
     if let Err(e) = map.erase_all().await {
         error!("Persistence: contact map clear failed: {:?}", e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contact_record_roundtrip_and_legacy_layout() {
+        let mut callsign = String::<32>::new();
+        let _ = callsign.push_str("ch1nn4n");
+        let contact = DiscoveredContact {
+            pub_key: [0x12; 32],
+            callsign,
+            node_id: [1, 2, 3, 4],
+            last_seen_epoch: 1_700_000_000,
+            rssi: -95,
+            snr: -12,
+            latitude: 37_774_900,
+            longitude: -122_419_400,
+            flags: 0x05,
+            contact_type: 1,
+            out_path: [0x33; 64],
+            out_path_len: 3,
+            last_advert_ts: 1_700_000_123,
+            saved_hash: 0,
+            sync_since: 42,
+        };
+
+        let bytes = encode_contact(&contact);
+        assert_eq!(bytes.len(), CONTACT_RECORD_SIZE);
+        assert_eq!(&bytes[132..136], &37_774_900i32.to_le_bytes());
+        assert_eq!(&bytes[148..150], &(-95i16).to_le_bytes());
+        assert_eq!(bytes[150], (-12i8) as u8);
+        assert_eq!(&bytes[156..160], &42u32.to_le_bytes());
+
+        let decoded = decode_contact(&bytes).expect("decode current");
+        assert_eq!(decoded.pub_key, contact.pub_key);
+        assert_eq!(decoded.callsign, contact.callsign);
+        assert_eq!(decoded.latitude, contact.latitude);
+        assert_eq!(decoded.longitude, contact.longitude);
+        assert_eq!(decoded.rssi, -95);
+        assert_eq!(decoded.snr, -12);
+        assert_eq!(decoded.sync_since, 42);
+
+        // Legacy 156-byte record without sync_since decodes with sync_since == 0.
+        let legacy = decode_contact(&bytes[..LEGACY_CONTACT_RECORD_SIZE]).expect("decode legacy");
+        assert_eq!(legacy.callsign, contact.callsign);
+        assert_eq!(legacy.rssi, -95);
+        assert_eq!(legacy.sync_since, 0);
     }
 }

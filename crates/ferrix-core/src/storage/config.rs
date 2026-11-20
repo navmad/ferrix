@@ -36,19 +36,22 @@ pub static CONFIG_SAVES: core::sync::atomic::AtomicU32 =
 pub static CONFIG_ERASES: core::sync::atomic::AtomicU32 =
     core::sync::atomic::AtomicU32::new(0);
 
-#[repr(C, align(4))]
+const SETTINGS_RECORD_SIZE: usize = 192;
+const LEGACY_SETTINGS_V1_SIZE: usize = 188;
+const CHANNEL_RECORD_SIZE: usize = 52;
+
+const _: () = assert!(SETTINGS_RECORD_SIZE <= SCRATCH_SIZE);
+const _: () = assert!(CHANNEL_RECORD_SIZE <= SCRATCH_SIZE);
+
 #[derive(Clone, Copy)]
 struct SettingsRecord {
     magic: u32,
     version: u16,
-    _pad: u16,
     callsign: [u8; 32],
     custom_priv_key: [u8; 64],
     has_custom_key: u8,
     is_repeater: u8,
     client_repeat: u8,
-    /// Explicit padding: `offgrid_home_freq` must be 4-byte aligned.
-    _pad_before_offgrid: u8,
     offgrid_home_freq: u32,
     radio_tx_power: i8,
     radio_sf: u8,
@@ -68,32 +71,116 @@ struct SettingsRecord {
     telemetry_mode_loc: u8,
     telemetry_mode_env: u8,
     multi_acks: u8,
-    /// Explicit padding: `ble_pin` must be 4-byte aligned.
-    _pad_before_ble_pin: [u8; 2],
     ble_pin: u32,
     radio_freq_hz: u32,
     radio_bw_khz: u32,
     display_refresh_interval_secs: u16,
-    _pad_after_refresh: u16,
 }
 
-#[repr(C, align(4))]
-#[derive(Clone, Copy)]
-struct ChannelRecord {
-    present: u8,
-    name: [u8; 32],
-    secret: [u8; 16],
-    _pad: [u8; 3],
+impl SettingsRecord {
+    fn encode(&self) -> [u8; SETTINGS_RECORD_SIZE] {
+        let mut buf = [0u8; SETTINGS_RECORD_SIZE];
+        buf[0..4].copy_from_slice(&self.magic.to_le_bytes());
+        buf[4..6].copy_from_slice(&self.version.to_le_bytes());
+        // 6..8: _pad = 0
+        buf[8..40].copy_from_slice(&self.callsign);
+        buf[40..104].copy_from_slice(&self.custom_priv_key);
+        buf[104] = self.has_custom_key;
+        buf[105] = self.is_repeater;
+        buf[106] = self.client_repeat;
+        // 107: _pad_before_offgrid = 0
+        buf[108..112].copy_from_slice(&self.offgrid_home_freq.to_le_bytes());
+        buf[112] = self.radio_tx_power as u8;
+        buf[113] = self.radio_sf;
+        buf[114] = self.radio_cr;
+        buf[115] = self.path_hash_mode;
+        buf[116] = self.autoadd_config;
+        buf[117] = self.autoadd_max_hops;
+        buf[118] = self.manual_add_contacts;
+        buf[119] = self.ui_disabled_flags;
+        buf[120] = self.rx_duty_cycle;
+        buf[121] = self.airtime_factor_tenths;
+        buf[122..153].copy_from_slice(&self.flood_scope_name);
+        buf[153..169].copy_from_slice(&self.flood_scope_key);
+        buf[169] = self.advert_loc_policy;
+        buf[170] = self.telemetry_mode_base;
+        buf[171] = self.telemetry_mode_loc;
+        buf[172] = self.telemetry_mode_env;
+        buf[173] = self.multi_acks;
+        // 174..176: _pad_before_ble_pin = 0
+        buf[176..180].copy_from_slice(&self.ble_pin.to_le_bytes());
+        buf[180..184].copy_from_slice(&self.radio_freq_hz.to_le_bytes());
+        buf[184..188].copy_from_slice(&self.radio_bw_khz.to_le_bytes());
+        buf[188..190].copy_from_slice(&self.display_refresh_interval_secs.to_le_bytes());
+        // 190..192: _pad_after_refresh = 0
+        buf
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < LEGACY_SETTINGS_V1_SIZE {
+            return None;
+        }
+        let mut raw = [0u8; SETTINGS_RECORD_SIZE];
+        let copy_len = bytes.len().min(SETTINGS_RECORD_SIZE);
+        raw[..copy_len].copy_from_slice(&bytes[..copy_len]);
+
+        let magic = u32::from_le_bytes(raw[0..4].try_into().ok()?);
+        let version = u16::from_le_bytes(raw[4..6].try_into().ok()?);
+        if magic != CONFIG_MAGIC || version != CONFIG_VERSION {
+            return None;
+        }
+        Some(Self {
+            magic,
+            version,
+            callsign: raw[8..40].try_into().ok()?,
+            custom_priv_key: raw[40..104].try_into().ok()?,
+            has_custom_key: raw[104],
+            is_repeater: raw[105],
+            client_repeat: raw[106],
+            offgrid_home_freq: u32::from_le_bytes(raw[108..112].try_into().ok()?),
+            radio_tx_power: raw[112] as i8,
+            radio_sf: raw[113],
+            radio_cr: raw[114],
+            path_hash_mode: raw[115],
+            autoadd_config: raw[116],
+            autoadd_max_hops: raw[117],
+            manual_add_contacts: raw[118],
+            ui_disabled_flags: raw[119],
+            rx_duty_cycle: raw[120],
+            airtime_factor_tenths: raw[121],
+            flood_scope_name: raw[122..153].try_into().ok()?,
+            flood_scope_key: raw[153..169].try_into().ok()?,
+            advert_loc_policy: raw[169],
+            telemetry_mode_base: raw[170],
+            telemetry_mode_loc: raw[171],
+            telemetry_mode_env: raw[172],
+            multi_acks: raw[173],
+            ble_pin: u32::from_le_bytes(raw[176..180].try_into().ok()?),
+            radio_freq_hz: u32::from_le_bytes(raw[180..184].try_into().ok()?),
+            radio_bw_khz: u32::from_le_bytes(raw[184..188].try_into().ok()?),
+            display_refresh_interval_secs: u16::from_le_bytes(raw[188..190].try_into().ok()?),
+        })
+    }
 }
 
-const LEGACY_SETTINGS_V1_SIZE: usize = 188;
+fn encode_channel_record(present: u8, ch: &ChannelData) -> [u8; CHANNEL_RECORD_SIZE] {
+    let mut buf = [0u8; CHANNEL_RECORD_SIZE];
+    buf[0] = present;
+    buf[1..33].copy_from_slice(&ch.name);
+    buf[33..49].copy_from_slice(&ch.secret);
+    // 49..52: _pad = 0
+    buf
+}
 
-const _: () = assert!(core::mem::size_of::<SettingsRecord>() <= SCRATCH_SIZE);
-const _: () = assert!(core::mem::offset_of!(SettingsRecord, offgrid_home_freq) == 108);
-const _: () = assert!(core::mem::offset_of!(SettingsRecord, ble_pin) == 176);
-const _: () = assert!(core::mem::offset_of!(SettingsRecord, display_refresh_interval_secs) == 188);
-const _: () = assert!(core::mem::size_of::<SettingsRecord>() == 192);
-const _: () = assert!(core::mem::size_of::<ChannelRecord>() <= SCRATCH_SIZE);
+fn decode_channel_record(bytes: &[u8]) -> Option<(bool, ChannelData)> {
+    if bytes.len() < CHANNEL_RECORD_SIZE {
+        return None;
+    }
+    let present = bytes[0] != 0;
+    let name: [u8; 32] = bytes[1..33].try_into().ok()?;
+    let secret: [u8; 16] = bytes[33..49].try_into().ok()?;
+    Some((present, ChannelData { name, secret }))
+}
 
 pub use crate::state::{BLE_PIN, CUSTOM_PRIV_KEY, NODE_CALLSIGN};
 
@@ -278,23 +365,7 @@ pub fn init_config(
     let (settings, channels, found) = util::block_on(async {
         let mut map = open(&mut flash, &region);
         let settings = match map.fetch_item::<&[u8]>(&mut sbuf.0, &SETTINGS_KEY).await {
-            Ok(Some(value)) if value.len() >= LEGACY_SETTINGS_V1_SIZE => {
-                let mut rec = core::mem::MaybeUninit::<SettingsRecord>::zeroed();
-                let copy_len = value.len().min(core::mem::size_of::<SettingsRecord>());
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        value.as_ptr(),
-                        rec.as_mut_ptr() as *mut u8,
-                        copy_len,
-                    );
-                }
-                let rec = unsafe { rec.assume_init() };
-                if rec.magic == CONFIG_MAGIC && rec.version == CONFIG_VERSION {
-                    Some(rec)
-                } else {
-                    None
-                }
-            }
+            Ok(Some(value)) => SettingsRecord::decode(value),
             _ => None,
         };
 
@@ -306,15 +377,9 @@ pub fn init_config(
         for i in 0..MAX_CHANNELS {
             let key = CHANNEL_KEY_BASE + i as u16;
             if let Ok(Some(value)) = map.fetch_item::<&[u8]>(&mut cbuf.0, &key).await {
-                if value.len() >= core::mem::size_of::<ChannelRecord>() {
-                    let rec = unsafe {
-                        core::ptr::read_unaligned(value.as_ptr() as *const ChannelRecord)
-                    };
-                    channels[i] = ChannelData {
-                        name: rec.name,
-                        secret: rec.secret,
-                    };
-                    found[i] = rec.present != 0;
+                if let Some((present, ch)) = decode_channel_record(value) {
+                    channels[i] = ch;
+                    found[i] = present;
                 }
             }
         }
@@ -457,13 +522,11 @@ fn assemble_settings() -> SettingsRecord {
     SettingsRecord {
         magic: CONFIG_MAGIC,
         version: CONFIG_VERSION,
-        _pad: 0,
         callsign,
         custom_priv_key,
         has_custom_key,
         is_repeater: if is_rep { 1 } else { 0 },
         client_repeat: if client_repeat { 1 } else { 0 },
-        _pad_before_offgrid: 0,
         offgrid_home_freq,
         radio_tx_power: tx,
         radio_sf: sf,
@@ -483,12 +546,10 @@ fn assemble_settings() -> SettingsRecord {
         telemetry_mode_loc: prefs.telemetry_mode_loc,
         telemetry_mode_env: prefs.telemetry_mode_env,
         multi_acks: prefs.multi_acks,
-        _pad_before_ble_pin: [0; 2],
         ble_pin: BLE_PIN.load(core::sync::atomic::Ordering::Relaxed),
         radio_freq_hz: freq,
         radio_bw_khz: bw,
         display_refresh_interval_secs: crate::state::display_refresh_interval_secs(),
-        _pad_after_refresh: 0,
     }
 }
 
@@ -498,13 +559,8 @@ where
     F: NorFlash + MultiwriteNorFlash,
     F::Error: defmt::Format,
 {
-    let settings = assemble_settings();
-    let settings_bytes = unsafe {
-        core::slice::from_raw_parts(
-            &settings as *const SettingsRecord as *const u8,
-            core::mem::size_of::<SettingsRecord>(),
-        )
-    };
+    let settings = assemble_settings().encode();
+    let settings_bytes: &[u8] = &settings;
 
     let mut buf = AlignedBuf::<SCRATCH_SIZE>::new();
     let mut map = open(flash, region);
@@ -534,18 +590,8 @@ where
             } else {
                 0
             };
-            let rec = ChannelRecord {
-                present,
-                name: ch.name,
-                secret: ch.secret,
-                _pad: [0; 3],
-            };
-            let bytes = unsafe {
-                core::slice::from_raw_parts(
-                    &rec as *const ChannelRecord as *const u8,
-                    core::mem::size_of::<ChannelRecord>(),
-                )
-            };
+            let rec = encode_channel_record(present, &ch);
+            let bytes: &[u8] = &rec;
             let key = CHANNEL_KEY_BASE + i as u16;
             if let Err(e) = map.store_item(&mut buf.0, &key, &bytes).await {
                 error!("Storage: config channel store failed: {:?}", e);
@@ -565,8 +611,72 @@ mod tests {
 
     #[test]
     fn records_fit_the_scratch_buffer() {
-        assert!(core::mem::size_of::<SettingsRecord>() <= SCRATCH_SIZE);
-        assert!(core::mem::size_of::<ChannelRecord>() <= SCRATCH_SIZE);
-        assert_eq!(core::mem::size_of::<ChannelRecord>(), 52);
+        assert!(SETTINGS_RECORD_SIZE <= SCRATCH_SIZE);
+        assert!(CHANNEL_RECORD_SIZE <= SCRATCH_SIZE);
+        assert_eq!(SETTINGS_RECORD_SIZE, 192);
+        assert_eq!(CHANNEL_RECORD_SIZE, 52);
+    }
+
+    #[test]
+    fn settings_record_roundtrip_and_legacy_v1_layout() {
+        let rec = SettingsRecord {
+            magic: CONFIG_MAGIC,
+            version: CONFIG_VERSION,
+            callsign: fixed_str::<32>("NavNode"),
+            custom_priv_key: [0x5A; 64],
+            has_custom_key: 1,
+            is_repeater: 0,
+            client_repeat: 1,
+            offgrid_home_freq: 910_525_000,
+            radio_tx_power: -5,
+            radio_sf: 7,
+            radio_cr: 5,
+            path_hash_mode: 2,
+            autoadd_config: 3,
+            autoadd_max_hops: 12,
+            manual_add_contacts: 1,
+            ui_disabled_flags: 2,
+            rx_duty_cycle: 1,
+            airtime_factor_tenths: 45,
+            flood_scope_name: [0x11; 31],
+            flood_scope_key: [0x22; 16],
+            advert_loc_policy: 1,
+            telemetry_mode_base: 2,
+            telemetry_mode_loc: 1,
+            telemetry_mode_env: 0,
+            multi_acks: 1,
+            ble_pin: 654_321,
+            radio_freq_hz: 910_525_000,
+            radio_bw_khz: 62_500,
+            display_refresh_interval_secs: 300,
+        };
+        let bytes = rec.encode();
+        assert_eq!(&bytes[0..4], &CONFIG_MAGIC.to_le_bytes());
+        assert_eq!(&bytes[108..112], &910_525_000u32.to_le_bytes());
+        assert_eq!(&bytes[176..180], &654_321u32.to_le_bytes());
+        assert_eq!(&bytes[188..190], &300u16.to_le_bytes());
+
+        let decoded = SettingsRecord::decode(&bytes).expect("decode current");
+        assert_eq!(decoded.offgrid_home_freq, 910_525_000);
+        assert_eq!(decoded.radio_tx_power, -5);
+        assert_eq!(decoded.ble_pin, 654_321);
+        assert_eq!(decoded.radio_bw_khz, 62_500);
+        assert_eq!(decoded.display_refresh_interval_secs, 300);
+
+        // Legacy 188-byte v1 records decode with display_refresh_interval_secs == 0.
+        let legacy = SettingsRecord::decode(&bytes[..LEGACY_SETTINGS_V1_SIZE]).expect("decode v1");
+        assert_eq!(legacy.ble_pin, 654_321);
+        assert_eq!(legacy.radio_bw_khz, 62_500);
+        assert_eq!(legacy.display_refresh_interval_secs, 0);
+
+        let ch = ChannelData {
+            name: fixed_str::<32>("#mesh"),
+            secret: [0xAB; 16],
+        };
+        let ch_bytes = encode_channel_record(1, &ch);
+        let (present, ch_dec) = decode_channel_record(&ch_bytes).expect("decode channel");
+        assert!(present);
+        assert_eq!(ch_dec.name, ch.name);
+        assert_eq!(ch_dec.secret, ch.secret);
     }
 }
