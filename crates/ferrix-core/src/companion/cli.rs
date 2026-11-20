@@ -126,20 +126,15 @@ pub(crate) fn normalize_cli_reply_in_place<const N: usize>(
     while out.len() > body_start && matches!(out.as_bytes().last(), Some(b'\r' | b'\n')) {
         out.pop();
     }
-    const PROMPT: &[u8] = b"  -> ";
+    const PROMPT: &str = "  -> ";
     if out
-        .as_bytes()
         .get(body_start..)
         .is_some_and(|rest| rest.starts_with(PROMPT))
     {
-        let new_len = out.len() - PROMPT.len();
-        // SAFETY: `body_start` and `body_start + PROMPT.len()` are ASCII
-        // boundaries within valid UTF-8, so shifting left preserves UTF-8.
-        unsafe {
-            let v = out.as_mut_vec();
-            v.copy_within(body_start + PROMPT.len().., body_start);
-            v.truncate(new_len);
-        }
+        let mut normalized = String::<N>::new();
+        let _ = normalized.push_str(&out[..body_start]);
+        let _ = normalized.push_str(&out[body_start + PROMPT.len()..]);
+        *out = normalized;
     }
 }
 

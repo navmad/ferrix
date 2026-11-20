@@ -91,27 +91,26 @@ async fn delayed_push_task() -> ! {
     }
 }
 
-/// Future wrapper whose `poll` is never inlined into its parent async state
-/// machine, keeping boot-phase stack frames disjoint from steady-state polling.
-struct NoInlineFuture<F>(F);
+/// Poll a pinned future through a `#[inline(never)]` boundary so boot-phase
+/// stack frames stay disjoint from steady-state polling.
+#[inline(never)]
+fn poll_noinline<F: core::future::Future>(
+    fut: core::pin::Pin<&mut F>,
+    cx: &mut core::task::Context<'_>,
+) -> core::task::Poll<F::Output> {
+    fut.poll(cx)
+}
 
-impl<F: core::future::Future> core::future::Future for NoInlineFuture<F> {
-    type Output = F::Output;
-
-    #[inline(never)]
-    fn poll(
-        self: core::pin::Pin<&mut Self>,
-        cx: &mut core::task::Context<'_>,
-    ) -> core::task::Poll<Self::Output> {
-        // SAFETY: structural pinning to the single inner field `0`.
-        let inner = unsafe { self.map_unchecked_mut(|this| &mut this.0) };
-        inner.poll(cx)
-    }
+macro_rules! await_noinline {
+    ($fut:expr) => {{
+        let mut fut = core::pin::pin!($fut);
+        core::future::poll_fn(|cx| poll_noinline(fut.as_mut(), cx)).await
+    }};
 }
 
 /// Run the companion role until the executor stops.
 pub async fn run<B: CompanionBoard>(mut board: B, spawner: Spawner) -> ! {
-    let (node_name, custom_key) = NoInlineFuture(board.init(spawner)).await;
+    let (node_name, custom_key) = await_noinline!(board.init(spawner));
 
     let local_id = if let Some(key) = custom_key {
         LocalIdentity::from_private(node_name.as_str(), &key).unwrap_or_else(|| {
@@ -145,10 +144,10 @@ pub async fn run<B: CompanionBoard>(mut board: B, spawner: Spawner) -> ! {
         board.companion_host(),
     );
 
-    NoInlineFuture(board.start_ui(&node)).await;
+    await_noinline!(board.start_ui(&node));
     board.start_radio(spawner);
 
     let mut app = board.take_app();
     let mut radio = board.take_radio();
-    NoInlineFuture(ferrix_runtime::app::run(&mut app, &mut mesh, &mut node, &mut radio)).await
+    await_noinline!(ferrix_runtime::app::run(&mut app, &mut mesh, &mut node, &mut radio))
 }
