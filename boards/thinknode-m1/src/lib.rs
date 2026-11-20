@@ -15,8 +15,6 @@ pub mod pins;
 pub mod radio;
 pub mod storage;
 
-use core::sync::atomic::{AtomicU16, Ordering};
-
 use defmt_rtt as _;
 
 use embassy_executor::Spawner;
@@ -31,6 +29,7 @@ use ferrix_core::companion::protocol::{
 };
 use ferrix_core::engine::EngineContext;
 use ferrix_nrf52::buzzer::PassiveBuzzer;
+use ferrix_nrf52::fatal::{FatalLed, Port};
 use ferrix_role_companion::CompanionBoard;
 use ferrix_runtime::radio::ChannelRadio;
 use heapless::String;
@@ -75,61 +74,23 @@ static EPD_PREV_FRAMEBUFFER: StaticCell<EpdFrameBuffer> = StaticCell::new();
 // Battery telemetry
 // ---------------------------------------------------------------------------
 
-/// Latest measured battery voltage. 0 means "not sampled / no battery".
-static BATTERY_MV: AtomicU16 = AtomicU16::new(0);
-
-pub use ferrix_core::battery::MIN_PLAUSIBLE_BATTERY_MV;
-
-pub fn set_battery_millivolts(mv: u16) {
-    if mv >= MIN_PLAUSIBLE_BATTERY_MV {
-        BATTERY_MV.store(mv, Ordering::Relaxed);
-    }
-}
-
-pub fn battery_millivolts() -> u16 {
-    BATTERY_MV.load(Ordering::Relaxed)
-}
-
-pub fn battery_percentage() -> u8 {
-    ferrix_core::battery::millivolts_to_percentage(battery_millivolts())
-}
+pub use ferrix_nrf52::battery::{
+    battery_millivolts, battery_percentage, set_battery_millivolts, MIN_PLAUSIBLE_BATTERY_MV,
+};
 
 /// ThinkNode M1 battery ADC: AIN2 (P0.04), 150K+150K divider (2:1), SAADC
 /// gain 1/6 with the internal 0.6 V reference.
 ///
 /// `7236 / 4096` matches the board's `vbat-mv-multiplier` (2:1 divider,
 /// 3.6 V full scale, +0.5% SAADC gain trim).
-pub fn adc_raw_to_battery_millivolts(raw: u16) -> u16 {
-    let mv = (raw as u32 * 7236) / 4096;
-    mv.min(u16::MAX as u32) as u16
-}
+pub const BATTERY_ADC_SCALE: u32 = 7236;
 
-const BATTERY_ADC_SAMPLES: usize = 8;
-
-/// Average [`BATTERY_ADC_SAMPLES`] SAADC conversions (within 100 ms) to
-/// suppress single-conversion ADC noise before smoothing.
+/// Averaged battery sample in millivolts; see `ferrix_nrf52::battery`.
 pub async fn sample_battery_adc_mv(adc: &mut saadc::Saadc<'static, 1>) -> Option<u16> {
     if !HAS_BATTERY_ADC {
         return None;
     }
-    let mut buf = [0i16; 1];
-    let mut sum: u32 = 0;
-    for _ in 0..BATTERY_ADC_SAMPLES {
-        match embassy_futures::select::select(
-            adc.sample(&mut buf),
-            Timer::after_millis(100),
-        )
-        .await
-        {
-            embassy_futures::select::Either::First(_) => {
-                sum += buf[0].max(0) as u32;
-            }
-            embassy_futures::select::Either::Second(_) => return None,
-        }
-    }
-    let avg_raw = (sum / BATTERY_ADC_SAMPLES as u32) as u16;
-    let mv = adc_raw_to_battery_millivolts(avg_raw);
-    (mv >= MIN_PLAUSIBLE_BATTERY_MV).then_some(mv)
+    ferrix_nrf52::battery::sample_adc_mv(adc, BATTERY_ADC_SCALE).await
 }
 
 // ---------------------------------------------------------------------------
@@ -144,55 +105,16 @@ pub async fn sample_battery_adc_mv(adc: &mut saadc::Saadc<'static, 1>) -> Option
 //   - SoftDevice:  10 quick blinks, repeated forever
 // ---------------------------------------------------------------------------
 
-const P0_BASE: u32 = 0x5000_0000;
-const P0_PIN_CNF13: *mut u32 = (P0_BASE + 0x504 + 4 * 13) as *mut u32;
-const P0_OUTSET: *mut u32 = (P0_BASE + 0x508) as *mut u32;
-const P0_OUTCLR: *mut u32 = (P0_BASE + 0x50C) as *mut u32;
-const P0_DIRSET: *mut u32 = (P0_BASE + 0x518) as *mut u32;
-const BLUE_LED: u32 = 1 << 13;
-
-/// ~35 ms at 64 MHz. Used instead of a timer so it still works when the
-/// scheduler, the SoftDevice or interrupts are wedged.
-#[inline(never)]
-fn fatal_delay() {
-    cortex_m::asm::delay(2_000_000);
-}
-
-fn blue_on() {
-    unsafe { P0_OUTSET.write_volatile(BLUE_LED) }
-}
-
-fn blue_off() {
-    unsafe { P0_OUTCLR.write_volatile(BLUE_LED) }
-}
-
-fn blue_init() {
-    unsafe {
-        // Dir=output, input buffer disconnected.
-        P0_PIN_CNF13.write_volatile(0x0000_0003);
-        P0_DIRSET.write_volatile(BLUE_LED);
-    }
-}
-
-fn fatal_blink_burst(count: u32) {
-    blue_init();
-    for _ in 0..count {
-        blue_on();
-        fatal_delay();
-        blue_off();
-        fatal_delay();
-    }
-    // Gap between bursts.
-    for _ in 0..4 {
-        fatal_delay();
-    }
-}
+/// The MCU-controlled blue LED (P0.13, active-high).
+const FATAL_LED: FatalLed = FatalLed {
+    port: Port::P0,
+    pin: 13,
+    active_high: true,
+};
 
 /// Repeat a burst forever. Used for fatal faults that cannot recover.
 pub(crate) fn fatal_blink_forever(count: u32) -> ! {
-    loop {
-        fatal_blink_burst(count);
-    }
+    FATAL_LED.blink_forever(count)
 }
 
 #[panic_handler]
@@ -435,7 +357,7 @@ impl CompanionBoard for ThinkNodeBoard {
             .spawn(ferrix_nrf52::ble::contact_task())
             .unwrap();
 
-        crate::storage::set_qspi(self.qspi.take());
+        ferrix_nrf52::storage::set_qspi(self.qspi.take());
         ferrix_nrf52::ble::init_ble_companion(
             spawner,
             public_key,
@@ -514,21 +436,5 @@ impl CompanionBoard for ThinkNodeBoard {
 
     fn take_radio(&mut self) -> Self::Radio {
         self.radio.take().expect("radio already taken")
-    }
-}
-
-#[cfg(test)]
-mod battery_tests {
-    use super::*;
-
-    #[test]
-    fn adc_raw_to_battery_millivolts() {
-        // Full-scale 3.6 V at the pin, 2:1 divider -> ~7.2 V battery.
-        assert_eq!(adc_raw_to_battery_millivolts(4095), 7234);
-        assert_eq!(adc_raw_to_battery_millivolts(0), 0);
-        // ~4.2 V battery -> ~2377 counts.
-        assert_eq!(adc_raw_to_battery_millivolts(2377), 4199);
-        // 3.7 V battery.
-        assert_eq!(adc_raw_to_battery_millivolts(2094), 3699);
     }
 }

@@ -4,6 +4,19 @@
 /// ADC noise, a failed sample, or a board without a battery.
 pub const MIN_PLAUSIBLE_BATTERY_MV: u16 = 2000;
 
+/// Number of SAADC counts at full scale (12-bit).
+pub const ADC_FULL_SCALE_COUNTS: u32 = 4096;
+
+/// Convert a 12-bit SAADC reading to battery millivolts.
+///
+/// `scale_num` is `divider_ratio * full_scale_mv` rounded for any gain trim:
+/// the result is `raw * scale_num / 4096`. With the internal 0.6 V reference
+/// and gain 1/6 the full scale is 3600 mV, so a 2:1 divider gives 7200.
+pub fn adc_raw_to_millivolts(raw: u16, scale_num: u32) -> u16 {
+    let mv = (raw as u32 * scale_num) / ADC_FULL_SCALE_COUNTS;
+    mv.min(u16::MAX as u32) as u16
+}
+
 /// Single-cell LiPo open-circuit voltage table in 10% steps from 100% down to
 /// 0% (generic 3.7 V LiPo discharge curve, 4200..3300 mV).
 const OCV_TABLE_MV: [u16; 11] = [
@@ -78,6 +91,22 @@ impl BatteryMvFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adc_raw_to_millivolts_thinknode_scale() {
+        // ThinkNode M1: 2:1 divider, 3.6 V full scale, +0.5% gain trim.
+        assert_eq!(adc_raw_to_millivolts(4095, 7236), 7234);
+        assert_eq!(adc_raw_to_millivolts(0, 7236), 0);
+        assert_eq!(adc_raw_to_millivolts(2377, 7236), 4199);
+        assert_eq!(adc_raw_to_millivolts(2094, 7236), 3699);
+    }
+
+    #[test]
+    fn adc_raw_to_millivolts_wio_scale() {
+        // Wio Tracker L1: 2:1 divider, 3.6 V full scale, no trim.
+        assert_eq!(adc_raw_to_millivolts(2389, 7200), 4199);
+        assert_eq!(adc_raw_to_millivolts(u16::MAX, 7200), u16::MAX);
+    }
 
     #[test]
     fn percentage_curve() {
