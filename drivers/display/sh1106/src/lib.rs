@@ -13,6 +13,10 @@
 
 #![cfg_attr(not(test), no_std)]
 
+use embedded_graphics_core::draw_target::DrawTarget;
+use embedded_graphics_core::geometry::{OriginDimensions, Size};
+use embedded_graphics_core::pixelcolor::BinaryColor;
+use embedded_graphics_core::Pixel;
 use embedded_hal_async::i2c::I2c;
 
 /// Panel width in pixels.
@@ -38,6 +42,71 @@ pub enum Error {
     I2c,
     /// The supplied frame is not [`FRAME_SIZE`] bytes.
     FrameSize,
+}
+
+/// In-memory 128x64 frame in the controller's page layout, usable as an
+/// `embedded-graphics` draw target. `BinaryColor::On` lights a pixel.
+pub struct Framebuffer {
+    buf: [u8; FRAME_SIZE],
+}
+
+impl Framebuffer {
+    pub const fn new() -> Self {
+        Self {
+            buf: [0; FRAME_SIZE],
+        }
+    }
+
+    /// Turn every pixel off.
+    pub fn clear(&mut self) {
+        self.buf.fill(0);
+    }
+
+    /// The frame bytes, ready for [`Sh1106::flush`].
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buf
+    }
+
+    /// Set one pixel; coordinates outside the panel are ignored.
+    pub fn set_pixel(&mut self, x: i32, y: i32, on: bool) {
+        if x < 0 || y < 0 || x >= WIDTH as i32 || y >= HEIGHT as i32 {
+            return;
+        }
+        let idx = (y as usize / 8) * WIDTH + x as usize;
+        let mask = 1u8 << (y as usize % 8);
+        if on {
+            self.buf[idx] |= mask;
+        } else {
+            self.buf[idx] &= !mask;
+        }
+    }
+}
+
+impl Default for Framebuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OriginDimensions for Framebuffer {
+    fn size(&self) -> Size {
+        Size::new(WIDTH as u32, HEIGHT as u32)
+    }
+}
+
+impl DrawTarget for Framebuffer {
+    type Color = BinaryColor;
+    type Error = core::convert::Infallible;
+
+    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = Pixel<Self::Color>>,
+    {
+        for Pixel(p, color) in pixels {
+            self.set_pixel(p.x, p.y, color == BinaryColor::On);
+        }
+        Ok(())
+    }
 }
 
 /// SH1106 on an I2C bus.
@@ -196,6 +265,46 @@ mod tests {
         assert_eq!(w[1].1[..2], [0x40, 0xAA]);
         // Last data write ends with the last frame byte.
         assert_eq!(*w.last().unwrap().1.last().unwrap(), 0x55);
+    }
+
+    #[test]
+    fn framebuffer_uses_page_layout() {
+        let mut fb = Framebuffer::new();
+        fb.set_pixel(0, 0, true); // page 0, bit 0
+        fb.set_pixel(5, 9, true); // page 1, bit 1
+        fb.set_pixel(127, 63, true); // page 7, bit 7
+        let b = fb.as_bytes();
+        assert_eq!(b[0], 0x01);
+        assert_eq!(b[WIDTH + 5], 0x02);
+        assert_eq!(b[FRAME_SIZE - 1], 0x80);
+        assert_eq!(b.iter().filter(|&&x| x != 0).count(), 3);
+        fb.set_pixel(5, 9, false);
+        assert_eq!(fb.as_bytes()[WIDTH + 5], 0);
+    }
+
+    #[test]
+    fn framebuffer_ignores_out_of_range_and_clears() {
+        let mut fb = Framebuffer::new();
+        fb.set_pixel(-1, 0, true);
+        fb.set_pixel(0, -1, true);
+        fb.set_pixel(128, 0, true);
+        fb.set_pixel(0, 64, true);
+        assert!(fb.as_bytes().iter().all(|&b| b == 0));
+        fb.set_pixel(10, 10, true);
+        fb.clear();
+        assert!(fb.as_bytes().iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn framebuffer_draw_target_lights_on_pixels() {
+        let mut fb = Framebuffer::new();
+        fb.draw_iter([
+            Pixel(embedded_graphics_core::geometry::Point::new(3, 2), BinaryColor::On),
+            Pixel(embedded_graphics_core::geometry::Point::new(4, 2), BinaryColor::Off),
+        ])
+        .unwrap();
+        assert_eq!(fb.as_bytes()[3], 0x04);
+        assert_eq!(fb.as_bytes()[4], 0x00);
     }
 
     #[test]

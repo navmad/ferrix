@@ -64,6 +64,7 @@ pub fn load() {
 }
 
 /// JEDEC IDs of the external flash fitted to the ThinkNode M1.
+#[cfg(not(feature = "internal-storage"))]
 static EXTERNAL_FLASH_IDS: [[u8; 3]; 1] = [ferrix_nrf52::qspi::MX25R1635F_ID];
 
 /// Spawn the storage task once the SoftDevice has been enabled.

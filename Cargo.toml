@@ -13,7 +13,9 @@ members = [
     "roles/companion",
     "roles/repeater",
     "firmware/thinknode-m1-companion",
+    "firmware/wio-tracker-l1-companion",
     "boards/thinknode-m1",
+    "boards/wio-tracker-l1",
 ]
 default-members = ["firmware/thinknode-m1-companion"]
 
