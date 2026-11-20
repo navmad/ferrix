@@ -985,14 +985,14 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
                             push_path_updated(&sender_pub);
                         }
                         storage::request_contacts();
-                        if is_flood && (path.extra_type & 0x0F) == 3 {
+                        if is_flood && path_updated {
                             let _ = mesh.queue_path_return_only(
                                 &sender_pub,
                                 path.path_len,
                                 &path.path,
                                 arrival_path_len,
                                 &arrival_path,
-                                200,
+                                500,
                             );
                         }
                         // A PATH return can carry an ACK or a RESPONSE as its

@@ -77,6 +77,10 @@ impl EngineContext for NoopContext {}
 
 pub const DEFAULT_MAX_HOPS: u8 = 64;
 
+/// Delay before transmitting a DM acknowledgment (direct, flooded, or PATH+ACK)
+/// so the sender has time to finish TX->RX turnaround. Matches MeshCore.
+pub const TXT_ACK_DELAY_MS: u64 = 200;
+
 struct PendingForward {
     hash: [u8; 8],
     queued_at_ms: u64,
@@ -198,6 +202,7 @@ pub struct MeshEngine<'a> {
     pub advert_type: u8,
     pub max_hops: u8,
     pub path_hash_mode: u8,
+    rng_state: u32,
     context: &'a dyn EngineContext,
 }
 
@@ -207,6 +212,8 @@ impl<'a> MeshEngine<'a> {
         advert_type: u8,
         context: &'a dyn EngineContext,
     ) -> Self {
+        let pk = identity.pub_key();
+        let seed = u32::from_le_bytes([pk[0], pk[1], pk[2], pk[3]]) ^ 0x9E37_79B9;
         Self {
             identity,
             seen_filter: SeenPacketFilter::new(),
@@ -216,8 +223,19 @@ impl<'a> MeshEngine<'a> {
             advert_type,
             max_hops: DEFAULT_MAX_HOPS,
             path_hash_mode: context.path_hash_mode(),
+            rng_state: if seed == 0 { 0x6D2B_79F5 } else { seed },
             context,
         }
+    }
+
+    /// Non-cryptographic salt for ACK deduplication tails and PATH nonces.
+    fn next_salt(&mut self) -> u32 {
+        let mut x = self.rng_state;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.rng_state = x;
+        x ^ (now_ms() as u32)
     }
 
     /// Update the local identity callsign
@@ -389,109 +407,136 @@ impl<'a> MeshEngine<'a> {
             return InboundAction::DropHopLimitExceeded;
         }
 
-        let is_dupe = self.seen_filter.check_and_mark(&pkt);
-        let already_in_path = pkt.contains_hop(self.identity.pub_key());
-        if is_dupe {
-            self.note_duplicate_of_pending(&pkt);
-        }
-
-        // 2. Direct forwarding: if the first hop is us, pop it and requeue.
-        if pkt.route_type() == meshcore_wire::packet::ROUTE_TYPE_DIRECT {
-            if pkt.path_hash_count() > 0 {
-                let size = pkt.path_hash_size();
-                if pkt.path[..size] == self.identity.pub_key()[..size] {
-                    if self.allow_forward {
-                        match pkt.payload_type() {
-                            PAYLOAD_TYPE_ACK => {
-                                if is_dupe {
-                                    return InboundAction::DropDuplicate;
-                                }
-                                let mut fwd = pkt.clone();
-                                if fwd.pop_front_hop() {
-                                    if let Ok(ack) =
-                                        AckPacket::decode(&fwd.payload[..fwd.payload_len])
-                                    {
-                                        let _ = self.emit_direct_ack_burst(
-                                            &fwd.payload[..fwd.payload_len],
-                                            fwd.path_len,
-                                            &fwd.path,
-                                            0,
-                                        );
-                                        return InboundAction::ReceivedAck {
-                                            ack,
-                                            is_flood: false,
-                                            arrival_path_len: 0,
-                                            arrival_path: heapless::Vec::new(),
-                                        };
-                                    }
-                                    self.queue_forward(fwd);
-                                    return InboundAction::Forwarded;
-                                }
+        // 2. Direct packets with remaining hops: forward when we are the next
+        //    hop (if forwarding is enabled), and deliver overheard ('early')
+        //    ACKs locally. This runs *before* seen_filter.check_and_mark so
+        //    overhearing a multi-hop direct packet (TXT_MSG, PATH, ACK, ...)
+        //    whose next hop is a repeater does not poison our seen-filter and
+        //    cause us to drop the final-hop delivery as a duplicate.
+        if !pkt.is_flood() && pkt.path_hash_count() > 0 {
+            let size = pkt.path_hash_size();
+            if pkt.path[..size] == self.identity.pub_key()[..size] && self.allow_forward {
+                match pkt.payload_type() {
+                    PAYLOAD_TYPE_ACK => {
+                        if self.seen_filter.check_and_mark(&pkt) {
+                            return InboundAction::DropDuplicate;
+                        }
+                        let mut fwd = pkt.clone();
+                        if fwd.pop_front_hop() {
+                            if let Ok(ack) = AckPacket::decode(&fwd.payload[..fwd.payload_len]) {
+                                let _ = self.emit_direct_ack_burst(
+                                    &fwd.payload[..fwd.payload_len],
+                                    fwd.path_len,
+                                    &fwd.path,
+                                    0,
+                                );
+                                return InboundAction::ReceivedAck {
+                                    ack,
+                                    is_flood: false,
+                                    arrival_path_len: 0,
+                                    arrival_path: heapless::Vec::new(),
+                                };
                             }
-                            PAYLOAD_TYPE_MULTIPART => {
-                                if let Ok(mp) =
-                                    MultipartPacket::decode(&pkt.payload[..pkt.payload_len])
-                                {
-                                    if mp.inner_type == PAYLOAD_TYPE_ACK && mp.body.len() >= 4 {
-                                        if let Ok(ack) = AckPacket::decode(&mp.body) {
-                                            let mut inner_pkt = Packet::new(
-                                                ROUTE_TYPE_DIRECT,
-                                                PAYLOAD_TYPE_ACK,
-                                            );
-                                            if inner_pkt.set_payload(&mp.body).is_ok() {
-                                                let inner_dupe =
-                                                    self.seen_filter.check_and_mark(&inner_pkt);
-                                                if is_dupe || inner_dupe {
-                                                    return InboundAction::DropDuplicate;
-                                                }
-                                                let mut fwd = pkt.clone();
-                                                if fwd.pop_front_hop() {
-                                                    let delay_ms = (mp.remaining as u64 + 1)
-                                                        * MULTI_ACK_SPACING_MS;
-                                                    let _ = self.emit_direct_ack_burst(
-                                                        &mp.body,
-                                                        fwd.path_len,
-                                                        &fwd.path,
-                                                        delay_ms,
-                                                    );
-                                                    return InboundAction::ReceivedAck {
-                                                        ack,
-                                                        is_flood: false,
-                                                        arrival_path_len: 0,
-                                                        arrival_path: heapless::Vec::new(),
-                                                    };
-                                                }
-                                            }
+                            self.queue_forward(fwd);
+                            return InboundAction::Forwarded;
+                        }
+                    }
+                    PAYLOAD_TYPE_MULTIPART => {
+                        if let Ok(mp) = MultipartPacket::decode(&pkt.payload[..pkt.payload_len]) {
+                            if mp.inner_type == PAYLOAD_TYPE_ACK && mp.body.len() >= 4 {
+                                if let Ok(ack) = AckPacket::decode(&mp.body) {
+                                    let mut inner_pkt =
+                                        Packet::new(ROUTE_TYPE_DIRECT, PAYLOAD_TYPE_ACK);
+                                    if inner_pkt.set_payload(&mp.body).is_ok() {
+                                        let outer_dupe = self.seen_filter.check_and_mark(&pkt);
+                                        let inner_dupe =
+                                            self.seen_filter.check_and_mark(&inner_pkt);
+                                        if outer_dupe || inner_dupe {
+                                            return InboundAction::DropDuplicate;
                                         }
-                                        return InboundAction::Unhandled;
+                                        let mut fwd = pkt.clone();
+                                        if fwd.pop_front_hop() {
+                                            let delay_ms =
+                                                (mp.remaining as u64 + 1) * MULTI_ACK_SPACING_MS;
+                                            let _ = self.emit_direct_ack_burst(
+                                                &mp.body,
+                                                fwd.path_len,
+                                                &fwd.path,
+                                                delay_ms,
+                                            );
+                                            return InboundAction::ReceivedAck {
+                                                ack,
+                                                is_flood: false,
+                                                arrival_path_len: 0,
+                                                arrival_path: heapless::Vec::new(),
+                                            };
+                                        }
                                     }
                                 }
-                                if is_dupe {
-                                    return InboundAction::DropDuplicate;
-                                }
-                                let mut fwd = pkt.clone();
-                                if fwd.pop_front_hop() {
-                                    self.queue_forward(fwd);
-                                    return InboundAction::Forwarded;
-                                }
+                                return InboundAction::Unhandled;
                             }
-                            _ => {
-                                if is_dupe {
-                                    return InboundAction::DropDuplicate;
-                                }
-                                let mut fwd = pkt.clone();
-                                if fwd.pop_front_hop() {
-                                    self.queue_forward(fwd);
-                                    return InboundAction::Forwarded;
-                                }
+                        }
+                        if self.seen_filter.check_and_mark(&pkt) {
+                            return InboundAction::DropDuplicate;
+                        }
+                        let mut fwd = pkt.clone();
+                        if fwd.pop_front_hop() {
+                            self.queue_forward(fwd);
+                            return InboundAction::Forwarded;
+                        }
+                    }
+                    _ => {
+                        if self.seen_filter.check_and_mark(&pkt) {
+                            return InboundAction::DropDuplicate;
+                        }
+                        let mut fwd = pkt.clone();
+                        if fwd.pop_front_hop() {
+                            self.queue_forward(fwd);
+                            return InboundAction::Forwarded;
+                        }
+                    }
+                }
+            }
+
+            // Overheard ('early received') direct ACK or MULTIPART ACK: deliver
+            // locally without retransmitting or marking seen_filter.
+            match pkt.payload_type() {
+                PAYLOAD_TYPE_ACK => {
+                    if let Ok(ack) = AckPacket::decode(&pkt.payload[..pkt.payload_len]) {
+                        return InboundAction::ReceivedAck {
+                            ack,
+                            is_flood: false,
+                            arrival_path_len: 0,
+                            arrival_path: heapless::Vec::new(),
+                        };
+                    }
+                }
+                PAYLOAD_TYPE_MULTIPART => {
+                    if let Ok(mp) = MultipartPacket::decode(&pkt.payload[..pkt.payload_len]) {
+                        if mp.inner_type == PAYLOAD_TYPE_ACK && mp.body.len() >= 4 {
+                            if let Ok(ack) = AckPacket::decode(&mp.body) {
+                                return InboundAction::ReceivedAck {
+                                    ack,
+                                    is_flood: false,
+                                    arrival_path_len: 0,
+                                    arrival_path: heapless::Vec::new(),
+                                };
                             }
                         }
                     }
                 }
-                // A direct packet with a non-empty path is not for us unless we
-                // are its next hop.
-                return InboundAction::Unhandled;
+                _ => {}
             }
+
+            // A direct packet with remaining hops is not for us unless we are
+            // its next hop.
+            return InboundAction::Unhandled;
+        }
+
+        let is_dupe = self.seen_filter.check_and_mark(&pkt);
+        let already_in_path = pkt.contains_hop(self.identity.pub_key());
+        if is_dupe {
+            self.note_duplicate_of_pending(&pkt);
         }
 
         // 3. Dispatch based on payload type, tracking whether this node
@@ -609,7 +654,7 @@ impl<'a> MeshEngine<'a> {
                                 AckPacket::with_extended(
                                     msg.ack_crc,
                                     msg.extended_attempt,
-                                    0,
+                                    self.next_salt() as u8,
                                 )
                             };
                             if pkt.is_flood() {
@@ -991,10 +1036,10 @@ impl<'a> MeshEngine<'a> {
         if route == ROUTE_TYPE_DIRECT {
             let mut ack_bytes = [0u8; 6];
             let alen = ack.encode(&mut ack_bytes)?;
-            self.emit_direct_ack_burst(&ack_bytes[..alen], path_len, out_path, 0)
+            self.emit_direct_ack_burst(&ack_bytes[..alen], path_len, out_path, TXT_ACK_DELAY_MS)
         } else {
             let pkt = ack.to_packet(ROUTE_TYPE_FLOOD)?;
-            Ok(self.finish_outbound(pkt, route, path_len, out_path))
+            Ok(self.finish_outbound_at(pkt, route, path_len, out_path, TXT_ACK_DELAY_MS))
         }
     }
 
@@ -1047,12 +1092,12 @@ impl<'a> MeshEngine<'a> {
         arrival: &Packet,
         ack: &[u8],
     ) -> Result<Packet, ()> {
-        const TXT_ACK_DELAY_MS: u64 = 200;
         let plen = arrival.path_byte_len();
         let mut path = [0u8; 64];
         path[..plen].copy_from_slice(&arrival.path[..plen]);
         let pp = PathPacket::new(dest, src, arrival.path_len, &path[..plen], 3, ack)?;
-        let pkt = pp.to_packet(ROUTE_TYPE_FLOOD, secret, &[0u8; 4])?;
+        let rand4 = self.next_salt().to_le_bytes();
+        let pkt = pp.to_packet(ROUTE_TYPE_FLOOD, secret, &rand4)?;
         Ok(self.finish_outbound_at(pkt, ROUTE_TYPE_FLOOD, 0, &[0u8; 64], TXT_ACK_DELAY_MS))
     }
 
@@ -1070,8 +1115,7 @@ impl<'a> MeshEngine<'a> {
         let secret = self.identity.shared_secret(dest_pub).ok_or(())?;
         let dest = dest_pub[0];
         let src = self.identity.pub_key()[0];
-        let mut rand4 = [0u8; 4];
-        rand4.copy_from_slice(&now_ms().to_le_bytes()[..4]);
+        let rand4 = self.next_salt().to_le_bytes();
         let pp = PathPacket::new(dest, src, returned_path_len, returned_path, 0xFF, &[])?;
         let (route, path_len) = route_for(send_path_len);
         let pkt = pp.to_packet(route, &secret, &rand4)?;
@@ -1413,7 +1457,7 @@ mod tests {
         assert_eq!(q0.packet.payload_type(), PAYLOAD_TYPE_ACK);
         assert_eq!(q0.packet.path_len, 1);
         assert_eq!(q0.packet.path[0], 0xAA);
-        assert_eq!(q0.due_at_ms, q0.queued_at_ms);
+        assert_eq!(q0.due_at_ms, q0.queued_at_ms + TXT_ACK_DELAY_MS);
     }
 
     #[test]
@@ -1442,7 +1486,7 @@ mod tests {
         assert_eq!(q0.packet.payload_type(), PAYLOAD_TYPE_MULTIPART);
         assert_eq!(q0.packet.path_len, 0x41);
         assert_eq!(&q0.packet.path[..2], &[0xAA, 0xBB]);
-        assert_eq!(q0.due_at_ms, q0.queued_at_ms);
+        assert_eq!(q0.due_at_ms, q0.queued_at_ms + TXT_ACK_DELAY_MS);
         let mp = MultipartPacket::decode(&q0.packet.payload[..q0.packet.payload_len]).unwrap();
         assert_eq!(mp.remaining, 1);
         assert_eq!(mp.inner_type, PAYLOAD_TYPE_ACK);
@@ -1453,7 +1497,10 @@ mod tests {
         assert_eq!(q1.packet.payload_type(), PAYLOAD_TYPE_ACK);
         assert_eq!(q1.packet.path_len, 0x41);
         assert_eq!(&q1.packet.path[..2], &[0xAA, 0xBB]);
-        assert_eq!(q1.due_at_ms, q1.queued_at_ms + MULTI_ACK_SPACING_MS);
+        assert_eq!(
+            q1.due_at_ms,
+            q1.queued_at_ms + TXT_ACK_DELAY_MS + MULTI_ACK_SPACING_MS
+        );
         assert_eq!(&q1.packet.payload[..q1.packet.payload_len], &mp.body[..]);
     }
 
@@ -1717,5 +1764,181 @@ mod tests {
             InboundAction::DropDuplicate
         ));
         assert!(engine.tx_queue.is_empty());
+    }
+
+    #[test]
+    fn overheard_multihop_direct_dm_does_not_poison_seen_filter() {
+        let id = identity();
+        // First we overhear the sender's direct DM while it still has hop [0xAA]
+        // ahead of us.
+        let mut overheard = make_direct_txt_to(&id, 0x33, "via repeater");
+        overheard.set_path_hash_size_and_count(1, 1);
+        overheard.path[0] = 0xAA;
+
+        let mut engine = MeshEngine::new(id, ADV_TYPE_REPEATER, &TestContext);
+        engine.allow_forward = false;
+
+        assert!(matches!(
+            engine.handle_inbound_packet(overheard.clone(), 4),
+            InboundAction::Unhandled
+        ));
+        assert!(engine.tx_queue.is_empty());
+
+        // Then repeater 0xAA strips itself and delivers the final hop (0 hops).
+        let mut final_hop = overheard;
+        assert!(final_hop.pop_front_hop());
+        assert_eq!(final_hop.path_hash_count(), 0);
+        assert!(matches!(
+            engine.handle_inbound_packet(final_hop.clone(), 4),
+            InboundAction::ReceivedDirectText { .. }
+        ));
+        assert_eq!(engine.tx_queue.len(), 1);
+        let ack_tx = engine.tx_queue.pop().unwrap();
+        assert_eq!(ack_tx.packet.route_type(), ROUTE_TYPE_FLOOD);
+        assert_eq!(ack_tx.packet.payload_type(), PAYLOAD_TYPE_ACK);
+        assert_eq!(ack_tx.due_at_ms, ack_tx.queued_at_ms + TXT_ACK_DELAY_MS);
+
+        // A genuine duplicate of the final hop IS dropped.
+        assert!(matches!(
+            engine.handle_inbound_packet(final_hop, 4),
+            InboundAction::DropDuplicate
+        ));
+    }
+
+    #[test]
+    fn overheard_multihop_direct_path_does_not_poison_seen_filter() {
+        let id = identity();
+        let src = 0x33u8;
+        let peer = [src; 32];
+        let secret = id.shared_secret(&peer).unwrap();
+
+        let pp = PathPacket::new(id.pub_key()[0], src, 1, &[0xAA], 0xFF, &[]).unwrap();
+        let mut overheard = pp.to_packet(ROUTE_TYPE_DIRECT, &secret, &[1, 2, 3, 4]).unwrap();
+        overheard.set_path_hash_size_and_count(1, 1);
+        overheard.path[0] = 0xAA;
+
+        let mut engine = MeshEngine::new(id, ADV_TYPE_REPEATER, &TestContext);
+        assert!(matches!(
+            engine.handle_inbound_packet(overheard.clone(), 4),
+            InboundAction::Unhandled
+        ));
+
+        let mut final_hop = overheard;
+        assert!(final_hop.pop_front_hop());
+        assert!(matches!(
+            engine.handle_inbound_packet(final_hop, 4),
+            InboundAction::ReceivedPath { .. }
+        ));
+    }
+
+    #[test]
+    fn early_direct_ack_and_multipart_ack_delivered_without_forwarding_or_poisoning() {
+        let id = identity();
+        let self_hash = id.pub_key()[0];
+        let mut engine = MeshEngine::new(id, ADV_TYPE_REPEATER, &TestContext);
+        engine.allow_forward = true;
+
+        // Overheard direct ACK whose first hop is NOT us (second hop IS us).
+        let ack = AckPacket::with_extended(0x1122_3344, 0, 0x5A);
+        let mut pkt = ack.to_packet(ROUTE_TYPE_DIRECT).unwrap();
+        pkt.set_path_hash_size_and_count(1, 2);
+        pkt.path[0] = self_hash ^ 0xFF;
+        pkt.path[1] = self_hash;
+
+        match engine.handle_inbound_packet(pkt.clone(), 4) {
+            InboundAction::ReceivedAck { ack: got, is_flood, .. } => {
+                assert_eq!(got.crc, 0x1122_3344);
+                assert!(!is_flood);
+            }
+            _ => panic!("expected ReceivedAck for overheard direct ACK"),
+        }
+        assert!(engine.tx_queue.is_empty());
+
+        // When the first hop forwards the packet to us, seen_filter was not
+        // poisoned so we still forward it properly.
+        assert!(pkt.pop_front_hop());
+        assert_eq!(pkt.path[0], self_hash);
+        match engine.handle_inbound_packet(pkt, 4) {
+            InboundAction::ReceivedAck { ack: got, .. } => {
+                assert_eq!(got.crc, 0x1122_3344);
+            }
+            _ => panic!("expected forwarding ReceivedAck on our hop"),
+        }
+        assert_eq!(engine.tx_queue.len(), 1);
+        let _ = engine.tx_queue.pop();
+
+        // Overheard direct MULTIPART ACK with remaining hops when forwarding is off.
+        engine.allow_forward = false;
+        let ack2 = AckPacket::with_extended(0x5566_7788, 1, 0x7E);
+        let mut ack_bytes = [0u8; 6];
+        let alen = ack2.encode(&mut ack_bytes).unwrap();
+        let mp = MultipartPacket::new(1, PAYLOAD_TYPE_ACK, &ack_bytes[..alen]).unwrap();
+        let mut mp_pkt = mp.to_packet(ROUTE_TYPE_DIRECT).unwrap();
+        mp_pkt.set_path_hash_size_and_count(1, 2);
+        mp_pkt.path[0] = 0xAA;
+        mp_pkt.path[1] = 0xBB;
+
+        match engine.handle_inbound_packet(mp_pkt, 4) {
+            InboundAction::ReceivedAck { ack: got, is_flood, .. } => {
+                assert_eq!(got.crc, 0x5566_7788);
+                assert!(!is_flood);
+            }
+            _ => panic!("expected ReceivedAck for overheard direct MULTIPART ACK"),
+        }
+        assert!(engine.tx_queue.is_empty());
+    }
+
+    #[test]
+    fn extended_ack_tail_and_path_nonce_vary_across_transmissions() {
+        let id = identity();
+        let pkt1 = make_direct_txt_to(&id, 0x33, "hi 1");
+        let pkt2 = make_direct_txt_to(&id, 0x33, "hi 2");
+        let peer = [0x33u8; 32];
+        let secret = id.shared_secret(&peer).unwrap();
+
+        let mut engine = MeshEngine::new(id, ADV_TYPE_REPEATER, &TestContext);
+
+        // Consecutive DM ACKs get distinct 6th-byte salts.
+        assert!(matches!(
+            engine.handle_inbound_packet(pkt1, 5),
+            InboundAction::ReceivedDirectText { .. }
+        ));
+        let q_ack1 = engine.tx_queue.pop().unwrap();
+        let ack1 = AckPacket::decode(&q_ack1.packet.payload[..q_ack1.packet.payload_len]).unwrap();
+        assert_eq!(ack1.tail_len, 2);
+
+        assert!(matches!(
+            engine.handle_inbound_packet(pkt2, 5),
+            InboundAction::ReceivedDirectText { .. }
+        ));
+        let q_ack2 = engine.tx_queue.pop().unwrap();
+        let ack2 = AckPacket::decode(&q_ack2.packet.payload[..q_ack2.packet.payload_len]).unwrap();
+        assert_eq!(ack2.tail_len, 2);
+        assert_ne!(ack1.tail[1], ack2.tail[1]);
+
+        // Consecutive standalone PATH returns get distinct 4-byte nonces.
+        let path_pkt1 = engine
+            .queue_path_return_only(&peer, 0, &[0u8; 64], 1, &[0xCC], 500)
+            .unwrap();
+        let path_pkt2 = engine
+            .queue_path_return_only(&peer, 0, &[0u8; 64], 1, &[0xCC], 500)
+            .unwrap();
+        let dec1 = PathPacket::decode(
+            &path_pkt1.payload[..path_pkt1.payload_len],
+            &secret,
+        )
+        .unwrap();
+        let dec2 = PathPacket::decode(
+            &path_pkt2.payload[..path_pkt2.payload_len],
+            &secret,
+        )
+        .unwrap();
+        assert_eq!(dec1.extra_type, 0xFF);
+        assert_eq!(dec2.extra_type, 0xFF);
+        assert_ne!(&dec1.extra[..4], &dec2.extra[..4]);
+        assert_ne!(
+            path_pkt1.calculate_packet_hash(),
+            path_pkt2.calculate_packet_hash()
+        );
     }
 }
