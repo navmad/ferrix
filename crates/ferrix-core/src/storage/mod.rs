@@ -121,9 +121,8 @@ pub fn external_drops() -> u32 {
 
 /// Synchronous reader over a memory-mapped flash region.
 ///
-/// Advert blobs are looked up from protocol handlers that cannot await, so the
-/// board exposes its mapped flash through this trait.
-pub trait MappedFlash: Sync {
+/// Used at boot to mount journals before the async storage task starts.
+pub trait MappedFlash {
     fn read(&self, offset: u32, out: &mut [u8]);
 }
 

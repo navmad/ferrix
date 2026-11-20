@@ -354,7 +354,7 @@ pub fn notify_save_complete(seq: u32) {
 
 /// Initialize configuration from the journal, or defaults if it is empty.
 pub fn init_config(
-    reader: &'static dyn MappedFlash,
+    reader: &dyn MappedFlash,
     region: Range<u32>,
     default_name: &str,
 ) -> (String<32>, Option<[u8; 64]>) {

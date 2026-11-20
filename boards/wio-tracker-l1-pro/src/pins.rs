@@ -121,6 +121,7 @@ pub struct Pins {
     pub usbd: peripherals::USBD,
     pub qspi: ferrix_nrf52::qspi::QspiPins,
     pub wdt: peripherals::WDT,
+    pub nvmc: peripherals::NVMC,
     /// Passive buzzer on P1.00, driven as a GPIO square wave.
     pub buzzer: Output<'static>,
 }
@@ -198,6 +199,7 @@ pub fn init(p: embassy_nrf::Peripherals) -> Pins {
         usbd: p.USBD,
         qspi,
         wdt: p.WDT,
+        nvmc: p.NVMC,
         buzzer,
     }
 }

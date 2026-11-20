@@ -61,13 +61,13 @@ impl NorFlashError for MappedFlashError {
 ///
 /// Used to mount `sequential-storage` maps during boot, before the storage
 /// task (and therefore the writable flash driver) exists.
-pub struct MappedAsyncFlash {
-    reader: &'static dyn MappedFlash,
+pub struct MappedAsyncFlash<'a> {
+    reader: &'a dyn MappedFlash,
     end: u32,
 }
 
-impl MappedAsyncFlash {
-    pub fn new(reader: &'static dyn MappedFlash, region: Range<u32>) -> Self {
+impl<'a> MappedAsyncFlash<'a> {
+    pub fn new(reader: &'a dyn MappedFlash, region: Range<u32>) -> Self {
         Self {
             reader,
             end: region.end,
@@ -75,11 +75,11 @@ impl MappedAsyncFlash {
     }
 }
 
-impl ErrorType for MappedAsyncFlash {
+impl ErrorType for MappedAsyncFlash<'_> {
     type Error = MappedFlashError;
 }
 
-impl ReadNorFlash for MappedAsyncFlash {
+impl ReadNorFlash for MappedAsyncFlash<'_> {
     const READ_SIZE: usize = 1;
 
     async fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
@@ -96,7 +96,7 @@ impl ReadNorFlash for MappedAsyncFlash {
     }
 }
 
-impl NorFlash for MappedAsyncFlash {
+impl NorFlash for MappedAsyncFlash<'_> {
     const WRITE_SIZE: usize = 4;
     const ERASE_SIZE: usize = 4096;
 
@@ -109,7 +109,7 @@ impl NorFlash for MappedAsyncFlash {
     }
 }
 
-impl MultiwriteNorFlash for MappedAsyncFlash {}
+impl MultiwriteNorFlash for MappedAsyncFlash<'_> {}
 
 /// Drive a future whose I/O completes synchronously.
 ///

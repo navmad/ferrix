@@ -183,7 +183,7 @@ fn same_address(a: &Bond, flags: u8, addr: [u8; 6]) -> bool {
 }
 
 /// Load the bond map into RAM. Called once at boot before BLE starts.
-pub fn init(reader: &'static dyn MappedFlash, region: Range<u32>) {
+pub fn init(reader: &dyn MappedFlash, region: Range<u32>) {
     let mut flash = MappedAsyncFlash::new(reader, region.clone());
     let mut buf = AlignedBuf::<SCRATCH_SIZE>::new();
 

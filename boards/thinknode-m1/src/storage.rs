@@ -14,6 +14,7 @@ pub use ferrix_core::storage::{
     set_custom_priv_key, set_path_hash_mode, util, MappedFlash, MessageCommand, StorageRegions,
 };
 
+pub use ferrix_nrf52::flash::{capture_softdevice_vectors, softdevice_vectors};
 use heapless::String;
 
 /// Default profile: config/bonds internal, contacts/adverts and messages on
@@ -47,18 +48,18 @@ pub use EXTERNAL_REGIONS as REGIONS;
 pub use INTERNAL_REGIONS as REGIONS;
 
 /// Initialize configuration from the journal, or defaults.
-pub fn init_config() -> (String<32>, Option<[u8; 64]>) {
+pub fn init_config(reader: &dyn MappedFlash) -> (String<32>, Option<[u8; 64]>) {
     ferrix_core::storage::config::init_config(
-        &ferrix_nrf52::flash::MAPPED,
+        reader,
         REGIONS.config.clone(),
         crate::NAME,
     )
 }
 
 /// Load the BLE bond map into RAM. Called once at boot, before BLE starts.
-pub fn load() {
+pub fn load(reader: &dyn MappedFlash) {
     ferrix_core::storage::bonds::init(
-        &ferrix_nrf52::flash::MAPPED,
+        reader,
         REGIONS.bonds.clone(),
     );
 }

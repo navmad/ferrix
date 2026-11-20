@@ -779,6 +779,7 @@ dependencies = [
  "embassy-usb",
  "embedded-hal 1.0.0",
  "embedded-io-async",
+ "embedded-storage",
  "ferrix-core",
  "ferrix-l76k",
  "ferrix-runtime",

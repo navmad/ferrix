@@ -246,6 +246,7 @@ impl CompanionBoard for ThinkNodeBoard {
             usbd,
             qspi,
             wdt,
+            nvmc,
             buzzer: buzzer_pin,
         } = pins;
 
@@ -281,23 +282,30 @@ impl CompanionBoard for ThinkNodeBoard {
             set_battery_millivolts(mv);
         }
 
-        let (node_name, custom_key) = crate::storage::init_config();
-        // A node without an imported key gets a random identity on first
-        // boot, persisted immediately. Factory reset therefore rotates it.
-        let custom_key = match custom_key {
-            Some(key) => Some(key),
-            None => {
-                let identity = meshcore_wire::LocalIdentity::from_seed(
-                    node_name.as_str(),
-                    &ferrix_nrf52::seed::random_seed(),
-                );
-                let key = identity.private_key_bytes();
-                crate::storage::set_custom_priv_key(key);
-                crate::storage::request_save_config();
-                Some(key)
-            }
+        let (node_name, custom_key) = {
+            // Safe NVMC reader lives only during boot, before SoftDevice takes
+            // ownership of internal flash.
+            let flash_reader = ferrix_nrf52::flash::NvmcReader::new(nvmc);
+            crate::storage::capture_softdevice_vectors(&flash_reader);
+            let (node_name, custom_key) = crate::storage::init_config(&flash_reader);
+            // A node without an imported key gets a random identity on first
+            // boot, persisted immediately. Factory reset therefore rotates it.
+            let custom_key = match custom_key {
+                Some(key) => Some(key),
+                None => {
+                    let identity = meshcore_wire::LocalIdentity::from_seed(
+                        node_name.as_str(),
+                        &ferrix_nrf52::seed::random_seed(),
+                    );
+                    let key = identity.private_key_bytes();
+                    crate::storage::set_custom_priv_key(key);
+                    crate::storage::request_save_config();
+                    Some(key)
+                }
+            };
+            crate::storage::load(&flash_reader);
+            (node_name, custom_key)
         };
-        crate::storage::load();
 
         if let Some(disp) = display_pins {
             self.build_display(spim1, disp);
