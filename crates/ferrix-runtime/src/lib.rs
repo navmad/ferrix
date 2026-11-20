@@ -2,6 +2,7 @@
 //! transports, input and display. Boards call [`storage::storage_loop`] with
 //! their flash device.
 #![cfg_attr(not(test), no_std)]
+#![forbid(unsafe_code)]
 
 pub mod app;
 pub mod radio;

@@ -10,6 +10,7 @@
 //! companion protocol assumptions.
 
 #![no_std]
+#![forbid(unsafe_code)]
 
 /// Placeholder for the repeater role.
 ///

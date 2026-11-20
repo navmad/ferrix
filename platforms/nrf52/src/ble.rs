@@ -28,48 +28,61 @@ use ferrix_core::companion::cli::CliHost;
 use ferrix_core::storage::bonds::{self, Bond};
 use ferrix_core::companion::session::{CompanionLink, CompanionSession};
 
-#[nrf_softdevice::gatt_service(uuid = "180a")]
-pub struct DeviceInformationService {
-    #[characteristic(uuid = "2a24", read)]
-    pub model_number: Vec<u8, 32>,
-    #[characteristic(uuid = "2a26", read)]
-    pub firmware_revision: Vec<u8, 32>,
-    #[characteristic(uuid = "2a29", read)]
-    pub manufacturer_name: Vec<u8, 32>,
+#[allow(unsafe_code)]
+mod gatt {
+    // `nrf_softdevice::gatt_service` expands `unsafe` SoftDevice FFI calls for
+    // characteristic accessors; keep the allow scoped strictly to these macro
+    // definitions.
+    use heapless::Vec;
+
+    #[nrf_softdevice::gatt_service(uuid = "180a")]
+    pub struct DeviceInformationService {
+        #[characteristic(uuid = "2a24", read)]
+        pub model_number: Vec<u8, 32>,
+        #[characteristic(uuid = "2a26", read)]
+        pub firmware_revision: Vec<u8, 32>,
+        #[characteristic(uuid = "2a29", read)]
+        pub manufacturer_name: Vec<u8, 32>,
+    }
+
+    #[nrf_softdevice::gatt_service(uuid = "6e400001-b5a3-f393-e0a9-e50e24dcca9e")]
+    pub struct NordicUartService {
+        #[characteristic(uuid = "6e400002-b5a3-f393-e0a9-e50e24dcca9e", write, write_without_response, security = "mitm")]
+        pub rx: Vec<u8, 256>,
+
+        #[characteristic(uuid = "6e400003-b5a3-f393-e0a9-e50e24dcca9e", notify, security = "mitm")]
+        pub tx: Vec<u8, 256>,
+    }
+
+    /// Legacy Nordic/Adafruit buttonless DFU service (`00001530-...`).
+    ///
+    /// Registered after `dis` and `nus` so bonded phones' cached NUS attribute
+    /// handles never shift. Writing `0x01` to `control_point` reboots into the
+    /// bootloader's BLE OTA mode (`GPREGRET = 0xA8`).
+    #[nrf_softdevice::gatt_service(uuid = "00001530-1212-efde-1523-785feabcd123")]
+    pub struct LegacyDfuService {
+        #[characteristic(uuid = "00001531-1212-efde-1523-785feabcd123", write, notify, security = "mitm")]
+        pub control_point: Vec<u8, 20>,
+
+        #[characteristic(uuid = "00001532-1212-efde-1523-785feabcd123", write_without_response, security = "mitm")]
+        pub packet: Vec<u8, 20>,
+
+        #[characteristic(uuid = "00001534-1212-efde-1523-785feabcd123", read, security = "mitm")]
+        pub revision: Vec<u8, 2>,
+    }
+
+    #[nrf_softdevice::gatt_server]
+    pub struct MeshCoreGattServer {
+        pub dis: DeviceInformationService,
+        pub nus: NordicUartService,
+        pub dfu: LegacyDfuService,
+    }
 }
 
-#[nrf_softdevice::gatt_service(uuid = "6e400001-b5a3-f393-e0a9-e50e24dcca9e")]
-pub struct NordicUartService {
-    #[characteristic(uuid = "6e400002-b5a3-f393-e0a9-e50e24dcca9e", write, write_without_response, security = "mitm")]
-    pub rx: Vec<u8, 256>,
-
-    #[characteristic(uuid = "6e400003-b5a3-f393-e0a9-e50e24dcca9e", notify, security = "mitm")]
-    pub tx: Vec<u8, 256>,
-}
-
-/// Legacy Nordic/Adafruit buttonless DFU service (`00001530-...`).
-///
-/// Registered after `dis` and `nus` so bonded phones' cached NUS attribute
-/// handles never shift. Writing `0x01` to `control_point` reboots into the
-/// bootloader's BLE OTA mode (`GPREGRET = 0xA8`).
-#[nrf_softdevice::gatt_service(uuid = "00001530-1212-efde-1523-785feabcd123")]
-pub struct LegacyDfuService {
-    #[characteristic(uuid = "00001531-1212-efde-1523-785feabcd123", write, notify, security = "mitm")]
-    pub control_point: Vec<u8, 20>,
-
-    #[characteristic(uuid = "00001532-1212-efde-1523-785feabcd123", write_without_response, security = "mitm")]
-    pub packet: Vec<u8, 20>,
-
-    #[characteristic(uuid = "00001534-1212-efde-1523-785feabcd123", read, security = "mitm")]
-    pub revision: Vec<u8, 2>,
-}
-
-#[nrf_softdevice::gatt_server]
-pub struct MeshCoreGattServer {
-    pub dis: DeviceInformationService,
-    pub nus: NordicUartService,
-    pub dfu: LegacyDfuService,
-}
+pub use gatt::{
+    DeviceInformationService, LegacyDfuService, LegacyDfuServiceEvent, MeshCoreGattServer,
+    MeshCoreGattServerEvent, NordicUartService, NordicUartServiceEvent,
+};
 
 /// Responses are queued here and drained by `push_fut`, never notified from
 /// inside the GATT callback. Sized for a full contact sync burst

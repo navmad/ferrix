@@ -12,6 +12,7 @@
 //! every page write starts at column 2.
 
 #![cfg_attr(not(test), no_std)]
+#![forbid(unsafe_code)]
 
 use embedded_graphics_core::draw_target::DrawTarget;
 use embedded_graphics_core::geometry::{OriginDimensions, Size};
@@ -229,14 +230,8 @@ mod tests {
     }
 
     fn block_on<F: core::future::Future>(f: F) -> F::Output {
-        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-        fn noop(_: *const ()) {}
-        fn clone(_: *const ()) -> RawWaker {
-            RawWaker::new(core::ptr::null(), &VTABLE)
-        }
-        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
-        let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
-        let mut cx = Context::from_waker(&waker);
+        use core::task::{Context, Poll, Waker};
+        let mut cx = Context::from_waker(Waker::noop());
         let mut f = core::pin::pin!(f);
         loop {
             if let Poll::Ready(v) = f.as_mut().poll(&mut cx) {

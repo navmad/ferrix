@@ -6,6 +6,7 @@
 //! [`CompanionBoard`].
 
 #![no_std]
+#![forbid(unsafe_code)]
 #![allow(async_fn_in_trait)]
 
 use embassy_executor::Spawner;

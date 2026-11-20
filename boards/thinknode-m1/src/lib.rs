@@ -6,6 +6,7 @@
 //! `firmware/thinknode-m1-companion` only chooses the role.
 
 #![no_std]
+#![deny(unsafe_code)]
 
 pub mod app;
 pub mod display;
@@ -111,6 +112,7 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
     ferrix_nrf52::fault::blink_pin_forever(BLUE_FAULT_LED, 3)
 }
 
+#[allow(unsafe_code)]
 #[cortex_m_rt::exception]
 unsafe fn HardFault(_frame: &cortex_m_rt::ExceptionFrame) -> ! {
     ferrix_nrf52::fault::blink_pin_forever(BLUE_FAULT_LED, 6)

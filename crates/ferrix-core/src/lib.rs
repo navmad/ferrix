@@ -3,6 +3,8 @@
 //!
 //! This crate must not depend on a platform, board or executor.
 #![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), forbid(unsafe_code))]
+#![cfg_attr(test, deny(unsafe_code))]
 
 pub mod airtime;
 pub mod battery;
@@ -17,6 +19,7 @@ pub mod types;
 pub mod version;
 
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod defmt_test_stubs {
     #[no_mangle]
     extern "C" fn _defmt_acquire() {}

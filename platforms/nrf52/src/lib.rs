@@ -5,6 +5,7 @@
 //! parts that every nRF52 board would otherwise duplicate.
 
 #![cfg_attr(not(test), no_std)]
+#![deny(unsafe_code)]
 
 pub mod battery;
 pub mod ble;

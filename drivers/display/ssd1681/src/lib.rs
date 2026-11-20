@@ -8,6 +8,7 @@
 //! matching the SSD1681 RAM format.
 
 #![no_std]
+#![forbid(unsafe_code)]
 
 use defmt::{info, warn};
 use embassy_time::Duration;

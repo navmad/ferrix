@@ -4,6 +4,8 @@
 //! runs on the host. The board crate (`ferrix-wio-tracker-l1-pro`) owns the
 //! hardware glue and re-exports these modules.
 #![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), forbid(unsafe_code))]
+#![cfg_attr(test, deny(unsafe_code))]
 
 #[cfg(test)]
 extern crate std;
@@ -17,6 +19,7 @@ pub mod sound;
 pub mod ui;
 
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod defmt_test_stubs {
     #[no_mangle]
     extern "C" fn _defmt_acquire() {}
