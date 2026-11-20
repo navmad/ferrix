@@ -1,4 +1,4 @@
-//! Display subsystem for the Wio Tracker L1.
+//! Display subsystem for the Wio Tracker L1 Pro.
 //!
 //! The SH1106 controller and the 128x64 [`Framebuffer`] live in
 //! `ferrix-sh1106`; this module owns the `WioDisplay` wrapper used by the
@@ -16,10 +16,10 @@ use ferrix_sh1106::{Error, Framebuffer, Sh1106};
 /// Bound on one frame flush so a stuck I2C bus cannot stall the app loop.
 const FLUSH_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Concrete driver type for the Wio Tracker L1's panel.
+/// Concrete driver type for the Wio Tracker L1 Pro's panel.
 pub type WioOled = Sh1106<Twim<'static, TWISPI1>>;
 
-/// Wio Tracker L1 display wrapper.
+/// Wio Tracker L1 Pro display wrapper.
 pub struct WioDisplay {
     oled: WioOled,
     fb: &'static mut Framebuffer,

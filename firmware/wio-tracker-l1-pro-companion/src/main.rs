@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-//! Ferrix companion firmware for the Seeed Wio Tracker L1.
+//! Ferrix companion firmware for the Seeed Wio Tracker L1 Pro.
 //!
 //! The board crate owns the hardware; the role crate owns the companion
 //! startup and application loop. This image only selects the pair.

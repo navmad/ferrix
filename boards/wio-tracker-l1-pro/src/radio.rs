@@ -1,4 +1,4 @@
-//! MeshCore radio task for the Wio Tracker L1.
+//! MeshCore radio task for the Wio Tracker L1 Pro.
 //!
 //! The chip mechanics live in `ferrix-sx1262` and the channel bridge lives in
 //! `ferrix-runtime`. This module only owns the board wiring: SPI device and
@@ -27,7 +27,7 @@ pub async fn sx1262_task(
     dio1: Input<'static>,
     rxen: Output<'static>,
 ) {
-    info!("Starting SX1262 radio task on Wio Tracker L1...");
+    info!("Starting SX1262 radio task on Wio Tracker L1 Pro...");
 
     let spi_device = ExclusiveDevice::new(spim, cs, Delay).unwrap();
 

@@ -1,4 +1,4 @@
-//! Seeed Wio Tracker L1 board support package.
+//! Seeed Wio Tracker L1 Pro board support package.
 //!
 //! This crate wires the nRF52840 peripherals, the SX1262 radio, the SH1106
 //! OLED, the L76K GNSS and the companion transports together. It implements
@@ -42,13 +42,13 @@ use crate::pins::{BoardIrqs, LoraPins, OledPins, Pins};
 use crate::radio::sx1262_task;
 
 /// Hardware model reported to MeshCore companion apps.
-pub const NAME: &str = "Wio Tracker L1";
+pub const NAME: &str = "Wio Tracker L1 Pro";
 /// Whether this board has a battery ADC.
 pub const HAS_BATTERY_ADC: bool = true;
 /// Protocol capability bits. The OLED has no dedicated capability bit.
 pub const CAPABILITIES: u32 = CAP_CLIENT | CAP_GPS | CAP_BLE;
 
-/// Board startup configuration for the Wio Tracker L1: DC/DC on REG1 and a
+/// Board startup configuration for the Wio Tracker L1 Pro: DC/DC on REG1 and a
 /// 32.768 kHz LFXO crystal (MeshCore builds with `USE_LFXO`).
 pub const STARTUP_CONFIG: ferrix_nrf52::startup::StartupConfig =
     ferrix_nrf52::startup::StartupConfig {
@@ -70,7 +70,7 @@ pub use ferrix_nrf52::battery::{
     battery_millivolts, battery_percentage, set_battery_millivolts, MIN_PLAUSIBLE_BATTERY_MV,
 };
 
-/// Wio Tracker L1 battery ADC: AIN7 (P0.31), 2:1 divider enabled by P0.04,
+/// Wio Tracker L1 Pro battery ADC: AIN7 (P0.31), 2:1 divider enabled by P0.04,
 /// SAADC gain 1/6 with the internal 0.6 V reference (3.6 V full scale).
 ///
 /// `7200 / 4096` = 2 (divider) x 3600 mV, matching MeshCore's
@@ -188,7 +188,7 @@ impl CompanionBoard for WioTrackerBoard {
     }
 
     fn usb_product(&self) -> &'static str {
-        "Wio Tracker L1 Companion"
+        "Wio Tracker L1 Pro Companion"
     }
 
     fn ble_model(&self) -> &'static str {

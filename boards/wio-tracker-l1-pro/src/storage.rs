@@ -63,7 +63,7 @@ pub fn load() {
     );
 }
 
-/// JEDEC IDs of the external flash fitted to the Wio Tracker L1.
+/// JEDEC IDs of the external flash fitted to the Wio Tracker L1 Pro.
 #[cfg(not(feature = "internal-storage"))]
 static EXTERNAL_FLASH_IDS: [[u8; 3]; 1] = [ferrix_nrf52::qspi::P25Q16H_ID];
 

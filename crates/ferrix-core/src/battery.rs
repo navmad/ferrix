@@ -103,7 +103,7 @@ mod tests {
 
     #[test]
     fn adc_raw_to_millivolts_wio_scale() {
-        // Wio Tracker L1: 2:1 divider, 3.6 V full scale, no trim.
+        // Wio Tracker L1 Pro: 2:1 divider, 3.6 V full scale, no trim.
         assert_eq!(adc_raw_to_millivolts(2389, 7200), 4199);
         assert_eq!(adc_raw_to_millivolts(u16::MAX, 7200), u16::MAX);
     }

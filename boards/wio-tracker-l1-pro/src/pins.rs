@@ -1,4 +1,4 @@
-//! Wio Tracker L1 pinout and peripheral construction.
+//! Wio Tracker L1 Pro pinout and peripheral construction.
 //!
 //! This module only describes the nRF52840 pins and the six-switch input
 //! cluster. It does not own board identity, power telemetry or startup logic.
@@ -118,7 +118,7 @@ pub async fn wio_input_task(mut inputs: WioInputs) -> ! {
     }
 }
 
-/// Combined board peripherals for the Wio Tracker L1.
+/// Combined board peripherals for the Wio Tracker L1 Pro.
 pub struct Pins {
     pub lora: LoraPins,
     pub oled: OledPins,
@@ -139,7 +139,7 @@ pub struct Pins {
     pub buzzer: Output<'static>,
 }
 
-/// Initialize the Wio Tracker L1 pinout and peripherals.
+/// Initialize the Wio Tracker L1 Pro pinout and peripherals.
 pub fn init(p: embassy_nrf::Peripherals) -> Pins {
     // --- LoRa SX1262 ---
     let lora = LoraPins {

@@ -1,4 +1,4 @@
-//! Wio Tracker L1 implementation of the runtime application board interface.
+//! Wio Tracker L1 Pro implementation of the runtime application board interface.
 
 use defmt::info;
 use embassy_nrf::gpio::Output;

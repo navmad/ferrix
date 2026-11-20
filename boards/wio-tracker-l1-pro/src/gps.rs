@@ -1,4 +1,4 @@
-//! Quectel L76K GNSS subsystem for the Wio Tracker L1.
+//! Quectel L76K GNSS subsystem for the Wio Tracker L1 Pro.
 //!
 //! The module is on UARTE0 at 9600 baud with a standby/enable line and no
 //! reset line. The task body lives in `ferrix_nrf52::gnss`.

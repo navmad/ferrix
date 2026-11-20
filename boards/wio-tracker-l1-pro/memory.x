@@ -1,4 +1,4 @@
-/* Linker script for Seeed Wio Tracker L1 (Nordic nRF52840) */
+/* Linker script for Seeed Wio Tracker L1 Pro (Nordic nRF52840) */
 /* Matches the factory Adafruit-derived UF2 bootloader with S140 v7.3.0 (app at 0x27000). */
 
 MEMORY

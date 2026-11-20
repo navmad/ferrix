@@ -37,7 +37,7 @@ pub const FLASH_SIZE: u32 = 2 * 1024 * 1024;
 
 /// Macronix MX25R1635F (ThinkNode M1).
 pub const MX25R1635F_ID: [u8; 3] = [0xC2, 0x28, 0x15];
-/// Puya P25Q16H (Wio Tracker L1).
+/// Puya P25Q16H (Wio Tracker L1 Pro).
 pub const P25Q16H_ID: [u8; 3] = [0x85, 0x60, 0x15];
 
 /// Create the QSPI driver in single-line mode at 16 MHz.

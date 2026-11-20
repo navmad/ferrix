@@ -116,7 +116,7 @@ pub struct Sh1106<I2C> {
 }
 
 impl<I2C: I2c> Sh1106<I2C> {
-    /// Default 7-bit address used by the Wio Tracker L1.
+    /// Default 7-bit address used by the Wio Tracker L1 Pro.
     pub const ADDRESS_WIO_TRACKER_L1: u8 = 0x3D;
 
     /// Wrap an I2C bus. Call [`Sh1106::init`] before drawing.

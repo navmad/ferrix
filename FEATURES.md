@@ -7,8 +7,8 @@ joystick), both with battery monitoring, USB CDC and BLE. It targets **MeshCore 
 apps and the v1.18 over-the-air protocol.
 
 - Firmware version: `1.18.2-ferrix` (from root `Cargo.toml` `[workspace.package]`; overridable at build time via `FERRIX_VERSION` and `FERRIX_BUILD_DATE` / `SOURCE_DATE_EPOCH`)
-- USB product/vendor: `ThinkNode M1 Companion` / `MeshCore` (Wio Tracker L1 Pro: `Wio Tracker L1 Companion` / `MeshCore`)
-- Board identity: `ThinkNode M1` or `Wio Tracker L1`
+- USB product/vendor: `ThinkNode M1 Companion` / `MeshCore` (Wio Tracker L1 Pro: `Wio Tracker L1 Pro Companion` / `MeshCore`)
+- Board identity: `ThinkNode M1` or `Wio Tracker L1 Pro`
 - Configuration layout: version 1
 
 ---
