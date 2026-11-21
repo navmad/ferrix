@@ -91,9 +91,27 @@ async fn delayed_push_task() -> ! {
     }
 }
 
+/// Future wrapper whose `poll` is never inlined into its parent async state
+/// machine, keeping boot-phase stack frames disjoint from steady-state polling.
+struct NoInlineFuture<F>(F);
+
+impl<F: core::future::Future> core::future::Future for NoInlineFuture<F> {
+    type Output = F::Output;
+
+    #[inline(never)]
+    fn poll(
+        self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<Self::Output> {
+        // SAFETY: structural pinning to the single inner field `0`.
+        let inner = unsafe { self.map_unchecked_mut(|this| &mut this.0) };
+        inner.poll(cx)
+    }
+}
+
 /// Run the companion role until the executor stops.
 pub async fn run<B: CompanionBoard>(mut board: B, spawner: Spawner) -> ! {
-    let (node_name, custom_key) = board.init(spawner).await;
+    let (node_name, custom_key) = NoInlineFuture(board.init(spawner)).await;
 
     let local_id = if let Some(key) = custom_key {
         LocalIdentity::from_private(node_name.as_str(), &key).unwrap_or_else(|| {
@@ -127,10 +145,10 @@ pub async fn run<B: CompanionBoard>(mut board: B, spawner: Spawner) -> ! {
         board.companion_host(),
     );
 
-    board.start_ui(&node).await;
+    NoInlineFuture(board.start_ui(&node)).await;
     board.start_radio(spawner);
 
     let mut app = board.take_app();
     let mut radio = board.take_radio();
-    ferrix_runtime::app::run(&mut app, &mut mesh, &mut node, &mut radio).await
+    NoInlineFuture(ferrix_runtime::app::run(&mut app, &mut mesh, &mut node, &mut radio)).await
 }

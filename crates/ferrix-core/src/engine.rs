@@ -325,6 +325,7 @@ impl<'a> MeshEngine<'a> {
     }
 
     /// Process a packet received over the LoRa radio interface
+    #[inline(never)]
     pub fn handle_inbound_packet(&mut self, pkt: Packet, snr: i8) -> InboundAction {
         // Zero-hop control data is delivered to the app (discovery, etc.).
         if pkt.route_type() == ROUTE_TYPE_DIRECT
@@ -544,147 +545,9 @@ impl<'a> MeshEngine<'a> {
         let mut consumed = false;
         let action = (|| {
             match pkt.payload_type() {
-            PAYLOAD_TYPE_ADVERT => {
-                if is_dupe {
-                    return InboundAction::DropDuplicate;
-                }
-                if let Ok(adv) = AdvertPacket::decode(&pkt.payload[..pkt.payload_len]) {
-                    // Verify Ed25519 signature before trusting this advert
-                    if !adv.verify_signature() {
-                        return InboundAction::DropDuplicate; // or a new DropInvalidSignature variant
-                    }
-                    // Only repeat adverts from other nodes
-                    if self.allow_forward && pkt.is_flood() && !already_in_path && adv.pub_key != *self.identity.pub_key() {
-                        let mut repeat_pkt = pkt.clone();
-                        repeat_pkt.append_hop_bytes(self.identity.pub_key());
-                        self.queue_forward(repeat_pkt);
-                    }
-                    InboundAction::ReceivedAdvert(adv)
-                } else {
-                    InboundAction::Unhandled
-                }
-            }
-            PAYLOAD_TYPE_GRP_TXT => {
-                // Look up matching channel by channel_hash (pkt.payload[0])
-                if pkt.payload_len > 0 {
-                    let ch_hash = pkt.payload[0];
-                    // Copy the channel array out of the lock before doing any crypto.
-                    // Running SHA-256 hashing and AES-128 decryption inside a lock callback
-                    // can block the BLE SoftDevice (S140) and freeze the device.
-                    //
-                    // The array ([ChannelData; 40] = 1920 bytes) is copied by value here,
-                    // which is cheap compared to the crypto operations below.
-                    let channels = self.context.channels();
-                    let mut matched = None;
-                    for (idx, ch) in channels.iter().enumerate() {
-                        if meshcore_wire::crypto::channel_hash(&ch.secret) == ch_hash {
-                            if let Ok(grp) = GrpTextPacket::decode_encrypted(&pkt.payload[..pkt.payload_len], &ch.secret) {
-                                matched = Some((idx as u8, grp));
-                                break;
-                            }
-                        }
-                    }
-
-                    if let Some((ch_idx, grp)) = matched {
-                        if grp.sender.as_str() == self.identity.callsign() {
-                            // Our own message echoed by repeater! NEVER re-broadcast our own message
-                            if pkt.path_hash_count() >= 1 {
-                                InboundAction::ReceivedRepeaterEcho {
-                                    pkt_hash: pkt.calculate_packet_hash(),
-                                    hops: pkt.path_hash_count() as u8,
-                                }
-                            } else {
-                                InboundAction::DropDuplicate
-                            }
-                        } else {
-                            if is_dupe {
-                                InboundAction::DropDuplicate
-                            } else {
-                                InboundAction::ReceivedGroupText {
-                                    channel_idx: ch_idx,
-                                    path_len: pkt.path_len,
-                                    packet: grp,
-                                }
-                            }
-                        }
-                    } else if is_dupe {
-                        InboundAction::DropDuplicate
-                    } else {
-                        InboundAction::Unhandled
-                    }
-                } else {
-                    InboundAction::Unhandled
-                }
-            }
-            PAYLOAD_TYPE_TXT_MSG => {
-                let payload = &pkt.payload[..pkt.payload_len];
-                // Addressed payload: dest(1) ‖ src(1) ‖ sealed.
-                if payload.len() <= 4 {
-                    return InboundAction::Unhandled;
-                }
-                let dest = payload[0];
-                let src = payload[1];
-
-                if is_dupe {
-                    return InboundAction::DropDuplicate;
-                }
-                if dest != self.identity.pub_key()[0] {
-                    return InboundAction::Unhandled;
-                }
-
-                // Collect candidate peer keys outside the lock, then try each
-                // shared secret until one authenticates the MAC.
-                let peers = self.peers_by_hash(src);
-                for peer in peers.iter() {
-                    let secret = match self.identity.shared_secret(peer) {
-                        Some(secret) => secret,
-                        None => continue,
-                    };
-                    if let Ok(msg) = TxtMsgPacket::decode(payload, &secret, peer) {
-                        let plain = msg.txt_type
-                            == meshcore_wire::packets::txtmsg::TXT_TYPE_PLAIN;
-                        let signed = msg.txt_type
-                            == meshcore_wire::packets::txtmsg::TXT_TYPE_SIGNED_PLAIN;
-                        if plain || signed {
-                            // Signed messages carry a 4-byte ACK; companions
-                            // use the extended 6-byte form.
-                            let ack = if signed {
-                                AckPacket::new(msg.ack_crc)
-                            } else {
-                                AckPacket::with_extended(
-                                    msg.ack_crc,
-                                    msg.extended_attempt,
-                                    self.next_salt() as u8,
-                                )
-                            };
-                            if pkt.is_flood() {
-                                // Flooded DM: return the arrival path with the ACK
-                                // as extra, so the sender learns a direct route.
-                                let mut ack_bytes = [0u8; 8];
-                                if let Ok(alen) = ack.encode(&mut ack_bytes) {
-                                    let _ = self.queue_path_return(
-                                        peer[0],
-                                        self.identity.pub_key()[0],
-                                        &secret,
-                                        &pkt,
-                                        &ack_bytes[..alen],
-                                    );
-                                }
-                            } else {
-                                let (out_path_len, out_path) = self.peer_path(peer);
-                                let _ = self.queue_ack_packet(ack, out_path_len, &out_path);
-                            }
-                        }
-                        consumed = true;
-                        return InboundAction::ReceivedDirectText {
-                            msg,
-                            sender_pub: *peer,
-                            path_len: if pkt.is_flood() { pkt.path_len } else { 0xFF },
-                        };
-                    }
-                }
-                InboundAction::Unhandled
-            }
+            PAYLOAD_TYPE_ADVERT => self.handle_inbound_advert(&pkt, is_dupe, already_in_path),
+            PAYLOAD_TYPE_GRP_TXT => self.handle_inbound_grp_txt(&pkt, is_dupe),
+            PAYLOAD_TYPE_TXT_MSG => self.handle_inbound_txt_msg(&pkt, is_dupe, &mut consumed),
             PAYLOAD_TYPE_ACK => {
                 if is_dupe {
                     return InboundAction::DropDuplicate;
@@ -703,36 +566,7 @@ impl<'a> MeshEngine<'a> {
                     InboundAction::Unhandled
                 }
             }
-            PAYLOAD_TYPE_PATH => {
-                let payload = &pkt.payload[..pkt.payload_len];
-                if payload.len() <= 4 {
-                    return InboundAction::Unhandled;
-                }
-                if is_dupe {
-                    return InboundAction::DropDuplicate;
-                }
-                if payload[0] != self.identity.pub_key()[0] {
-                    return InboundAction::Unhandled;
-                }
-                for peer in self.peers_by_hash(payload[1]).iter() {
-                    if let Some(secret) = self.identity.shared_secret(peer) {
-                        if let Ok(path) = PathPacket::decode(payload, &secret) {
-                            let mut arrival_path = heapless::Vec::<u8, 64>::new();
-                            let an = pkt.path_byte_len();
-                            let _ = arrival_path.extend_from_slice(&pkt.path[..an]);
-                            consumed = true;
-                            return InboundAction::ReceivedPath {
-                                packet: path,
-                                sender_pub: *peer,
-                                is_flood: pkt.is_flood(),
-                                arrival_path_len: pkt.path_len,
-                                arrival_path,
-                            };
-                        }
-                    }
-                }
-                InboundAction::Unhandled
-            }
+            PAYLOAD_TYPE_PATH => self.handle_inbound_path(&pkt, is_dupe, &mut consumed),
             PAYLOAD_TYPE_MULTIPART => {
                 if is_dupe {
                     return InboundAction::DropDuplicate;
@@ -765,83 +599,9 @@ impl<'a> MeshEngine<'a> {
                 }
                 InboundAction::Unhandled
             }
-            PAYLOAD_TYPE_GRP_DATA => {
-                if is_dupe {
-                    return InboundAction::DropDuplicate;
-                }
-                if pkt.payload_len < 4 {
-                    return InboundAction::Unhandled;
-                }
-                let ch_hash = pkt.payload[0];
-                let channels = self.context.channels();
-                for (idx, ch) in channels.iter().enumerate() {
-                    if meshcore_wire::crypto::channel_hash(&ch.secret) == ch_hash {
-                        if let Ok(grp) =
-                            GrpDataPacket::decode_encrypted(&pkt.payload[..pkt.payload_len], &ch.secret)
-                        {
-                            return InboundAction::ReceivedGroupData {
-                                channel_idx: idx as u8,
-                                path_len: if pkt.is_flood() { pkt.path_len } else { 0xFF },
-                                packet: grp,
-                            };
-                        }
-                    }
-                }
-                InboundAction::Unhandled
-            }
+            PAYLOAD_TYPE_GRP_DATA => self.handle_inbound_grp_data(&pkt, is_dupe),
             PAYLOAD_TYPE_REQ | PAYLOAD_TYPE_RESPONSE => {
-                let payload = &pkt.payload[..pkt.payload_len];
-                if payload.len() <= 4 {
-                    return InboundAction::Unhandled;
-                }
-                let dest = payload[0];
-                let src = payload[1];
-
-                if is_dupe {
-                    return InboundAction::DropDuplicate;
-                }
-                if dest != self.identity.pub_key()[0] {
-                    return InboundAction::Unhandled;
-                }
-
-                for peer in self.peers_by_hash(src).iter() {
-                    if let Some(secret) = self.identity.shared_secret(peer) {
-                        if let Ok(ap) = AddressedPacket::decode(payload, &secret) {
-                            consumed = true;
-                            return if pkt.payload_type() == PAYLOAD_TYPE_RESPONSE {
-                                InboundAction::ReceivedResponse {
-                                    plain: ap.plain,
-                                    sender_pub: *peer,
-                                }
-                            } else {
-                                let mut arrival_path = heapless::Vec::<u8, 64>::new();
-                                let an = pkt.path_byte_len();
-                                let _ = arrival_path.extend_from_slice(&pkt.path[..an]);
-                                InboundAction::ReceivedRequest {
-                                    plain: ap.plain,
-                                    sender_pub: *peer,
-                                    is_flood: pkt.is_flood(),
-                                    arrival_path_len: pkt.path_len,
-                                    arrival_path,
-                                }
-                            };
-                        }
-                    }
-                }
-                if pkt.payload_type() == PAYLOAD_TYPE_RESPONSE {
-                    if let Some(peer) = self.context.anon_peer_key(src) {
-                        if let Some(secret) = self.identity.shared_secret(&peer) {
-                            if let Ok(ap) = AddressedPacket::decode(payload, &secret) {
-                                consumed = true;
-                                return InboundAction::ReceivedResponse {
-                                    plain: ap.plain,
-                                    sender_pub: peer,
-                                };
-                            }
-                        }
-                    }
-                }
-                InboundAction::Unhandled
+                self.handle_inbound_req_or_resp(&pkt, is_dupe, &mut consumed)
             }
             PAYLOAD_TYPE_ANON_REQ => {
                 let payload = &pkt.payload[..pkt.payload_len];
@@ -894,6 +654,288 @@ impl<'a> MeshEngine<'a> {
         }
 
         action
+    }
+
+    #[inline(never)]
+    fn handle_inbound_advert(
+        &mut self,
+        pkt: &Packet,
+        is_dupe: bool,
+        already_in_path: bool,
+    ) -> InboundAction {
+        if is_dupe {
+            return InboundAction::DropDuplicate;
+        }
+        if let Ok(adv) = AdvertPacket::decode(&pkt.payload[..pkt.payload_len]) {
+            // Verify Ed25519 signature before trusting this advert
+            if !adv.verify_signature() {
+                return InboundAction::DropDuplicate;
+            }
+            // Only repeat adverts from other nodes
+            if self.allow_forward
+                && pkt.is_flood()
+                && !already_in_path
+                && adv.pub_key != *self.identity.pub_key()
+            {
+                let mut repeat_pkt = pkt.clone();
+                repeat_pkt.append_hop_bytes(self.identity.pub_key());
+                self.queue_forward(repeat_pkt);
+            }
+            InboundAction::ReceivedAdvert(adv)
+        } else {
+            InboundAction::Unhandled
+        }
+    }
+
+    #[inline(never)]
+    fn handle_inbound_grp_txt(&self, pkt: &Packet, is_dupe: bool) -> InboundAction {
+        // Look up matching channel by channel_hash (pkt.payload[0])
+        if pkt.payload_len == 0 {
+            return InboundAction::Unhandled;
+        }
+        let ch_hash = pkt.payload[0];
+        // Copy the channel array out of the lock before doing any crypto.
+        // Running SHA-256 hashing and AES-128 decryption inside a lock callback
+        // can block the BLE SoftDevice (S140) and freeze the device.
+        //
+        // Kept in its own #[inline(never)] frame so the 1920-byte channel copy
+        // does not stay on the stack during advert Ed25519 verification.
+        let channels = self.context.channels();
+        let mut matched = None;
+        for (idx, ch) in channels.iter().enumerate() {
+            if meshcore_wire::crypto::channel_hash(&ch.secret) == ch_hash {
+                if let Ok(grp) =
+                    GrpTextPacket::decode_encrypted(&pkt.payload[..pkt.payload_len], &ch.secret)
+                {
+                    matched = Some((idx as u8, grp));
+                    break;
+                }
+            }
+        }
+
+        if let Some((ch_idx, grp)) = matched {
+            if grp.sender.as_str() == self.identity.callsign() {
+                // Our own message echoed by repeater! NEVER re-broadcast our own message
+                if pkt.path_hash_count() >= 1 {
+                    InboundAction::ReceivedRepeaterEcho {
+                        pkt_hash: pkt.calculate_packet_hash(),
+                        hops: pkt.path_hash_count() as u8,
+                    }
+                } else {
+                    InboundAction::DropDuplicate
+                }
+            } else if is_dupe {
+                InboundAction::DropDuplicate
+            } else {
+                InboundAction::ReceivedGroupText {
+                    channel_idx: ch_idx,
+                    path_len: pkt.path_len,
+                    packet: grp,
+                }
+            }
+        } else if is_dupe {
+            InboundAction::DropDuplicate
+        } else {
+            InboundAction::Unhandled
+        }
+    }
+
+    #[inline(never)]
+    fn handle_inbound_grp_data(&self, pkt: &Packet, is_dupe: bool) -> InboundAction {
+        if is_dupe {
+            return InboundAction::DropDuplicate;
+        }
+        if pkt.payload_len < 4 {
+            return InboundAction::Unhandled;
+        }
+        let ch_hash = pkt.payload[0];
+        let channels = self.context.channels();
+        for (idx, ch) in channels.iter().enumerate() {
+            if meshcore_wire::crypto::channel_hash(&ch.secret) == ch_hash {
+                if let Ok(grp) =
+                    GrpDataPacket::decode_encrypted(&pkt.payload[..pkt.payload_len], &ch.secret)
+                {
+                    return InboundAction::ReceivedGroupData {
+                        channel_idx: idx as u8,
+                        path_len: if pkt.is_flood() { pkt.path_len } else { 0xFF },
+                        packet: grp,
+                    };
+                }
+            }
+        }
+        InboundAction::Unhandled
+    }
+
+    #[inline(never)]
+    fn handle_inbound_txt_msg(
+        &mut self,
+        pkt: &Packet,
+        is_dupe: bool,
+        consumed: &mut bool,
+    ) -> InboundAction {
+        let payload = &pkt.payload[..pkt.payload_len];
+        // Addressed payload: dest(1) ‖ src(1) ‖ sealed.
+        if payload.len() <= 4 {
+            return InboundAction::Unhandled;
+        }
+        let dest = payload[0];
+        let src = payload[1];
+
+        if is_dupe {
+            return InboundAction::DropDuplicate;
+        }
+        if dest != self.identity.pub_key()[0] {
+            return InboundAction::Unhandled;
+        }
+
+        // Collect candidate peer keys outside the lock, then try each
+        // shared secret until one authenticates the MAC.
+        let peers = self.peers_by_hash(src);
+        for peer in peers.iter() {
+            let secret = match self.identity.shared_secret(peer) {
+                Some(secret) => secret,
+                None => continue,
+            };
+            if let Ok(msg) = TxtMsgPacket::decode(payload, &secret, peer) {
+                let plain = msg.txt_type == meshcore_wire::packets::txtmsg::TXT_TYPE_PLAIN;
+                let signed = msg.txt_type == meshcore_wire::packets::txtmsg::TXT_TYPE_SIGNED_PLAIN;
+                if plain || signed {
+                    // Signed messages carry a 4-byte ACK; companions
+                    // use the extended 6-byte form.
+                    let ack = if signed {
+                        AckPacket::new(msg.ack_crc)
+                    } else {
+                        AckPacket::with_extended(
+                            msg.ack_crc,
+                            msg.extended_attempt,
+                            self.next_salt() as u8,
+                        )
+                    };
+                    if pkt.is_flood() {
+                        // Flooded DM: return the arrival path with the ACK
+                        // as extra, so the sender learns a direct route.
+                        let mut ack_bytes = [0u8; 8];
+                        if let Ok(alen) = ack.encode(&mut ack_bytes) {
+                            let _ = self.queue_path_return(
+                                peer[0],
+                                self.identity.pub_key()[0],
+                                &secret,
+                                pkt,
+                                &ack_bytes[..alen],
+                            );
+                        }
+                    } else {
+                        let (out_path_len, out_path) = self.peer_path(peer);
+                        let _ = self.queue_ack_packet(ack, out_path_len, &out_path);
+                    }
+                }
+                *consumed = true;
+                return InboundAction::ReceivedDirectText {
+                    msg,
+                    sender_pub: *peer,
+                    path_len: if pkt.is_flood() { pkt.path_len } else { 0xFF },
+                };
+            }
+        }
+        InboundAction::Unhandled
+    }
+
+    #[inline(never)]
+    fn handle_inbound_path(
+        &self,
+        pkt: &Packet,
+        is_dupe: bool,
+        consumed: &mut bool,
+    ) -> InboundAction {
+        let payload = &pkt.payload[..pkt.payload_len];
+        if payload.len() <= 4 {
+            return InboundAction::Unhandled;
+        }
+        if is_dupe {
+            return InboundAction::DropDuplicate;
+        }
+        if payload[0] != self.identity.pub_key()[0] {
+            return InboundAction::Unhandled;
+        }
+        for peer in self.peers_by_hash(payload[1]).iter() {
+            if let Some(secret) = self.identity.shared_secret(peer) {
+                if let Ok(path) = PathPacket::decode(payload, &secret) {
+                    let mut arrival_path = heapless::Vec::<u8, 64>::new();
+                    let an = pkt.path_byte_len();
+                    let _ = arrival_path.extend_from_slice(&pkt.path[..an]);
+                    *consumed = true;
+                    return InboundAction::ReceivedPath {
+                        packet: path,
+                        sender_pub: *peer,
+                        is_flood: pkt.is_flood(),
+                        arrival_path_len: pkt.path_len,
+                        arrival_path,
+                    };
+                }
+            }
+        }
+        InboundAction::Unhandled
+    }
+
+    #[inline(never)]
+    fn handle_inbound_req_or_resp(
+        &self,
+        pkt: &Packet,
+        is_dupe: bool,
+        consumed: &mut bool,
+    ) -> InboundAction {
+        let payload = &pkt.payload[..pkt.payload_len];
+        if payload.len() <= 4 {
+            return InboundAction::Unhandled;
+        }
+        let dest = payload[0];
+        let src = payload[1];
+
+        if is_dupe {
+            return InboundAction::DropDuplicate;
+        }
+        if dest != self.identity.pub_key()[0] {
+            return InboundAction::Unhandled;
+        }
+
+        for peer in self.peers_by_hash(src).iter() {
+            if let Some(secret) = self.identity.shared_secret(peer) {
+                if let Ok(ap) = AddressedPacket::decode(payload, &secret) {
+                    *consumed = true;
+                    return if pkt.payload_type() == PAYLOAD_TYPE_RESPONSE {
+                        InboundAction::ReceivedResponse {
+                            plain: ap.plain,
+                            sender_pub: *peer,
+                        }
+                    } else {
+                        let mut arrival_path = heapless::Vec::<u8, 64>::new();
+                        let an = pkt.path_byte_len();
+                        let _ = arrival_path.extend_from_slice(&pkt.path[..an]);
+                        InboundAction::ReceivedRequest {
+                            plain: ap.plain,
+                            sender_pub: *peer,
+                            is_flood: pkt.is_flood(),
+                            arrival_path_len: pkt.path_len,
+                            arrival_path,
+                        }
+                    };
+                }
+            }
+        }
+        if pkt.payload_type() == PAYLOAD_TYPE_RESPONSE {
+            if let Some(peer) = self.context.anon_peer_key(src) {
+                if let Some(secret) = self.identity.shared_secret(&peer) {
+                    if let Ok(ap) = AddressedPacket::decode(payload, &secret) {
+                        *consumed = true;
+                        return InboundAction::ReceivedResponse {
+                            plain: ap.plain,
+                            sender_pub: peer,
+                        };
+                    }
+                }
+            }
+        }
+        InboundAction::Unhandled
     }
 
     /// Construct and queue an advertisement packet for transmission
