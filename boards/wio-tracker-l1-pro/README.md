@@ -81,8 +81,8 @@ re-exports these modules, so there is one copy of the code.
 
 It checks clocks and regulators, QSPI flash, battery, radio settings, the binary companion
 handshake, GPS UART traffic, and that a name change survives a real reboot (the original name is
-restored). It exercises the hardware items listed as unverified below (GPS wiring, QSPI ID); `--tx`
-verifies the SX1262 path. `--flash` builds and flashes first. `hil --self-test` runs the script's
+restored). It has confirmed the GPS wiring and the QSPI ID on hardware (see below); `--tx`
+verifies the SX1262 transmit path. `--flash` builds and flashes first. `hil --self-test` runs the script's
 own logic against a fake device and is run in CI.
 
 ## Flashing
@@ -100,13 +100,19 @@ own logic against a fake device and is run in CI.
 
 The UF2 base address is `0x27000` and the DFU package targets SoftDevice ID `0x0123` (S140 v7.3.0).
 
+## Verified on hardware
+
+Confirmed on a real board with `hil` (firmware 1.18.2-ferrix, 2026-11-21): 32.768 kHz LFXO and REG1 DC/DC active, P25Q16H QSPI flash (JEDEC `856015`), battery ADC, companion handshake, config persistence across a reboot, a 5-minute CLI/watchdog soak, and the pins below.
+
+- **GPS wiring and polarity.** MCU RX P0.26, MCU TX P0.27, standby/enable P1.09 active-high: the L76K streamed NMEA (33,200 bytes, 609 lines) and reached a fix with 10 satellites.
+- **SX1262 transmit path.** A zero-hop advert was transmitted (TCXO, DC/DC, SPI).
+
 ## Hardware items still to confirm on a device
 
 These were taken from MeshCore's variant files and have not been verified on hardware:
 
 1. **USB PID.** Ferrix reports Seeed VID `0x2886`, PID `0x1668` (from MeshCore's board definition, where `0x1667` is the bootloader). Check that companion apps detect the port.
-2. **GPS wiring and polarity.** MCU RX is P0.26 and MCU TX is P0.27 (`Serial1`); standby/enable is P1.09, assumed active-high. If the `gps` CLI counters show no bytes after enabling GPS, swap the polarity in `src/gps.rs` or the RX/TX pins in `src/pins.rs`.
-3. **OLED bus.** The OLED is assumed to be on P0.06 / P0.05 at `0x3D`. A blank screen with a normal boot means the bus or address is wrong (the firmware logs an OLED init failure but keeps running).
-4. **RF switch.** If RX sensitivity is poor, check the `RXEN` handling in `src/radio.rs`.
-5. **SoftDevice RAM.** If the node shows 10 fast blinks at boot, raise the RAM origin in `memory.x` to `0x20008000`.
-6. **BLE OTA DFU name.** The on-screen DFU notice is generic because the bootloader's advertised name is not confirmed.
+2. **OLED bus.** The OLED is assumed to be on P0.06 / P0.05 at `0x3D`. A blank screen with a normal boot means the bus or address is wrong (the firmware logs an OLED init failure but keeps running).
+3. **RF switch (RX).** Transmit is verified; receive needs a second node. If RX sensitivity is poor, check the `RXEN` handling in `src/radio.rs`.
+4. **SoftDevice RAM.** If the node shows 10 fast blinks at boot, raise the RAM origin in `memory.x` to `0x20008000`.
+5. **BLE OTA DFU name.** The on-screen DFU notice is generic because the bootloader's advertised name is not confirmed.
