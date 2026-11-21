@@ -11,7 +11,6 @@ use embassy_nrf::spim::Spim;
 use embassy_time::Delay;
 use embedded_hal_bus::spi::ExclusiveDevice;
 
-use ferrix_core::scheduler::preamble_for;
 use ferrix_hal::radio::LoraConfig;
 use ferrix_sx1262::{Sx1262BoardConfig, Sx1262Radio, TcxoCtrlVoltage};
 
@@ -55,16 +54,6 @@ pub async fn sx1262_task(
 }
 
 fn lora_config_from_state() -> LoraConfig {
-    ferrix_core::state::RADIO_SETTINGS.lock(|r| {
-        let s = r.borrow();
-        LoraConfig {
-            frequency_hz: s.frequency_hz,
-            tx_power_dbm: s.tx_power_dbm,
-            spreading_factor: s.sf,
-            bandwidth_khz: s.bw_khz,
-            coding_rate: s.cr,
-            preamble_length: preamble_for(s.sf),
-            rx_duty_cycle: s.rx_duty_cycle,
-        }
-    })
+    let settings = ferrix_core::state::RADIO_SETTINGS.lock(|r| *r.borrow());
+    ferrix_wio_tracker_l1_pro_logic::radio::lora_config_from_settings(&settings)
 }

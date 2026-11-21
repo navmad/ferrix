@@ -46,3 +46,7 @@ jobs:
         run: ./tools/build.sh thinknode-m1 build --release
       - name: Build Wio Tracker L1 Pro release firmware and verify task arena fit
         run: ./tools/build.sh wio-tracker-l1-pro build --release
+      - name: Build Wio Tracker L1 Pro internal-storage firmware and verify task arena fit
+        run: ./tools/build.sh wio-tracker-l1-pro build --release --features internal-storage
+      - name: HIL smoke test script parses and reports no device
+        run: python3 -I tools/hil/wio_smoke.py --self-test

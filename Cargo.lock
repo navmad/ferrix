@@ -916,6 +916,7 @@ dependencies = [
  "ferrix-runtime",
  "ferrix-sh1106",
  "ferrix-sx1262",
+ "ferrix-wio-tracker-l1-pro-logic",
  "heapless",
  "meshcore-wire",
  "nrf-softdevice",
@@ -932,6 +933,22 @@ dependencies = [
  "ferrix-nrf52",
  "ferrix-role-companion",
  "ferrix-wio-tracker-l1-pro",
+]
+
+[[package]]
+name = "ferrix-wio-tracker-l1-pro-logic"
+version = "1.18.2"
+dependencies = [
+ "critical-section",
+ "defmt 0.3.101",
+ "embassy-time",
+ "embedded-graphics",
+ "ferrix-core",
+ "ferrix-hal",
+ "ferrix-l76k",
+ "ferrix-runtime",
+ "ferrix-sh1106",
+ "heapless",
 ]
 
 [[package]]

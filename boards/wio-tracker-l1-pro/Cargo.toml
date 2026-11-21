@@ -37,3 +37,4 @@ ferrix-sx1262 = { path = "../../drivers/radio/sx1262" }
 ferrix-sh1106 = { path = "../../drivers/display/sh1106" }
 ferrix-l76k = { path = "../../drivers/gnss/l76k" }
 ferrix-role-companion = { path = "../../roles/companion" }
+ferrix-wio-tracker-l1-pro-logic = { path = "logic" }

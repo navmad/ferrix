@@ -2,13 +2,14 @@
 #
 # Board selector for ferrix.
 #
-#   ./tools/build.sh <board> [build|run|test] [cargo args...]
+#   ./tools/build.sh <board> [build|run|test|hil] [cargo args...]
 #
 # Examples:
 #   ./tools/build.sh thinknode-m1 build --release
 #   ./tools/build.sh thinknode-m1 run
 #   ./tools/build.sh thinknode-m1 test
 #   ./tools/build.sh wio-tracker-l1-pro build --release
+#   ./tools/build.sh wio-tracker-l1-pro hil [--port /dev/cu.usbmodemXXXX]   # needs hardware
 #
 # The target is always passed explicitly because .cargo/config.toml sets a
 # default embedded target, which must not leak into host tests or other boards.
@@ -18,7 +19,7 @@ set -euo pipefail
 board="${1:-}"
 action="${2:-build}"
 [[ -n "$board" ]] || {
-    echo "usage: tools/build.sh <board> [build|run|test] [cargo args...]" >&2
+    echo "usage: tools/build.sh <board> [build|run|test|hil] [cargo args...]" >&2
     echo "boards: thinknode-m1 wio-tracker-l1-pro" >&2
     exit 2
 }
@@ -45,7 +46,15 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ "$action" == "test" ]]; then
     host="$(rustc -vV | sed -n 's/host: //p')"
     python3 "$script_dir/check_task_arena.py" --self-test
-    exec cargo test -p meshcore-wire -p ferrix-hal -p ferrix-core -p ferrix-runtime -p ferrix-sx1262 -p ferrix-ssd1681 -p ferrix-sh1106 -p ferrix-l76k --target "$host" "$@"
+    exec cargo test -p meshcore-wire -p ferrix-hal -p ferrix-core -p ferrix-runtime -p ferrix-sx1262 -p ferrix-ssd1681 -p ferrix-sh1106 -p ferrix-l76k -p ferrix-wio-tracker-l1-pro-logic --target "$host" "$@"
+fi
+
+if [[ "$action" == "hil" ]]; then
+    # Hardware-in-the-loop smoke test against a connected board (USB CDC CLI).
+    case "$board" in
+        wio-tracker-l1-pro) exec python3 -I "$script_dir/hil/wio_smoke.py" "$@" ;;
+        *) echo "hil is only implemented for wio-tracker-l1-pro" >&2; exit 2 ;;
+    esac
 fi
 
 if [[ "$action" == "build" ]]; then

@@ -42,7 +42,7 @@ use crate::pins::{BoardIrqs, LoraPins, OledPins, Pins};
 use crate::radio::sx1262_task;
 
 /// Hardware model reported to MeshCore companion apps.
-pub const NAME: &str = "Wio Tracker L1 Pro";
+pub use ferrix_wio_tracker_l1_pro_logic::config::NAME;
 /// Whether this board has a battery ADC.
 pub const HAS_BATTERY_ADC: bool = true;
 /// Protocol capability bits. The OLED has no dedicated capability bit.
@@ -70,12 +70,8 @@ pub use ferrix_nrf52::battery::{
     battery_millivolts, battery_percentage, set_battery_millivolts, MIN_PLAUSIBLE_BATTERY_MV,
 };
 
-/// Wio Tracker L1 Pro battery ADC: AIN7 (P0.31), 2:1 divider enabled by P0.04,
-/// SAADC gain 1/6 with the internal 0.6 V reference (3.6 V full scale).
-///
-/// `7200 / 4096` = 2 (divider) x 3600 mV, matching MeshCore's
-/// `ADC_MULTIPLIER` / `AREF_VOLTAGE`.
-pub const BATTERY_ADC_SCALE: u32 = 7200;
+/// Battery ADC scale; see `ferrix_wio_tracker_l1_pro_logic::config`.
+pub use ferrix_wio_tracker_l1_pro_logic::config::BATTERY_ADC_SCALE;
 
 /// Averaged battery sample in millivolts; see `ferrix_nrf52::battery`.
 pub async fn sample_battery_adc_mv(adc: &mut saadc::Saadc<'static, 1>) -> Option<u16> {
@@ -108,12 +104,12 @@ pub(crate) fn fatal_blink_forever(count: u32) -> ! {
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    fatal_blink_forever(3)
+    fatal_blink_forever(ferrix_wio_tracker_l1_pro_logic::config::PANIC_BLINKS)
 }
 
 #[cortex_m_rt::exception]
 unsafe fn HardFault(_frame: &cortex_m_rt::ExceptionFrame) -> ! {
-    fatal_blink_forever(6)
+    fatal_blink_forever(ferrix_wio_tracker_l1_pro_logic::config::HARDFAULT_BLINKS)
 }
 
 /// Persistent state the role needs across the startup phases.
@@ -182,7 +178,7 @@ impl CompanionBoard for WioTrackerBoard {
     /// Seeed VID with the application PID from MeshCore's board definition
     /// (`hwids[1]`; `0x1667` is the bootloader).
     fn usb_ids(&self) -> (u16, u16) {
-        (0x2886, 0x1668)
+        ferrix_wio_tracker_l1_pro_logic::config::USB_IDS
     }
 
     fn usb_manufacturer(&self) -> &'static str {

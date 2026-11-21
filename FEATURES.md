@@ -323,8 +323,12 @@ the 175-byte `PACKET_CLI_REPLY` (`0x1D`) binary companion frame limit:
 # Package Nordic/Adafruit DFU .zip for BLE OTA or web/serial flashing
 ./tools/build_ota.sh thinknode-m1 release
 
-# Host tests (wire codecs, message queue, contact map, scheduler, vectors)
+# Host tests (wire codecs, message queue, contact map, scheduler, vectors,
+# plus the Wio Tracker L1 Pro board logic and OLED golden frames)
 ./tools/build.sh thinknode-m1 test
+
+# Hardware-in-the-loop smoke test on a connected Wio Tracker L1 Pro
+./tools/build.sh wio-tracker-l1-pro hil
 
 # Flash over USB serial DFU
 ./tools/flash_serial.sh

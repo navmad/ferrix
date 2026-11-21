@@ -6,17 +6,16 @@ use embassy_nrf::saadc;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::TrySendError;
 use embassy_sync::signal::Signal;
-use embassy_time::{Duration, Instant};
+use embassy_time::Instant;
 use ferrix_core::companion::protocol::CompanionNode;
 use ferrix_nrf52::buzzer::PassiveBuzzer;
 use ferrix_runtime::app::{AppBoard, UiSound, UiState};
 use ferrix_sh1106::Framebuffer;
+use ferrix_wio_tracker_l1_pro_logic::power::DisplayPower;
+use ferrix_wio_tracker_l1_pro_logic::sound::{pattern, Pattern};
 
 use crate::display::{DisplayCmd, DISPLAY_CMD, DISPLAY_RETURN};
 use crate::gps;
-
-/// Seconds the OLED stays on after the last button press.
-const DISPLAY_IDLE_SECS: u64 = 30;
 
 /// Sound requests played off the radio RX/TX loop by [`buzzer_task`].
 pub static BUZZER_SIGNAL: Signal<CriticalSectionRawMutex, UiSound> = Signal::new();
@@ -29,12 +28,9 @@ pub async fn buzzer_task(mut buzzer: PassiveBuzzer<'static>) -> ! {
         if !ferrix_core::state::buzzer_enabled() {
             continue;
         }
-        match sound {
-            UiSound::Click => buzzer.beep(2_200, 15).await,
-            UiSound::Action => buzzer.beep(1_800, 35).await,
-            UiSound::Notify => {
-                buzzer.melody(&[(2_700, 70), (3_200, 90)], 50).await;
-            }
+        match pattern(sound) {
+            Pattern::Beep((hz, ms)) => buzzer.beep(hz, ms).await,
+            Pattern::Melody { tones, gap_ms } => buzzer.melody(tones, gap_ms).await,
         }
     }
 }
@@ -46,9 +42,7 @@ pub struct WioApp {
     has_display: bool,
     battery_adc: saadc::Saadc<'static, 1>,
     battery_filter: ferrix_core::battery::BatteryMvFilter,
-    display_on: bool,
-    display_deadline: Instant,
-    last_periodic_refresh: Instant,
+    power: DisplayPower,
 }
 
 impl WioApp {
@@ -70,11 +64,7 @@ impl WioApp {
             has_display,
             battery_adc,
             battery_filter,
-            display_on: true,
-            display_deadline: now
-                .checked_add(Duration::from_secs(DISPLAY_IDLE_SECS))
-                .unwrap(),
-            last_periodic_refresh: now,
+            power: DisplayPower::new(now),
         }
     }
 
@@ -136,10 +126,10 @@ impl AppBoard for WioApp {
         };
         // The OLED has no refresh cost and its RAM keeps updating while
         // the panel is off, so a wake always shows current content.
-        crate::display::ui::render_dashboard(node, ui, fb);
+        crate::display::ui::render_dashboard(node, ui, gps::gps_enabled(), fb);
         match DISPLAY_CMD.try_send(DisplayCmd::Flush { fb }) {
             Ok(()) => {
-                self.last_periodic_refresh = Instant::now();
+                self.power.mark_refreshed(Instant::now());
                 true
             }
             Err(TrySendError::Full(DisplayCmd::Flush { fb })) => {
@@ -151,28 +141,23 @@ impl AppBoard for WioApp {
     }
 
     fn input_wake(&mut self) {
-        self.display_deadline = Instant::now()
-            .checked_add(Duration::from_secs(DISPLAY_IDLE_SECS))
-            .unwrap();
-        if !self.display_on {
-            if !self.has_display || DISPLAY_CMD.try_send(DisplayCmd::SetOn(true)).is_ok() {
-                self.display_on = true;
-            }
+        if self.power.wake(Instant::now())
+            && (!self.has_display || DISPLAY_CMD.try_send(DisplayCmd::SetOn(true)).is_ok())
+        {
+            self.power.commit(true);
         }
     }
 
     fn tick(&mut self, node: &CompanionNode<'_>, ui: &UiState, _tick: u32) {
         self.reclaim_fb();
-        if self.display_on && Instant::now() >= self.display_deadline {
-            if !self.has_display || DISPLAY_CMD.try_send(DisplayCmd::SetOn(false)).is_ok() {
-                self.display_on = false;
-            }
+        if self.power.idle_expired(Instant::now())
+            && (!self.has_display || DISPLAY_CMD.try_send(DisplayCmd::SetOn(false)).is_ok())
+        {
+            self.power.commit(false);
         }
 
         let interval_secs = ferrix_core::state::display_refresh_interval_secs();
-        if interval_secs > 0
-            && self.last_periodic_refresh.elapsed() >= Duration::from_secs(interval_secs as u64)
-        {
+        if self.power.periodic_due(Instant::now(), interval_secs) {
             let _ = self.render(node, ui, false);
         }
     }
@@ -195,7 +180,7 @@ impl AppBoard for WioApp {
     }
 
     async fn prepare_ota_dfu(&mut self, node: &CompanionNode<'_>, _ui: &UiState) {
-        self.display_on = true;
+        self.power.commit(true);
         if !self.has_display {
             return;
         }

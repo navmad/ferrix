@@ -53,21 +53,7 @@ pub struct WioInputs {
     pub press: Input<'static>,
 }
 
-/// Map a switch index (the order used by [`WioInputs::wait_event`]) to the
-/// semantic event it produces.
-///
-/// - joystick left/up: previous page
-/// - joystick right/down: next page
-/// - joystick press: primary page action (FK1)
-/// - user button: secondary page action (FK2)
-pub(crate) fn event_for_switch(index: usize) -> InputEvent {
-    match index {
-        0 => InputEvent::ActionSecondary,
-        1 | 3 => InputEvent::PrevPage,
-        2 | 4 => InputEvent::NextPage,
-        _ => InputEvent::ActionPrimary,
-    }
-}
+pub(crate) use ferrix_wio_tracker_l1_pro_logic::input::event_for_switch;
 
 impl WioInputs {
     /// Wait for the next debounced switch press.

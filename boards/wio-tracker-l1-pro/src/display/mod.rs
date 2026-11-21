@@ -4,7 +4,7 @@
 //! `ferrix-sh1106`; this module owns the `WioDisplay` wrapper used by the
 //! application loop and the compact UI in [`ui`].
 
-pub mod ui;
+pub use ferrix_wio_tracker_l1_pro_logic::ui;
 
 use embassy_nrf::peripherals::TWISPI1;
 use embassy_nrf::twim::Twim;
@@ -116,7 +116,7 @@ impl WioDisplay {
         node: &CompanionNode<'_>,
         ui: &UiState,
     ) -> Result<(), Error> {
-        ui::render_dashboard(node, ui, self.fb);
+        ui::render_dashboard(node, ui, crate::gps::gps_enabled(), self.fb);
         self.panel.flush(self.fb).await
     }
 
