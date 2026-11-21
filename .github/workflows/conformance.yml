@@ -41,7 +41,7 @@ jobs:
           targets: thumbv7em-none-eabihf
           components: llvm-tools
       - name: Run workspace host tests and arena verifier self-test
-        run: ./tools/build.sh thinknode-m1 test
+        run: ./tools/build.sh test
       - name: Build ThinkNode M1 release firmware and verify task arena fit
         run: ./tools/build.sh thinknode-m1 build --release
       - name: Build ThinkNode M1 internal-storage firmware and verify task arena fit
