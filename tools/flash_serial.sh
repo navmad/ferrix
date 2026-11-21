@@ -28,7 +28,7 @@ case "${BOARD}" in
         PKG="ferrix-wio-tracker-l1-pro-companion"
         BOARD_LABEL="Wio Tracker L1 Pro"
         # Substring of the bootloader's USB product string in `ioreg`.
-        BOOT_USB_MATCH="Wio"
+        BOOT_USB_MATCH="TRACKER L1"
         SD_REQ="0x0123" # S140 7.3.0
         ;;
     *)
