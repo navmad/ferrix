@@ -24,7 +24,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Run host unit tests
-        run: ./tools/build.sh thinknode-m1 test
+        run: ./tools/build.sh test
 
   build:
     name: Build ${{ matrix.firmware }}
@@ -68,10 +68,19 @@ jobs:
           REF_IS_TAG: ${{ startsWith(github.ref, 'refs/tags/') }}
         run: |
           if [ -n "$INPUT_VERSION" ]; then
-            echo "FERRIX_VERSION=$INPUT_VERSION" >> "$GITHUB_ENV"
+            VER="$INPUT_VERSION"
+            echo "FERRIX_VERSION=$VER" >> "$GITHUB_ENV"
           elif [ "$REF_IS_TAG" = "true" ]; then
-            echo "FERRIX_VERSION=$REF_NAME" >> "$GITHUB_ENV"
+            VER="$REF_NAME"
+            echo "FERRIX_VERSION=$VER" >> "$GITHUB_ENV"
+          else
+            VER="$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
           fi
+          VER="${VER#v}"
+          VER="${VER#V}"
+          VER="${VER%-ferrix}"
+          echo "RELEASE_TAG=v${VER}" >> "$GITHUB_ENV"
+          echo "Resolved release tag: v${VER}"
 
       - name: Build ${{ matrix.firmware }} UF2 and DFU ZIP
         run: |
@@ -83,29 +92,30 @@ jobs:
             exit 1
           fi
           mkdir -p dist
+          ASSET="ferrix-${{ matrix.firmware }}-${RELEASE_TAG}"
           "$OBJCOPY" -O binary \
             "target/${{ matrix.target }}/release/ferrix" \
-            "dist/ferrix-${{ matrix.firmware }}.bin"
+            "dist/${ASSET}.bin"
           python3 tools/uf2conv.py \
-            "dist/ferrix-${{ matrix.firmware }}.bin" \
-            -o "dist/ferrix-${{ matrix.firmware }}.uf2" \
+            "dist/${ASSET}.bin" \
+            -o "dist/${ASSET}.uf2" \
             -b "${{ matrix.uf2_base }}"
           "$OBJCOPY" -O ihex \
             "target/${{ matrix.target }}/release/ferrix" \
-            "dist/ferrix-${{ matrix.firmware }}.hex"
+            "dist/${ASSET}.hex"
           adafruit-nrfutil dfu genpkg \
             --dev-type "${{ matrix.dfu_dev_type }}" \
             --sd-req "${{ matrix.dfu_sd_req }}" \
-            --application "dist/ferrix-${{ matrix.firmware }}.hex" \
-            "dist/ferrix-${{ matrix.firmware }}.zip"
+            --application "dist/${ASSET}.hex" \
+            "dist/${ASSET}.zip"
 
       - name: Upload firmware artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ferrix-${{ matrix.firmware }}
+          name: ferrix-${{ matrix.firmware }}-${{ env.RELEASE_TAG }}
           path: |
-            dist/ferrix-${{ matrix.firmware }}.uf2
-            dist/ferrix-${{ matrix.firmware }}.zip
+            dist/ferrix-${{ matrix.firmware }}-${{ env.RELEASE_TAG }}.uf2
+            dist/ferrix-${{ matrix.firmware }}-${{ env.RELEASE_TAG }}.zip
           if-no-files-found: error
 
   release:
