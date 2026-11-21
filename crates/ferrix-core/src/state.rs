@@ -602,6 +602,104 @@ pub static GPS_SENTENCES: AtomicU32 = AtomicU32::new(0);
 /// POWER.RESETREAS captured at boot. Bit 1 is the watchdog (DOG) flag.
 pub static RESET_REASON: AtomicU32 = AtomicU32::new(0);
 
+/// Number of entries in the inbound advert-path RAM cache, matching upstream
+/// `ADVERT_PATH_TABLE_SIZE` in `MyMesh.h`.
+pub const ADVERT_PATH_TABLE_SIZE: usize = 16;
+/// Number of leading public-key bytes stored per advert-path entry.
+pub const ADVERT_PATH_PREFIX_LEN: usize = 7;
+
+/// Cached inbound arrival path of a recently received advertisement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdvertPath {
+    pub pubkey_prefix: [u8; ADVERT_PATH_PREFIX_LEN],
+    pub recv_timestamp: u32,
+    pub path_len: u8,
+    pub path: [u8; 64],
+}
+
+static ADVERT_PATHS: Mutex<SharedRawMutex, RefCell<[Option<AdvertPath>; ADVERT_PATH_TABLE_SIZE]>> =
+    Mutex::new(RefCell::new([None; ADVERT_PATH_TABLE_SIZE]));
+
+/// Record the inbound arrival path and local receive timestamp of a valid
+/// advertisement, updating an existing entry in place or evicting the oldest.
+pub fn record_advert_path(
+    pub_key: &[u8; 32],
+    recv_timestamp: u32,
+    path_len: u8,
+    path: &[u8; 64],
+) {
+    if !meshcore_wire::packet::Packet::is_valid_path_len(path_len) {
+        return;
+    }
+    let byte_len = (path_len & 63) as usize * (((path_len >> 6) as usize) + 1);
+    let mut clean_path = [0u8; 64];
+    clean_path[..byte_len].copy_from_slice(&path[..byte_len]);
+
+    let mut prefix = [0u8; ADVERT_PATH_PREFIX_LEN];
+    prefix.copy_from_slice(&pub_key[..ADVERT_PATH_PREFIX_LEN]);
+
+    let entry = AdvertPath {
+        pubkey_prefix: prefix,
+        recv_timestamp,
+        path_len,
+        path: clean_path,
+    };
+
+    ADVERT_PATHS.lock(|table| {
+        let mut slots = table.borrow_mut();
+        // 1. Update existing entry for this pubkey prefix in place.
+        for slot in slots.iter_mut() {
+            if let Some(existing) = slot {
+                if existing.pubkey_prefix == prefix {
+                    *slot = Some(entry);
+                    return;
+                }
+            }
+        }
+        // 2. Otherwise use the first free slot.
+        for slot in slots.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(entry);
+                return;
+            }
+        }
+        // 3. Table full: evict the slot with the smallest recv_timestamp.
+        let mut oldest_idx = 0;
+        let mut oldest_ts = u32::MAX;
+        for (i, slot) in slots.iter().enumerate() {
+            if let Some(existing) = slot {
+                if existing.recv_timestamp < oldest_ts {
+                    oldest_ts = existing.recv_timestamp;
+                    oldest_idx = i;
+                }
+            }
+        }
+        slots[oldest_idx] = Some(entry);
+    });
+}
+
+/// Look up the cached inbound advert path for a 7-byte public-key prefix.
+pub fn lookup_advert_path(prefix: &[u8; ADVERT_PATH_PREFIX_LEN]) -> Option<AdvertPath> {
+    ADVERT_PATHS.lock(|table| {
+        table
+            .borrow()
+            .iter()
+            .flatten()
+            .find(|e| e.pubkey_prefix == *prefix)
+            .copied()
+    })
+}
+
+/// Clear the inbound advert-path RAM cache (used by tests).
+pub fn clear_advert_paths() {
+    ADVERT_PATHS.lock(|table| {
+        *table.borrow_mut() = [None; ADVERT_PATH_TABLE_SIZE];
+    });
+}
+
+#[cfg(test)]
+pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -640,5 +738,50 @@ mod tests {
         assert!(set_display_refresh_interval_secs(900));
         assert_eq!(display_refresh_interval_secs(), 900);
         init_display_refresh_interval_secs(0);
+    }
+
+    #[test]
+    fn advert_path_cache_updates_in_place_and_evicts_oldest() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_advert_paths();
+
+        // Invalid path_len (0xFF or reserved hash size 4) is ignored.
+        record_advert_path(&[0xEE; 32], 100, 0xFF, &[0u8; 64]);
+        assert!(lookup_advert_path(&[0xEE; 7]).is_none());
+
+        // Fill all 16 slots with increasing timestamps.
+        for i in 0..ADVERT_PATH_TABLE_SIZE {
+            let mut key = [0u8; 32];
+            key[0] = (i as u8) + 1;
+            let mut path = [0u8; 64];
+            path[0] = 0xA0 + (i as u8);
+            record_advert_path(&key, 1000 + i as u32, 1, &path);
+        }
+
+        // Update slot 0 (oldest so far, ts=1000) in place with a newer timestamp;
+        // now slot 1 (ts=1001) becomes the oldest.
+        let mut key0 = [0u8; 32];
+        key0[0] = 1;
+        let mut new_path = [0u8; 64];
+        new_path[0] = 0x55;
+        new_path[1] = 0x66;
+        record_advert_path(&key0, 2000, 2, &new_path);
+        let got0 = lookup_advert_path(&key0[..7].try_into().unwrap()).unwrap();
+        assert_eq!(got0.recv_timestamp, 2000);
+        assert_eq!(got0.path_len, 2);
+        assert_eq!(&got0.path[..2], &[0x55, 0x66]);
+
+        // Adding a 17th distinct key evicts key 2 (index 1, ts=1001).
+        let mut key17 = [0u8; 32];
+        key17[0] = 99;
+        record_advert_path(&key17, 2001, 0, &[0u8; 64]);
+        let mut evicted_prefix = [0u8; 7];
+        evicted_prefix[0] = 2;
+        assert!(lookup_advert_path(&evicted_prefix).is_none());
+        let got17 = lookup_advert_path(&key17[..7].try_into().unwrap()).unwrap();
+        assert_eq!(got17.recv_timestamp, 2001);
+        assert_eq!(got17.path_len, 0);
+
+        clear_advert_paths();
     }
 }

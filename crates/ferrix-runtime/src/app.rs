@@ -174,22 +174,6 @@ static PENDING_MESSAGE_ACKS: Mutex<
     core::cell::RefCell<Vec<PendingMessageAck, 16>>,
 > = Mutex::new(core::cell::RefCell::new(Vec::new()));
 
-/// Tell the app that a contact was discovered (full record) or re-advertised.
-fn push_new_advert(ct: &DiscoveredContact) {
-    let record = ferrix_core::companion::contacts::serialize_contact(ct);
-    let mut frame = Vec::<u8, 256>::new();
-    let _ = frame.push(protocol::PUSH_CODE_NEW_ADVERT);
-    let _ = frame.extend_from_slice(&record[1..]);
-    push_companion(&frame);
-}
-
-fn push_advert(pub_key: &[u8; 32]) {
-    let mut frame = Vec::<u8, 256>::new();
-    let _ = frame.push(protocol::PUSH_CODE_ADVERT);
-    let _ = frame.extend_from_slice(pub_key);
-    push_companion(&frame);
-}
-
 fn push_path_updated(pub_key: &[u8; 32]) {
     let mut frame = Vec::<u8, 256>::new();
     let _ = frame.push(protocol::PUSH_CODE_PATH_UPDATED);
@@ -479,144 +463,6 @@ fn push_inbound_text<B: AppBoard>(
 }
 
 #[inline(never)]
-fn handle_inbound_advert(
-    node: &CompanionNode<'_>,
-    adv: meshcore_wire::packets::AdvertPacket,
-    advert_hops: u8,
-    advert_payload: Option<&[u8]>,
-    rssi: i16,
-    snr: i8,
-    advert_epoch: &mut u32,
-) {
-    info!("MeshCore Advert from: {}", adv.name.as_str());
-    let had_blob = storage::adverts::has_blob(&adv.pub_key);
-    protocol::note_advert(&adv.pub_key, adv.timestamp, had_blob);
-    let node_id = [
-        adv.pub_key[0],
-        adv.pub_key[1],
-        adv.pub_key[2],
-        adv.pub_key[3],
-    ];
-
-    // Check if this contact already exists in our list
-    let contact_type = CompanionNode::get_contact_type_from_flags(adv.flags);
-    let should_add =
-        node.should_auto_add_contact_type(contact_type) && node.autoadd_allows_hops(advert_hops);
-
-    let mut store_blob = false;
-    let mut overwritten_key: Option<[u8; 32]> = None;
-    DISCOVERED_CONTACTS.lock(|c| {
-        let mut list = c.borrow_mut();
-        if let Some(existing) = list.iter_mut().find(|ct| ct.pub_key == adv.pub_key) {
-            // Anti-replay: ignore an advert no newer than the last accepted one.
-            if existing.last_advert_ts != 0 && adv.timestamp <= existing.last_advert_ts {
-                return;
-            }
-            // Only rewrite the shared advert blob when the
-            // contact's advertised identity actually changed.
-            // A missing blob is not backfilled on every
-            // advert: that would append a record per advert
-            // and wear the log. The next real change (or a
-            // re-add) stores it.
-            if existing.callsign != adv.name
-                || existing.contact_type != contact_type
-                || existing.latitude != adv.latitude
-                || existing.longitude != adv.longitude
-            {
-                store_blob = true;
-            }
-            existing.callsign = adv.name.clone();
-            existing.last_seen_epoch = node.epoch_time as u32;
-            existing.last_advert_ts = adv.timestamp;
-            existing.rssi = rssi;
-            existing.snr = snr;
-            existing.latitude = adv.latitude;
-            existing.longitude = adv.longitude;
-            existing.contact_type = contact_type;
-            // Contact flags (favorite/telemetry permissions) are
-            // independent of the advert flags; keep the stored ones.
-            push_advert(&adv.pub_key);
-            return;
-        }
-
-        // New contact. The app is told even when auto-add
-        // declines it, matching the reference discovery flow.
-        let mut cs = heapless::String::new();
-        let _ = cs.push_str(adv.name.as_str());
-        let discovered = DiscoveredContact {
-            pub_key: adv.pub_key,
-            callsign: cs,
-            node_id,
-            last_seen_epoch: node.epoch_time as u32,
-            rssi,
-            snr,
-            latitude: adv.latitude,
-            longitude: adv.longitude,
-            // Contact flags start cleared; the advert flags
-            // only classified `contact_type` above.
-            flags: 0,
-            contact_type,
-            out_path: [0u8; 64],
-            out_path_len: 0xFF,
-            last_advert_ts: adv.timestamp,
-            saved_hash: 0,
-            sync_since: 0,
-        };
-
-        let mut added = false;
-        if should_add {
-            if list.len() < list.capacity() {
-                let _ = list.push(discovered.clone());
-                added = true;
-            } else if node.should_overwrite_when_full() {
-                // Find the oldest non-favorite contact to overwrite.
-                let mut oldest_idx = None;
-                let mut oldest_lastmod = u32::MAX;
-                for (idx, ct) in list.iter().enumerate() {
-                    let is_favorite = (ct.flags & protocol::CONTACT_FLAG_FAVORITE) != 0;
-                    if !is_favorite && ct.last_seen_epoch < oldest_lastmod {
-                        oldest_lastmod = ct.last_seen_epoch;
-                        oldest_idx = Some(idx);
-                    }
-                }
-                if let Some(idx) = oldest_idx {
-                    let overwritten = list[idx].pub_key;
-                    let mut push = heapless::Vec::<u8, 256>::new();
-                    let _ = push.push(protocol::PUSH_CODE_CONTACT_DELETED);
-                    let _ = push.extend_from_slice(&overwritten);
-                    let _ = push_companion(&push);
-                    storage::adverts::forget(&overwritten);
-                    overwritten_key = Some(overwritten);
-                    list[idx] = discovered.clone();
-                    added = true;
-                }
-            }
-        }
-
-        if added {
-            store_blob = true;
-        }
-        push_new_advert(&discovered);
-
-        if !added && list.len() >= list.capacity() {
-            let mut push = heapless::Vec::<u8, 256>::new();
-            let _ = push.push(protocol::PUSH_CODE_CONTACTS_FULL);
-            let _ = push_companion(&push);
-        }
-    });
-    if store_blob {
-        if let Some(payload) = advert_payload {
-            storage::adverts::remember(&adv.pub_key, payload);
-        }
-    }
-    if let Some(key) = overwritten_key {
-        let _ = storage::contacts::try_queue_remove(key);
-    }
-    storage::request_contacts();
-    *advert_epoch = advert_epoch.wrapping_add(1);
-}
-
-#[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn handle_inbound_rx<B: AppBoard>(
     board: &mut B,
@@ -661,7 +507,8 @@ fn handle_inbound_rx<B: AppBoard>(
 
     // Deserialize and dispatch through MeshCore Network Engine
     if let Ok(pkt) = Packet::read_from(raw) {
-        let advert_hops = pkt.path_hash_count() as u8;
+        let advert_path_len = pkt.path_len;
+        let advert_path = pkt.path;
         // Retain the signed payload so the contact can be exported.
         let advert_payload = if pkt.payload_type() == meshcore_wire::packet::PAYLOAD_TYPE_ADVERT {
             let mut v = heapless::Vec::<u8, 184>::new();
@@ -678,7 +525,8 @@ fn handle_inbound_rx<B: AppBoard>(
             msg_epoch,
             advert_epoch,
             action,
-            advert_hops,
+            advert_path_len,
+            &advert_path,
             advert_payload.as_deref(),
             rssi,
             snr,
@@ -697,22 +545,25 @@ fn dispatch_inbound_action<B: AppBoard>(
     msg_epoch: &mut u32,
     advert_epoch: &mut u32,
     action: InboundAction,
-    advert_hops: u8,
+    advert_path_len: u8,
+    advert_path: &[u8; 64],
     advert_payload: Option<&[u8]>,
     rssi: i16,
     snr: i8,
 ) {
         match action {
             InboundAction::ReceivedAdvert(adv) => {
-                handle_inbound_advert(
+                if protocol::process_inbound_advert(
                     node,
                     adv,
-                    advert_hops,
+                    advert_path_len,
+                    advert_path,
                     advert_payload,
                     rssi,
                     snr,
-                    advert_epoch,
-                );
+                ) {
+                    *advert_epoch = advert_epoch.wrapping_add(1);
+                }
             }
             InboundAction::ReceivedGroupText {
                 channel_idx,
@@ -1059,6 +910,7 @@ fn dispatch_inbound_action<B: AppBoard>(
 fn handle_usb_command(
     mesh: &mut MeshEngine<'_>,
     node: &mut CompanionNode<'_>,
+    advert_epoch: &mut u32,
     cmd: UsbCommand,
 ) -> bool {
     let mut needs_render = false;
@@ -1247,6 +1099,12 @@ fn handle_usb_command(
                     .push_control(pkt, embassy_time::Instant::now().as_millis() as u64);
             }
         }
+        UsbCommand::ImportContact { raw } => {
+            if protocol::process_imported_contact(node, raw.as_slice()) {
+                *advert_epoch = advert_epoch.wrapping_add(1);
+                needs_render = true;
+            }
+        }
         UsbCommand::SendTracePath {
             tag,
             auth,
@@ -1422,7 +1280,7 @@ pub async fn run<B: AppBoard, R: LoraRadio>(
             board.reboot_to_ota_dfu();
         }
         Either4::Second(cmd) => {
-            if handle_usb_command(mesh, node, cmd) {
+            if handle_usb_command(mesh, node, &mut advert_epoch, cmd) {
                 if board.render(node, &ui, false) {
                     last_snapshot = UiSnapshot::capture(board, node, msg_epoch, advert_epoch);
                     last_render_at = Instant::now();

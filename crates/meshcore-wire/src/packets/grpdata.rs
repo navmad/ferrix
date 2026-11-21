@@ -8,6 +8,8 @@ use crate::crypto::{meshcore_encrypt_then_mac, meshcore_mac_then_decrypt};
 use crate::packet::{Packet, PAYLOAD_TYPE_GRP_DATA};
 
 pub const MAX_GROUP_DATA: usize = 165;
+/// Largest AES-128-ECB padded ciphertext for GRP_DATA (`3 + 165 = 168` -> 176 B).
+const MAX_GROUP_DATA_CIPHER: usize = 176;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct GrpDataPacket {
@@ -51,7 +53,7 @@ impl GrpDataPacket {
             return Err(());
         }
         let channel_hash = src[0];
-        let mut plain = [0u8; 3 + MAX_GROUP_DATA];
+        let mut plain = [0u8; MAX_GROUP_DATA_CIPHER];
         let plen = meshcore_mac_then_decrypt(secret, &mut plain, &src[1..])?;
         if plen < 3 {
             return Err(());
@@ -59,7 +61,7 @@ impl GrpDataPacket {
 
         let data_type = u16::from_le_bytes([plain[0], plain[1]]);
         let len = plain[2] as usize;
-        if 3 + len > plen {
+        if 3 + len > plen || len > MAX_GROUP_DATA {
             return Err(());
         }
         let mut data = Vec::new();
@@ -98,6 +100,24 @@ mod tests {
         assert_eq!(decoded.channel_hash, 0x7A);
         assert_eq!(decoded.data_type, 0x1234);
         assert_eq!(decoded.data, payload);
+    }
+
+    #[test]
+    fn max_length_encrypted_roundtrip() {
+        let secret = [0x42u8; 16];
+        let mut input = [0u8; MAX_GROUP_DATA];
+        for (i, b) in input.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(3);
+        }
+        let original = GrpDataPacket::new(0x55, 0xABCD, &input).unwrap();
+        let mut buf = [0u8; 184];
+        let len = original.encode_encrypted(&secret, &mut buf).unwrap();
+        assert_eq!(len, 1 + 2 + MAX_GROUP_DATA_CIPHER);
+
+        let decoded = GrpDataPacket::decode_encrypted(&buf[..len], &secret).unwrap();
+        assert_eq!(decoded.channel_hash, 0x55);
+        assert_eq!(decoded.data_type, 0xABCD);
+        assert_eq!(decoded.data.as_slice(), &input);
     }
 
     #[test]

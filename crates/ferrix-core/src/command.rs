@@ -52,6 +52,9 @@ pub enum UsbCommand {
     SendRawPacket {
         raw: Vec<u8, 255>,
     },
+    ImportContact {
+        raw: Vec<u8, 255>,
+    },
     SendTracePath {
         tag: u32,
         auth: u32,

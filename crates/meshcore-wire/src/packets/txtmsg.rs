@@ -12,6 +12,9 @@ use crate::crypto::{
 use crate::packet::{Packet, PAYLOAD_TYPE_TXT_MSG};
 
 pub const MAX_TEXT_LEN: usize = 160;
+/// Largest AES-128-ECB padded ciphertext that fits in a TXT_MSG payload
+/// (`dest(1) + src(1) + mac(2) + 176 = 180 <= MAX_PACKET_PAYLOAD(184)`).
+const MAX_TXT_CIPHER: usize = 176;
 
 pub const TXT_TYPE_PLAIN: u8 = 0;
 pub const TXT_TYPE_CLI_DATA: u8 = 1;
@@ -75,7 +78,7 @@ impl TxtMsgPacket {
         if out.len() < 2 {
             return Err(());
         }
-        let mut plain = [0u8; 4 + 1 + MAX_TEXT_LEN + 2];
+        let mut plain = [0u8; MAX_TXT_CIPHER];
         let plain_len = self.write_plaintext(&mut plain)?;
 
         out[0] = self.dest;
@@ -86,9 +89,15 @@ impl TxtMsgPacket {
 
     /// Decode and decrypt an addressed TXT_MSG payload.
     ///
-    /// `sender_pub` is the candidate peer's public key; the caller tries each
-    /// contact whose `pub[0]` equals the payload's `src` byte.
-    pub fn decode(src: &[u8], secret: &[u8; 32], sender_pub: &[u8; 32]) -> Result<Self, ()> {
+    /// `sender_pub` is the candidate peer's public key (hashed for plain DM
+    /// ACKs); `recipient_pub` is the receiver's own public key (hashed for
+    /// `TXT_TYPE_SIGNED_PLAIN` room ACKs per upstream `BaseChatMesh.cpp`).
+    pub fn decode(
+        src: &[u8],
+        secret: &[u8; 32],
+        sender_pub: &[u8; 32],
+        recipient_pub: &[u8; 32],
+    ) -> Result<Self, ()> {
         // The C++ requires more than 4 bytes before it even attempts decrypt.
         if src.len() <= 4 {
             return Err(());
@@ -96,7 +105,7 @@ impl TxtMsgPacket {
         let dest = src[0];
         let src_hash = src[1];
 
-        let mut plain = [0u8; 4 + 1 + MAX_TEXT_LEN + 2];
+        let mut plain = [0u8; MAX_TXT_CIPHER];
         let plain_len = meshcore_mac_then_decrypt(secret, &mut plain, &src[2..])?;
         // The C++ requires `len > 5`.
         if plain_len <= 5 {
@@ -137,7 +146,13 @@ impl TxtMsgPacket {
         };
 
         let crc = if signed {
-            ack_crc_signed(timestamp, flags, &signed_prefix, text.as_bytes(), sender_pub)
+            ack_crc_signed(
+                timestamp,
+                flags,
+                &signed_prefix,
+                text.as_bytes(),
+                recipient_pub,
+            )
         } else {
             ack_crc(timestamp, flags, text.as_bytes(), sender_pub)
         };
@@ -196,4 +211,128 @@ impl TxtMsgPacket {
 #[inline]
 fn flags_of(txt_type: u8, attempt: u8) -> u8 {
     ((txt_type & 0x3F) << 2) | (attempt & 0x03)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signed_room_ack_hashes_recipient_key_while_plain_hashes_sender_key() {
+        let secret = [0x33u8; 32];
+        let room_pub = [0xAAu8; 32];
+        let client_pub = [0xBBu8; 32];
+        let author_prefix = [0x11, 0x22, 0x33, 0x44];
+        let ts = 1_700_000_123;
+
+        // Signed room post sent from room_pub to client_pub.
+        let mut signed = TxtMsgPacket::new(
+            client_pub[0],
+            room_pub[0],
+            ts,
+            TXT_TYPE_SIGNED_PLAIN,
+            0,
+            "hello room",
+            &room_pub,
+        )
+        .unwrap();
+        signed.signed_prefix = author_prefix;
+
+        let mut wire = [0u8; 184];
+        let len = signed.encode(&secret, &mut wire).unwrap();
+        let decoded = TxtMsgPacket::decode(&wire[..len], &secret, &room_pub, &client_pub).unwrap();
+
+        let flags = flags_of(TXT_TYPE_SIGNED_PLAIN, 0);
+        let expected_signed_crc =
+            ack_crc_signed(ts, flags, &author_prefix, b"hello room", &client_pub);
+        let wrong_sender_crc =
+            ack_crc_signed(ts, flags, &author_prefix, b"hello room", &room_pub);
+        assert_eq!(decoded.ack_crc, expected_signed_crc);
+        assert_ne!(decoded.ack_crc, wrong_sender_crc);
+        assert_eq!(decoded.signed_prefix, author_prefix);
+        assert_eq!(decoded.text.as_str(), "hello room");
+
+        // Plain DM still hashes sender_pub.
+        let plain = TxtMsgPacket::new(
+            client_pub[0],
+            room_pub[0],
+            ts,
+            TXT_TYPE_PLAIN,
+            0,
+            "hello dm",
+            &room_pub,
+        )
+        .unwrap();
+        let len = plain.encode(&secret, &mut wire).unwrap();
+        let decoded = TxtMsgPacket::decode(&wire[..len], &secret, &room_pub, &client_pub).unwrap();
+        assert_eq!(
+            decoded.ack_crc,
+            ack_crc(ts, flags_of(TXT_TYPE_PLAIN, 0), b"hello dm", &room_pub)
+        );
+    }
+
+    #[test]
+    fn max_length_txt_msg_roundtrips_with_176_byte_ciphertext() {
+        let secret = [0x55u8; 32];
+        let sender_pub = [0x10u8; 32];
+        let recipient_pub = [0x20u8; 32];
+        let max_text = "a".repeat(MAX_TEXT_LEN);
+
+        // Plain 160-byte text: 5 + 160 = 165B plaintext -> 176B ciphertext -> 180B wire payload.
+        let msg = TxtMsgPacket::new(
+            recipient_pub[0],
+            sender_pub[0],
+            42,
+            TXT_TYPE_PLAIN,
+            1,
+            &max_text,
+            &sender_pub,
+        )
+        .unwrap();
+        let mut wire = [0u8; 184];
+        let len = msg.encode(&secret, &mut wire).unwrap();
+        assert_eq!(len, 2 + 2 + 176);
+        let decoded =
+            TxtMsgPacket::decode(&wire[..len], &secret, &sender_pub, &recipient_pub).unwrap();
+        assert_eq!(decoded.text.as_str(), max_text);
+        assert_eq!(decoded.attempt, 1);
+
+        // Extended attempt (>3) at max allowed length (158B): 5 + 158 + 2 = 165B -> 176B ciphertext.
+        let ext_text = "b".repeat(MAX_TEXT_LEN - 2);
+        let ext_msg = TxtMsgPacket::new(
+            recipient_pub[0],
+            sender_pub[0],
+            43,
+            TXT_TYPE_PLAIN,
+            5,
+            &ext_text,
+            &sender_pub,
+        )
+        .unwrap();
+        let len = ext_msg.encode(&secret, &mut wire).unwrap();
+        assert_eq!(len, 2 + 2 + 176);
+        let decoded =
+            TxtMsgPacket::decode(&wire[..len], &secret, &sender_pub, &recipient_pub).unwrap();
+        assert_eq!(decoded.text.as_str(), ext_text);
+        assert_eq!(decoded.attempt, 5);
+
+        // Signed 160-byte text: 5 + 4 + 160 = 169B plaintext -> 176B ciphertext.
+        let mut signed = TxtMsgPacket::new(
+            recipient_pub[0],
+            sender_pub[0],
+            44,
+            TXT_TYPE_SIGNED_PLAIN,
+            0,
+            &max_text,
+            &sender_pub,
+        )
+        .unwrap();
+        signed.signed_prefix = [1, 2, 3, 4];
+        let len = signed.encode(&secret, &mut wire).unwrap();
+        assert_eq!(len, 2 + 2 + 176);
+        let decoded =
+            TxtMsgPacket::decode(&wire[..len], &secret, &sender_pub, &recipient_pub).unwrap();
+        assert_eq!(decoded.text.as_str(), max_text);
+        assert_eq!(decoded.signed_prefix, [1, 2, 3, 4]);
+    }
 }
