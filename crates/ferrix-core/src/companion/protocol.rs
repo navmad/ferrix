@@ -1403,36 +1403,23 @@ impl<'a> CompanionNode<'a> {
             }
 
             CMD_GET_ADVERT_PATH => {
-                let mut found = None;
-                if payload.len() >= 9 {
-                    let prefix = &payload[2..9];
-                    found = crate::state::DISCOVERED_CONTACTS.lock(|c| {
-                        c.borrow()
-                            .iter()
-                            .find(|ct| &ct.pub_key[..7] == prefix)
-                            .map(|ct| (ct.out_path_len, ct.out_path, ct.last_advert_ts))
-                    });
-                }
-                if let Some((path_len, path, ts)) = found {
-                    if path_len != 0xFF
-                        && meshcore_wire::packet::Packet::is_valid_path_len(path_len)
-                    {
-                        let n = (path_len & 63) as usize * (((path_len >> 6) as usize) + 1);
+                if payload.len() < 2 + crate::state::ADVERT_PATH_PREFIX_LEN {
+                    emit(&[RESP_CODE_ERR, ERR_ILLEGAL_ARG]);
+                } else {
+                    let mut prefix = [0u8; crate::state::ADVERT_PATH_PREFIX_LEN];
+                    prefix.copy_from_slice(&payload[2..2 + crate::state::ADVERT_PATH_PREFIX_LEN]);
+                    if let Some(entry) = crate::state::lookup_advert_path(&prefix) {
+                        let n = (entry.path_len & 63) as usize
+                            * (((entry.path_len >> 6) as usize) + 1);
                         let mut resp = Vec::<u8, 72>::new();
                         let _ = resp.push(RESP_CODE_ADVERT_PATH);
-                        let _ = resp.extend_from_slice(&ts.to_le_bytes());
-                        let _ = resp.push(path_len);
-                        let _ = resp.extend_from_slice(&path[..n]);
+                        let _ = resp.extend_from_slice(&entry.recv_timestamp.to_le_bytes());
+                        let _ = resp.push(entry.path_len);
+                        let _ = resp.extend_from_slice(&entry.path[..n]);
                         emit(&resp);
                     } else {
-                        let mut resp = Vec::<u8, 4>::new();
-                        let _ = resp.push(RESP_CODE_ERR);
-                        emit(&resp);
+                        emit(&[RESP_CODE_ERR, ERR_NOT_FOUND]);
                     }
-                } else {
-                    let mut resp = Vec::<u8, 4>::new();
-                    let _ = resp.push(RESP_CODE_ERR);
-                    emit(&resp);
                 }
             }
 
@@ -2420,39 +2407,34 @@ impl<'a> CompanionNode<'a> {
                         self.callsign.as_str(),
                         &private_key,
                     );
-                    match id {
-                        Some(id) => {
-                            let ts = crate::state::get_device_time();
-                            let (adv_lat, adv_lon) =
-                                advert_location(self.latitude, self.longitude);
-                            let lat = (adv_lat * 1_000_000.0) as i32;
-                            let lon = (adv_lon * 1_000_000.0) as i32;
-                            let mut adv = AdvertPacket::new(
-                                *id.pub_key(),
-                                ts,
-                                meshcore_wire::packets::advert::ADV_TYPE_CHAT,
-                                lat,
-                                lon,
-                                self.callsign.as_str(),
-                            );
-                            adv.sign(&id);
-                            if let Ok(pkt) =
-                                adv.to_packet(meshcore_wire::packet::ROUTE_TYPE_FLOOD)
-                            {
-                                let mut raw = [0u8; 184];
-                                if let Ok(n) = pkt.write_to(&mut raw) {
-                                    let mut resp = Vec::<u8, 185>::new();
-                                    let _ = resp.push(RESP_CODE_EXPORT_CONTACT);
-                                    let _ = resp.extend_from_slice(&raw[..n]);
-                                    emit(&resp);
-                                }
+                    let mut sent = false;
+                    if let Some(id) = id {
+                        let ts = crate::state::get_device_time();
+                        let (adv_lat, adv_lon) = advert_location(self.latitude, self.longitude);
+                        let lat = (adv_lat * 1_000_000.0) as i32;
+                        let lon = (adv_lon * 1_000_000.0) as i32;
+                        let mut adv = AdvertPacket::new(
+                            *id.pub_key(),
+                            ts,
+                            meshcore_wire::packets::advert::ADV_TYPE_CHAT,
+                            lat,
+                            lon,
+                            self.callsign.as_str(),
+                        );
+                        adv.sign(&id);
+                        if let Ok(pkt) = adv.to_packet(meshcore_wire::packet::ROUTE_TYPE_FLOOD) {
+                            let mut raw = [0u8; 184];
+                            if let Ok(n) = pkt.write_to(&mut raw) {
+                                let mut resp = Vec::<u8, 185>::new();
+                                let _ = resp.push(RESP_CODE_EXPORT_CONTACT);
+                                let _ = resp.extend_from_slice(&raw[..n]);
+                                emit(&resp);
+                                sent = true;
                             }
                         }
-                        None => {
-                            let mut resp = Vec::<u8, 4>::new();
-                            let _ = resp.push(RESP_CODE_ERR);
-                            emit(&resp);
-                        }
+                    }
+                    if !sent {
+                        emit(&[RESP_CODE_ERR, ERR_TABLE_FULL]);
                     }
                 } else {
                     let mut key = [0u8; 32];
@@ -2474,104 +2456,50 @@ impl<'a> CompanionNode<'a> {
                         let _ = resp.extend_from_slice(&advert);
                     } else {
                         let _ = resp.push(RESP_CODE_ERR);
-                        let _ = resp.push(ERR_BAD_STATE);
+                        let _ = resp.push(ERR_NOT_FOUND);
                     }
                     emit(&resp);
                 }
             }
 
             CMD_IMPORT_CONTACT => {
-                let mut ok = false;
-                if payload.len() > 1 {
-                    if let Ok(pkt) = Packet::read_from(&payload[1..]) {
-                        if pkt.payload_type() == PAYLOAD_TYPE_ADVERT {
-                            if let Ok(adv) = AdvertPacket::decode(&pkt.payload[..pkt.payload_len]) {
-                                if adv.verify_signature() {
-                                    let mut callsign = String::<32>::new();
-                                    let _ = callsign.push_str(adv.name.as_str());
-                                    let mut out_path = [0u8; 64];
-                                    let plen = pkt.path_byte_len();
-                                    out_path[..plen].copy_from_slice(&pkt.path[..plen]);
-                                    let node_id = [
-                                        adv.pub_key[0],
-                                        adv.pub_key[1],
-                                        adv.pub_key[2],
-                                        adv.pub_key[3],
-                                    ];
-                                    let last_seen_epoch =
-                                        crate::state::get_device_time();
-                                    let contact_type =
-                                        CompanionNode::get_contact_type_from_flags(adv.flags);
-
-                                    // The reference loops the imported advert back
-                                    // through the receive path, which also emits the
-                                    // discovery push the app expects.
-                                    let existing = crate::state::DISCOVERED_CONTACTS
-                                        .lock(|c| {
-                                            c.borrow()
-                                                .iter()
-                                                .find(|ct| ct.pub_key == adv.pub_key)
-                                                .map(|ct| ct.last_advert_ts)
-                                        });
-                                    if existing.map_or(true, |ts| adv.timestamp > ts) {
-                                        let mut frame = Vec::<u8, 256>::new();
-                                        if existing.is_some() {
-                                            let _ = frame.push(PUSH_CODE_ADVERT);
-                                            let _ = frame.extend_from_slice(&adv.pub_key);
+                // Loop the imported advert back through the normal receive path
+                // (matching upstream BaseChatMesh::importContact), so replay
+                // checks, auto-add type/hop rules, blob storage, advert-path
+                // caching, and discovery pushes all apply identically and
+                // `out_path_len` stays unknown (0xFF).
+                let mut err = Some(ERR_ILLEGAL_ARG);
+                if payload.len() > 2 + 32 + 64 {
+                    let raw_slice = &payload[1..];
+                    if raw_slice.len() <= 255 {
+                        if let Ok(pkt) = Packet::read_from(raw_slice) {
+                            if pkt.payload_type() == PAYLOAD_TYPE_ADVERT {
+                                if let Ok(adv) =
+                                    AdvertPacket::decode(&pkt.payload[..pkt.payload_len])
+                                {
+                                    if adv.verify_signature() {
+                                        let mut raw = Vec::<u8, 255>::new();
+                                        let _ = raw.extend_from_slice(raw_slice);
+                                        if crate::command::USB_COMMAND_CHANNEL
+                                            .try_send(crate::command::UsbCommand::ImportContact {
+                                                raw,
+                                            })
+                                            .is_ok()
+                                        {
+                                            err = None;
                                         } else {
-                                            let discovered =
-                                                crate::types::DiscoveredContact {
-                                                    pub_key: adv.pub_key,
-                                                    callsign: callsign.clone(),
-                                                    node_id,
-                                                    last_seen_epoch,
-                                                    rssi: 0,
-                                                    snr: 0,
-                                                    latitude: adv.latitude,
-                                                    longitude: adv.longitude,
-                                                    flags: 0,
-                                                    contact_type,
-                                                    out_path,
-                                                    out_path_len: pkt.path_len,
-                                                    last_advert_ts: adv.timestamp,
-                                                    saved_hash: 0,
-                            sync_since: 0,
-                                                };
-                                            let record = serialize_contact(&discovered);
-                                            let _ = frame.push(PUSH_CODE_NEW_ADVERT);
-                                            let _ = frame.extend_from_slice(&record[1..]);
+                                            err = Some(ERR_TABLE_FULL);
                                         }
-                                        crate::command::push_companion(&frame);
-                                        self.host.advert_remember(
-                                            &adv.pub_key,
-                                            &pkt.payload[..pkt.payload_len],
-                                        );
                                     }
-
-                                    ok = crate::command::CONTACT_OP_CHANNEL
-                                        .try_send(crate::command::ContactOperation::AddOrUpdate {
-                                            pub_key: adv.pub_key,
-                                            callsign,
-                                            node_id,
-                                            last_seen_epoch,
-                                            latitude: adv.latitude,
-                                            longitude: adv.longitude,
-                                            // Imported adverts carry no contact flags.
-                                            flags: 0,
-                                            contact_type,
-                                            out_path,
-                                            out_path_len: pkt.path_len,
-                                            last_advert_ts: adv.timestamp,
-                                        })
-                                        .is_ok();
                                 }
                             }
                         }
                     }
                 }
-                let mut resp = Vec::<u8, 4>::new();
-                let _ = resp.push(if ok { RESP_CODE_OK } else { RESP_CODE_ERR });
-                emit(&resp);
+                match err {
+                    None => emit(&[RESP_CODE_OK]),
+                    Some(code) => emit(&[RESP_CODE_ERR, code]),
+                }
             }
 
             CMD_SET_OTHER_PARAMS => {
@@ -3708,6 +3636,7 @@ mod tests {
 
     #[test]
     fn multi_acks_clamped_in_set_other_params_and_reported_in_self_info() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut node = CompanionNode::new(
             "test",
             "test-board",
@@ -3763,7 +3692,7 @@ mod tests {
         assert_eq!(&lpp[15..19], &[1, LPP_TEMPERATURE, 0x00, 0xEB]);
     }
 
-    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use crate::state::TEST_LOCK;
 
     fn poll_sync<F: core::future::Future>(fut: F) -> F::Output {
         use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -4144,6 +4073,603 @@ mod tests {
         );
         crate::state::set_advert_lat_lon_e6(0, 0);
     }
+
+    #[test]
+    fn cmd_get_advert_path_uses_inbound_cache_and_returns_not_found() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::state::clear_advert_paths();
+        crate::state::DISCOVERED_CONTACTS.lock(|c| c.borrow_mut().clear());
+
+        let key = [0x42u8; 32];
+        // Put a contact in DISCOVERED_CONTACTS with a *different* outbound path
+        // and sender timestamp so we prove GET_ADVERT_PATH ignores them.
+        crate::state::DISCOVERED_CONTACTS.lock(|c| {
+            let _ = c.borrow_mut().push(crate::types::DiscoveredContact {
+                pub_key: key,
+                callsign: String::new(),
+                node_id: [0x42; 4],
+                last_seen_epoch: 100,
+                rssi: -80,
+                snr: 5,
+                latitude: 0,
+                longitude: 0,
+                flags: 0,
+                contact_type: 1,
+                out_path: [0xEE; 64],
+                out_path_len: 1,
+                last_advert_ts: 9999,
+                saved_hash: 0,
+                sync_since: 0,
+            });
+        });
+
+        let mut node = CompanionNode::new("n", "b", 0, [1u8; 32], [2u8; 64], &TestHost);
+
+        // Short payload -> ERR_ILLEGAL_ARG.
+        let mut resp = Vec::<u8, 80>::new();
+        poll_sync(node.handle_command(&[CMD_GET_ADVERT_PATH, 0, 1, 2], |r| {
+            let _ = resp.extend_from_slice(r);
+        }));
+        assert_eq!(resp.as_slice(), &[RESP_CODE_ERR, ERR_ILLEGAL_ARG]);
+
+        // Not in advert path cache (even though contact has an out_path) -> ERR_NOT_FOUND.
+        let mut query = Vec::<u8, 40>::new();
+        let _ = query.push(CMD_GET_ADVERT_PATH);
+        let _ = query.push(0);
+        let _ = query.extend_from_slice(&key);
+        resp.clear();
+        poll_sync(node.handle_command(&query, |r| {
+            let _ = resp.extend_from_slice(r);
+        }));
+        assert_eq!(resp.as_slice(), &[RESP_CODE_ERR, ERR_NOT_FOUND]);
+
+        // Record inbound advert path and verify response returns local recv_ts + inbound path.
+        let mut inbound = [0u8; 64];
+        inbound[0] = 0x11;
+        inbound[1] = 0x22;
+        crate::state::record_advert_path(&key, 1_700_000_777, 2, &inbound);
+
+        resp.clear();
+        poll_sync(node.handle_command(&query, |r| {
+            let _ = resp.extend_from_slice(r);
+        }));
+        assert_eq!(resp.len(), 1 + 4 + 1 + 2);
+        assert_eq!(resp[0], RESP_CODE_ADVERT_PATH);
+        assert_eq!(
+            u32::from_le_bytes(resp[1..5].try_into().unwrap()),
+            1_700_000_777
+        );
+        assert_eq!(resp[5], 2);
+        assert_eq!(&resp[6..8], &[0x11, 0x22]);
+
+        // 0-hop direct advert also succeeds with path_len = 0.
+        let key_direct = [0x43u8; 32];
+        crate::state::record_advert_path(&key_direct, 1_700_000_888, 0, &[0u8; 64]);
+        query.clear();
+        let _ = query.push(CMD_GET_ADVERT_PATH);
+        let _ = query.push(0);
+        let _ = query.extend_from_slice(&key_direct);
+        resp.clear();
+        poll_sync(node.handle_command(&query, |r| {
+            let _ = resp.extend_from_slice(r);
+        }));
+        assert_eq!(resp.len(), 1 + 4 + 1);
+        assert_eq!(resp[0], RESP_CODE_ADVERT_PATH);
+        assert_eq!(
+            u32::from_le_bytes(resp[1..5].try_into().unwrap()),
+            1_700_000_888
+        );
+        assert_eq!(resp[5], 0);
+
+        crate::state::clear_advert_paths();
+        crate::state::DISCOVERED_CONTACTS.lock(|c| c.borrow_mut().clear());
+    }
+
+    #[test]
+    fn cmd_import_contact_enqueues_loopback_and_rejects_invalid() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        drain_usb_commands();
+        while crate::command::CONTACT_OP_CHANNEL.try_receive().is_ok() {}
+
+        let mut node = CompanionNode::new("n", "b", 0, [1u8; 32], [2u8; 64], &TestHost);
+
+        // Short / malformed payload -> ERR_ILLEGAL_ARG.
+        let mut resp = Vec::<u8, 16>::new();
+        poll_sync(node.handle_command(&[CMD_IMPORT_CONTACT, 0x11, 0x00], |r| {
+            let _ = resp.extend_from_slice(r);
+        }));
+        assert_eq!(resp.as_slice(), &[RESP_CODE_ERR, ERR_ILLEGAL_ARG]);
+
+        // Valid signed advert packet -> RESP_CODE_OK and enqueues UsbCommand::ImportContact,
+        // without touching CONTACT_OP_CHANNEL directly.
+        let id = meshcore_wire::identity::LocalIdentity::from_seed("Peer", &[0x5Au8; 32]);
+        let mut adv = AdvertPacket::new(
+            *id.pub_key(),
+            1_700_000_100,
+            meshcore_wire::packets::advert::ADV_TYPE_CHAT,
+            0,
+            0,
+            "Peer",
+        );
+        adv.sign(&id);
+        let mut pkt = adv
+            .to_packet(meshcore_wire::packet::ROUTE_TYPE_FLOOD)
+            .unwrap();
+        pkt.append_hop(0xAA);
+        let mut raw_pkt = [0u8; 184];
+        let raw_len = pkt.write_to(&mut raw_pkt).unwrap();
+
+        let mut frame = Vec::<u8, 200>::new();
+        let _ = frame.push(CMD_IMPORT_CONTACT);
+        let _ = frame.extend_from_slice(&raw_pkt[..raw_len]);
+
+        resp.clear();
+        poll_sync(node.handle_command(&frame, |r| {
+            let _ = resp.extend_from_slice(r);
+        }));
+        assert_eq!(resp.as_slice(), &[RESP_CODE_OK]);
+        assert!(crate::command::CONTACT_OP_CHANNEL.try_receive().is_err());
+
+        match crate::command::USB_COMMAND_CHANNEL.try_receive() {
+            Ok(crate::command::UsbCommand::ImportContact { raw }) => {
+                assert_eq!(raw.as_slice(), &raw_pkt[..raw_len]);
+            }
+            other => panic!("expected UsbCommand::ImportContact, got {:?}", other),
+        }
+
+        // Tampered signature -> ERR_ILLEGAL_ARG.
+        let mut bad_frame = frame.clone();
+        bad_frame[raw_len] ^= 0xFF;
+        resp.clear();
+        poll_sync(node.handle_command(&bad_frame, |r| {
+            let _ = resp.extend_from_slice(r);
+        }));
+        assert_eq!(resp.as_slice(), &[RESP_CODE_ERR, ERR_ILLEGAL_ARG]);
+        assert!(crate::command::USB_COMMAND_CHANNEL.try_receive().is_err());
+    }
+
+    struct CaptureSink;
+    static CAPTURED_PUSHES: embassy_sync::blocking_mutex::Mutex<
+        embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex,
+        core::cell::RefCell<Vec<Vec<u8, 256>, 16>>,
+    > = embassy_sync::blocking_mutex::Mutex::new(core::cell::RefCell::new(Vec::new()));
+
+    impl crate::command::PushSink for CaptureSink {
+        fn is_connected(&self) -> bool {
+            true
+        }
+        fn try_push(&self, frame: &[u8]) -> bool {
+            CAPTURED_PUSHES.lock(|p| {
+                let mut v = Vec::<u8, 256>::new();
+                let _ = v.extend_from_slice(frame);
+                let _ = p.borrow_mut().push(v);
+            });
+            true
+        }
+    }
+
+    static TEST_PUSH_SINK: CaptureSink = CaptureSink;
+
+    fn clear_pushes() {
+        crate::command::register_push_sink(&TEST_PUSH_SINK);
+        CAPTURED_PUSHES.lock(|p| p.borrow_mut().clear());
+    }
+
+    fn take_pushes() -> Vec<Vec<u8, 256>, 16> {
+        CAPTURED_PUSHES.lock(|p| {
+            let mut out = Vec::new();
+            for item in p.borrow().iter() {
+                let _ = out.push(item.clone());
+            }
+            p.borrow_mut().clear();
+            out
+        })
+    }
+
+    fn signed_advert_packet(seed: u8, name: &str, ts: u32, hops: &[u8]) -> (AdvertPacket, Packet) {
+        let id = meshcore_wire::identity::LocalIdentity::from_seed(name, &[seed; 32]);
+        let mut adv = AdvertPacket::new(
+            *id.pub_key(),
+            ts,
+            meshcore_wire::packets::advert::ADV_TYPE_CHAT,
+            0,
+            0,
+            name,
+        );
+        adv.sign(&id);
+        let mut pkt = adv
+            .to_packet(meshcore_wire::packet::ROUTE_TYPE_FLOOD)
+            .unwrap();
+        for &h in hops {
+            pkt.append_hop(h);
+        }
+        (adv, pkt)
+    }
+
+    #[test]
+    fn advert_push_rules_import_loopback_and_advert_path_cache() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_pushes();
+        crate::state::DISCOVERED_CONTACTS.lock(|c| c.borrow_mut().clear());
+        crate::state::clear_advert_paths();
+        crate::state::set_device_time(1_700_000_500);
+
+        let local_id = meshcore_wire::identity::LocalIdentity::from_seed("Me", &[0x01u8; 32]);
+        let mut node = CompanionNode::new(
+            "Me",
+            "test",
+            0,
+            *local_id.pub_key(),
+            *local_id.private_key(),
+            &TestHost,
+        );
+        node.epoch_time = 1_700_000_500;
+        let set_autoadd = |manual: u8, config: u8, max_hops: u8| {
+            crate::state::AUTOADD_SETTINGS.lock(|a| {
+                let mut s = a.borrow_mut();
+                s.manual_add_contacts = manual;
+                s.config = config;
+                s.max_hops = max_hops;
+            });
+        };
+        set_autoadd(0, 0, 0); // auto-add enabled
+
+        // 1. F3 + F5: New contact auto-added -> emits PUSH_CODE_ADVERT (not NEW_ADVERT),
+        //    stores contact with out_path_len = 0xFF, and caches inbound advert path + local recv_ts.
+        let (adv1, pkt1) = signed_advert_packet(0x11, "Alice", 1_700_000_100, &[0xAA, 0xBB]);
+        let stored_changed = process_inbound_advert(
+            &node,
+            adv1.clone(),
+            pkt1.path_len,
+            &pkt1.path,
+            Some(&pkt1.payload[..pkt1.payload_len]),
+            -70,
+            6,
+        );
+        assert!(stored_changed);
+        let pushes = take_pushes();
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(pushes[0][0], PUSH_CODE_ADVERT);
+        assert_eq!(pushes[0].len(), 33);
+        assert_eq!(&pushes[0][1..33], &adv1.pub_key);
+
+        let stored = crate::state::DISCOVERED_CONTACTS.lock(|c| c.borrow()[0].clone());
+        assert_eq!(stored.pub_key, adv1.pub_key);
+        assert_eq!(stored.out_path_len, 0xFF);
+        assert_eq!(stored.callsign.as_str(), "Alice");
+
+        // CMD_GET_ADVERT_PATH returns inbound path + local recv_ts even while out_path_len == 0xFF.
+        let mut query = Vec::<u8, 40>::new();
+        let _ = query.push(CMD_GET_ADVERT_PATH);
+        let _ = query.push(0);
+        let _ = query.extend_from_slice(&adv1.pub_key);
+        let mut resp = Vec::<u8, 80>::new();
+        poll_sync(node.handle_command(&query, |r| {
+            let _ = resp.extend_from_slice(r);
+        }));
+        assert_eq!(resp[0], RESP_CODE_ADVERT_PATH);
+        let recv_ts = u32::from_le_bytes(resp[1..5].try_into().unwrap());
+        assert!(recv_ts >= 1_700_000_500);
+        assert_ne!(recv_ts, 1_700_000_100);
+        assert_eq!(resp[5], 2);
+        assert_eq!(&resp[6..8], &[0xAA, 0xBB]);
+
+        // 2. Anti-replay: older or equal timestamp advert does NOT overwrite, push, or touch cache.
+        let (adv1_old, pkt1_old) = signed_advert_packet(0x11, "AliceOld", 1_700_000_090, &[0xCC]);
+        let changed = process_inbound_advert(
+            &node,
+            adv1_old,
+            pkt1_old.path_len,
+            &pkt1_old.path,
+            Some(&pkt1_old.payload[..pkt1_old.payload_len]),
+            -90,
+            1,
+        );
+        assert!(!changed);
+        assert!(take_pushes().is_empty());
+        assert_eq!(
+            crate::state::DISCOVERED_CONTACTS
+                .lock(|c| c.borrow()[0].callsign.clone())
+                .as_str(),
+            "Alice"
+        );
+        let cached_after_replay =
+            crate::state::lookup_advert_path(&adv1.pub_key[..7].try_into().unwrap()).unwrap();
+        assert_eq!(&cached_after_replay.path[..2], &[0xAA, 0xBB]);
+
+        // 3. F3 + F5: Manual-add mode declines storing -> emits PUSH_CODE_NEW_ADVERT,
+        //    does NOT store, still caches inbound advert path.
+        set_autoadd(1, 0, 0);
+        let (adv2, pkt2) = signed_advert_packet(0x22, "Bob", 1_700_000_200, &[0xDD]);
+        let changed = process_inbound_advert(
+            &node,
+            adv2.clone(),
+            pkt2.path_len,
+            &pkt2.path,
+            Some(&pkt2.payload[..pkt2.payload_len]),
+            -75,
+            5,
+        );
+        assert!(!changed);
+        assert_eq!(
+            crate::state::DISCOVERED_CONTACTS.lock(|c| c.borrow().len()),
+            1
+        );
+        let pushes = take_pushes();
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(pushes[0][0], PUSH_CODE_NEW_ADVERT);
+        assert_eq!(&pushes[0][1..33], &adv2.pub_key);
+        let bob_cached =
+            crate::state::lookup_advert_path(&adv2.pub_key[..7].try_into().unwrap()).unwrap();
+        assert_eq!(bob_cached.path_len, 1);
+        assert_eq!(bob_cached.path[0], 0xDD);
+
+        // 4. F4: Imported contact goes through normal receive path:
+        //    - in manual-add mode, does NOT add contact (emits PUSH_CODE_NEW_ADVERT).
+        let (adv3, pkt3) = signed_advert_packet(0x33, "Carol", 1_700_000_300, &[0x11, 0x22]);
+        let mut raw3 = [0u8; 184];
+        let raw3_len = pkt3.write_to(&mut raw3).unwrap();
+
+        let changed = process_imported_contact(&node, &raw3[..raw3_len]);
+        assert!(!changed);
+        assert_eq!(
+            crate::state::DISCOVERED_CONTACTS.lock(|c| c.borrow().len()),
+            1
+        );
+        let pushes = take_pushes();
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(pushes[0][0], PUSH_CODE_NEW_ADVERT);
+
+        //    - in auto-add mode, adds Carol with out_path_len = 0xFF (NOT pkt.path_len = 2!),
+        //      emits PUSH_CODE_ADVERT, and rejects an older re-import.
+        set_autoadd(0, 0, 0);
+        let changed = process_imported_contact(&node, &raw3[..raw3_len]);
+        assert!(changed);
+        let pushes = take_pushes();
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(pushes[0][0], PUSH_CODE_ADVERT);
+
+        let carol = crate::state::DISCOVERED_CONTACTS.lock(|c| {
+            c.borrow()
+                .iter()
+                .find(|ct| ct.pub_key == adv3.pub_key)
+                .cloned()
+                .unwrap()
+        });
+        assert_eq!(carol.callsign.as_str(), "Carol");
+        assert_eq!(carol.out_path_len, 0xFF);
+
+        // Older imported advert for Carol is rejected by anti-replay.
+        let (_adv3_old, pkt3_old) = signed_advert_packet(0x33, "CarolStale", 1_700_000_250, &[]);
+        let mut raw3_old = [0u8; 184];
+        let raw3_old_len = pkt3_old.write_to(&mut raw3_old).unwrap();
+        assert!(!process_imported_contact(&node, &raw3_old[..raw3_old_len]));
+        assert!(take_pushes().is_empty());
+        let carol_after = crate::state::DISCOVERED_CONTACTS.lock(|c| {
+            c.borrow()
+                .iter()
+                .find(|ct| ct.pub_key == adv3.pub_key)
+                .cloned()
+                .unwrap()
+        });
+        assert_eq!(carol_after.callsign.as_str(), "Carol");
+
+        set_autoadd(0, 0, 0);
+        crate::state::DISCOVERED_CONTACTS.lock(|c| c.borrow_mut().clear());
+        crate::state::clear_advert_paths();
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdvertOutcome {
+    Replayed,
+    Stored,
+    NotStored,
+}
+
+fn push_new_advert(ct: &crate::types::DiscoveredContact) {
+    let record = serialize_contact(ct);
+    let mut frame = Vec::<u8, 256>::new();
+    let _ = frame.push(PUSH_CODE_NEW_ADVERT);
+    let _ = frame.extend_from_slice(&record[1..]);
+    crate::command::push_companion(&frame);
+}
+
+fn push_advert(pub_key: &[u8; 32]) {
+    let mut frame = Vec::<u8, 256>::new();
+    let _ = frame.push(PUSH_CODE_ADVERT);
+    let _ = frame.extend_from_slice(pub_key);
+    crate::command::push_companion(&frame);
+}
+
+/// Process a verified inbound (or looped-back imported) advertisement.
+///
+/// Mirrors upstream `BaseChatMesh::onAdvertRecv` + `MyMesh::onDiscoveredContact`:
+/// - rejects replays (`timestamp <= existing.last_advert_ts`),
+/// - checks auto-add type/hop rules and optional oldest-non-favorite eviction,
+/// - initializes new contacts with `out_path_len = 0xFF` (unknown),
+/// - emits `PUSH_CODE_ADVERT` when stored and `PUSH_CODE_NEW_ADVERT` only when
+///   not stored,
+/// - records the inbound arrival path and local receive timestamp in
+///   [`crate::state::record_advert_path`],
+/// - queues blob/contact persistence only when stored.
+///
+/// Returns `true` when `DISCOVERED_CONTACTS` was stored or updated.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+pub fn process_inbound_advert(
+    node: &CompanionNode<'_>,
+    adv: AdvertPacket,
+    path_len: u8,
+    path: &[u8; 64],
+    advert_payload: Option<&[u8]>,
+    rssi: i16,
+    snr: i8,
+) -> bool {
+    defmt::info!("MeshCore Advert from: {}", adv.name.as_str());
+    let had_blob = crate::storage::adverts::has_blob(&adv.pub_key);
+    note_advert(&adv.pub_key, adv.timestamp, had_blob);
+    let node_id = [
+        adv.pub_key[0],
+        adv.pub_key[1],
+        adv.pub_key[2],
+        adv.pub_key[3],
+    ];
+
+    let advert_hops = (path_len & 63) as u8;
+    let recv_ts = {
+        let t = crate::state::get_device_time();
+        if t != 0 {
+            t
+        } else {
+            node.epoch_time as u32
+        }
+    };
+
+    let contact_type = CompanionNode::get_contact_type_from_flags(adv.flags);
+    let should_add =
+        node.should_auto_add_contact_type(contact_type) && node.autoadd_allows_hops(advert_hops);
+
+    let mut store_blob = false;
+    let mut overwritten_key: Option<[u8; 32]> = None;
+    let mut outcome = AdvertOutcome::NotStored;
+    crate::state::DISCOVERED_CONTACTS.lock(|c| {
+        let mut list = c.borrow_mut();
+        if let Some(existing) = list.iter_mut().find(|ct| ct.pub_key == adv.pub_key) {
+            // Anti-replay: ignore an advert no newer than the last accepted one.
+            if existing.last_advert_ts != 0 && adv.timestamp <= existing.last_advert_ts {
+                outcome = AdvertOutcome::Replayed;
+                return;
+            }
+            if existing.callsign != adv.name
+                || existing.contact_type != contact_type
+                || existing.latitude != adv.latitude
+                || existing.longitude != adv.longitude
+            {
+                store_blob = true;
+            }
+            existing.callsign = adv.name.clone();
+            existing.last_seen_epoch = recv_ts;
+            existing.last_advert_ts = adv.timestamp;
+            existing.rssi = rssi;
+            existing.snr = snr;
+            existing.latitude = adv.latitude;
+            existing.longitude = adv.longitude;
+            existing.contact_type = contact_type;
+            // Contact flags (favorite/telemetry permissions) are
+            // independent of the advert flags; keep the stored ones.
+            push_advert(&adv.pub_key);
+            outcome = AdvertOutcome::Stored;
+            return;
+        }
+
+        // New contact. The app is told even when auto-add declines it.
+        let mut cs = String::<32>::new();
+        let _ = cs.push_str(adv.name.as_str());
+        let discovered = crate::types::DiscoveredContact {
+            pub_key: adv.pub_key,
+            callsign: cs,
+            node_id,
+            last_seen_epoch: recv_ts,
+            rssi,
+            snr,
+            latitude: adv.latitude,
+            longitude: adv.longitude,
+            flags: 0,
+            contact_type,
+            out_path: [0u8; 64],
+            out_path_len: 0xFF,
+            last_advert_ts: adv.timestamp,
+            saved_hash: 0,
+            sync_since: 0,
+        };
+
+        let mut added = false;
+        if should_add {
+            if list.len() < list.capacity() {
+                let _ = list.push(discovered.clone());
+                added = true;
+            } else if node.should_overwrite_when_full() {
+                let mut oldest_idx = None;
+                let mut oldest_lastmod = u32::MAX;
+                for (idx, ct) in list.iter().enumerate() {
+                    let is_favorite = (ct.flags & CONTACT_FLAG_FAVORITE) != 0;
+                    if !is_favorite && ct.last_seen_epoch < oldest_lastmod {
+                        oldest_lastmod = ct.last_seen_epoch;
+                        oldest_idx = Some(idx);
+                    }
+                }
+                if let Some(idx) = oldest_idx {
+                    let overwritten = list[idx].pub_key;
+                    let mut push = Vec::<u8, 256>::new();
+                    let _ = push.push(PUSH_CODE_CONTACT_DELETED);
+                    let _ = push.extend_from_slice(&overwritten);
+                    crate::command::push_companion(&push);
+                    crate::storage::adverts::forget(&overwritten);
+                    overwritten_key = Some(overwritten);
+                    list[idx] = discovered.clone();
+                    added = true;
+                }
+            }
+        }
+
+        if added {
+            store_blob = true;
+            push_advert(&adv.pub_key);
+            outcome = AdvertOutcome::Stored;
+        } else {
+            push_new_advert(&discovered);
+            if should_add && list.len() >= list.capacity() {
+                let mut push = Vec::<u8, 256>::new();
+                let _ = push.push(PUSH_CODE_CONTACTS_FULL);
+                crate::command::push_companion(&push);
+            }
+            outcome = AdvertOutcome::NotStored;
+        }
+    });
+
+    if outcome == AdvertOutcome::Replayed {
+        return false;
+    }
+
+    crate::state::record_advert_path(&adv.pub_key, recv_ts, path_len, path);
+
+    if store_blob {
+        if let Some(payload) = advert_payload {
+            crate::storage::adverts::remember(&adv.pub_key, payload);
+        }
+    }
+    if let Some(key) = overwritten_key {
+        let _ = crate::storage::contacts::try_queue_remove(key);
+    }
+    if outcome == AdvertOutcome::Stored {
+        crate::storage::request_contacts();
+        return true;
+    }
+    false
+}
+
+/// Process a raw imported contact advert packet through [`process_inbound_advert`].
+#[inline(never)]
+pub fn process_imported_contact(node: &CompanionNode<'_>, raw: &[u8]) -> bool {
+    if let Ok(pkt) = Packet::read_from(raw) {
+        if pkt.payload_type() == PAYLOAD_TYPE_ADVERT {
+            if let Ok(adv) = AdvertPacket::decode(&pkt.payload[..pkt.payload_len]) {
+                if adv.verify_signature() {
+                    return process_inbound_advert(
+                        node,
+                        adv,
+                        pkt.path_len,
+                        &pkt.path,
+                        Some(&pkt.payload[..pkt.payload_len]),
+                        0,
+                        0,
+                    );
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Dispatch a companion frame, including the local-CLI command.

@@ -9,12 +9,14 @@ use crate::crypto::{meshcore_encrypt_then_mac, meshcore_mac_then_decrypt};
 use crate::packet::{Packet, PAYLOAD_TYPE_ANON_REQ};
 
 pub const MAX_ANON_PLAIN: usize = 136;
+/// Largest AES-128-ECB padded ciphertext for ANON_REQ (9 × 16 B).
+pub const MAX_ANON_CIPHER: usize = 144;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct AnonReqPacket {
     pub dest: u8,
     pub sender_pub: [u8; 32],
-    pub plain: Vec<u8, MAX_ANON_PLAIN>,
+    pub plain: Vec<u8, MAX_ANON_CIPHER>,
 }
 
 impl AnonReqPacket {
@@ -50,7 +52,7 @@ impl AnonReqPacket {
         let mut sender_pub = [0u8; 32];
         sender_pub.copy_from_slice(&src[1..33]);
 
-        let mut plain = [0u8; MAX_ANON_PLAIN];
+        let mut plain = [0u8; MAX_ANON_CIPHER];
         let plen = meshcore_mac_then_decrypt(secret, &mut plain, &src[33..])?;
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&plain[..plen]).map_err(|_| ())?;
@@ -68,5 +70,33 @@ impl AnonReqPacket {
         let len = self.encode(secret, &mut buf)?;
         pkt.set_payload(&buf[..len])?;
         Ok(pkt)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn max_length_anon_req_roundtrip() {
+        let secret = [0x66u8; 32];
+        let sender = [0x99u8; 32];
+        let mut input = [0u8; MAX_ANON_PLAIN];
+        for (i, b) in input.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_add(7);
+        }
+        let pkt = AnonReqPacket::new(0x44, sender, &input).unwrap();
+        let mut wire = [0u8; 184];
+        let len = pkt.encode(&secret, &mut wire).unwrap();
+        assert_eq!(len, 1 + 32 + 2 + MAX_ANON_CIPHER);
+
+        let decoded = AnonReqPacket::decode(&wire[..len], &secret).unwrap();
+        assert_eq!(decoded.dest, 0x44);
+        assert_eq!(decoded.sender_pub, sender);
+        assert_eq!(decoded.plain.len(), MAX_ANON_CIPHER);
+        assert_eq!(&decoded.plain[..MAX_ANON_PLAIN], &input);
+        assert!(decoded.plain[MAX_ANON_PLAIN..].iter().all(|&b| b == 0));
+
+        assert!(AnonReqPacket::new(0x44, sender, &[0u8; MAX_ANON_PLAIN + 1]).is_err());
     }
 }

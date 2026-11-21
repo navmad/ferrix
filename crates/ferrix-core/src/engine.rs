@@ -159,7 +159,7 @@ pub enum InboundAction {
     ReceivedAnonReq(AnonReqPacket),
     /// Received addressed request (REQ) for this node
     ReceivedRequest {
-        plain: heapless::Vec<u8, 167>,
+        plain: heapless::Vec<u8, 176>,
         sender_pub: [u8; 32],
         is_flood: bool,
         arrival_path_len: u8,
@@ -167,7 +167,7 @@ pub enum InboundAction {
     },
     /// Received addressed response (RESPONSE) for this node
     ReceivedResponse {
-        plain: heapless::Vec<u8, 167>,
+        plain: heapless::Vec<u8, 176>,
         sender_pub: [u8; 32],
     },
     /// Zero-hop control data addressed to the companion (discovery, etc.).
@@ -796,7 +796,7 @@ impl<'a> MeshEngine<'a> {
                 Some(secret) => secret,
                 None => continue,
             };
-            if let Ok(msg) = TxtMsgPacket::decode(payload, &secret, peer) {
+            if let Ok(msg) = TxtMsgPacket::decode(payload, &secret, peer, self.identity.pub_key()) {
                 let plain = msg.txt_type == meshcore_wire::packets::txtmsg::TXT_TYPE_PLAIN;
                 let signed = msg.txt_type == meshcore_wire::packets::txtmsg::TXT_TYPE_SIGNED_PLAIN;
                 if plain || signed {
@@ -1982,5 +1982,59 @@ mod tests {
             path_pkt1.calculate_packet_hash(),
             path_pkt2.calculate_packet_hash()
         );
+    }
+
+    #[test]
+    fn signed_room_message_ack_hashes_receiver_own_public_key() {
+        let id = identity();
+        let my_pub = *id.pub_key();
+        let room_pub = [0x33u8; 32];
+        let secret = id.shared_secret(&room_pub).unwrap();
+        let author_prefix = [0xDE, 0xAD, 0xBE, 0xEF];
+        let ts = 1_700_000_555;
+
+        let mut msg = TxtMsgPacket::new(
+            my_pub[0],
+            room_pub[0],
+            ts,
+            meshcore_wire::packets::txtmsg::TXT_TYPE_SIGNED_PLAIN,
+            0,
+            "room post",
+            &room_pub,
+        )
+        .unwrap();
+        msg.signed_prefix = author_prefix;
+        let pkt = msg.to_packet(ROUTE_TYPE_DIRECT, &secret).unwrap();
+
+        let mut engine = MeshEngine::new(id, ADV_TYPE_REPEATER, &TestContext);
+        let expected_crc = meshcore_wire::crypto::ack_crc_signed(
+            ts,
+            meshcore_wire::packets::txtmsg::TXT_TYPE_SIGNED_PLAIN << 2,
+            &author_prefix,
+            b"room post",
+            &my_pub,
+        );
+        let wrong_room_crc = meshcore_wire::crypto::ack_crc_signed(
+            ts,
+            meshcore_wire::packets::txtmsg::TXT_TYPE_SIGNED_PLAIN << 2,
+            &author_prefix,
+            b"room post",
+            &room_pub,
+        );
+        assert_ne!(expected_crc, wrong_room_crc);
+
+        match engine.handle_inbound_packet(pkt, 5) {
+            InboundAction::ReceivedDirectText { msg, sender_pub, .. } => {
+                assert_eq!(sender_pub, room_pub);
+                assert_eq!(msg.ack_crc, expected_crc);
+            }
+            _ => panic!("expected ReceivedDirectText for signed room post"),
+        }
+
+        let queued = engine.tx_queue.pop().expect("signed post ACK queued");
+        let ack =
+            AckPacket::decode(&queued.packet.payload[..queued.packet.payload_len]).unwrap();
+        assert_eq!(ack.tail_len, 0);
+        assert_eq!(ack.crc, expected_crc);
     }
 }

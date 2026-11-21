@@ -542,7 +542,7 @@ fn txt_vectors() {
         assert_eq!(&encoded[..n], &payload[..], "{}: payload", t.packet);
 
         // The recipient can decrypt with the same shared secret.
-        let decoded = TxtMsgPacket::decode(&payload, &secret, &sender_pub)
+        let decoded = TxtMsgPacket::decode(&payload, &secret, &sender_pub, &recipient_pub)
             .unwrap_or_else(|_| panic!("{}: decode", t.packet));
         assert_eq!(decoded.timestamp, t.ts, "{}: ts", t.packet);
         assert_eq!(decoded.text.as_str(), text, "{}: text", t.packet);

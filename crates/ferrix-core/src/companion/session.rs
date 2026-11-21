@@ -317,6 +317,9 @@ mod tests {
 
     #[test]
     fn get_contacts_since_filters_older_records_but_reports_total_count() {
+        let _guard = crate::state::TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         crate::state::DISCOVERED_CONTACTS.lock(|c| {
             let mut list = c.borrow_mut();
             list.clear();

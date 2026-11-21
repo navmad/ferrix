@@ -189,21 +189,24 @@ pub fn ack_crc(ts: u32, flags: u8, text: &[u8], sender_pub: &[u8; 32]) -> u32 {
     u32::from_le_bytes([full[0], full[1], full[2], full[3]])
 }
 
-/// ACK CRC for a signed message: the signing-key prefix is part of the
-/// authenticated plaintext, between the flags and the text.
+/// ACK CRC for a signed (room) message: `SHA256(ts u32 LE ‖ flags ‖ prefix ‖ text ‖ recipient_pub)[0..4]`.
+///
+/// Upstream `BaseChatMesh::onPeerDataRecv` hashes the receiver's own public key
+/// (`self_id.pub_key`) for `TXT_TYPE_SIGNED_PLAIN`, unlike plain DMs which hash
+/// the sender's key.
 pub fn ack_crc_signed(
     ts: u32,
     flags: u8,
     prefix: &[u8; 4],
     text: &[u8],
-    sender_pub: &[u8; 32],
+    recipient_pub: &[u8; 32],
 ) -> u32 {
     let mut hasher = Sha256::new();
     hasher.update(ts.to_le_bytes());
     hasher.update([flags]);
     hasher.update(prefix);
     hasher.update(text);
-    hasher.update(sender_pub);
+    hasher.update(recipient_pub);
     let full: [u8; 32] = hasher.finalize().into();
     u32::from_le_bytes([full[0], full[1], full[2], full[3]])
 }
