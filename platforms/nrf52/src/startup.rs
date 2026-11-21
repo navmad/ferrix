@@ -7,6 +7,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use embassy_nrf::interrupt::{InterruptExt, Priority};
+use nrf_pac as pac;
 
 static DCDC_REG1_ENABLED: AtomicBool = AtomicBool::new(false);
 static LFCLK_MODE: AtomicU8 = AtomicU8::new(0);
@@ -101,20 +102,18 @@ pub fn lfclk_config() -> Lfclk {
 
 /// Read live LFCLK and DC-DC hardware registers for diagnostics.
 pub fn hardware_power_clock_status() -> HardwarePowerClockStatus {
-    // CLOCK.LFCLKSTAT (0x4000_0418): bits [1:0] = SRC, bit 16 = STATE.
-    // POWER.DCDCEN (0x4000_0578): bit 0 = REG1 enable.
-    // POWER.DCDCEN0 (0x4000_0580): bit 0 = REG0 enable.
-    let lfclkstat_raw = unsafe { core::ptr::read_volatile(0x4000_0418 as *const u32) };
-    let dcdc1_raw = unsafe { core::ptr::read_volatile(0x4000_0578 as *const u32) };
-    let dcdc0_raw = unsafe { core::ptr::read_volatile(0x4000_0580 as *const u32) };
+    let lfclkstat = pac::CLOCK.lfclkstat().read();
+    let lfclkstat_raw = lfclkstat.0;
+    let dcdc_reg1_active = pac::POWER.dcdcen().read().dcdcen();
+    let dcdc_reg0_active = pac::POWER.dcdcen0().read().dcdcen();
     HardwarePowerClockStatus {
         configured_lfclk: lfclk_config(),
         lfclk_running: (lfclkstat_raw & (1 << 16)) != 0,
         lfclk_src: (lfclkstat_raw & 0x3) as u8,
         lfclkstat_raw,
         configured_dcdc_reg1: dcdc_reg1_enabled(),
-        dcdc_reg1_active: (dcdc1_raw & 1) != 0,
-        dcdc_reg0_active: (dcdc0_raw & 1) != 0,
+        dcdc_reg1_active,
+        dcdc_reg0_active,
         sd_dcdc_result: SD_DCDC_RESULT.load(Ordering::Relaxed),
     }
 }
@@ -161,46 +160,35 @@ pub fn init_with(opts: StartupConfig) -> embassy_nrf::Peripherals {
     peripherals
 }
 
-/// Read `POWER.RESETREAS` (0x4000_0400).
+/// Read `POWER.RESETREAS`.
 pub fn reset_reason() -> u32 {
-    unsafe { core::ptr::read_volatile(0x4000_0400 as *const u32) }
+    pac::POWER.resetreas().read().0
 }
 
 /// Read the nRF52840 die temperature in `0.1 °C` units (`i16`) for Cayenne LPP
 /// temperature telemetry (`LPP_TEMPERATURE = 0x67`).
 ///
-/// Uses `sd_temp_get` when the S140 SoftDevice is active (`NRF_TEMP` is a
-/// SoftDevice-restricted peripheral), or polls `NRF_TEMP` directly when the
-/// SoftDevice is disabled.
+/// Uses `sd_temp_get` (via [`crate::sd_ffi`]) when the S140 SoftDevice is
+/// active (`NRF_TEMP` is a SoftDevice-restricted peripheral), or polls
+/// `pac::TEMP` directly when the SoftDevice is disabled.
 pub fn mcu_temperature_tenths_c(softdevice_active: bool) -> Option<i16> {
     let raw_quarters: i32 = if softdevice_active {
-        let mut temp: i32 = 0;
-        let ret = unsafe { nrf_softdevice::raw::sd_temp_get(&mut temp) };
-        if ret != nrf_softdevice::raw::NRF_SUCCESS {
-            return None;
-        }
-        temp
+        crate::sd_ffi::temp_get_quarters()?
     } else {
-        const NRF_TEMP_BASE: usize = 0x4000_C000;
-        let tasks_start = (NRF_TEMP_BASE + 0x000) as *mut u32;
-        let tasks_stop = (NRF_TEMP_BASE + 0x004) as *mut u32;
-        let events_datardy = (NRF_TEMP_BASE + 0x100) as *mut u32;
-        let temp_reg = (NRF_TEMP_BASE + 0x508) as *const i32;
-        unsafe {
-            events_datardy.write_volatile(0);
-            tasks_start.write_volatile(1);
-            let mut spins = 10_000u32;
-            while events_datardy.read_volatile() == 0 {
-                spins -= 1;
-                if spins == 0 {
-                    tasks_stop.write_volatile(1);
-                    return None;
-                }
+        let temp = pac::TEMP;
+        temp.events_datardy().write_value(0);
+        temp.tasks_start().write_value(1);
+        let mut spins = 10_000u32;
+        while temp.events_datardy().read() == 0 {
+            spins -= 1;
+            if spins == 0 {
+                temp.tasks_stop().write_value(1);
+                return None;
             }
-            let val = temp_reg.read_volatile();
-            tasks_stop.write_volatile(1);
-            val
         }
+        let val = temp.temp().read() as i32;
+        temp.tasks_stop().write_value(1);
+        val
     };
     // raw_quarters is in 0.25 °C units; convert to 0.1 °C (tenths):
     // quarters * 0.25 * 10 = (quarters * 5) / 2.

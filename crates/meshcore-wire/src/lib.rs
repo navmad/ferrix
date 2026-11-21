@@ -7,6 +7,7 @@
 //! so it builds and tests on the host.
 
 #![cfg_attr(not(test), no_std)]
+#![forbid(unsafe_code)]
 
 pub mod crypto;
 pub mod identity;

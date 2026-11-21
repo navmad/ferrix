@@ -154,6 +154,10 @@ impl CliHost for NrfCompanionHost {
         })
     }
 
+    fn softdevice_vectors(&self) -> Option<(u32, u32)> {
+        crate::flash::softdevice_vectors()
+    }
+
     fn set_tx_slot_override(&self, ms: u32) {
         ferrix_core::state::TX_SLOT_MS_OVERRIDE.store(ms, Ordering::Relaxed);
     }

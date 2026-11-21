@@ -6,6 +6,7 @@
 //! `firmware/thinknode-m1-companion` only chooses the role.
 
 #![no_std]
+#![deny(unsafe_code)]
 
 pub mod app;
 pub mod display;
@@ -29,7 +30,6 @@ use ferrix_core::companion::protocol::{
 };
 use ferrix_core::engine::EngineContext;
 use ferrix_nrf52::buzzer::PassiveBuzzer;
-use ferrix_nrf52::fatal::{FatalLed, Port};
 use ferrix_role_companion::CompanionBoard;
 use ferrix_runtime::radio::ChannelRadio;
 use heapless::String;
@@ -105,26 +105,17 @@ pub async fn sample_battery_adc_mv(adc: &mut saadc::Saadc<'static, 1>) -> Option
 //   - SoftDevice:  10 quick blinks, repeated forever
 // ---------------------------------------------------------------------------
 
-/// The MCU-controlled blue LED (P0.13, active-high).
-const FATAL_LED: FatalLed = FatalLed {
-    port: Port::P0,
-    pin: 13,
-    active_high: true,
-};
-
-/// Repeat a burst forever. Used for fatal faults that cannot recover.
-pub(crate) fn fatal_blink_forever(count: u32) -> ! {
-    FATAL_LED.blink_forever(count)
-}
+const BLUE_FAULT_LED: ferrix_nrf52::fault::FaultLed = ferrix_nrf52::fault::FaultLed::p0(13);
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    fatal_blink_forever(3)
+    ferrix_nrf52::fault::blink_pin_forever(BLUE_FAULT_LED, 3)
 }
 
+#[allow(unsafe_code)]
 #[cortex_m_rt::exception]
 unsafe fn HardFault(_frame: &cortex_m_rt::ExceptionFrame) -> ! {
-    fatal_blink_forever(6)
+    ferrix_nrf52::fault::blink_pin_forever(BLUE_FAULT_LED, 6)
 }
 
 /// Persistent state the role needs across the startup phases.
@@ -257,6 +248,7 @@ impl CompanionBoard for ThinkNodeBoard {
             usbd,
             qspi,
             wdt,
+            nvmc,
             buzzer: buzzer_pin,
         } = pins;
 
@@ -292,23 +284,30 @@ impl CompanionBoard for ThinkNodeBoard {
             set_battery_millivolts(mv);
         }
 
-        let (node_name, custom_key) = crate::storage::init_config();
-        // A node without an imported key gets a random identity on first
-        // boot, persisted immediately. Factory reset therefore rotates it.
-        let custom_key = match custom_key {
-            Some(key) => Some(key),
-            None => {
-                let identity = meshcore_wire::LocalIdentity::from_seed(
-                    node_name.as_str(),
-                    &ferrix_nrf52::seed::random_seed(),
-                );
-                let key = identity.private_key_bytes();
-                crate::storage::set_custom_priv_key(key);
-                crate::storage::request_save_config();
-                Some(key)
-            }
+        let (node_name, custom_key) = {
+            // Safe NVMC reader lives only during boot, before SoftDevice takes
+            // ownership of internal flash.
+            let flash_reader = ferrix_nrf52::flash::NvmcReader::new(nvmc);
+            crate::storage::capture_softdevice_vectors(&flash_reader);
+            let (node_name, custom_key) = crate::storage::init_config(&flash_reader);
+            // A node without an imported key gets a random identity on first
+            // boot, persisted immediately. Factory reset therefore rotates it.
+            let custom_key = match custom_key {
+                Some(key) => Some(key),
+                None => {
+                    let identity = meshcore_wire::LocalIdentity::from_seed(
+                        node_name.as_str(),
+                        &ferrix_nrf52::seed::random_seed(),
+                    );
+                    let key = identity.private_key_bytes();
+                    crate::storage::set_custom_priv_key(key);
+                    crate::storage::request_save_config();
+                    Some(key)
+                }
+            };
+            crate::storage::load(&flash_reader);
+            (node_name, custom_key)
         };
-        crate::storage::load();
 
         if let Some(disp) = display_pins {
             self.build_display(spim1, disp);
@@ -372,7 +371,7 @@ impl CompanionBoard for ThinkNodeBoard {
             self.capabilities(),
             self.ble_model(),
             self.cli_host(),
-            crate::fatal_blink_forever,
+            Some(BLUE_FAULT_LED),
             crate::storage::spawn_storage,
         );
     }

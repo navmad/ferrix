@@ -3,9 +3,9 @@
 //! Exposes Nordic UART Service (NUS) over BLE GATT, enabling official MeshCore
 //! mobile apps (iOS & Android) to discover, pair, and communicate with ThinkNode M1.
 
-use core::cell::{RefCell, UnsafeCell};
+use core::cell::RefCell;
 use core::future::poll_fn;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use core::task::Poll;
 
 use defmt::{debug, error, info, warn};
@@ -14,60 +14,75 @@ use embassy_sync::blocking_mutex::Mutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::waitqueue::AtomicWaker;
 
+use heapless::spsc::Queue;
 use heapless::Vec;
 use nrf_softdevice::ble::gatt_server;
 use nrf_softdevice::ble::peripheral;
 use nrf_softdevice::ble::security::{IoCapabilities, SecurityHandler};
 use nrf_softdevice::ble::{Connection, EncryptionInfo, IdentityKey, MasterId, PasskeyReply};
 use nrf_softdevice::Softdevice;
+use static_cell::StaticCell;
 
 use ferrix_core::command::PushSink;
 use ferrix_core::companion::cli::CliHost;
 use ferrix_core::storage::bonds::{self, Bond};
 use ferrix_core::companion::session::{CompanionLink, CompanionSession};
 
-#[nrf_softdevice::gatt_service(uuid = "180a")]
-pub struct DeviceInformationService {
-    #[characteristic(uuid = "2a24", read)]
-    pub model_number: Vec<u8, 32>,
-    #[characteristic(uuid = "2a26", read)]
-    pub firmware_revision: Vec<u8, 32>,
-    #[characteristic(uuid = "2a29", read)]
-    pub manufacturer_name: Vec<u8, 32>,
+#[allow(unsafe_code)]
+mod gatt {
+    // `nrf_softdevice::gatt_service` expands `unsafe` SoftDevice FFI calls for
+    // characteristic accessors; keep the allow scoped strictly to these macro
+    // definitions.
+    use heapless::Vec;
+
+    #[nrf_softdevice::gatt_service(uuid = "180a")]
+    pub struct DeviceInformationService {
+        #[characteristic(uuid = "2a24", read)]
+        pub model_number: Vec<u8, 32>,
+        #[characteristic(uuid = "2a26", read)]
+        pub firmware_revision: Vec<u8, 32>,
+        #[characteristic(uuid = "2a29", read)]
+        pub manufacturer_name: Vec<u8, 32>,
+    }
+
+    #[nrf_softdevice::gatt_service(uuid = "6e400001-b5a3-f393-e0a9-e50e24dcca9e")]
+    pub struct NordicUartService {
+        #[characteristic(uuid = "6e400002-b5a3-f393-e0a9-e50e24dcca9e", write, write_without_response, security = "mitm")]
+        pub rx: Vec<u8, 256>,
+
+        #[characteristic(uuid = "6e400003-b5a3-f393-e0a9-e50e24dcca9e", notify, security = "mitm")]
+        pub tx: Vec<u8, 256>,
+    }
+
+    /// Legacy Nordic/Adafruit buttonless DFU service (`00001530-...`).
+    ///
+    /// Registered after `dis` and `nus` so bonded phones' cached NUS attribute
+    /// handles never shift. Writing `0x01` to `control_point` reboots into the
+    /// bootloader's BLE OTA mode (`GPREGRET = 0xA8`).
+    #[nrf_softdevice::gatt_service(uuid = "00001530-1212-efde-1523-785feabcd123")]
+    pub struct LegacyDfuService {
+        #[characteristic(uuid = "00001531-1212-efde-1523-785feabcd123", write, notify, security = "mitm")]
+        pub control_point: Vec<u8, 20>,
+
+        #[characteristic(uuid = "00001532-1212-efde-1523-785feabcd123", write_without_response, security = "mitm")]
+        pub packet: Vec<u8, 20>,
+
+        #[characteristic(uuid = "00001534-1212-efde-1523-785feabcd123", read, security = "mitm")]
+        pub revision: Vec<u8, 2>,
+    }
+
+    #[nrf_softdevice::gatt_server]
+    pub struct MeshCoreGattServer {
+        pub dis: DeviceInformationService,
+        pub nus: NordicUartService,
+        pub dfu: LegacyDfuService,
+    }
 }
 
-#[nrf_softdevice::gatt_service(uuid = "6e400001-b5a3-f393-e0a9-e50e24dcca9e")]
-pub struct NordicUartService {
-    #[characteristic(uuid = "6e400002-b5a3-f393-e0a9-e50e24dcca9e", write, write_without_response, security = "mitm")]
-    pub rx: Vec<u8, 256>,
-
-    #[characteristic(uuid = "6e400003-b5a3-f393-e0a9-e50e24dcca9e", notify, security = "mitm")]
-    pub tx: Vec<u8, 256>,
-}
-
-/// Legacy Nordic/Adafruit buttonless DFU service (`00001530-...`).
-///
-/// Registered after `dis` and `nus` so bonded phones' cached NUS attribute
-/// handles never shift. Writing `0x01` to `control_point` reboots into the
-/// bootloader's BLE OTA mode (`GPREGRET = 0xA8`).
-#[nrf_softdevice::gatt_service(uuid = "00001530-1212-efde-1523-785feabcd123")]
-pub struct LegacyDfuService {
-    #[characteristic(uuid = "00001531-1212-efde-1523-785feabcd123", write, notify, security = "mitm")]
-    pub control_point: Vec<u8, 20>,
-
-    #[characteristic(uuid = "00001532-1212-efde-1523-785feabcd123", write_without_response, security = "mitm")]
-    pub packet: Vec<u8, 20>,
-
-    #[characteristic(uuid = "00001534-1212-efde-1523-785feabcd123", read, security = "mitm")]
-    pub revision: Vec<u8, 2>,
-}
-
-#[nrf_softdevice::gatt_server]
-pub struct MeshCoreGattServer {
-    pub dis: DeviceInformationService,
-    pub nus: NordicUartService,
-    pub dfu: LegacyDfuService,
-}
+pub use gatt::{
+    DeviceInformationService, LegacyDfuService, LegacyDfuServiceEvent, MeshCoreGattServer,
+    MeshCoreGattServerEvent, NordicUartService, NordicUartServiceEvent,
+};
 
 /// Responses are queued here and drained by `push_fut`, never notified from
 /// inside the GATT callback. Sized for a full contact sync burst
@@ -75,8 +90,8 @@ pub struct MeshCoreGattServer {
 
 /// Largest companion command accepted over NUS.
 const CMD_MAX_LEN: usize = 247;
-/// Number of queued commands. Commands arrive one at a time from the app, so
-/// a small ring is plenty.
+/// Number of slots in the SPSC command queue (7 usable). Commands arrive one
+/// at a time from the app, so a small ring is plenty.
 const CMD_RING_SLOTS: usize = 8;
 
 #[derive(Clone, Copy)]
@@ -85,98 +100,25 @@ struct CmdSlot {
     data: [u8; CMD_MAX_LEN],
 }
 
-/// Single-producer/single-consumer ring between the GATT callback and
-/// `command_fut`.
-///
-/// The GATT callback must never run companion protocol code: `handle_command`
-/// takes locks, reads shared state and can emit many responses. Doing that
-/// inside a SoftDevice event callback can stall the SoftDevice and freeze the
-/// device. The callback now only copies the bytes here.
-struct CmdRing {
-    slots: UnsafeCell<[CmdSlot; CMD_RING_SLOTS]>,
-    head: AtomicUsize,
-    tail: AtomicUsize,
-}
-
-// SAFETY: the producer (GATT callback) and consumer (`command_fut`) are
-// distinct. The producer writes a slot only after observing it free and
-// publishes it with a Release store to `head`; the consumer only reads slots
-// below `head` (Acquire) and advances `tail` with Release before reuse.
-unsafe impl Sync for CmdRing {}
-
-impl CmdRing {
-    const fn new() -> Self {
-        Self {
-            slots: UnsafeCell::new(
-                [CmdSlot {
-                    len: 0,
-                    data: [0u8; CMD_MAX_LEN],
-                }; CMD_RING_SLOTS],
-            ),
-            head: AtomicUsize::new(0),
-            tail: AtomicUsize::new(0),
-        }
-    }
-
-    /// Enqueue one command. Never blocks, never takes a lock. Returns false if
-    /// the command is too long or the ring is full.
-    fn push(&self, data: &[u8]) -> bool {
+impl CmdSlot {
+    fn from_slice(data: &[u8]) -> Option<Self> {
         if data.is_empty() || data.len() > CMD_MAX_LEN {
-            return false;
-        }
-
-        let head = self.head.load(Ordering::Relaxed);
-        let tail = self.tail.load(Ordering::Acquire);
-        if head.wrapping_sub(tail) >= CMD_RING_SLOTS {
-            return false;
-        }
-
-        let idx = head % CMD_RING_SLOTS;
-        // SAFETY: `idx` is free (head - tail < SLOTS) and only the producer
-        // writes slots.
-        unsafe {
-            let slot = &mut (*self.slots.get())[idx];
-            slot.len = data.len() as u8;
-            slot.data[..data.len()].copy_from_slice(data);
-        }
-        self.head.store(head.wrapping_add(1), Ordering::Release);
-        true
-    }
-
-    /// Dequeue one command into `out`, returning its length.
-    fn pop(&self, out: &mut [u8; CMD_MAX_LEN]) -> Option<usize> {
-        let tail = self.tail.load(Ordering::Relaxed);
-        let head = self.head.load(Ordering::Acquire);
-        if head == tail {
             return None;
         }
-
-        let idx = tail % CMD_RING_SLOTS;
-        // SAFETY: the slot was published by the producer (Acquire on head) and
-        // only the consumer reads it until it advances `tail`.
-        let len = unsafe {
-            let slot = &(*self.slots.get())[idx];
-            let len = slot.len as usize;
-            out[..len].copy_from_slice(&slot.data[..len]);
-            len
+        let mut slot = Self {
+            len: data.len() as u8,
+            data: [0u8; CMD_MAX_LEN],
         };
-        self.tail.store(tail.wrapping_add(1), Ordering::Release);
-        Some(len)
-    }
-
-    fn is_empty(&self) -> bool {
-        self.head.load(Ordering::Acquire) == self.tail.load(Ordering::Relaxed)
-    }
-
-    /// Discard queued commands. Called by the consumer after a disconnect,
-    /// when the producer is no longer running.
-    fn clear(&self) {
-        let head = self.head.load(Ordering::Acquire);
-        self.tail.store(head, Ordering::Release);
+        slot.data[..data.len()].copy_from_slice(data);
+        Some(slot)
     }
 }
 
-static BLE_CMD_RING: CmdRing = CmdRing::new();
+/// Lock-free single-producer/single-consumer queue between the GATT callback
+/// and `command_fut`. Split once inside `ble_companion_task` into disjoint
+/// producer/consumer halves so the GATT callback never takes locks or runs
+/// companion protocol code inside SoftDevice event context.
+static BLE_CMD_QUEUE: StaticCell<Queue<CmdSlot, CMD_RING_SLOTS>> = StaticCell::new();
 static BLE_CMD_WAKER: AtomicWaker = AtomicWaker::new();
 static BLE_DFU_REQUESTED: AtomicBool = AtomicBool::new(false);
 
@@ -278,19 +220,7 @@ fn set_static_passkey(pin: u32) {
             buf[i] = b'0' + (value % 10) as u8;
             value /= 10;
         }
-        let opt = nrf_softdevice::raw::ble_opt_t {
-            gap_opt: nrf_softdevice::raw::ble_gap_opt_t {
-                passkey: nrf_softdevice::raw::ble_gap_opt_passkey_t {
-                    p_passkey: buf.as_ptr(),
-                },
-            },
-        };
-        let ret = unsafe {
-            nrf_softdevice::raw::sd_ble_opt_set(
-                nrf_softdevice::raw::BLE_GAP_OPTS_BLE_GAP_OPT_PASSKEY,
-                &opt,
-            )
-        };
+        let ret = crate::sd_ffi::ble_set_static_passkey(&buf);
         if ret != 0 {
             error!("BLE: static passkey set failed {=u32:#x}", ret);
         }
@@ -371,21 +301,6 @@ impl SecurityHandler for MeshCoreSecurityHandler {
         }
         let _ = reply.reply(Some(&buf));
     }
-}
-
-/// Board-provided fatal-fault indicator (normally an LED blink pattern).
-static FAULT: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
-
-fn fault(count: u32) -> ! {
-    let ptr = FAULT.load(Ordering::Relaxed);
-    if ptr.is_null() {
-        loop {
-            cortex_m::asm::wfi();
-        }
-    }
-    // SAFETY: set once from `init_ble_companion` from a `fn(u32) -> !`.
-    let handler: fn(u32) -> ! = unsafe { core::mem::transmute(ptr) };
-    handler(count)
 }
 
 static SECURITY_HANDLER: MeshCoreSecurityHandler = MeshCoreSecurityHandler;
@@ -511,6 +426,8 @@ pub async fn ble_companion_task(
     let _ = dfu_rev.extend_from_slice(&[0x01, 0x00]);
     let _ = server.dfu.revision_set(&dfu_rev);
 
+    let (mut cmd_tx, mut cmd_rx) = BLE_CMD_QUEUE.init(Queue::new()).split();
+
     loop {
         info!("BLE: Waiting for pairable connection from MeshCore companion app...");
         // Pick up a PIN or callsign changed since the last advertising cycle.
@@ -580,106 +497,115 @@ pub async fn ble_companion_task(
         // session futures still borrow `conn`.
         let mut latency_conn = conn.clone();
 
-        // The GATT callback only copies the command into the lock-free ring and
-        // wakes `command_fut`. It must not parse commands, take locks, allocate
-        // or log: `handle_command` can emit dozens of responses (contact sync)
-        // and doing that inside a SoftDevice callback can stall the SoftDevice.
-        let gatt_fut = gatt_server::run(&conn, &server, |event| match event {
-            MeshCoreGattServerEvent::Nus(NordicUartServiceEvent::RxWrite(data)) => {
-                if !BLE_CMD_RING.push(data.as_slice()) {
-                    // Ring full: drop rather than spin inside the callback.
-                    // Command drops are counted and logged by `command_fut`.
-                    BLE_CMD_DROPS.fetch_add(1, Ordering::Relaxed);
-                }
-                BLE_CMD_WAKER.wake();
-            }
-            MeshCoreGattServerEvent::Nus(NordicUartServiceEvent::TxCccdWrite {
-                notifications: _,
-            }) => {
-                // Never log from a SoftDevice callback.
-            }
-            MeshCoreGattServerEvent::Dfu(LegacyDfuServiceEvent::ControlPointWrite(data)) => {
-                // Opcode 0x01: Start DFU (optional second byte selects image type).
-                if data.first() == Some(&0x01) {
-                    BLE_DFU_REQUESTED.store(true, Ordering::Release);
+        let session_result = {
+            // The GATT callback only copies the command into the lock-free SPSC
+            // queue and wakes `command_fut`. It must not parse commands, take
+            // locks, allocate or log: `handle_command` can emit dozens of
+            // responses (contact sync) and doing that inside a SoftDevice
+            // callback can stall the SoftDevice.
+            let gatt_fut = gatt_server::run(&conn, &server, |event| match event {
+                MeshCoreGattServerEvent::Nus(NordicUartServiceEvent::RxWrite(data)) => {
+                    let pushed = CmdSlot::from_slice(data.as_slice())
+                        .and_then(|slot| cmd_tx.enqueue(slot).ok())
+                        .is_some();
+                    if !pushed {
+                        // Queue full: drop rather than spin inside the callback.
+                        // Command drops are counted and logged by `command_fut`.
+                        BLE_CMD_DROPS.fetch_add(1, Ordering::Relaxed);
+                    }
                     BLE_CMD_WAKER.wake();
                 }
-            }
-            _ => {}
-        });
-
-        // Companion protocol processing, running in normal task context. One
-        // command at a time, then yield so `push_fut` can drain the responses
-        // before the next command is handled.
-        let mut cmd_buf = [0u8; CMD_MAX_LEN];
-        let command_fut = async {
-            loop {
-                if BLE_DFU_REQUESTED.swap(false, Ordering::AcqRel) {
-                    let _ = ferrix_core::command::USB_COMMAND_CHANNEL
-                        .try_send(ferrix_core::command::UsbCommand::RebootToOtaDfu);
-                } else if let Some(len) = BLE_CMD_RING.pop(&mut cmd_buf) {
-                    let drops = BLE_CMD_DROPS.swap(0, Ordering::Relaxed);
-                    if drops != 0 {
-                        debug!("BLE: dropped {} command(s) because the ring was full", drops);
-                    }
-                    session.handle_frame(&cmd_buf[..len], &mut BleLink).await;
-                    embassy_futures::yield_now().await;
-                } else {
-                    // Register before the emptiness check to avoid a lost wake.
-                    poll_fn(|cx| {
-                        BLE_CMD_WAKER.register(cx.waker());
-                        if BLE_CMD_RING.is_empty() && !BLE_DFU_REQUESTED.load(Ordering::Acquire) {
-                            Poll::Pending
-                        } else {
-                            Poll::Ready(())
-                        }
-                    })
-                    .await;
+                MeshCoreGattServerEvent::Nus(NordicUartServiceEvent::TxCccdWrite {
+                    notifications: _,
+                }) => {
+                    // Never log from a SoftDevice callback.
                 }
-            }
-        };
+                MeshCoreGattServerEvent::Dfu(LegacyDfuServiceEvent::ControlPointWrite(data)) => {
+                    // Opcode 0x01: Start DFU (optional second byte selects image type).
+                    if data.first() == Some(&0x01) {
+                        BLE_DFU_REQUESTED.store(true, Ordering::Release);
+                        BLE_CMD_WAKER.wake();
+                    }
+                }
+                _ => {}
+            });
 
-        let push_fut = async {
-            loop {
-                let msg = BLE_PUSH_CHANNEL.receive().await;
-                let mut vec = Vec::<u8, 256>::new();
-                let copy_len = msg.len().min(247);
-                let _ = vec.extend_from_slice(&msg[..copy_len]);
-                // The SoftDevice HVX queue can be momentarily full during a
-                // contact sync burst. Retry briefly instead of dropping.
-                for attempt in 0..40 {
-                    match server.nus.tx_notify(&conn, &vec) {
-                        Ok(()) => break,
-                        Err(e) => {
-                            if attempt == 39 {
-                                debug!("BLE NUS tx_notify push failed: {:?}", e);
+            // Companion protocol processing, running in normal task context. One
+            // command at a time, then yield so `push_fut` can drain the responses
+            // before the next command is handled.
+            let command_fut = async {
+                loop {
+                    if BLE_DFU_REQUESTED.swap(false, Ordering::AcqRel) {
+                        let _ = ferrix_core::command::USB_COMMAND_CHANNEL
+                            .try_send(ferrix_core::command::UsbCommand::RebootToOtaDfu);
+                    } else if let Some(slot) = cmd_rx.dequeue() {
+                        let drops = BLE_CMD_DROPS.swap(0, Ordering::Relaxed);
+                        if drops != 0 {
+                            debug!("BLE: dropped {} command(s) because the ring was full", drops);
+                        }
+                        session
+                            .handle_frame(&slot.data[..slot.len as usize], &mut BleLink)
+                            .await;
+                        embassy_futures::yield_now().await;
+                    } else {
+                        // Register before the emptiness check to avoid a lost wake.
+                        poll_fn(|cx| {
+                            BLE_CMD_WAKER.register(cx.waker());
+                            if !cmd_rx.ready() && !BLE_DFU_REQUESTED.load(Ordering::Acquire) {
+                                Poll::Pending
                             } else {
-                                embassy_time::Timer::after_millis(5).await;
+                                Poll::Ready(())
+                            }
+                        })
+                        .await;
+                    }
+                }
+            };
+
+            let push_fut = async {
+                loop {
+                    let msg = BLE_PUSH_CHANNEL.receive().await;
+                    let mut vec = Vec::<u8, 256>::new();
+                    let copy_len = msg.len().min(247);
+                    let _ = vec.extend_from_slice(&msg[..copy_len]);
+                    // The SoftDevice HVX queue can be momentarily full during a
+                    // contact sync burst. Retry briefly instead of dropping.
+                    for attempt in 0..40 {
+                        match server.nus.tx_notify(&conn, &vec) {
+                            Ok(()) => break,
+                            Err(e) => {
+                                if attempt == 39 {
+                                    debug!("BLE NUS tx_notify push failed: {:?}", e);
+                                } else {
+                                    embassy_time::Timer::after_millis(5).await;
+                                }
                             }
                         }
                     }
                 }
-            }
-        };
+            };
 
-        let mut session = core::pin::pin!(embassy_futures::select::select3(
-            gatt_fut,
-            command_fut,
-            push_fut
-        ));
-        let mut latency_timer =
-            embassy_time::Timer::after_secs(SLAVE_LATENCY_RESTORE_SECS);
-        let mut latency_restored = false;
-        let session_result = loop {
-            match embassy_futures::select::select(session.as_mut(), &mut latency_timer).await {
-                embassy_futures::select::Either::First(result) => break result,
-                embassy_futures::select::Either::Second(_) => {
-                    if !latency_restored {
-                        let _ = latency_conn.ignore_slave_latency(false);
-                        latency_restored = true;
-                        info!("BLE: restored slave latency after sync window");
+            let mut session_fut = core::pin::pin!(embassy_futures::select::select3(
+                gatt_fut,
+                command_fut,
+                push_fut
+            ));
+            let mut latency_timer =
+                embassy_time::Timer::after_secs(SLAVE_LATENCY_RESTORE_SECS);
+            let mut latency_restored = false;
+            loop {
+                match embassy_futures::select::select(session_fut.as_mut(), &mut latency_timer)
+                    .await
+                {
+                    embassy_futures::select::Either::First(result) => break result,
+                    embassy_futures::select::Either::Second(_) => {
+                        if !latency_restored {
+                            let _ = latency_conn.ignore_slave_latency(false);
+                            latency_restored = true;
+                            info!("BLE: restored slave latency after sync window");
+                        }
+                        latency_timer = embassy_time::Timer::after_secs(3600);
                     }
-                    latency_timer = embassy_time::Timer::after_secs(3600);
                 }
             }
         };
@@ -690,7 +616,7 @@ pub async fn ble_companion_task(
                 BLE_CONNECTED.store(false, Ordering::Relaxed);
                 // Drop anything left over from the closed connection so the
                 // next app session never receives stale responses.
-                BLE_CMD_RING.clear();
+                while cmd_rx.dequeue().is_some() {}
                 while BLE_PUSH_CHANNEL.try_receive().is_ok() {}
                 // After a connection, use the 1s interval for power saving.
                 adv_config.interval = ADVERTISING_SLOW_INTERVAL;
@@ -707,13 +633,6 @@ pub use ferrix_core::state::{BLE_CONNECTED, BLE_PIN, BLE_STATUS};
 /// Counts commands dropped because the GATT command ring was full.
 static BLE_CMD_DROPS: AtomicU32 = AtomicU32::new(0);
 
-unsafe extern "C" fn sd_fault_handler(id: u32, pc: u32, info: u32) {
-    defmt::error!("Softdevice fault: id={=u32:#x} pc={=u32:#x} info={=u32:#x}", id, pc, info);
-    // A SoftDevice assert is fatal. Signal it with 10 blue blinks so the
-    // failure can be identified without a debugger.
-    fault(10)
-}
-
 #[embassy_executor::task]
 pub async fn ble_companion_supervisor_task(
     spawner: embassy_executor::Spawner,
@@ -723,10 +642,10 @@ pub async fn ble_companion_supervisor_task(
     capabilities: u32,
     model_name: &'static str,
     host: &'static dyn CliHost,
-    fault_handler: fn(u32) -> !,
+    fault_led: Option<crate::fault::FaultLed>,
     storage_spawn: fn(embassy_executor::Spawner, &'static Softdevice),
 ) {
-    FAULT.store(fault_handler as *mut (), Ordering::Relaxed);
+    crate::fault::set_fault_led(fault_led);
     BLE_STATUS.store(1, Ordering::Relaxed);
     info!("BLE: Initializing SoftDevice S140 subsystem...");
 
@@ -790,8 +709,7 @@ pub async fn ble_companion_supervisor_task(
     };
 
     // Safely probe SoftDevice enablement without touching SCB->VTOR
-    let p_clock = sd_config.clock.as_ref().map(|x| x as _).unwrap_or(core::ptr::null());
-    let ret = unsafe { nrf_softdevice::raw::sd_softdevice_enable(p_clock, Some(sd_fault_handler as _)) };
+    let ret = crate::sd_ffi::softdevice_probe_enable(sd_config.clock.as_ref());
     if ret != 0 {
         error!("BLE: sd_softdevice_enable returned status code {=u32:#x}", ret);
         BLE_STATUS.store(0x1000 | ret, Ordering::Relaxed);
@@ -802,15 +720,11 @@ pub async fn ble_companion_supervisor_task(
     BLE_STATUS.store(2, Ordering::Relaxed);
 
     // Disable raw SD so that embassy's Softdevice::enable can manage state cleanly
-    unsafe { nrf_softdevice::raw::sd_softdevice_disable() };
+    crate::sd_ffi::softdevice_disable();
 
     let sd = Softdevice::enable(&sd_config);
     if crate::startup::dcdc_reg1_enabled() {
-        let ret = unsafe {
-            nrf_softdevice::raw::sd_power_dcdc_mode_set(
-                nrf_softdevice::raw::NRF_POWER_DCDC_MODES_NRF_POWER_DCDC_ENABLE as u8,
-            )
-        };
+        let ret = crate::sd_ffi::power_dcdc_enable();
         crate::startup::record_sd_dcdc_result(ret);
         if ret != 0 {
             warn!("BLE: sd_power_dcdc_mode_set returned {=u32:#x}", ret);
@@ -859,7 +773,7 @@ pub fn init_ble_companion(
     capabilities: u32,
     model_name: &'static str,
     host: &'static dyn CliHost,
-    fault_handler: fn(u32) -> !,
+    fault_led: Option<crate::fault::FaultLed>,
     storage_spawn: fn(embassy_executor::Spawner, &'static Softdevice),
 ) -> bool {
     spawner
@@ -871,7 +785,7 @@ pub fn init_ble_companion(
             capabilities,
             model_name,
             host,
-            fault_handler,
+            fault_led,
             storage_spawn,
         ))
         .is_ok()

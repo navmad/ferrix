@@ -6,6 +6,7 @@
 //! `firmware/wio-tracker-l1-pro-companion` only chooses the role.
 
 #![no_std]
+#![deny(unsafe_code)]
 
 pub mod app;
 pub mod display;
@@ -28,7 +29,6 @@ use ferrix_core::companion::cli::CliHost;
 use ferrix_core::companion::protocol::{CompanionHost, CompanionNode, CAP_BLE, CAP_CLIENT, CAP_GPS};
 use ferrix_core::engine::EngineContext;
 use ferrix_nrf52::buzzer::PassiveBuzzer;
-use ferrix_nrf52::fatal::{FatalLed, Port};
 use ferrix_role_companion::CompanionBoard;
 use ferrix_runtime::radio::ChannelRadio;
 use ferrix_sh1106::{Framebuffer, Sh1106};
@@ -91,25 +91,23 @@ pub async fn sample_battery_adc_mv(adc: &mut saadc::Saadc<'static, 1>) -> Option
 //   - SoftDevice:  10 quick blinks, repeated forever
 // ---------------------------------------------------------------------------
 
-const FATAL_LED: FatalLed = FatalLed {
-    port: Port::P1,
-    pin: 1,
-    active_high: true,
-};
-
-/// Repeat a burst forever. Used for fatal faults that cannot recover.
-pub(crate) fn fatal_blink_forever(count: u32) -> ! {
-    FATAL_LED.blink_forever(count)
-}
+const STATUS_FAULT_LED: ferrix_nrf52::fault::FaultLed = ferrix_nrf52::fault::FaultLed::p1(1);
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    fatal_blink_forever(ferrix_wio_tracker_l1_pro_logic::config::PANIC_BLINKS)
+    ferrix_nrf52::fault::blink_pin_forever(
+        STATUS_FAULT_LED,
+        ferrix_wio_tracker_l1_pro_logic::config::PANIC_BLINKS,
+    )
 }
 
+#[allow(unsafe_code)]
 #[cortex_m_rt::exception]
 unsafe fn HardFault(_frame: &cortex_m_rt::ExceptionFrame) -> ! {
-    fatal_blink_forever(ferrix_wio_tracker_l1_pro_logic::config::HARDFAULT_BLINKS)
+    ferrix_nrf52::fault::blink_pin_forever(
+        STATUS_FAULT_LED,
+        ferrix_wio_tracker_l1_pro_logic::config::HARDFAULT_BLINKS,
+    )
 }
 
 /// Persistent state the role needs across the startup phases.
@@ -229,6 +227,7 @@ impl CompanionBoard for WioTrackerBoard {
             usbd,
             qspi,
             wdt,
+            nvmc,
             buzzer: buzzer_pin,
         } = pins;
 
@@ -264,23 +263,30 @@ impl CompanionBoard for WioTrackerBoard {
             set_battery_millivolts(mv);
         }
 
-        let (node_name, custom_key) = crate::storage::init_config();
-        // A node without an imported key gets a random identity on first
-        // boot, persisted immediately. Factory reset therefore rotates it.
-        let custom_key = match custom_key {
-            Some(key) => Some(key),
-            None => {
-                let identity = meshcore_wire::LocalIdentity::from_seed(
-                    node_name.as_str(),
-                    &ferrix_nrf52::seed::random_seed(),
-                );
-                let key = identity.private_key_bytes();
-                crate::storage::set_custom_priv_key(key);
-                crate::storage::request_save_config();
-                Some(key)
-            }
+        let (node_name, custom_key) = {
+            // Safe NVMC reader lives only during boot, before SoftDevice takes
+            // ownership of internal flash.
+            let flash_reader = ferrix_nrf52::flash::NvmcReader::new(nvmc);
+            crate::storage::capture_softdevice_vectors(&flash_reader);
+            let (node_name, custom_key) = crate::storage::init_config(&flash_reader);
+            // A node without an imported key gets a random identity on first
+            // boot, persisted immediately. Factory reset therefore rotates it.
+            let custom_key = match custom_key {
+                Some(key) => Some(key),
+                None => {
+                    let identity = meshcore_wire::LocalIdentity::from_seed(
+                        node_name.as_str(),
+                        &ferrix_nrf52::seed::random_seed(),
+                    );
+                    let key = identity.private_key_bytes();
+                    crate::storage::set_custom_priv_key(key);
+                    crate::storage::request_save_config();
+                    Some(key)
+                }
+            };
+            crate::storage::load(&flash_reader);
+            (node_name, custom_key)
         };
-        crate::storage::load();
 
         self.build_display(oled);
 
@@ -341,7 +347,7 @@ impl CompanionBoard for WioTrackerBoard {
             self.capabilities(),
             self.ble_model(),
             self.cli_host(),
-            crate::fatal_blink_forever,
+            Some(STATUS_FAULT_LED),
             crate::storage::spawn_storage,
         );
     }

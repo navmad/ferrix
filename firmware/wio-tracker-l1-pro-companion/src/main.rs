@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![forbid(unsafe_code)]
 
 //! Ferrix companion firmware for the Seeed Wio Tracker L1 Pro.
 //!

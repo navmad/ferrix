@@ -2,7 +2,7 @@
 
 use core::future::Future;
 use core::ops::Range;
-use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use core::task::{Context, Poll, Waker};
 
 use embedded_storage_async::nor_flash::{
     ErrorType, MultiwriteNorFlash, NorFlash, NorFlashError, NorFlashErrorKind, ReadNorFlash,
@@ -61,13 +61,13 @@ impl NorFlashError for MappedFlashError {
 ///
 /// Used to mount `sequential-storage` maps during boot, before the storage
 /// task (and therefore the writable flash driver) exists.
-pub struct MappedAsyncFlash {
-    reader: &'static dyn MappedFlash,
+pub struct MappedAsyncFlash<'a> {
+    reader: &'a dyn MappedFlash,
     end: u32,
 }
 
-impl MappedAsyncFlash {
-    pub fn new(reader: &'static dyn MappedFlash, region: Range<u32>) -> Self {
+impl<'a> MappedAsyncFlash<'a> {
+    pub fn new(reader: &'a dyn MappedFlash, region: Range<u32>) -> Self {
         Self {
             reader,
             end: region.end,
@@ -75,11 +75,11 @@ impl MappedAsyncFlash {
     }
 }
 
-impl ErrorType for MappedAsyncFlash {
+impl ErrorType for MappedAsyncFlash<'_> {
     type Error = MappedFlashError;
 }
 
-impl ReadNorFlash for MappedAsyncFlash {
+impl ReadNorFlash for MappedAsyncFlash<'_> {
     const READ_SIZE: usize = 1;
 
     async fn read(&mut self, offset: u32, bytes: &mut [u8]) -> Result<(), Self::Error> {
@@ -96,7 +96,7 @@ impl ReadNorFlash for MappedAsyncFlash {
     }
 }
 
-impl NorFlash for MappedAsyncFlash {
+impl NorFlash for MappedAsyncFlash<'_> {
     const WRITE_SIZE: usize = 4;
     const ERASE_SIZE: usize = 4096;
 
@@ -109,22 +109,14 @@ impl NorFlash for MappedAsyncFlash {
     }
 }
 
-impl MultiwriteNorFlash for MappedAsyncFlash {}
-
-unsafe fn noop_clone(_: *const ()) -> RawWaker {
-    RawWaker::new(core::ptr::null(), &NOOP_VTABLE)
-}
-unsafe fn noop(_: *const ()) {}
-static NOOP_VTABLE: RawWakerVTable =
-    RawWakerVTable::new(noop_clone, noop, noop, noop);
+impl MultiwriteNorFlash for MappedAsyncFlash<'_> {}
 
 /// Drive a future whose I/O completes synchronously.
 ///
 /// The mapped flash adapter reads finish on the first poll, so this is used
 /// only for boot-time mount/lookups and cannot block on a real device.
 pub fn block_on<F: Future>(future: F) -> F::Output {
-    let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &NOOP_VTABLE)) };
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = Context::from_waker(Waker::noop());
     let mut future = core::pin::pin!(future);
     loop {
         match future.as_mut().poll(&mut cx) {

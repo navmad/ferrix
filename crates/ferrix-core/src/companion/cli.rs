@@ -91,6 +91,11 @@ pub trait CliHost: CompanionHost {
     fn power_clock_stats(&self) -> Option<PowerClockStats> {
         None
     }
+    /// Optional SoftDevice vector words `(w0, w1)` for `stats-ble` diagnostics
+    /// when SoftDevice initialization fails.
+    fn softdevice_vectors(&self) -> Option<(u32, u32)> {
+        None
+    }
     fn set_tx_slot_override(&self, ms: u32);
     fn clear_radio_stats(&self);
     fn advert_stats(&self) -> (usize, usize, bool);
@@ -126,20 +131,15 @@ pub(crate) fn normalize_cli_reply_in_place<const N: usize>(
     while out.len() > body_start && matches!(out.as_bytes().last(), Some(b'\r' | b'\n')) {
         out.pop();
     }
-    const PROMPT: &[u8] = b"  -> ";
+    const PROMPT: &str = "  -> ";
     if out
-        .as_bytes()
         .get(body_start..)
         .is_some_and(|rest| rest.starts_with(PROMPT))
     {
-        let new_len = out.len() - PROMPT.len();
-        // SAFETY: `body_start` and `body_start + PROMPT.len()` are ASCII
-        // boundaries within valid UTF-8, so shifting left preserves UTF-8.
-        unsafe {
-            let v = out.as_mut_vec();
-            v.copy_within(body_start + PROMPT.len().., body_start);
-            v.truncate(new_len);
-        }
+        let mut normalized = String::<N>::new();
+        let _ = normalized.push_str(&out[..body_start]);
+        let _ = normalized.push_str(&out[body_start + PROMPT.len()..]);
+        *out = normalized;
     }
 }
 
@@ -1611,13 +1611,19 @@ pub async fn handle_text_cli<W: TextSink>(
                     );
                 }
                 code if code >= 0x1000 => {
-                    let w0 = unsafe { *(0x1000 as *const u32) };
-                    let w1 = unsafe { *(0x1004 as *const u32) };
-                    let _ = write!(
-                        s,
-                        "  -> {{\"state\":\"sd_enable_err\",\"code\":\"0x{:04x}\",\"w0\":\"0x{:08x}\",\"w1\":\"0x{:08x}\"}}\r\n",
-                        code & 0xFFF, w0, w1
-                    );
+                    if let Some((w0, w1)) = host.softdevice_vectors() {
+                        let _ = write!(
+                            s,
+                            "  -> {{\"state\":\"sd_enable_err\",\"code\":\"0x{:04x}\",\"w0\":\"0x{:08x}\",\"w1\":\"0x{:08x}\"}}\r\n",
+                            code & 0xFFF, w0, w1
+                        );
+                    } else {
+                        let _ = write!(
+                            s,
+                            "  -> {{\"state\":\"sd_enable_err\",\"code\":\"0x{:04x}\"}}\r\n",
+                            code & 0xFFF
+                        );
+                    }
                 }
                 code => {
                     let _ = write!(s, "  -> {{\"state\":\"error\",\"code\":{}}}\r\n", code);

@@ -3695,16 +3695,8 @@ mod tests {
     use crate::state::TEST_LOCK;
 
     fn poll_sync<F: core::future::Future>(fut: F) -> F::Output {
-        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-        const VTABLE: RawWakerVTable = RawWakerVTable::new(
-            |p| RawWaker::new(p, &VTABLE),
-            |_| {},
-            |_| {},
-            |_| {},
-        );
-        // SAFETY: the raw waker is a no-op stub; we only poll ready futures.
-        let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
-        let mut cx = Context::from_waker(&waker);
+        use core::task::{Context, Poll, Waker};
+        let mut cx = Context::from_waker(Waker::noop());
         let mut fut = core::pin::pin!(fut);
         match fut.as_mut().poll(&mut cx) {
             Poll::Ready(out) => out,

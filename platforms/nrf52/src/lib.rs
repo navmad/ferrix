@@ -5,16 +5,18 @@
 //! parts that every nRF52 board would otherwise duplicate.
 
 #![cfg_attr(not(test), no_std)]
+#![deny(unsafe_code)]
 
 pub mod battery;
 pub mod ble;
 pub mod buzzer;
-pub mod fatal;
+pub mod fault;
 pub mod flash;
 pub mod gnss;
 pub mod host;
 pub mod qspi;
 pub mod reset;
+mod sd_ffi;
 pub mod seed;
 pub mod startup;
 pub mod storage;

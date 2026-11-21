@@ -23,21 +23,16 @@ pub use EXTERNAL_REGIONS as REGIONS;
 #[cfg(feature = "internal-storage")]
 pub use INTERNAL_REGIONS as REGIONS;
 
+pub use ferrix_nrf52::flash::{capture_softdevice_vectors, softdevice_vectors};
+
 /// Initialize configuration from the journal, or defaults.
-pub fn init_config() -> (String<32>, Option<[u8; 64]>) {
-    ferrix_core::storage::config::init_config(
-        &ferrix_nrf52::flash::MAPPED,
-        REGIONS.config.clone(),
-        crate::NAME,
-    )
+pub fn init_config(reader: &dyn MappedFlash) -> (String<32>, Option<[u8; 64]>) {
+    ferrix_core::storage::config::init_config(reader, REGIONS.config.clone(), crate::NAME)
 }
 
 /// Load the BLE bond map into RAM. Called once at boot, before BLE starts.
-pub fn load() {
-    ferrix_core::storage::bonds::init(
-        &ferrix_nrf52::flash::MAPPED,
-        REGIONS.bonds.clone(),
-    );
+pub fn load(reader: &dyn MappedFlash) {
+    ferrix_core::storage::bonds::init(reader, REGIONS.bonds.clone());
 }
 
 /// JEDEC IDs of the external flash fitted to the Wio Tracker L1 Pro.
