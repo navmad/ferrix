@@ -1667,15 +1667,15 @@ pub async fn handle_text_cli<W: TextSink>(
             let _ = sender.send( s.as_bytes()).await;
         }
         "stats-packets" => {
-            let (tx, rx) = RADIO_TELEMETRY.lock(|t| {
+            let (tx, rx, rx_drops) = RADIO_TELEMETRY.lock(|t| {
                 let tel = t.borrow();
-                (tel.tx_beacons, tel.rx_packets)
+                (tel.tx_beacons, tel.rx_packets, tel.rx_dropped)
             });
-            let mut s: heapless::String<128> = heapless::String::new();
+            let mut s: heapless::String<160> = heapless::String::new();
             let _ = write!(
                 s,
-                "  -> {{\"recv\":{},\"sent\":{},\"flood_tx\":{},\"direct_tx\":0,\"flood_rx\":{},\"direct_rx\":0,\"recv_errors\":0}}\r\n",
-                rx, tx, tx, rx
+                "  -> {{\"recv\":{},\"sent\":{},\"flood_tx\":{},\"direct_tx\":0,\"flood_rx\":{},\"direct_rx\":0,\"recv_errors\":0,\"rx_drops\":{}}}\r\n",
+                rx, tx, tx, rx, rx_drops
             );
             let _ = sender.send( s.as_bytes()).await;
         }
@@ -1695,6 +1695,7 @@ pub async fn handle_text_cli<W: TextSink>(
                 tel.tx_cancelled = 0;
                 tel.tx_retries = 0;
                 tel.tx_dropped = 0;
+                tel.rx_dropped = 0;
             });
             host.clear_radio_stats();
             let _ = sender.send( b"  -> OK\r\n").await;
