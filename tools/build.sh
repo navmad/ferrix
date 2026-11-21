@@ -46,14 +46,15 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [[ "$action" == "test" ]]; then
     host="$(rustc -vV | sed -n 's/host: //p')"
     python3 "$script_dir/check_task_arena.py" --self-test
-    exec cargo test -p meshcore-wire -p ferrix-hal -p ferrix-core -p ferrix-runtime -p ferrix-sx1262 -p ferrix-ssd1681 -p ferrix-sh1106 -p ferrix-l76k -p ferrix-wio-tracker-l1-pro-logic --target "$host" "$@"
+    exec cargo test -p meshcore-wire -p ferrix-hal -p ferrix-core -p ferrix-runtime -p ferrix-sx1262 -p ferrix-ssd1681 -p ferrix-sh1106 -p ferrix-l76k -p ferrix-thinknode-m1-logic -p ferrix-wio-tracker-l1-pro-logic --target "$host" "$@"
 fi
 
 if [[ "$action" == "hil" ]]; then
     # Hardware-in-the-loop smoke test against a connected board (USB CDC CLI).
     case "$board" in
+        thinknode-m1) exec python3 -I "$script_dir/hil/thinknode_smoke.py" "$@" ;;
         wio-tracker-l1-pro) exec python3 -I "$script_dir/hil/wio_smoke.py" "$@" ;;
-        *) echo "hil is only implemented for wio-tracker-l1-pro" >&2; exit 2 ;;
+        *) echo "hil is not implemented for $board" >&2; exit 2 ;;
     esac
 fi
 
