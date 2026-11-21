@@ -15,6 +15,7 @@ members = [
     "firmware/thinknode-m1-companion",
     "firmware/wio-tracker-l1-pro-companion",
     "boards/thinknode-m1",
+    "boards/thinknode-m1/logic",
     "boards/wio-tracker-l1-pro",
     "boards/wio-tracker-l1-pro/logic",
 ]

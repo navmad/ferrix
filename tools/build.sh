@@ -2,12 +2,15 @@
 #
 # Board selector for ferrix.
 #
+#   ./tools/build.sh test [cargo args...]
 #   ./tools/build.sh <board> [build|run|test|hil] [cargo args...]
 #
 # Examples:
+#   ./tools/build.sh test
+#   ./tools/build.sh test --lib --tests
 #   ./tools/build.sh thinknode-m1 build --release
 #   ./tools/build.sh thinknode-m1 run
-#   ./tools/build.sh thinknode-m1 test
+#   ./tools/build.sh thinknode-m1 hil [--port /dev/cu.usbmodemXXXX]         # needs hardware
 #   ./tools/build.sh wio-tracker-l1-pro build --release
 #   ./tools/build.sh wio-tracker-l1-pro hil [--port /dev/cu.usbmodemXXXX]   # needs hardware
 #
@@ -16,10 +19,36 @@
 
 set -euo pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+run_host_tests() {
+    local host
+    host="$(rustc -vV | sed -n 's/host: //p')"
+    python3 "$script_dir/check_task_arena.py" --self-test
+    exec cargo test \
+        -p meshcore-wire \
+        -p ferrix-hal \
+        -p ferrix-core \
+        -p ferrix-runtime \
+        -p ferrix-sx1262 \
+        -p ferrix-ssd1681 \
+        -p ferrix-sh1106 \
+        -p ferrix-l76k \
+        -p ferrix-thinknode-m1-logic \
+        -p ferrix-wio-tracker-l1-pro-logic \
+        --target "$host" "$@"
+}
+
+if [[ "${1:-}" == "test" ]]; then
+    shift
+    run_host_tests "$@"
+fi
+
 board="${1:-}"
 action="${2:-build}"
 [[ -n "$board" ]] || {
-    echo "usage: tools/build.sh <board> [build|run|test|hil] [cargo args...]" >&2
+    echo "usage: tools/build.sh test [cargo args...]" >&2
+    echo "       tools/build.sh <board> [build|run|test|hil] [cargo args...]" >&2
     echo "boards: thinknode-m1 wio-tracker-l1-pro" >&2
     exit 2
 }
@@ -41,19 +70,16 @@ case "$board" in
         ;;
 esac
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
 if [[ "$action" == "test" ]]; then
-    host="$(rustc -vV | sed -n 's/host: //p')"
-    python3 "$script_dir/check_task_arena.py" --self-test
-    exec cargo test -p meshcore-wire -p ferrix-hal -p ferrix-core -p ferrix-runtime -p ferrix-sx1262 -p ferrix-ssd1681 -p ferrix-sh1106 -p ferrix-l76k -p ferrix-wio-tracker-l1-pro-logic --target "$host" "$@"
+    run_host_tests "$@"
 fi
 
 if [[ "$action" == "hil" ]]; then
     # Hardware-in-the-loop smoke test against a connected board (USB CDC CLI).
     case "$board" in
+        thinknode-m1) exec python3 -I "$script_dir/hil/thinknode_smoke.py" "$@" ;;
         wio-tracker-l1-pro) exec python3 -I "$script_dir/hil/wio_smoke.py" "$@" ;;
-        *) echo "hil is only implemented for wio-tracker-l1-pro" >&2; exit 2 ;;
+        *) echo "hil is not implemented for $board" >&2; exit 2 ;;
     esac
 fi
 

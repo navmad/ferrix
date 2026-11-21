@@ -876,6 +876,7 @@ dependencies = [
  "ferrix-runtime",
  "ferrix-ssd1681",
  "ferrix-sx1262",
+ "ferrix-thinknode-m1-logic",
  "heapless",
  "meshcore-wire",
  "nrf-softdevice",
@@ -892,6 +893,21 @@ dependencies = [
  "ferrix-nrf52",
  "ferrix-role-companion",
  "ferrix-thinknode-m1",
+]
+
+[[package]]
+name = "ferrix-thinknode-m1-logic"
+version = "1.18.2"
+dependencies = [
+ "critical-section",
+ "defmt 0.3.101",
+ "embassy-time",
+ "embedded-graphics",
+ "ferrix-core",
+ "ferrix-hal",
+ "ferrix-l76k",
+ "ferrix-runtime",
+ "heapless",
 ]
 
 [[package]]

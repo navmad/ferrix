@@ -6,16 +6,15 @@ use embassy_nrf::saadc;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::TrySendError;
 use embassy_sync::signal::Signal;
-use embassy_time::{Duration, Instant};
+use embassy_time::Instant;
 use ferrix_core::companion::protocol::CompanionNode;
 use ferrix_nrf52::buzzer::PassiveBuzzer;
 use ferrix_runtime::app::{AppBoard, UiSound, UiState};
+use ferrix_thinknode_m1_logic::power::DisplayPower;
+use ferrix_thinknode_m1_logic::sound::{pattern, Pattern};
 
 use crate::display::{DisplayCmd, EpdFrameBuffer, DISPLAY_CMD, DISPLAY_RETURN};
 use crate::gps;
-
-/// Seconds the display frontlight stays on after the last button press.
-const BACKLIGHT_IDLE_SECS: u64 = 15;
 
 /// Sound requests played off the radio RX/TX loop by [`buzzer_task`].
 pub static BUZZER_SIGNAL: Signal<CriticalSectionRawMutex, UiSound> = Signal::new();
@@ -28,12 +27,9 @@ pub async fn buzzer_task(mut buzzer: PassiveBuzzer<'static>) -> ! {
         if !ferrix_core::state::buzzer_enabled() {
             continue;
         }
-        match sound {
-            UiSound::Click => buzzer.beep(2_200, 15).await,
-            UiSound::Action => buzzer.beep(1_800, 35).await,
-            UiSound::Notify => {
-                buzzer.melody(&[(2_700, 70), (3_200, 90)], 50).await;
-            }
+        match pattern(sound) {
+            Pattern::Beep((hz, ms)) => buzzer.beep(hz, ms).await,
+            Pattern::Melody { tones, gap_ms } => buzzer.melody(tones, gap_ms).await,
         }
     }
 }
@@ -46,9 +42,7 @@ pub struct ThinkNodeApp {
     has_display: bool,
     battery_adc: saadc::Saadc<'static, 1>,
     battery_filter: ferrix_core::battery::BatteryMvFilter,
-    backlight_on: bool,
-    backlight_deadline: Instant,
-    last_periodic_refresh: Instant,
+    power: DisplayPower,
 }
 
 impl ThinkNodeApp {
@@ -72,11 +66,7 @@ impl ThinkNodeApp {
             has_display,
             battery_adc,
             battery_filter,
-            backlight_on: false,
-            backlight_deadline: now
-                .checked_add(Duration::from_secs(BACKLIGHT_IDLE_SECS))
-                .unwrap(),
-            last_periodic_refresh: now,
+            power: DisplayPower::new(now),
         }
     }
 
@@ -146,15 +136,15 @@ impl AppBoard for ThinkNodeApp {
         let Some(fb) = self.fb.take() else {
             return false;
         };
-        crate::display::ui::render_dashboard(node, ui, fb);
+        crate::display::ui::render_dashboard(node, ui, gps::gps_enabled(), fb);
         let cmd = DisplayCmd::Flush {
             fb,
             full,
-            sleep_after: !self.backlight_on,
+            sleep_after: self.power.sleep_after_flush(),
         };
         match DISPLAY_CMD.try_send(cmd) {
             Ok(()) => {
-                self.last_periodic_refresh = Instant::now();
+                self.power.mark_refreshed(Instant::now());
                 true
             }
             Err(TrySendError::Full(DisplayCmd::Flush { fb, .. })) => {
@@ -166,27 +156,22 @@ impl AppBoard for ThinkNodeApp {
     }
 
     fn input_wake(&mut self) {
-        self.backlight_on = true;
-        self.backlight_deadline = Instant::now()
-            .checked_add(Duration::from_secs(BACKLIGHT_IDLE_SECS))
-            .unwrap();
+        self.power.wake(Instant::now());
         self.set_backlight(true);
     }
 
     fn tick(&mut self, node: &CompanionNode<'_>, ui: &UiState, _tick: u32) {
         self.reclaim_fb();
-        if self.backlight_on && Instant::now() >= self.backlight_deadline {
+        if self.power.idle_expired(Instant::now()) {
             self.set_backlight(false);
             if self.has_display {
                 let _ = DISPLAY_CMD.try_send(DisplayCmd::Sleep);
             }
-            self.backlight_on = false;
+            self.power.sleep();
         }
 
         let interval_secs = ferrix_core::state::display_refresh_interval_secs();
-        if interval_secs > 0
-            && self.last_periodic_refresh.elapsed() >= Duration::from_secs(interval_secs as u64)
-        {
+        if self.power.periodic_due(Instant::now(), interval_secs) {
             let _ = self.render(node, ui, false);
         }
     }
@@ -209,7 +194,7 @@ impl AppBoard for ThinkNodeApp {
     }
 
     async fn prepare_ota_dfu(&mut self, node: &CompanionNode<'_>, _ui: &UiState) {
-        self.backlight_on = false;
+        self.power.sleep();
         self.set_backlight(false);
         if !self.has_display {
             return;

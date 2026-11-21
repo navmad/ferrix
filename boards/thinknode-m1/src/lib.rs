@@ -43,7 +43,7 @@ use crate::pins::{BoardIrqs, DisplayPins, LoraPins, Pins, TelemetryPins};
 use crate::radio::sx1262_task;
 
 /// Hardware model reported to MeshCore companion apps.
-pub const NAME: &str = "ThinkNode M1";
+pub use ferrix_thinknode_m1_logic::config::NAME;
 /// Whether this board has a display.
 pub const HAS_DISPLAY: bool = true;
 /// Whether this board has a GNSS receiver.
@@ -78,12 +78,7 @@ pub use ferrix_nrf52::battery::{
     battery_millivolts, battery_percentage, set_battery_millivolts, MIN_PLAUSIBLE_BATTERY_MV,
 };
 
-/// ThinkNode M1 battery ADC: AIN2 (P0.04), 150K+150K divider (2:1), SAADC
-/// gain 1/6 with the internal 0.6 V reference.
-///
-/// `7236 / 4096` matches the board's `vbat-mv-multiplier` (2:1 divider,
-/// 3.6 V full scale, +0.5% SAADC gain trim).
-pub const BATTERY_ADC_SCALE: u32 = 7236;
+pub use ferrix_thinknode_m1_logic::config::BATTERY_ADC_SCALE;
 
 /// Averaged battery sample in millivolts; see `ferrix_nrf52::battery`.
 pub async fn sample_battery_adc_mv(adc: &mut saadc::Saadc<'static, 1>) -> Option<u16> {
@@ -109,13 +104,19 @@ const BLUE_FAULT_LED: ferrix_nrf52::fault::FaultLed = ferrix_nrf52::fault::Fault
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
-    ferrix_nrf52::fault::blink_pin_forever(BLUE_FAULT_LED, 3)
+    ferrix_nrf52::fault::blink_pin_forever(
+        BLUE_FAULT_LED,
+        ferrix_thinknode_m1_logic::config::PANIC_BLINKS,
+    )
 }
 
 #[allow(unsafe_code)]
 #[cortex_m_rt::exception]
 unsafe fn HardFault(_frame: &cortex_m_rt::ExceptionFrame) -> ! {
-    ferrix_nrf52::fault::blink_pin_forever(BLUE_FAULT_LED, 6)
+    ferrix_nrf52::fault::blink_pin_forever(
+        BLUE_FAULT_LED,
+        ferrix_thinknode_m1_logic::config::HARDFAULT_BLINKS,
+    )
 }
 
 /// Persistent state the role needs across the startup phases.
@@ -195,7 +196,7 @@ impl CompanionBoard for ThinkNodeBoard {
     }
 
     fn usb_ids(&self) -> (u16, u16) {
-        (0x239A, 0x8029)
+        ferrix_thinknode_m1_logic::config::USB_IDS
     }
 
     fn usb_manufacturer(&self) -> &'static str {

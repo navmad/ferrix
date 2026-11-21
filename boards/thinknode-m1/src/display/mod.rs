@@ -4,9 +4,11 @@
 //! board's 200x200 framebuffer, its `embedded-graphics` integration and the
 //! `ThinkNodeDisplay` wrapper used by the application loop.
 
-pub mod ui;
-
 pub use ferrix_ssd1681::{PanelConfig, Ssd1681};
+pub use ferrix_thinknode_m1_logic::framebuffer::{
+    EpdFrameBuffer, EPD_BUFFER_SIZE, EPD_HEIGHT, EPD_WIDTH,
+};
+pub use ferrix_thinknode_m1_logic::ui;
 pub use ui::render_dashboard;
 
 use embassy_nrf::gpio::{Input, Output};
@@ -15,76 +17,9 @@ use embassy_nrf::spim::Spim;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time::Delay;
-use embedded_graphics::pixelcolor::BinaryColor;
-use embedded_graphics::prelude::*;
 use embedded_hal_bus::spi::ExclusiveDevice;
 use ferrix_core::companion::protocol::CompanionNode;
 use ferrix_runtime::app::UiState;
-
-pub const EPD_WIDTH: usize = 200;
-pub const EPD_HEIGHT: usize = 200;
-pub const EPD_BUFFER_SIZE: usize = (EPD_WIDTH * EPD_HEIGHT) / 8;
-
-/// In-memory monochrome framebuffer for the 200x200 panel.
-pub struct EpdFrameBuffer {
-    pub buffer: [u8; EPD_BUFFER_SIZE],
-}
-
-impl EpdFrameBuffer {
-    pub const fn new() -> Self {
-        // 1 = white in SSD1681 RAM.
-        Self {
-            buffer: [0xFF; EPD_BUFFER_SIZE],
-        }
-    }
-
-    pub fn clear(&mut self) {
-        self.buffer.fill(0xFF);
-    }
-}
-
-impl Default for EpdFrameBuffer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl OriginDimensions for EpdFrameBuffer {
-    fn size(&self) -> Size {
-        Size::new(EPD_WIDTH as u32, EPD_HEIGHT as u32)
-    }
-}
-
-impl DrawTarget for EpdFrameBuffer {
-    type Color = BinaryColor;
-    type Error = core::convert::Infallible;
-
-    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
-    where
-        I: IntoIterator<Item = Pixel<Self::Color>>,
-    {
-        for Pixel(coord, color) in pixels.into_iter() {
-            if coord.x >= 0
-                && coord.x < EPD_WIDTH as i32
-                && coord.y >= 0
-                && coord.y < EPD_HEIGHT as i32
-            {
-                let x = coord.x as usize;
-                let y = coord.y as usize;
-                let byte_idx = (y * EPD_WIDTH + x) / 8;
-                let bit_mask = 0x80 >> (x % 8);
-
-                match color {
-                    // Black: cleared bit.
-                    BinaryColor::On => self.buffer[byte_idx] &= !bit_mask,
-                    // White: set bit.
-                    BinaryColor::Off => self.buffer[byte_idx] |= bit_mask,
-                }
-            }
-        }
-        Ok(())
-    }
-}
 
 type EpdSpi = ExclusiveDevice<Spim<'static, TWISPI1>, Output<'static>, Delay>;
 
@@ -263,7 +198,7 @@ impl ThinkNodeDisplay {
         node: &CompanionNode<'_>,
         ui: &UiState,
     ) -> Result<(), ferrix_ssd1681::Error> {
-        ui::render_dashboard(node, ui, self.fb);
+        ui::render_dashboard(node, ui, crate::gps::gps_enabled(), self.fb);
         self.panel.flush(self.fb, false, false).await
     }
 
