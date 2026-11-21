@@ -2,7 +2,7 @@
 
 A native `no_std` embedded Rust firmware workspace for **MeshCore v1.18** LoRa mesh nodes, built on [Embassy](https://embassy.dev/).
 
-> **Firmware identity:** Ferrix reports `<version>-ferrix` (currently `1.18.2-ferrix`) in version strings and its boot splash while keeping `ThinkNode M1` / `MeshCore` USB and protocol identifiers for drop-in compatibility with MeshCore companion apps (iOS, Android, Web, and CLI).
+> **Firmware identity:** Ferrix reports `<version>-ferrix` (currently `1.18.4-ferrix`) in version strings and its boot splash while keeping `ThinkNode M1` / `MeshCore` USB and protocol identifiers for drop-in compatibility with MeshCore companion apps (iOS, Android, Web, and CLI).
 
 > **Important — Storage format & full erase required:** Ferrix **does not** follow the standard MeshCore on-flash storage format (it uses its own `sequential-storage` layout across internal flash and external QSPI flash rather than MeshCore's LittleFS layout). **Flashing Ferrix onto a device previously running stock MeshCore (or switching back from Ferrix to stock MeshCore) requires a full flash erase** so leftover filesystem/config sectors do not conflict. Export your private key and contacts beforehand if you want to keep your identity. Normal upgrades between Ferrix releases preserve your identity and configuration.
 

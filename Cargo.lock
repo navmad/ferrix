@@ -736,7 +736,7 @@ checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
 
 [[package]]
 name = "ferrix-core"
-version = "1.18.2"
+version = "1.18.4"
 dependencies = [
  "critical-section",
  "defmt 0.3.101",
@@ -751,14 +751,14 @@ dependencies = [
 
 [[package]]
 name = "ferrix-hal"
-version = "1.18.2"
+version = "1.18.4"
 dependencies = [
  "meshcore-wire",
 ]
 
 [[package]]
 name = "ferrix-l76k"
-version = "1.18.2"
+version = "1.18.4"
 dependencies = [
  "embedded-hal 1.0.0",
  "embedded-hal-async",
@@ -767,7 +767,7 @@ dependencies = [
 
 [[package]]
 name = "ferrix-nrf52"
-version = "1.18.2"
+version = "1.18.4"
 dependencies = [
  "cortex-m",
  "defmt 0.3.101",
@@ -792,7 +792,7 @@ dependencies = [
 
 [[package]]
 name = "ferrix-role-companion"
-version = "1.18.2"
+version = "1.18.4"
 dependencies = [
  "defmt 0.3.101",
  "embassy-executor",
@@ -805,11 +805,11 @@ dependencies = [
 
 [[package]]
 name = "ferrix-role-repeater"
-version = "1.18.2"
+version = "1.18.4"
 
 [[package]]
 name = "ferrix-runtime"
-version = "1.18.2"
+version = "1.18.4"
 dependencies = [
  "defmt 0.3.101",
  "embassy-futures",
@@ -824,7 +824,7 @@ dependencies = [
 
 [[package]]
 name = "ferrix-sh1106"
-version = "1.18.2"
+version = "1.18.4"
 dependencies = [
  "embedded-graphics-core",
  "embedded-hal-async",
@@ -832,7 +832,7 @@ dependencies = [
 
 [[package]]
 name = "ferrix-ssd1681"
-version = "1.18.2"
+version = "1.18.4"
 dependencies = [
  "defmt 0.3.101",
  "embassy-time",
@@ -842,7 +842,7 @@ dependencies = [
 
 [[package]]
 name = "ferrix-sx1262"
-version = "1.18.2"
+version = "1.18.4"
 dependencies = [
  "defmt 0.3.101",
  "embassy-time",
@@ -854,7 +854,7 @@ dependencies = [
 
 [[package]]
 name = "ferrix-thinknode-m1"
-version = "1.18.2"
+version = "1.18.4"
 dependencies = [
  "cortex-m",
  "cortex-m-rt",
@@ -885,7 +885,7 @@ dependencies = [
 
 [[package]]
 name = "ferrix-thinknode-m1-companion"
-version = "1.18.2"
+version = "1.18.4"
 dependencies = [
  "cortex-m-rt",
  "defmt-rtt",
@@ -897,7 +897,7 @@ dependencies = [
 
 [[package]]
 name = "ferrix-thinknode-m1-logic"
-version = "1.18.2"
+version = "1.18.4"
 dependencies = [
  "critical-section",
  "defmt 0.3.101",
@@ -912,7 +912,7 @@ dependencies = [
 
 [[package]]
 name = "ferrix-wio-tracker-l1-pro"
-version = "1.18.2"
+version = "1.18.4"
 dependencies = [
  "cortex-m",
  "cortex-m-rt",
@@ -943,7 +943,7 @@ dependencies = [
 
 [[package]]
 name = "ferrix-wio-tracker-l1-pro-companion"
-version = "1.18.2"
+version = "1.18.4"
 dependencies = [
  "cortex-m-rt",
  "defmt-rtt",
@@ -955,7 +955,7 @@ dependencies = [
 
 [[package]]
 name = "ferrix-wio-tracker-l1-pro-logic"
-version = "1.18.2"
+version = "1.18.4"
 dependencies = [
  "critical-section",
  "defmt 0.3.101",
@@ -1231,7 +1231,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "meshcore-wire"
-version = "1.18.2"
+version = "1.18.4"
 dependencies = [
  "aes",
  "curve25519-dalek",
