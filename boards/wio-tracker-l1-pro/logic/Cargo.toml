@@ -1,0 +1,20 @@
+[package]
+name = "ferrix-wio-tracker-l1-pro-logic"
+version.workspace = true
+edition = "2021"
+description = "Host-testable pure logic for the Wio Tracker L1 Pro board (UI, input map, display power, flash layout)"
+
+[dependencies]
+ferrix-core = { path = "../../../crates/ferrix-core" }
+ferrix-hal = { path = "../../../crates/ferrix-hal" }
+ferrix-runtime = { path = "../../../crates/ferrix-runtime" }
+ferrix-sh1106 = { path = "../../../drivers/display/sh1106" }
+ferrix-l76k = { path = "../../../drivers/gnss/l76k" }
+embedded-graphics = "0.8"
+embassy-time = { version = "0.4", features = ["defmt"] }
+heapless = { version = "0.8", features = ["defmt-03"] }
+defmt = "0.3"
+
+[dev-dependencies]
+critical-section = { version = "1", features = ["std"] }
+embassy-time = { version = "0.4", features = ["mock-driver"] }

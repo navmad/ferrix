@@ -180,7 +180,13 @@ fn draw_wrapped(
 // --- frame ------------------------------------------------------------------
 
 /// Render the active page onto the framebuffer.
-pub fn render_page(page: u8, node: &CompanionNode<'_>, ui: &UiState, fb: &mut Framebuffer) {
+pub fn render_page(
+    page: u8,
+    node: &CompanionNode<'_>,
+    ui: &UiState,
+    gps_on: bool,
+    fb: &mut Framebuffer,
+) {
     fb.clear();
     let page = page.min(PAGE_COUNT - 1);
     draw_top_bar(page, node, fb);
@@ -192,7 +198,7 @@ pub fn render_page(page: u8, node: &CompanionNode<'_>, ui: &UiState, fb: &mut Fr
         2 => page_radar(node, ui, fb),
         3 => page_radio(fb),
         4 => page_signal(ui, fb),
-        5 => page_position(node, fb),
+        5 => page_position(node, gps_on, fb),
         6 => page_offgrid(fb),
         7 => page_settings(fb),
         _ => page_system(node, fb),
@@ -225,7 +231,7 @@ fn draw_top_bar(page: u8, node: &CompanionNode<'_>, fb: &mut Framebuffer) {
         let _ = name.push(c);
     }
     if name.is_empty() {
-        for c in crate::NAME.chars().take(max_chars) {
+        for c in crate::config::NAME.chars().take(max_chars) {
             let _ = name.push(c);
         }
     }
@@ -477,7 +483,7 @@ fn page_signal(ui: &UiState, fb: &mut Framebuffer) {
     draw(fb, line.as_str(), 1, ROWS[2], small);
 }
 
-fn page_position(node: &CompanionNode<'_>, fb: &mut Framebuffer) {
+fn page_position(node: &CompanionNode<'_>, gps_on: bool, fb: &mut Framebuffer) {
     let (hero, small) = (hero_style(), small_style());
     draw(fb, "POSITION", 1, HERO_Y, hero);
     draw_right(
@@ -499,7 +505,7 @@ fn page_position(node: &CompanionNode<'_>, fb: &mut Framebuffer) {
     let _ = write!(
         row,
         "GPS {}  advert LOC {}",
-        if crate::gps::gps_enabled() { "ON" } else { "OFF" },
+        if gps_on { "ON" } else { "OFF" },
         if policy != 0 { "ON" } else { "OFF" }
     );
     draw(fb, row.as_str(), 1, ROWS[2], small);
@@ -589,7 +595,7 @@ pub fn render_boot(node: &CompanionNode<'_>, fb: &mut Framebuffer) {
     draw(fb, "FW", 1, 28, small);
     draw(fb, FIRMWARE_VERSION, 36, 28, small);
     draw(fb, "BOARD", 1, 37, small);
-    draw(fb, crate::NAME, 36, 37, small);
+    draw(fb, crate::config::NAME, 36, 37, small);
     draw(fb, "NODE", 1, 46, small);
     let mut name: String<32> = String::new();
     for c in node.callsign.chars().take(18) {
@@ -614,6 +620,117 @@ pub fn render_ota_dfu(_node: &CompanionNode<'_>, fb: &mut Framebuffer) {
 }
 
 /// Page render entry point.
-pub fn render_dashboard(node: &CompanionNode<'_>, ui: &UiState, fb: &mut Framebuffer) {
-    render_page(node.current_page, node, ui, fb);
+pub fn render_dashboard(
+    node: &CompanionNode<'_>,
+    ui: &UiState,
+    gps_on: bool,
+    fb: &mut Framebuffer,
+) {
+    render_page(node.current_page, node, ui, gps_on, fb);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lit(fb: &Framebuffer, x: usize, y: usize) -> bool {
+        fb.as_bytes()[(y / 8) * ferrix_sh1106::WIDTH + x] & (1 << (y % 8)) != 0
+    }
+
+    fn any_lit_in_rows(fb: &Framebuffer, y0: usize, y1: usize) -> bool {
+        (y0..y1).any(|y| (0..ferrix_sh1106::WIDTH).any(|x| lit(fb, x, y)))
+    }
+
+    #[test]
+    fn text_width_counts_chars_not_bytes() {
+        assert_eq!(text_width("", 6), 0);
+        assert_eq!(text_width("abc", 6), 18);
+        assert_eq!(text_width("é", 5), 5);
+    }
+
+    #[test]
+    fn clock_label_wraps_at_24_hours() {
+        assert_eq!(clock_label(0).as_str(), "00:00");
+        assert_eq!(clock_label(3_600 * 13 + 60 * 7).as_str(), "13:07");
+        assert_eq!(clock_label(86_400 + 61).as_str(), "00:01");
+        assert_eq!(clock_label(86_399).as_str(), "23:59");
+    }
+
+    #[test]
+    fn format_mhz_prints_three_decimals() {
+        assert_eq!(format_mhz(910_525_000).as_str(), "910.525");
+        assert_eq!(format_mhz(869_618_000).as_str(), "869.618");
+        assert_eq!(format_mhz(433_000_000).as_str(), "433.000");
+    }
+
+    #[test]
+    fn format_bw_trims_to_the_shortest_exact_form() {
+        for (khz, want) in [
+            (7, "7.8"),
+            (10, "10.4"),
+            (15, "15.6"),
+            (20, "20.8"),
+            (31, "31.25"),
+            (41, "41.67"),
+            (62, "62.5"),
+            (125, "125"),
+            (250, "250"),
+            (500, "500"),
+        ] {
+            assert_eq!(format_bw(khz).as_str(), want, "{khz} kHz");
+        }
+    }
+
+    #[test]
+    fn every_page_has_a_footer_that_fits_the_screen() {
+        for page in 0..PAGE_COUNT {
+            let text = actions(page);
+            assert!(!text.is_empty(), "page {page}");
+            assert!(
+                text_width(text, SMALL_W) + 1 <= W,
+                "page {page} footer `{text}` is wider than the panel"
+            );
+        }
+    }
+
+    #[test]
+    fn page_count_matches_the_runtime_page_switch() {
+        // `actions` and `render_page` both fall through to the last page.
+        assert_eq!(PAGE_COUNT, 9);
+        assert_eq!(actions(PAGE_COUNT - 1), actions(200));
+    }
+
+    #[test]
+    fn draw_wrapped_stops_at_max_lines() {
+        let mut fb = Framebuffer::new();
+        let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi";
+        draw_wrapped(&mut fb, text, 0, 10, 12, 2, small_style());
+        // Two 9px lines starting at y=10 -> nothing at or below y=28.
+        assert!(any_lit_in_rows(&fb, 10, 28));
+        assert!(!any_lit_in_rows(&fb, 28, 64));
+        assert!(!any_lit_in_rows(&fb, 0, 10));
+    }
+
+    #[test]
+    fn draw_wrapped_clips_a_single_overlong_word() {
+        let mut fb = Framebuffer::new();
+        draw_wrapped(&mut fb, "Supercalifragilisticexpialidocious", 0, 0, 6, 2, small_style());
+        // 6 chars * 5px = 30px; nothing beyond.
+        assert!((30..ferrix_sh1106::WIDTH).all(|x| (0..64).all(|y| !lit(&fb, x, y))));
+    }
+
+    #[test]
+    fn draw_wrapped_ignores_empty_text() {
+        let mut fb = Framebuffer::new();
+        draw_wrapped(&mut fb, "   ", 0, 0, 20, 3, small_style());
+        assert!(!any_lit_in_rows(&fb, 0, 64));
+    }
+
+    #[test]
+    fn sin_cos_table_is_a_unit_circle() {
+        for (c, s) in SIN_COS {
+            let r2 = (c as i32).pow(2) + (s as i32).pow(2);
+            assert!((r2 - 256 * 256).abs() < 512, "({c},{s}) r2={r2}");
+        }
+    }
 }
