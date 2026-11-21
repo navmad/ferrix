@@ -3,24 +3,49 @@
 use defmt::info;
 use embassy_nrf::gpio::Output;
 use embassy_nrf::saadc;
-use embassy_time::{Duration, Instant, Timer};
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::TrySendError;
+use embassy_sync::signal::Signal;
+use embassy_time::{Duration, Instant};
 use ferrix_core::companion::protocol::CompanionNode;
 use ferrix_nrf52::buzzer::PassiveBuzzer;
 use ferrix_runtime::app::{AppBoard, UiSound, UiState};
+use ferrix_sh1106::Framebuffer;
 
-use crate::display::WioDisplay;
+use crate::display::{DisplayCmd, DISPLAY_CMD, DISPLAY_RETURN};
 use crate::gps;
 
 /// Seconds the OLED stays on after the last button press.
 const DISPLAY_IDLE_SECS: u64 = 30;
 
+/// Sound requests played off the radio RX/TX loop by [`buzzer_task`].
+pub static BUZZER_SIGNAL: Signal<CriticalSectionRawMutex, UiSound> = Signal::new();
+
+/// Background task that drives the passive buzzer without stalling `app::run`.
+#[embassy_executor::task]
+pub async fn buzzer_task(mut buzzer: PassiveBuzzer<'static>) -> ! {
+    loop {
+        let sound = BUZZER_SIGNAL.wait().await;
+        if !ferrix_core::state::buzzer_enabled() {
+            continue;
+        }
+        match sound {
+            UiSound::Click => buzzer.beep(2_200, 15).await,
+            UiSound::Action => buzzer.beep(1_800, 35).await,
+            UiSound::Notify => {
+                buzzer.melody(&[(2_700, 70), (3_200, 90)], 50).await;
+            }
+        }
+    }
+}
+
 /// Board-side devices used by the application loop.
 pub struct WioApp {
     led: Output<'static>,
-    display: Option<WioDisplay>,
+    fb: Option<&'static mut Framebuffer>,
+    has_display: bool,
     battery_adc: saadc::Saadc<'static, 1>,
     battery_filter: ferrix_core::battery::BatteryMvFilter,
-    buzzer: PassiveBuzzer<'static>,
     display_on: bool,
     display_deadline: Instant,
     last_periodic_refresh: Instant,
@@ -29,11 +54,11 @@ pub struct WioApp {
 impl WioApp {
     pub fn new(
         led: Output<'static>,
-        display: Option<WioDisplay>,
+        fb: Option<&'static mut Framebuffer>,
         battery_adc: saadc::Saadc<'static, 1>,
-        buzzer: PassiveBuzzer<'static>,
     ) -> Self {
         let now = Instant::now();
+        let has_display = fb.is_some();
         let mut battery_filter = ferrix_core::battery::BatteryMvFilter::new();
         let initial_mv = crate::battery_millivolts();
         if initial_mv >= crate::MIN_PLAUSIBLE_BATTERY_MV {
@@ -41,15 +66,23 @@ impl WioApp {
         }
         Self {
             led,
-            display,
+            fb,
+            has_display,
             battery_adc,
             battery_filter,
-            buzzer,
             display_on: true,
             display_deadline: now
                 .checked_add(Duration::from_secs(DISPLAY_IDLE_SECS))
                 .unwrap(),
             last_periodic_refresh: now,
+        }
+    }
+
+    fn reclaim_fb(&mut self) {
+        if self.fb.is_none() {
+            if let Ok(fb) = DISPLAY_RETURN.try_receive() {
+                self.fb = Some(fb);
+            }
         }
     }
 }
@@ -63,22 +96,13 @@ pub fn set_status_led(led: &mut Output<'static>, on: bool) {
     }
 }
 
-async fn advert_feedback(led: &mut Output<'static>) {
-    for _ in 0..2 {
-        set_status_led(led, true);
-        Timer::after_millis(40).await;
-        set_status_led(led, false);
-        Timer::after_millis(40).await;
-    }
-}
-
 impl AppBoard for WioApp {
     fn page_count(&self) -> u8 {
         crate::display::ui::PAGE_COUNT
     }
 
     fn has_display(&self) -> bool {
-        self.display.is_some()
+        self.has_display
     }
 
     fn has_battery_adc(&self) -> bool {
@@ -98,44 +122,58 @@ impl AppBoard for WioApp {
         set_status_led(&mut self.led, on);
     }
 
-    async fn advert_feedback(&mut self) {
-        advert_feedback(&mut self.led).await;
+    fn advert_feedback(&mut self) {
+        set_status_led(&mut self.led, true);
     }
 
-    async fn render(&mut self, node: &CompanionNode<'_>, ui: &UiState, _full: bool) {
-        self.last_periodic_refresh = Instant::now();
-        if let Some(d) = &mut self.display {
-            // The OLED has no refresh cost and its RAM keeps updating while
-            // the panel is off, so a wake always shows current content.
-            d.render_dashboard(node, ui).await.ok();
+    fn render(&mut self, node: &CompanionNode<'_>, ui: &UiState, _full: bool) -> bool {
+        if !self.has_display {
+            return true;
+        }
+        self.reclaim_fb();
+        let Some(fb) = self.fb.take() else {
+            return false;
+        };
+        // The OLED has no refresh cost and its RAM keeps updating while
+        // the panel is off, so a wake always shows current content.
+        crate::display::ui::render_dashboard(node, ui, fb);
+        match DISPLAY_CMD.try_send(DisplayCmd::Flush { fb }) {
+            Ok(()) => {
+                self.last_periodic_refresh = Instant::now();
+                true
+            }
+            Err(TrySendError::Full(DisplayCmd::Flush { fb })) => {
+                self.fb = Some(fb);
+                false
+            }
+            Err(TrySendError::Full(DisplayCmd::SetOn(_))) => unreachable!(),
         }
     }
 
-    async fn input_wake(&mut self) {
+    fn input_wake(&mut self) {
         self.display_deadline = Instant::now()
             .checked_add(Duration::from_secs(DISPLAY_IDLE_SECS))
             .unwrap();
         if !self.display_on {
-            if let Some(d) = &mut self.display {
-                d.set_on(true).await.ok();
+            if !self.has_display || DISPLAY_CMD.try_send(DisplayCmd::SetOn(true)).is_ok() {
+                self.display_on = true;
             }
-            self.display_on = true;
         }
     }
 
-    async fn tick(&mut self, node: &CompanionNode<'_>, ui: &UiState, _tick: u32) {
+    fn tick(&mut self, node: &CompanionNode<'_>, ui: &UiState, _tick: u32) {
+        self.reclaim_fb();
         if self.display_on && Instant::now() >= self.display_deadline {
-            if let Some(d) = &mut self.display {
-                d.set_on(false).await.ok();
+            if !self.has_display || DISPLAY_CMD.try_send(DisplayCmd::SetOn(false)).is_ok() {
+                self.display_on = false;
             }
-            self.display_on = false;
         }
 
         let interval_secs = ferrix_core::state::display_refresh_interval_secs();
         if interval_secs > 0
             && self.last_periodic_refresh.elapsed() >= Duration::from_secs(interval_secs as u64)
         {
-            self.render(node, ui, false).await;
+            let _ = self.render(node, ui, false);
         }
     }
 
@@ -150,25 +188,26 @@ impl AppBoard for WioApp {
         crate::host::set_leds_disabled(disabled);
     }
 
-    async fn beep(&mut self, sound: UiSound) {
-        if !ferrix_core::state::buzzer_enabled() {
-            return;
-        }
-        match sound {
-            UiSound::Click => self.buzzer.beep(2_200, 15).await,
-            UiSound::Action => self.buzzer.beep(1_800, 35).await,
-            UiSound::Notify => {
-                self.buzzer.melody(&[(2_700, 70), (3_200, 90)], 50).await;
-            }
+    fn beep(&mut self, sound: UiSound) {
+        if ferrix_core::state::buzzer_enabled() {
+            BUZZER_SIGNAL.signal(sound);
         }
     }
 
     async fn prepare_ota_dfu(&mut self, node: &CompanionNode<'_>, _ui: &UiState) {
-        if let Some(d) = &mut self.display {
-            d.set_on(true).await.ok();
-            d.render_ota_dfu(node).await.ok();
-        }
         self.display_on = true;
+        if !self.has_display {
+            return;
+        }
+        let fb = match self.fb.take() {
+            Some(fb) => fb,
+            None => DISPLAY_RETURN.receive().await,
+        };
+        crate::display::ui::render_ota_dfu(node, fb);
+        DISPLAY_CMD.send(DisplayCmd::SetOn(true)).await;
+        DISPLAY_CMD.send(DisplayCmd::Flush { fb }).await;
+        // Wait for the OTA notice to finish painting before resetting.
+        self.fb = Some(DISPLAY_RETURN.receive().await);
     }
 
     fn reboot_to_ota_dfu(&mut self) -> ! {

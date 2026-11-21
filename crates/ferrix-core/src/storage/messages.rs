@@ -69,10 +69,25 @@ pub async fn queue_append(msg: ReceivedMessage) {
     let _ = COMMAND_CHANNEL.send(MessageCommand::Append(msg)).await;
 }
 
+/// Non-blocking append for the radio RX loop so storage backpressure never
+/// stalls packet handling or ACK transmission.
+#[inline(never)]
+pub fn try_queue_append(msg: ReceivedMessage) -> bool {
+    COMMAND_CHANNEL.try_send(MessageCommand::Append(msg)).is_ok()
+}
+
 pub async fn queue_append_channel_data(data: ReceivedChannelData) {
     let _ = COMMAND_CHANNEL
         .send(MessageCommand::AppendChannelData(data))
         .await;
+}
+
+/// Non-blocking channel-data append for the radio RX loop.
+#[inline(never)]
+pub fn try_queue_append_channel_data(data: ReceivedChannelData) -> bool {
+    COMMAND_CHANNEL
+        .try_send(MessageCommand::AppendChannelData(data))
+        .is_ok()
 }
 
 pub async fn queue_consume() {

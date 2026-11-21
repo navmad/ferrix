@@ -123,6 +123,7 @@ pub struct WioTrackerBoard {
     led: Option<Output<'static>>,
     battery_adc: Option<saadc::Saadc<'static, 1>>,
     display: Option<WioDisplay>,
+    app_fb: Option<&'static mut Framebuffer>,
     buzzer: Option<PassiveBuzzer<'static>>,
     radio: Option<ChannelRadio>,
     spim0: Option<peripherals::TWISPI0>,
@@ -145,6 +146,7 @@ impl WioTrackerBoard {
             led: None,
             battery_adc: None,
             display: None,
+            app_fb: None,
             buzzer: None,
             radio: None,
             spim0: None,
@@ -391,15 +393,25 @@ impl CompanionBoard for WioTrackerBoard {
             ))
             .unwrap();
 
+        if let Some(buzzer) = self.buzzer.take() {
+            spawner.spawn(crate::app::buzzer_task(buzzer)).unwrap();
+        }
+        if let Some(display) = self.display.take() {
+            let (panel, fb) = display.into_parts();
+            spawner
+                .spawn(crate::display::display_task(panel))
+                .unwrap();
+            self.app_fb = Some(fb);
+        }
+
         self.radio = Some(ChannelRadio::new());
     }
 
     fn take_app(&mut self) -> Self::App {
         WioApp::new(
             self.led.take().expect("LED already taken"),
-            self.display.take(),
+            self.app_fb.take(),
             self.battery_adc.take().expect("battery ADC already taken"),
-            self.buzzer.take().expect("buzzer already taken"),
         )
     }
 

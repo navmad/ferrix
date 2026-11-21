@@ -100,6 +100,12 @@ pub async fn queue_remove(pub_key: [u8; 32]) {
     let _ = OP_CHANNEL.send(ContactOp::Remove(pub_key)).await;
 }
 
+/// Non-blocking remove for the radio RX loop so advert eviction never stalls
+/// packet handling.
+pub fn try_queue_remove(pub_key: [u8; 32]) -> bool {
+    OP_CHANNEL.try_send(ContactOp::Remove(pub_key)).is_ok()
+}
+
 pub async fn queue_clear() {
     let _ = OP_CHANNEL.send(ContactOp::Clear).await;
 }
