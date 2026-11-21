@@ -2,6 +2,10 @@
 """Poll the ThinkNode M1 USB CLI and log when it stops responding.
 
 Usage: cli_monitor.py <seconds> [logfile]
+
+The serial port defaults to /dev/cu.usbmodem1101; override it with the
+FERRIX_CLI_PORT environment variable. For a scripted pass/fail check of a
+Wio Tracker L1 Pro see tools/hil/wio_smoke.py.
 """
 import os
 import select
@@ -9,7 +13,7 @@ import sys
 import termios
 import time
 
-PORT = "/dev/cu.usbmodem1101"
+PORT = os.environ.get("FERRIX_CLI_PORT", "/dev/cu.usbmodem1101")
 
 
 def open_port():
