@@ -57,6 +57,34 @@ See `memory.x`. The app is linked at `0x27000`, after the S140 v7.3.0 SoftDevice
 ./tools/build.sh wio-tracker-l1-pro test
 ```
 
+## Testing
+
+**Host tests** (`./tools/build.sh wio-tracker-l1-pro test`, also run in CI) include the
+`ferrix-wio-tracker-l1-pro-logic` crate (`logic/`), which holds the board's pure logic so it
+builds off-target: the OLED UI, joystick/button mapping, display idle/wake/refresh state
+machine, buzzer patterns, flash layout and the settings-to-SX1262 mapping. The firmware crate
+re-exports these modules, so there is one copy of the code.
+
+- The UI is checked against golden frames in `logic/tests/golden/*.txt` (128x64, `#` = lit).
+  After an intentional UI change, regenerate and review the diff:
+  `BLESS=1 cargo test -p ferrix-wio-tracker-l1-pro-logic --target "$(rustc -vV | sed -n 's/host: //p')" --test snapshots`
+- `layout.rs` tests parse `memory.x`, so the linker script and the storage regions cannot drift.
+
+**Hardware-in-the-loop smoke test** (needs a board on USB, not run in CI):
+
+```sh
+./tools/build.sh wio-tracker-l1-pro hil                      # auto-detects the port
+./tools/build.sh wio-tracker-l1-pro hil --port /dev/cu.usbmodemXXXX --gps-timeout 60
+./tools/build.sh wio-tracker-l1-pro hil --internal-storage   # for --features internal-storage builds
+./tools/build.sh wio-tracker-l1-pro hil --tx --soak 600      # also transmit one advert; 10 min stability soak
+```
+
+It checks clocks and regulators, QSPI flash, battery, radio settings, the binary companion
+handshake, GPS UART traffic, and that a name change survives a real reboot (the original name is
+restored). It exercises the hardware items listed as unverified below (GPS wiring, QSPI ID); `--tx`
+verifies the SX1262 path. `--flash` builds and flashes first. `hil --self-test` runs the script's
+own logic against a fake device and is run in CI.
+
 ## Flashing
 
 > **Before your first flash:** Ferrix uses its own on-flash storage format, so do a full flash erase before the first Ferrix flash and again if you return to stock MeshCore. Back up your private key first if you want to keep your node identity.
