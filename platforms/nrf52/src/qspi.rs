@@ -1,27 +1,31 @@
 //! External QSPI NOR flash support.
 //!
-//! The ThinkNode M1 carries a Macronix MX25R1635F (2 MB) on the nRF52840
-//! QSPI peripheral. The flash rail is switched, so bring-up is deliberately
-//! late and retried: a cold boot after a UF2 update can beat the rail.
+//! Supported boards carry a 2 MB NOR flash on the nRF52840 QSPI peripheral:
+//! a Macronix MX25R1635F on the ThinkNode M1 and a Puya P25Q16H on the Wio
+//! Tracker L1. The ThinkNode's flash rail is switched, so bring-up is
+//! deliberately late and retried: a cold boot after a UF2 update can beat the
+//! rail.
 
 use core::sync::atomic::Ordering;
 
 use defmt::{error, info};
+use embassy_nrf::gpio::AnyPin;
 use embassy_nrf::peripherals;
 use embassy_nrf::qspi::{self, Qspi};
 use embassy_time::Timer;
 
 use ferrix_core::state::{QSPI_ID, QSPI_STATUS};
 
-/// Board wiring for the external QSPI flash.
+/// Board wiring for the external QSPI flash. Boards pass their pins through
+/// `gpio::Pin::degrade()` so one type serves every pinout.
 pub struct QspiPins {
     pub qspi: peripherals::QSPI,
-    pub sck: peripherals::P1_14,
-    pub csn: peripherals::P1_15,
-    pub io0: peripherals::P1_12,
-    pub io1: peripherals::P1_13,
-    pub io2: peripherals::P0_07,
-    pub io3: peripherals::P0_05,
+    pub sck: AnyPin,
+    pub csn: AnyPin,
+    pub io0: AnyPin,
+    pub io1: AnyPin,
+    pub io2: AnyPin,
+    pub io3: AnyPin,
 }
 
 embassy_nrf::bind_interrupts!(struct QspiIrqs {
@@ -31,7 +35,10 @@ embassy_nrf::bind_interrupts!(struct QspiIrqs {
 /// Total size of the external flash.
 pub const FLASH_SIZE: u32 = 2 * 1024 * 1024;
 
-const MX25R1635F_ID: [u8; 3] = [0xC2, 0x28, 0x15];
+/// Macronix MX25R1635F (ThinkNode M1).
+pub const MX25R1635F_ID: [u8; 3] = [0xC2, 0x28, 0x15];
+/// Puya P25Q16H (Wio Tracker L1 Pro).
+pub const P25Q16H_ID: [u8; 3] = [0x85, 0x60, 0x15];
 
 /// Create the QSPI driver in single-line mode at 16 MHz.
 ///
@@ -71,7 +78,10 @@ pub fn init(pins: QspiPins) -> Qspi<'static, peripherals::QSPI> {
 /// Read-only: there is no erase/write probe. The stores exercise the write
 /// path when they first save data, and a missing or unknown chip is reported
 /// as unavailable rather than silently ignored.
-pub async fn probe(flash: &mut Qspi<'static, peripherals::QSPI>) -> bool {
+pub async fn probe(
+    flash: &mut Qspi<'static, peripherals::QSPI>,
+    accepted_ids: &[[u8; 3]],
+) -> bool {
     let mut id = [0u8; 3];
     let mut ready = false;
 
@@ -79,7 +89,7 @@ pub async fn probe(flash: &mut Qspi<'static, peripherals::QSPI>) -> bool {
         if attempt != 0 {
             Timer::after_millis(20).await;
         }
-        if flash.custom_instruction(0x9F, &[], &mut id).await.is_ok() && id == MX25R1635F_ID {
+        if flash.custom_instruction(0x9F, &[], &mut id).await.is_ok() && accepted_ids.contains(&id) {
             ready = true;
             break;
         }
@@ -100,6 +110,6 @@ pub async fn probe(flash: &mut Qspi<'static, peripherals::QSPI>) -> bool {
     }
 
     QSPI_STATUS.store(1, Ordering::Relaxed);
-    info!("QSPI: MX25R1635F ready");
+    info!("QSPI: flash ready, JEDEC {=[u8]:x}", id);
     true
 }

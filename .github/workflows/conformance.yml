@@ -44,3 +44,5 @@ jobs:
         run: ./tools/build.sh thinknode-m1 test
       - name: Build ThinkNode M1 release firmware and verify task arena fit
         run: ./tools/build.sh thinknode-m1 build --release
+      - name: Build Wio Tracker L1 Pro release firmware and verify task arena fit
+        run: ./tools/build.sh wio-tracker-l1-pro build --release

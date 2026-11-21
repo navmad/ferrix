@@ -14,15 +14,6 @@ pub use ferrix_core::storage::{
     set_custom_priv_key, set_path_hash_mode, util, MappedFlash, MessageCommand, StorageRegions,
 };
 
-use core::cell::RefCell;
-
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
-use embassy_sync::blocking_mutex::Mutex;
-#[cfg(not(feature = "internal-storage"))]
-use ferrix_runtime::storage::storage_loop_external;
-#[cfg(feature = "internal-storage")]
-use ferrix_runtime::storage::storage_loop_internal;
-use ferrix_runtime::storage::StorageExit;
 use heapless::String;
 
 /// Default profile: config/bonds internal, contacts/adverts and messages on
@@ -72,29 +63,18 @@ pub fn load() {
     );
 }
 
-/// QSPI pins are parked here between board startup and the storage task.
-static QSPI_PINS: Mutex<CriticalSectionRawMutex, RefCell<Option<ferrix_nrf52::qspi::QspiPins>>> =
-    Mutex::new(RefCell::new(None));
-
-/// Hand the optional external flash pins to the storage task.
-pub fn set_qspi(pins: Option<ferrix_nrf52::qspi::QspiPins>) {
-    QSPI_PINS.lock(|c| *c.borrow_mut() = pins);
-}
+/// JEDEC IDs of the external flash fitted to the ThinkNode M1.
+#[cfg(not(feature = "internal-storage"))]
+static EXTERNAL_FLASH_IDS: [[u8; 3]; 1] = [ferrix_nrf52::qspi::MX25R1635F_ID];
 
 /// Spawn the storage task once the SoftDevice has been enabled.
 pub fn spawn_storage(
     spawner: embassy_executor::Spawner,
     sd: &'static nrf_softdevice::Softdevice,
 ) {
-    let pins = QSPI_PINS.lock(|c| c.borrow_mut().take());
+    let pins = ferrix_nrf52::storage::take_qspi();
     let _ = spawner.spawn(storage_task(sd, pins));
 }
-
-#[cfg(not(feature = "internal-storage"))]
-type QspiFlash = embassy_nrf::qspi::Qspi<'static, embassy_nrf::peripherals::QSPI>;
-
-#[cfg(not(feature = "internal-storage"))]
-static QSPI: static_cell::StaticCell<QspiFlash> = static_cell::StaticCell::new();
 
 /// Background storage task that serializes all flash writes.
 #[embassy_executor::task]
@@ -102,45 +82,14 @@ pub async fn storage_task(
     sd: &'static nrf_softdevice::Softdevice,
     qspi_pins: Option<ferrix_nrf52::qspi::QspiPins>,
 ) -> ! {
-    let mut flash = ferrix_nrf52::flash::take(sd);
-
     #[cfg(not(feature = "internal-storage"))]
-    let exit = {
-        let mut qspi = if let Some(pins) = qspi_pins {
-            // The external flash is on a switched rail. Give it time and let
-            // the JEDEC probe retry while the rail settles.
-            embassy_time::Timer::after_millis(10).await;
-            Some(QSPI.init(ferrix_nrf52::qspi::init(pins)))
-        } else {
-            None
-        };
-
-        let ready = match qspi.as_mut() {
-            Some(qspi) => ferrix_nrf52::qspi::probe(qspi).await,
-            None => false,
-        };
-
-        let external: Option<&mut QspiFlash> = if ready {
-            defmt::info!("Storage: internal + external flash");
-            qspi
-        } else {
-            // No fallback: external stores stay unavailable for this session.
-            ferrix_core::storage::mark_external_unavailable();
-            None
-        };
-
-        storage_loop_external(&mut flash, external, &REGIONS).await
-    };
+    {
+        ferrix_nrf52::storage::run_external(sd, qspi_pins, &REGIONS, &EXTERNAL_FLASH_IDS).await
+    }
 
     #[cfg(feature = "internal-storage")]
-    let exit = {
+    {
         let _ = qspi_pins;
-        defmt::info!("Storage: internal flash only");
-        storage_loop_internal(&mut flash, &REGIONS).await
-    };
-
-    if exit == StorageExit::FactoryReset {
-        ferrix_nrf52::reset::system_reset();
+        ferrix_nrf52::storage::run_internal(sd, &REGIONS).await
     }
-    core::future::pending().await
 }

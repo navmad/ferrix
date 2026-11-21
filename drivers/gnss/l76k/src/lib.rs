@@ -5,7 +5,7 @@
 //! stay in `ferrix-core`, so a different GNSS chip can reuse the parser and a
 //! different protocol can reuse the power/reset sequence.
 
-#![no_std]
+#![cfg_attr(not(test), no_std)]
 #![allow(async_fn_in_trait)]
 
 use embedded_hal::digital::OutputPin;
@@ -28,7 +28,7 @@ pub struct L76kConfig {
     pub standby_active_high: bool,
     /// Reset is active-low (asserted by driving it low).
     pub reset_active_low: bool,
-    /// How long reset is held before release.
+    /// How long reset is held before release. `0` skips the pulse entirely.
     pub reset_pulse_ms: u32,
 }
 
@@ -39,6 +39,27 @@ impl Default for L76kConfig {
             reset_active_low: true,
             reset_pulse_ms: 120,
         }
+    }
+}
+
+/// A reset "pin" for boards that do not route the module's reset line.
+///
+/// Writes are accepted and ignored, so [`L76k`] skips the reset pulse
+/// without a separate code path.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoPin;
+
+impl embedded_hal::digital::ErrorType for NoPin {
+    type Error = core::convert::Infallible;
+}
+
+impl OutputPin for NoPin {
+    fn set_low(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn set_high(&mut self) -> Result<(), Self::Error> {
+        Ok(())
     }
 }
 
@@ -98,8 +119,14 @@ where
     }
 
     /// Power the module and release reset.
+    ///
+    /// With `reset_pulse_ms == 0` (boards without a reset line, see
+    /// [`NoPin`]) the reset pulse and its delay are skipped.
     pub async fn power_on(&mut self) -> Result<(), Error> {
         self.write_standby(true)?;
+        if self.config.reset_pulse_ms == 0 {
+            return Ok(());
+        }
         self.write_reset(true)?;
         self.delay.delay_ms(self.config.reset_pulse_ms).await;
         self.write_reset(false)?;
@@ -136,6 +163,82 @@ fn output_is_high(active: bool, active_high: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Recorder(std::vec::Vec<bool>);
+
+    impl embedded_hal::digital::ErrorType for Recorder {
+        type Error = core::convert::Infallible;
+    }
+
+    impl OutputPin for Recorder {
+        fn set_low(&mut self) -> Result<(), Self::Error> {
+            self.0.push(false);
+            Ok(())
+        }
+        fn set_high(&mut self) -> Result<(), Self::Error> {
+            self.0.push(true);
+            Ok(())
+        }
+    }
+
+    struct NoDelay;
+    impl DelayNs for NoDelay {
+        async fn delay_ns(&mut self, _ns: u32) {}
+    }
+
+    struct NoUart;
+    impl embedded_io_async::ErrorType for NoUart {
+        type Error = embedded_io_async::ErrorKind;
+    }
+    impl Read for NoUart {
+        async fn read(&mut self, _buf: &mut [u8]) -> Result<usize, Self::Error> {
+            Ok(0)
+        }
+    }
+
+    fn block_on<F: core::future::Future>(f: F) -> F::Output {
+        use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+        fn noop(_: *const ()) {}
+        fn clone(_: *const ()) -> RawWaker {
+            RawWaker::new(core::ptr::null(), &VTABLE)
+        }
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+        let waker = unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) };
+        let mut cx = Context::from_waker(&waker);
+        let mut f = core::pin::pin!(f);
+        loop {
+            if let Poll::Ready(v) = f.as_mut().poll(&mut cx) {
+                return v;
+            }
+        }
+    }
+
+    #[test]
+    fn power_on_without_reset_line_skips_pulse() {
+        let cfg = L76kConfig {
+            reset_pulse_ms: 0,
+            ..L76kConfig::default()
+        };
+        let mut gps = L76k::new(NoUart, Recorder(std::vec::Vec::new()), NoPin, NoDelay, cfg).unwrap();
+        block_on(gps.power_on()).unwrap();
+        // new(): standby off (low); power_on(): standby on (high), nothing else.
+        assert_eq!(gps.standby.0, std::vec![false, true]);
+    }
+
+    #[test]
+    fn power_on_with_reset_line_pulses_reset() {
+        let mut gps = L76k::new(
+            NoUart,
+            Recorder(std::vec::Vec::new()),
+            Recorder(std::vec::Vec::new()),
+            NoDelay,
+            L76kConfig::default(),
+        )
+        .unwrap();
+        block_on(gps.power_on()).unwrap();
+        // Active-low reset: held (low) in new(), re-asserted, then released (high).
+        assert_eq!(gps.reset.0, std::vec![false, false, true]);
+    }
 
     #[test]
     fn standby_polarity() {

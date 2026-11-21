@@ -777,7 +777,11 @@ dependencies = [
  "embassy-sync 0.6.2",
  "embassy-time",
  "embassy-usb",
+ "embedded-hal 1.0.0",
+ "embedded-io-async",
  "ferrix-core",
+ "ferrix-l76k",
+ "ferrix-runtime",
  "heapless",
  "meshcore-wire",
  "nrf-softdevice",
@@ -814,6 +818,14 @@ dependencies = [
  "ferrix-hal",
  "heapless",
  "meshcore-wire",
+]
+
+[[package]]
+name = "ferrix-sh1106"
+version = "1.18.2"
+dependencies = [
+ "embedded-graphics-core",
+ "embedded-hal-async",
 ]
 
 [[package]]
@@ -878,6 +890,48 @@ dependencies = [
  "ferrix-nrf52",
  "ferrix-role-companion",
  "ferrix-thinknode-m1",
+]
+
+[[package]]
+name = "ferrix-wio-tracker-l1-pro"
+version = "1.18.2"
+dependencies = [
+ "cortex-m",
+ "cortex-m-rt",
+ "defmt 0.3.101",
+ "defmt-rtt",
+ "embassy-executor",
+ "embassy-futures",
+ "embassy-nrf",
+ "embassy-sync 0.6.2",
+ "embassy-time",
+ "embedded-graphics",
+ "embedded-hal-bus",
+ "embedded-io-async",
+ "ferrix-core",
+ "ferrix-hal",
+ "ferrix-l76k",
+ "ferrix-nrf52",
+ "ferrix-role-companion",
+ "ferrix-runtime",
+ "ferrix-sh1106",
+ "ferrix-sx1262",
+ "heapless",
+ "meshcore-wire",
+ "nrf-softdevice",
+ "static_cell",
+]
+
+[[package]]
+name = "ferrix-wio-tracker-l1-pro-companion"
+version = "1.18.2"
+dependencies = [
+ "cortex-m-rt",
+ "defmt-rtt",
+ "embassy-executor",
+ "ferrix-nrf52",
+ "ferrix-role-companion",
+ "ferrix-wio-tracker-l1-pro",
 ]
 
 [[package]]

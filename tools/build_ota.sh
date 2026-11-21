@@ -6,6 +6,7 @@ set -euo pipefail
 # Usage: ./tools/build_ota.sh [board] [profile]
 # Examples:
 #   ./tools/build_ota.sh thinknode-m1 release
+#   ./tools/build_ota.sh wio-tracker-l1-pro release
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -17,10 +18,15 @@ TARGET="thumbv7em-none-eabihf"
 case "$BOARD" in
     thinknode-m1)
         pkg="ferrix-thinknode-m1-companion"
+        sd_req="0x00B6" # S140 6.1.1
+        ;;
+    wio-tracker-l1-pro)
+        pkg="ferrix-wio-tracker-l1-pro-companion"
+        sd_req="0x0123" # S140 7.3.0
         ;;
     *)
         echo "unknown board: $BOARD" >&2
-        echo "boards: thinknode-m1" >&2
+        echo "boards: thinknode-m1 wio-tracker-l1-pro" >&2
         exit 2
         ;;
 esac
@@ -63,10 +69,10 @@ echo "==> Converting ELF to Intel HEX with llvm-objcopy..."
 "${OBJCOPY}" -O ihex "${ELF}" "${HEX}"
 
 echo "==> Generating Nordic DFU package (.zip)..."
-# Target nRF52840 (dev-type 0x0052) with SoftDevice S140 6.1.1 (sd-req 0x00B6)
+# Target nRF52840 (dev-type 0x0052) with the board's SoftDevice (sd-req from the board case above)
 "${NRFUTIL}" dfu genpkg \
     --dev-type 0x0052 \
-    --sd-req 0x00B6 \
+    --sd-req "${sd_req}" \
     --application "${HEX}" \
     "${ZIP}"
 

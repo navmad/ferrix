@@ -3,9 +3,10 @@
 //! This module only describes the nRF52840 pins and the timing of the two
 //! buttons. It does not own board identity, power telemetry or startup logic.
 
-use embassy_nrf::gpio::{Input, Level, Output, OutputDrive, Pull};
+use embassy_nrf::gpio::{Input, Level, Output, OutputDrive, Pin as _, Pull};
 use embassy_nrf::peripherals;
 use embassy_time::Timer;
+use ferrix_nrf52::gnss::GnssPins;
 use ferrix_runtime::app::{InputEvent, INPUT_EVENT_CHANNEL};
 
 embassy_nrf::bind_interrupts!(pub(crate) struct BoardIrqs {
@@ -35,17 +36,6 @@ pub struct DisplayPins {
     pub reset: Output<'static>,
     pub busy: Input<'static>,
     pub backlight: Output<'static>,
-}
-
-/// Quectel L76K GNSS / GPS Module Pin Configuration
-pub struct GpsPins {
-    pub tx: peripherals::P1_08,
-    pub rx: peripherals::P1_09,
-    pub standby: Output<'static>,
-    pub reinit: Output<'static>,
-    pub timer1: peripherals::TIMER1,
-    pub ppi_ch0: peripherals::PPI_CH0,
-    pub ppi_ch1: peripherals::PPI_CH1,
 }
 
 /// Physical user controls mapped to semantic input events.
@@ -130,7 +120,7 @@ pub struct TelemetryPins {
 pub struct Pins {
     pub lora: LoraPins,
     pub display: Option<DisplayPins>,
-    pub gps: Option<GpsPins>,
+    pub gps: Option<GnssPins<Output<'static>, Output<'static>>>,
     pub inputs: ThinkNodeInputs,
     pub telemetry: TelemetryPins,
     pub power_en: Output<'static>,
@@ -193,11 +183,11 @@ pub fn init(p: embassy_nrf::Peripherals) -> Pins {
     let gps_standby = Output::new(p.P1_02, Level::Low, OutputDrive::Standard);
     let gps_reinit = Output::new(p.P1_05, Level::High, OutputDrive::Standard);
 
-    let gps = GpsPins {
-        tx: p.P1_08,
-        rx: p.P1_09,
+    let gps = GnssPins {
+        rx: p.P1_09.degrade(),
+        tx: p.P1_08.degrade(),
         standby: gps_standby,
-        reinit: gps_reinit,
+        reset: gps_reinit,
         timer1: p.TIMER1,
         ppi_ch0: p.PPI_CH0,
         ppi_ch1: p.PPI_CH1,
@@ -224,12 +214,12 @@ pub fn init(p: embassy_nrf::Peripherals) -> Pins {
     // --- External QSPI Flash (MX25R1635F) ---
     let qspi = ferrix_nrf52::qspi::QspiPins {
         qspi: p.QSPI,
-        sck: p.P1_14,
-        csn: p.P1_15,
-        io0: p.P1_12,
-        io1: p.P1_13,
-        io2: p.P0_07,
-        io3: p.P0_05,
+        sck: p.P1_14.degrade(),
+        csn: p.P1_15.degrade(),
+        io0: p.P1_12.degrade(),
+        io1: p.P1_13.degrade(),
+        io2: p.P0_07.degrade(),
+        io3: p.P0_05.degrade(),
     };
 
     Pins {

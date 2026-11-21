@@ -7,6 +7,7 @@ set -euo pipefail
 #   ./tools/flash_serial.sh
 #   ./tools/flash_serial.sh /dev/cu.usbmodem1101
 #   ./tools/flash_serial.sh /dev/cu.usbmodem1101 thinknode-m1 release
+#   ./tools/flash_serial.sh /dev/cu.usbmodem1101 wio-tracker-l1-pro release
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -15,6 +16,27 @@ PORT="${1:-}"
 BOARD="${2:-thinknode-m1}"
 PROFILE="${3:-release}"
 TARGET="thumbv7em-none-eabihf"
+
+case "${BOARD}" in
+    thinknode-m1)
+        PKG="ferrix-thinknode-m1-companion"
+        BOARD_LABEL="ThinkNode M1"
+        BOOT_USB_MATCH="ThinkNodeM1"
+        SD_REQ="0x00B6" # S140 6.1.1
+        ;;
+    wio-tracker-l1-pro)
+        PKG="ferrix-wio-tracker-l1-pro-companion"
+        BOARD_LABEL="Wio Tracker L1 Pro"
+        # Substring of the bootloader's USB product string in `ioreg`.
+        BOOT_USB_MATCH="TRACKER L1"
+        SD_REQ="0x0123" # S140 7.3.0
+        ;;
+    *)
+        echo "unknown board: ${BOARD}" >&2
+        echo "boards: thinknode-m1 wio-tracker-l1-pro" >&2
+        exit 2
+        ;;
+esac
 
 # Locate adafruit-nrfutil
 NRFUTIL=""
@@ -47,7 +69,7 @@ if [ -z "${PORT}" ]; then
         fi
     done
 
-    # Filter for ThinkNode / MeshCore port if multiple ports detected
+    # Filter for the MeshCore/Ferrix port if multiple ports detected
     MESH_PORTS=()
     for p in "${VALID_PORTS[@]}"; do
         if [[ "${p}" =~ Ferrix|MESH|1101 ]]; then
@@ -57,7 +79,7 @@ if [ -z "${PORT}" ]; then
 
     if [ ${#MESH_PORTS[@]} -eq 1 ]; then
         PORT="${MESH_PORTS[0]}"
-        echo "==> Auto-detected ThinkNode M1 port: ${PORT}"
+        echo "==> Auto-detected ${BOARD_LABEL} port: ${PORT}"
     elif [ ${#VALID_PORTS[@]} -eq 1 ]; then
         PORT="${VALID_PORTS[0]}"
         echo "==> Auto-detected serial port: ${PORT}"
@@ -71,7 +93,7 @@ if [ -z "${PORT}" ]; then
         exit 1
     else
         echo "ERROR: No USB serial device detected (/dev/cu.usbmodem* or /dev/ttyACM*)." >&2
-        echo "Please connect your ThinkNode M1 via USB-C or specify the port explicitly, e.g.:" >&2
+        echo "Please connect your ${BOARD_LABEL} via USB-C or specify the port explicitly, e.g.:" >&2
         echo "  $0 /dev/cu.usbmodemXXXX" >&2
         exit 1
     fi
@@ -91,7 +113,7 @@ if [ "${PROFILE}" = "release" ]; then
     CARGO_FLAGS+=("--release")
 fi
 
-cargo build -p ferrix-thinknode-m1-companion "${CARGO_FLAGS[@]}"
+cargo build -p "${PKG}" "${CARGO_FLAGS[@]}"
 
 ELF="${ROOT_DIR}/target/${TARGET}/${PROFILE}/ferrix"
 HEX="${ROOT_DIR}/target/${TARGET}/${PROFILE}/ferrix-${BOARD}.hex"
@@ -103,10 +125,10 @@ echo "==> Converting ELF to Intel HEX format..."
 "${OBJCOPY}" -O ihex "${ELF}" "${HEX}"
 
 echo "==> Generating Nordic DFU package (.zip)..."
-# Target nRF52840 (dev-type 0x0052) with SoftDevice S140 6.1.1 (sd-req 0x00B6)
+# Target nRF52840 (dev-type 0x0052) with the board's SoftDevice (SD_REQ above)
 "${NRFUTIL}" dfu genpkg \
     --dev-type 0x0052 \
-    --sd-req 0x00B6 \
+    --sd-req "${SD_REQ}" \
     --application "${HEX}" \
     "${ZIP}"
 
@@ -147,7 +169,7 @@ except Exception:
     sleep 1.0
     IN_BOOTLOADER=false
     for i in $(seq 1 40); do
-        if ioreg -p IOUSB -l -w 0 2>/dev/null | grep -q "ThinkNodeM1"; then
+        if ioreg -p IOUSB -l -w 0 2>/dev/null | grep -q "${BOOT_USB_MATCH}"; then
             IN_BOOTLOADER=true
             break
         fi

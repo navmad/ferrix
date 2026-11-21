@@ -5,6 +5,7 @@ set -euo pipefail
 # Usage: ./tools/build_uf2.sh [board] [profile]
 # Examples:
 #   ./tools/build_uf2.sh thinknode-m1 release
+#   ./tools/build_uf2.sh wio-tracker-l1-pro release
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -16,10 +17,17 @@ TARGET="thumbv7em-none-eabihf"
 case "$BOARD" in
     thinknode-m1)
         pkg="ferrix-thinknode-m1-companion"
+        # Application start: after the S140 6.1.1 SoftDevice.
+        uf2_base="0x26000"
+        ;;
+    wio-tracker-l1-pro)
+        pkg="ferrix-wio-tracker-l1-pro-companion"
+        # Application start: after the S140 7.3.0 SoftDevice.
+        uf2_base="0x27000"
         ;;
     *)
         echo "unknown board: $BOARD" >&2
-        echo "boards: thinknode-m1" >&2
+        echo "boards: thinknode-m1 wio-tracker-l1-pro" >&2
         exit 2
         ;;
 esac
@@ -53,7 +61,7 @@ echo "==> Converting ELF to raw binary with llvm-objcopy..."
 "${OBJCOPY}" -O binary "${ELF}" "${BIN}"
 
 echo "==> Converting binary to UF2 package..."
-python3 "${SCRIPT_DIR}/uf2conv.py" "${BIN}" -o "${UF2}" -b 0x26000
+python3 "${SCRIPT_DIR}/uf2conv.py" "${BIN}" -o "${UF2}" -b "${uf2_base}"
 
 echo ""
 echo "=========================================================="

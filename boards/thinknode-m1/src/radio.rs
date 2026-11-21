@@ -47,7 +47,7 @@ pub async fn sx1262_task(
         rx_boost: true,
     };
 
-    let device = match Sx1262Radio::new(spi_device, reset, dio1, busy, Delay, board, cfg).await {
+    let device = match Sx1262Radio::new(spi_device, reset, dio1, busy, None, Delay, board, cfg).await {
         Ok(device) => device,
         Err(e) => {
             error!("sx1262: failed to initialise radio: {:?}", e);
