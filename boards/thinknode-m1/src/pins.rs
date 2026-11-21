@@ -55,48 +55,43 @@ impl ThinkNodeInputs {
     /// Wait for the next debounced semantic input event.
     pub async fn wait_event(&mut self) -> Option<InputEvent> {
         use embassy_futures::select::{select, Either};
+        use ferrix_thinknode_m1_logic::input::{
+            event_for_click, Button, DEBOUNCE_MS, DOUBLE_CLICK_MS,
+        };
 
         let first = select(
             self.function_btn.wait_for_falling_edge(),
             self.page_btn.wait_for_falling_edge(),
         )
         .await;
-        let is_function = matches!(first, Either::First(_));
+        let button = match first {
+            Either::First(_) => Button::Function,
+            Either::Second(_) => Button::Page,
+        };
 
         // Let contact bounce settle, then look for a second click of the
         // same button within the double-click window.
-        Timer::after_millis(40).await;
-        let double = if is_function {
-            matches!(
+        Timer::after_millis(DEBOUNCE_MS).await;
+        let double = match button {
+            Button::Function => matches!(
                 select(
                     self.function_btn.wait_for_falling_edge(),
-                    Timer::after_millis(280)
+                    Timer::after_millis(DOUBLE_CLICK_MS)
                 )
                 .await,
                 Either::First(_)
-            )
-        } else {
-            matches!(
+            ),
+            Button::Page => matches!(
                 select(
                     self.page_btn.wait_for_falling_edge(),
-                    Timer::after_millis(280)
+                    Timer::after_millis(DOUBLE_CLICK_MS)
                 )
                 .await,
                 Either::First(_)
-            )
+            ),
         };
 
-        Some(if is_function {
-            if double {
-                InputEvent::ActionSecondary
-            } else {
-                InputEvent::ActionPrimary
-            }
-        } else if double {
-            InputEvent::PrevPage
-        } else {
-            InputEvent::NextPage
-        })
+        Some(event_for_click(button, double))
     }
 }
 

@@ -5,8 +5,8 @@
 
 use embassy_nrf::gpio::Output;
 use embassy_nrf::peripherals;
-use ferrix_l76k::L76kConfig;
 use ferrix_nrf52::gnss::GnssPins;
+use ferrix_thinknode_m1_logic::config::L76K_CONFIG;
 
 pub use ferrix_nrf52::gnss::{gps_enabled, set_gps_enabled};
 
@@ -16,5 +16,5 @@ pub async fn gps_task(
     uarte: peripherals::UARTE0,
     pins: GnssPins<Output<'static>, Output<'static>>,
 ) -> ! {
-    ferrix_nrf52::gnss::run(uarte, pins, L76kConfig::default()).await
+    ferrix_nrf52::gnss::run(uarte, pins, L76K_CONFIG).await
 }

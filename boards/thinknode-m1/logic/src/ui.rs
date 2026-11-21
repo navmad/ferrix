@@ -1,6 +1,6 @@
 //! Ferrix mesh-terminal UI for the 200x200 SSD1681 e-paper display.
 //!
-//! Eight pages share a mesh page rail, a top status strip and a two-action
+//! Nine pages share a mesh page rail, a top status strip and a two-action
 //! footer. The bottom button navigates; the top button fires FK1 on a single
 //! click and FK2 on a double click.
 
@@ -18,18 +18,19 @@ use ferrix_core::companion::protocol::CompanionNode;
 use ferrix_core::types::InboxItem;
 use ferrix_runtime::app::{RadarSort, UiState};
 
-use crate::display::{EpdFrameBuffer, EPD_WIDTH};
+use crate::framebuffer::{EpdFrameBuffer, EPD_WIDTH};
 
 pub const PAGE_COUNT: u8 = 9;
 pub const FIRMWARE_VERSION: &str = ferrix_core::version::FIRMWARE_VERSION;
 pub const PROTOCOL_VERSION: &str = "MeshCore v1.18";
 
+pub const SEPARATOR_Y: i32 = 30;
+pub const ACTION_SEP_Y: i32 = 162;
+
 const DISP_W: i32 = EPD_WIDTH as i32;
 const SMALL_W: i32 = 6;
 const TITLE_W: i32 = 9;
 const LINE_H: i32 = 12;
-const SEPARATOR_Y: i32 = 30;
-const ACTION_SEP_Y: i32 = 162;
 
 type SmallStyle = MonoTextStyle<'static, BinaryColor>;
 type TitleStyle = MonoTextStyle<'static, BinaryColor>;
@@ -43,7 +44,13 @@ const SIN_COS: [(i16, i16); 32] = [
 ];
 
 /// Render the active page onto the framebuffer.
-pub fn render_page(page: u8, node: &CompanionNode<'_>, ui: &UiState, fb: &mut EpdFrameBuffer) {
+pub fn render_page(
+    page: u8,
+    node: &CompanionNode<'_>,
+    ui: &UiState,
+    gps_on: bool,
+    fb: &mut EpdFrameBuffer,
+) {
     fb.clear();
     let small = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
     let title = MonoTextStyle::new(&FONT_9X15_BOLD, BinaryColor::On);
@@ -59,7 +66,7 @@ pub fn render_page(page: u8, node: &CompanionNode<'_>, ui: &UiState, fb: &mut Ep
         2 => page_radar(node, ui, fb, small, title),
         3 => page_radio(fb, small, title),
         4 => page_signal(ui, node, fb, small, title),
-        5 => page_position(node, fb, small, title),
+        5 => page_position(node, gps_on, fb, small, title),
         6 => page_offgrid(fb, small, title),
         7 => page_settings(fb, small, title),
         _ => page_system(node, fb, small, title),
@@ -90,7 +97,7 @@ fn draw_top_bar(
         let _ = name.push(c);
     }
     if name.is_empty() {
-        let _ = name.push_str(crate::NAME);
+        let _ = name.push_str(crate::config::NAME);
     }
     draw_text(fb, name.as_str(), 2, 14, title);
 }
@@ -435,6 +442,7 @@ fn page_signal(
 
 fn page_position(
     node: &CompanionNode<'_>,
+    gps_on: bool,
     fb: &mut EpdFrameBuffer,
     small: SmallStyle,
     title: TitleStyle,
@@ -450,7 +458,7 @@ fn page_position(
     let _ = write!(row, "Lon {:.5}", node.longitude);
     draw_text(fb, row.as_str(), 2, 86, small);
 
-    let power = if crate::gps::gps_enabled() { "ON" } else { "OFF" };
+    let power = if gps_on { "ON" } else { "OFF" };
     let policy = ferrix_core::state::prefs().advert_loc_policy;
     row.clear();
     let _ = write!(row, "GPS {}", power);
@@ -553,7 +561,7 @@ fn page_system(
     let _ = write!(row, "FW {}", FIRMWARE_VERSION);
     draw_text(fb, row.as_str(), 2, 134, small);
     row.clear();
-    let _ = write!(row, "BOARD {}", crate::NAME);
+    let _ = write!(row, "BOARD {}", crate::config::NAME);
     draw_text(fb, row.as_str(), 2, 146, small);
 }
 
@@ -685,7 +693,6 @@ fn draw_wrapped(
     }
 }
 
-
 fn format_bw(bw_khz: u32) -> String<10> {
     let hz = ferrix_core::airtime::bw_khz_to_hz(bw_khz);
     let mut s: String<10> = String::new();
@@ -719,7 +726,6 @@ fn draw_centered(fb: &mut EpdFrameBuffer, text: &str, y: i32, style: SmallStyle)
 
 /// Boot splash: firmware, board, device, radio and protocol.
 pub fn render_boot(node: &CompanionNode<'_>, fb: &mut EpdFrameBuffer) {
-    use embedded_graphics::mono_font::ascii::{FONT_6X10, FONT_9X15_BOLD};
     let small = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
     let title = MonoTextStyle::new(&FONT_9X15_BOLD, BinaryColor::On);
 
@@ -734,7 +740,7 @@ pub fn render_boot(node: &CompanionNode<'_>, fb: &mut EpdFrameBuffer) {
     draw_text(fb, "FW", 2, 86, small);
     draw_text(fb, FIRMWARE_VERSION, 66, 86, small);
     draw_text(fb, "BOARD", 2, 100, small);
-    draw_text(fb, crate::NAME, 66, 100, small);
+    draw_text(fb, crate::config::NAME, 66, 100, small);
     draw_text(fb, "DEVICE", 2, 114, small);
     let mut name: String<32> = String::new();
     let _ = name.push_str(node.callsign.as_str());
@@ -753,7 +759,6 @@ pub fn render_boot(node: &CompanionNode<'_>, fb: &mut EpdFrameBuffer) {
 
 /// Full-screen BLE OTA DFU notice shown before resetting into `TNM1_DFU`.
 pub fn render_ota_dfu(node: &CompanionNode<'_>, fb: &mut EpdFrameBuffer) {
-    use embedded_graphics::mono_font::ascii::{FONT_6X10, FONT_9X15_BOLD};
     let small = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
     let title = MonoTextStyle::new(&FONT_9X15_BOLD, BinaryColor::On);
 
@@ -773,7 +778,124 @@ pub fn render_ota_dfu(node: &CompanionNode<'_>, fb: &mut EpdFrameBuffer) {
     draw_mesh_glyph(fb, 100, 174, 12);
 }
 
-/// Backward-compatible page render entry point.
-pub fn render_dashboard(node: &CompanionNode<'_>, ui: &UiState, fb: &mut EpdFrameBuffer) {
-    render_page(node.current_page, node, ui, fb);
+/// Page render entry point.
+pub fn render_dashboard(
+    node: &CompanionNode<'_>,
+    ui: &UiState,
+    gps_on: bool,
+    fb: &mut EpdFrameBuffer,
+) {
+    render_page(node.current_page, node, ui, gps_on, fb);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::framebuffer::EPD_HEIGHT;
+
+    fn any_black_in_rows(fb: &EpdFrameBuffer, y0: usize, y1: usize) -> bool {
+        (y0..y1).any(|y| (0..EPD_WIDTH).any(|x| fb.is_black(x, y)))
+    }
+
+    #[test]
+    fn text_width_counts_chars_not_bytes() {
+        assert_eq!(text_width("", 6), 0);
+        assert_eq!(text_width("abc", 6), 18);
+        assert_eq!(text_width("é", 6), 6);
+    }
+
+    #[test]
+    fn clock_label_wraps_at_24_hours() {
+        assert_eq!(clock_label(0).as_str(), "00:00");
+        assert_eq!(clock_label(3_600 * 13 + 60 * 7).as_str(), "13:07");
+        assert_eq!(clock_label(86_400 + 61).as_str(), "00:01");
+        assert_eq!(clock_label(86_399).as_str(), "23:59");
+    }
+
+    #[test]
+    fn format_bw_trims_to_the_shortest_exact_form() {
+        for (khz, want) in [
+            (7, "7.8"),
+            (10, "10.4"),
+            (15, "15.6"),
+            (20, "20.8"),
+            (31, "31.25"),
+            (41, "41.67"),
+            (62, "62.5"),
+            (125, "125"),
+            (250, "250"),
+            (500, "500"),
+        ] {
+            assert_eq!(format_bw(khz).as_str(), want, "{khz} kHz");
+        }
+    }
+
+    #[test]
+    fn every_page_has_actions_that_fit_the_screen() {
+        for page in 0..PAGE_COUNT {
+            let (a1, a2) = actions(page);
+            assert!(!a1.is_empty(), "page {page} missing FK1 action");
+            assert!(
+                24 + text_width(a1, SMALL_W) <= DISP_W,
+                "page {page} FK1 `{a1}` overflows the panel"
+            );
+            assert!(
+                24 + text_width(a2, SMALL_W) <= DISP_W,
+                "page {page} FK2 `{a2}` overflows the panel"
+            );
+        }
+    }
+
+    #[test]
+    fn page_count_matches_the_runtime_page_switch() {
+        // `actions` and `render_page` both fall through to the last page.
+        assert_eq!(PAGE_COUNT, 9);
+        assert_eq!(actions(PAGE_COUNT - 1), actions(200));
+    }
+
+    #[test]
+    fn draw_wrapped_stops_at_max_lines() {
+        let mut fb = EpdFrameBuffer::new();
+        let small = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
+        let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi";
+        // Baseline y=20 -> line 0 occupies y 13..=22, line 1 (y=32) occupies y 25..=34.
+        draw_wrapped(&mut fb, text, 0, 20, 12, 2, small);
+        assert!(any_black_in_rows(&fb, 13, 35));
+        assert!(!any_black_in_rows(&fb, 36, EPD_HEIGHT));
+        assert!(!any_black_in_rows(&fb, 0, 12));
+    }
+
+    #[test]
+    fn draw_wrapped_clips_a_single_overlong_word() {
+        let mut fb = EpdFrameBuffer::new();
+        let small = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
+        draw_wrapped(
+            &mut fb,
+            "Supercalifragilisticexpialidocious",
+            0,
+            20,
+            6,
+            2,
+            small,
+        );
+        // 6 chars * 6px = 36px; nothing drawn beyond x=36.
+        assert!((36..EPD_WIDTH).all(|x| (0..EPD_HEIGHT).all(|y| !fb.is_black(x, y))));
+        assert!(any_black_in_rows(&fb, 13, 23));
+    }
+
+    #[test]
+    fn draw_wrapped_ignores_empty_text() {
+        let mut fb = EpdFrameBuffer::new();
+        let small = MonoTextStyle::new(&FONT_6X10, BinaryColor::On);
+        draw_wrapped(&mut fb, "   ", 0, 20, 20, 3, small);
+        assert!(!any_black_in_rows(&fb, 0, EPD_HEIGHT));
+    }
+
+    #[test]
+    fn sin_cos_table_is_a_unit_circle() {
+        for (c, s) in SIN_COS {
+            let r2 = (c as i32).pow(2) + (s as i32).pow(2);
+            assert!((r2 - 256 * 256).abs() < 512, "({c},{s}) r2={r2}");
+        }
+    }
 }
