@@ -29,7 +29,7 @@ pub trait CompanionBoard {
     /// Physical radio exposed to the runtime scheduler.
     type Radio: LoraRadio;
 
-    /// Hardware model string reported over the protocol.
+    /// Hardware model string reported in DEVICE_INFO (max 40 bytes).
     fn name(&self) -> &'static str;
     /// Protocol capability bits.
     fn capabilities(&self) -> u32;

@@ -2,8 +2,15 @@
 
 use ferrix_l76k::L76kConfig;
 
-/// Hardware model reported to MeshCore companion apps.
+/// Short board name (UI, BLE DIS model number, `board` CLI command).
 pub const NAME: &str = "Wio Tracker L1 Pro";
+
+/// Hardware model reported in the companion DEVICE_INFO reply (max 40 bytes).
+/// Matches upstream MeshCore's Wio Tracker L1 variant.
+pub const DEVICE_MODEL: &str = "Seeed Wio Tracker L1";
+
+/// BLE Device Information manufacturer name (max 32 bytes).
+pub const MANUFACTURER: &str = "Seeed";
 
 /// USB (vendor, product) IDs the board enumerates with.
 pub const USB_IDS: (u16, u16) = (0x2886, 0x1668);
@@ -26,3 +33,14 @@ pub const L76K_CONFIG: L76kConfig = L76kConfig {
     reset_active_low: true,
     reset_pulse_ms: 0,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identity_strings_fit_their_wire_fields() {
+        assert!(DEVICE_MODEL.len() <= 40);
+        assert!(MANUFACTURER.len() <= 32);
+    }
+}

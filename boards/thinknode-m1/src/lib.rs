@@ -188,7 +188,7 @@ impl CompanionBoard for ThinkNodeBoard {
     type Radio = ChannelRadio;
 
     fn name(&self) -> &'static str {
-        NAME
+        ferrix_thinknode_m1_logic::config::DEVICE_MODEL
     }
 
     fn capabilities(&self) -> u32 {

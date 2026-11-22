@@ -1094,8 +1094,9 @@ impl<'a> CompanionNode<'a> {
                 let _ = resp.extend_from_slice(&bdate);
 
                 let mut mmodel = [0u8; 40];
-                let m = b"Elecrow ThinkNode M1";
-                mmodel[..m.len()].copy_from_slice(m);
+                let m = self.hw_model.as_bytes();
+                let m_len = m.len().min(mmodel.len());
+                mmodel[..m_len].copy_from_slice(&m[..m_len]);
                 let _ = resp.extend_from_slice(&mmodel);
 
                 let mut sver = [0u8; 20];
@@ -3658,6 +3659,33 @@ mod tests {
         assert_eq!(node.multi_acks, 0);
         assert_eq!(crate::state::prefs().multi_acks, 0);
         assert_eq!(node.build_self_info()[44], 0);
+    }
+
+    fn device_info_model_field(hw_model: &'static str) -> [u8; 40] {
+        let mut node = CompanionNode::new("test", hw_model, 0, [1u8; 32], [2u8; 64], &TestHost);
+        let mut resp = Vec::<u8, 128>::new();
+        poll_sync(node.handle_command(&[CMD_DEVICE_QUERY, 3], |r| {
+            let _ = resp.extend_from_slice(r);
+        }));
+        assert_eq!(resp[0], RESP_CODE_DEVICE_INFO);
+        // code, fw_ver, max_contacts/2, max_channels, ble_pin(4), build_date(12)
+        resp[20..60].try_into().unwrap()
+    }
+
+    #[test]
+    fn device_info_reports_the_board_model() {
+        let field = device_info_model_field("Seeed Wio Tracker L1");
+        let mut expected = [0u8; 40];
+        expected[..20].copy_from_slice(b"Seeed Wio Tracker L1");
+        assert_eq!(field, expected);
+    }
+
+    #[test]
+    fn device_info_truncates_an_oversized_model() {
+        let field = device_info_model_field(
+            "0123456789012345678901234567890123456789-overflow-is-dropped",
+        );
+        assert_eq!(&field, b"0123456789012345678901234567890123456789");
     }
 
     #[test]

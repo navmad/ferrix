@@ -2,8 +2,14 @@
 
 use ferrix_l76k::L76kConfig;
 
-/// Hardware model reported to MeshCore companion apps.
+/// Short board name (UI, BLE DIS model number, `board` CLI command).
 pub const NAME: &str = "ThinkNode M1";
+
+/// Hardware model reported in the companion DEVICE_INFO reply (max 40 bytes).
+pub const DEVICE_MODEL: &str = "Elecrow ThinkNode M1";
+
+/// BLE Device Information manufacturer name (max 32 bytes).
+pub const MANUFACTURER: &str = "Elecrow";
 
 /// USB (vendor, product) IDs the board enumerates with.
 pub const USB_IDS: (u16, u16) = (0x239A, 0x8029);
@@ -37,6 +43,12 @@ mod tests {
         assert_eq!(L76K_CONFIG.standby_active_high, def.standby_active_high);
         assert_eq!(L76K_CONFIG.reset_active_low, def.reset_active_low);
         assert_eq!(L76K_CONFIG.reset_pulse_ms, def.reset_pulse_ms);
+    }
+
+    #[test]
+    fn identity_strings_fit_their_wire_fields() {
+        assert!(DEVICE_MODEL.len() <= 40);
+        assert!(MANUFACTURER.len() <= 32);
     }
 
     #[test]
