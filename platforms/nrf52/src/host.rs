@@ -122,6 +122,14 @@ impl CliHost for NrfCompanionHost {
             used: ferrix_core::state::TX_SLOT_USED.load(Ordering::Relaxed),
             forward_scheduled: ferrix_core::state::FORWARD_SCHEDULED.load(Ordering::Relaxed),
             forward_sent: ferrix_core::state::FORWARD_SENT.load(Ordering::Relaxed),
+            ack_stats: [
+                ferrix_core::state::ACK_RX_MATCHED.load(Ordering::Relaxed),
+                ferrix_core::state::ACK_RX_UNMATCHED.load(Ordering::Relaxed),
+                ferrix_core::state::PENDING_ACK_EVICTED.load(Ordering::Relaxed),
+            ],
+            queue_full: core::array::from_fn(|i| {
+                ferrix_core::state::TX_QUEUE_FULL[i].load(Ordering::Relaxed)
+            }),
             duplicate_deltas: ferrix_core::state::duplicate_deltas(),
         }
     }
@@ -165,6 +173,12 @@ impl CliHost for NrfCompanionHost {
     fn clear_radio_stats(&self) {
         ferrix_core::state::FORWARD_SCHEDULED.store(0, Ordering::Relaxed);
         ferrix_core::state::FORWARD_SENT.store(0, Ordering::Relaxed);
+        ferrix_core::state::ACK_RX_MATCHED.store(0, Ordering::Relaxed);
+        ferrix_core::state::ACK_RX_UNMATCHED.store(0, Ordering::Relaxed);
+        ferrix_core::state::PENDING_ACK_EVICTED.store(0, Ordering::Relaxed);
+        for c in &ferrix_core::state::TX_QUEUE_FULL {
+            c.store(0, Ordering::Relaxed);
+        }
         ferrix_core::state::clear_duplicate_deltas();
     }
 
@@ -252,6 +266,14 @@ impl EngineContext for NrfEngineContext {
 
     fn note_forward_scheduled(&self) {
         ferrix_core::state::FORWARD_SCHEDULED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn is_pending_ack(&self, crc: u32) -> bool {
+        ferrix_runtime::app::is_pending_ack(crc)
+    }
+
+    fn note_tx_queue_full(&self, lane: meshcore_wire::tx::TxLane) {
+        ferrix_core::state::TX_QUEUE_FULL[lane as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     fn note_duplicate_delta(&self, ms: u64) {

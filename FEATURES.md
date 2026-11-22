@@ -180,7 +180,7 @@ The radio task owns all transmission timing.
   management and ACK traffic cannot be starved.
 - **Retries**: up to 4 attempts with backoff; failed floods are rescheduled.
 
-Inspect with `stats-tx`; override the slot width with `set tx.slot <ms>`
+Inspect with `stats-tx` and `stats-fwd`; override the slot width with `set tx.slot <ms>`
 (`0` = automatic).
 
 ---
@@ -264,7 +264,7 @@ contacts, clear contacts
 messages, clear messages, channels
 advert, advert.zerohop, gps advert, clock / time, clock sync
 battery
-stats-radio, stats-flash, stats-qspi, stats-tx, stats-packets, stats-ble,
+stats-radio, stats-flash, stats-qspi, stats-tx, stats-fwd, stats-packets, stats-ble,
 stats-login, stats-scope, stats-trace, stats-adverts, stats-disc, stats-binary,
 stats-core, stats-gps, stats-wdt, stats-power
 clear stats
@@ -289,12 +289,19 @@ stats-power
 All `stats-*` commands return compact single-line JSON designed to fit within
 the 175-byte `PACKET_CLI_REPLY` (`0x1D`) binary companion frame limit:
 
-- `stats-radio` — airtime, RSSI/SNR, transmit wait, lane counts, retries/drops.
+- `stats-radio` — airtime, RSSI/SNR, sent count, retries/drops.
 - `stats-flash` — active storage profile, QSPI availability/skipped ops,
   per-store saves/erases, queued messages.
 - `stats-qspi` (or `qspi`) — QSPI JEDEC ID, status, and flash health.
 - `stats-tx` — slot width/occupancy, control/flood/background counts,
-  cancelled/stale floods, duplicate-delay histogram.
+  cancelled/stale floods, `qfull` (packets dropped by a full TX queue:
+  control/flood/background) and `ack` (DM ACKs matched, unmatched, pending
+  sends evicted).
+- `stats-fwd` — forwards scheduled/sent, longest TX queue wait (`wait_ms`) and
+  the duplicate-delay histogram.
+- Reply size: `stats-core`, `stats-radio` and `stats-packets` also exist in
+  MeshCore and stay within 176 bytes (tag included); Ferrix-only `stats-*`
+  replies stay within one companion frame (255 bytes). Unit tests enforce both.
 - `stats-packets` — received/sent flood/direct counters.
 - `stats-power` — LFCLK source (`LFXO` vs `LFRC`) and REG1 DC-DC regulator status.
 - `stats-gps` (or `gps`) — fix status, satellites, coordinates, and UART activity.

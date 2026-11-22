@@ -252,6 +252,8 @@ mod tests {
                 used: 0,
                 forward_scheduled: 0,
                 forward_sent: 0,
+                queue_full: [0; 3],
+                ack_stats: [0; 3],
                 duplicate_deltas: [0; 6],
             }
         }

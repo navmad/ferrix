@@ -221,6 +221,16 @@ pub static TX_SLOT_USED: AtomicU32 = AtomicU32::new(0);
 pub static FORWARD_SCHEDULED: AtomicU32 = AtomicU32::new(0);
 pub static FORWARD_SENT: AtomicU32 = AtomicU32::new(0);
 
+/// DM ACKs received that confirmed a pending send, ACKs with no pending send
+/// (stale, foreign or a second copy), and pending sends evicted by a full table.
+pub static ACK_RX_MATCHED: AtomicU32 = AtomicU32::new(0);
+pub static ACK_RX_UNMATCHED: AtomicU32 = AtomicU32::new(0);
+pub static PENDING_ACK_EVICTED: AtomicU32 = AtomicU32::new(0);
+
+/// Packets dropped because the transmit queue was full: control, flood, background.
+pub static TX_QUEUE_FULL: [AtomicU32; 3] =
+    [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+
 const DUP_BUCKETS: [AtomicU32; 6] = [
     AtomicU32::new(0),
     AtomicU32::new(0),

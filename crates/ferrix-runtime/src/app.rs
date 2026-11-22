@@ -187,6 +187,7 @@ fn track_pending_ack(crc: u32, dest_pub: [u8; 32]) {
         let mut list = a.borrow_mut();
         if list.is_full() {
             list.remove(0);
+            PENDING_ACK_EVICTED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
         let _ = list.push(PendingMessageAck {
             crc,
@@ -194,6 +195,11 @@ fn track_pending_ack(crc: u32, dest_pub: [u8; 32]) {
             send_instant_ms: now,
         });
     });
+}
+
+/// True while a DM we sent is still waiting for the ACK with this CRC.
+pub fn is_pending_ack(crc: u32) -> bool {
+    PENDING_MESSAGE_ACKS.lock(|a| a.borrow().iter().any(|p| p.crc == crc))
 }
 
 fn handle_direct_message_confirmed(crc: u32) -> Option<[u8; 32]> {
@@ -205,7 +211,12 @@ fn handle_direct_message_confirmed(crc: u32) -> Option<[u8; 32]> {
             (item.dest_pub, now.saturating_sub(item.send_instant_ms) as u32)
         })
     });
-    let (dest_pub, rtt_ms) = matched?;
+    let Some((dest_pub, rtt_ms)) = matched else {
+        // Also counts the second copy of an ACK delivered twice (early + relayed).
+        ACK_RX_UNMATCHED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        return None;
+    };
+    ACK_RX_MATCHED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     info!(
         "MeshCore Direct Message Delivery ACK Confirmed! (crc {:08x}, RTT: {} ms)",
         crc, rtt_ms

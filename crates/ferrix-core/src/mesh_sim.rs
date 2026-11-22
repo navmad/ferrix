@@ -49,6 +49,8 @@ struct Contact {
 struct SimContext {
     extra_acks: u8,
     contacts: Mutex<Vec<Contact>>,
+    /// ACK CRCs this node's "app" is still waiting for (`PENDING_MESSAGE_ACKS`).
+    pending: Mutex<Vec<u32>>,
 }
 
 impl SimContext {
@@ -99,6 +101,10 @@ impl EngineContext for SimContext {
     fn peer_path(&self, pub_key: &[u8; 32]) -> (u8, [u8; 64]) {
         self.path(pub_key)
     }
+
+    fn is_pending_ack(&self, crc: u32) -> bool {
+        self.pending.lock().unwrap().contains(&crc)
+    }
 }
 
 struct Node {
@@ -106,8 +112,6 @@ struct Node {
     pub_key: [u8; 32],
     ctx: &'static SimContext,
     engine: MeshEngine<'static>,
-    /// ACK CRCs this node's "app" is still waiting for (`PENDING_MESSAGE_ACKS`).
-    pending: Vec<u32>,
 }
 
 /// What a node's engine reported for one received packet.
@@ -182,6 +186,7 @@ impl Sim {
         let ctx: &'static SimContext = Box::leak(Box::new(SimContext {
             extra_acks,
             contacts: Mutex::new(Vec::new()),
+            pending: Mutex::new(Vec::new()),
         }));
         for other in &self.nodes {
             ctx.add_contact(other.pub_key);
@@ -194,7 +199,6 @@ impl Sim {
             pub_key,
             ctx,
             engine,
-            pending: Vec::new(),
         });
         self.nodes.len() - 1
     }
@@ -258,7 +262,7 @@ impl Sim {
             "engine ACK CRC differs from the companion's expected_ack formula"
         );
 
-        self.nodes[from].pending.push(crc);
+        self.nodes[from].ctx.pending.lock().unwrap().push(crc);
         self.drain(from);
         crc
     }
@@ -391,9 +395,10 @@ impl Sim {
 
     /// `handle_direct_message_confirmed`: the first match consumes the entry.
     fn confirm(&mut self, node: usize, crc: u32) {
-        let pending = &mut self.nodes[node].pending;
+        let mut pending = self.nodes[node].ctx.pending.lock().unwrap();
         if let Some(pos) = pending.iter().position(|&c| c == crc) {
             pending.remove(pos);
+            drop(pending);
             self.confirmed.push((node, crc));
         }
     }
@@ -731,5 +736,39 @@ mod tests {
         assert_eq!(s.paths_at(a).len(), 1, "the second PATH is a duplicate at A");
         assert_eq!(s.confirmations(a, crc), 1);
         assert_eq!(s.path_len(a, b), 1, "A learned a one-hop route");
+    }
+
+    /// 10. Upstream `markDoNotRetransmit`: a flooded ACK that confirms our own
+    ///     send is consumed. B has no route back to A, so it floods the ACK.
+    ///     A (which also forwards) must not re-flood it, while an unrelated
+    ///     forwarding node R still relays it.
+    #[test]
+    fn matched_flood_ack_is_not_relayed_but_others_are() {
+        let mut s = Sim::new();
+        let a = s.add_node("A", 1, true, 0);
+        let b = s.add_node("B", 2, false, 0);
+        let r = s.add_node("R", 3, true, 0);
+        s.link(a, b);
+        s.link(b, r);
+        s.set_path(a, b, &[]); // A -> B direct; B has no path back to A
+
+        let crc = s.send_dm(a, b, "ping", 0);
+        s.run();
+
+        assert_eq!(s.texts_at(b), ["ping"]);
+        let acks = s.tx_by(b, PAYLOAD_TYPE_ACK);
+        assert_eq!(acks.len(), 1);
+        assert_eq!(acks[0].route, ROUTE_TYPE_FLOOD, "B has no path, so it floods");
+        assert_eq!(s.confirmations(a, crc), 1);
+        assert_eq!(
+            s.tx_by(a, PAYLOAD_TYPE_ACK).len(),
+            0,
+            "A consumed its own ACK and must not re-flood it"
+        );
+        assert_eq!(
+            s.tx_by(r, PAYLOAD_TYPE_ACK).len(),
+            1,
+            "a node with no matching send keeps relaying ACKs"
+        );
     }
 }
