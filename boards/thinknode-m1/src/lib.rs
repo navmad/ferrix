@@ -211,6 +211,10 @@ impl CompanionBoard for ThinkNodeBoard {
         NAME
     }
 
+    fn ble_manufacturer(&self) -> &'static str {
+        ferrix_thinknode_m1_logic::config::MANUFACTURER
+    }
+
     fn companion_host(&self) -> &'static dyn CompanionHost {
         &BOARD_HOST
     }
@@ -371,6 +375,7 @@ impl CompanionBoard for ThinkNodeBoard {
             self.name(),
             self.capabilities(),
             self.ble_model(),
+            self.ble_manufacturer(),
             self.cli_host(),
             Some(BLUE_FAULT_LED),
             crate::storage::spawn_storage,

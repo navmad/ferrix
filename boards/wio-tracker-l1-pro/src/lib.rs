@@ -191,6 +191,10 @@ impl CompanionBoard for WioTrackerBoard {
         NAME
     }
 
+    fn ble_manufacturer(&self) -> &'static str {
+        ferrix_wio_tracker_l1_pro_logic::config::MANUFACTURER
+    }
+
     fn companion_host(&self) -> &'static dyn CompanionHost {
         &BOARD_HOST
     }
@@ -346,6 +350,7 @@ impl CompanionBoard for WioTrackerBoard {
             self.name(),
             self.capabilities(),
             self.ble_model(),
+            self.ble_manufacturer(),
             self.cli_host(),
             Some(STATUS_FAULT_LED),
             crate::storage::spawn_storage,

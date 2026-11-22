@@ -41,6 +41,8 @@ pub trait CompanionBoard {
     fn usb_product(&self) -> &'static str;
     /// BLE model name.
     fn ble_model(&self) -> &'static str;
+    /// BLE Device Information manufacturer name (max 32 bytes).
+    fn ble_manufacturer(&self) -> &'static str;
     /// Companion persistence and telemetry interface.
     fn companion_host(&self) -> &'static dyn CompanionHost;
     /// CLI host interface (also a `CompanionHost`).
