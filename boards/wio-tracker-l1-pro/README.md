@@ -53,19 +53,19 @@ See `memory.x`. The app is linked at `0x27000`, after the S140 v7.3.0 SoftDevice
 # Release build storing everything in internal flash (no QSPI init)
 ./tools/build.sh wio-tracker-l1-pro build --release --features internal-storage
 
-# Run host unit tests (shared with every board)
-./tools/build.sh wio-tracker-l1-pro test
+# Run all host unit tests (shared across workspace crates and board logic)
+./tools/build.sh test
 ```
 
 ## Testing
 
-**Host tests** (`./tools/build.sh wio-tracker-l1-pro test`, also run in CI) include the
+**Host tests** (`./tools/build.sh test`, also run in CI) include the
 `ferrix-wio-tracker-l1-pro-logic` crate (`logic/`), which holds the board's pure logic so it
 builds off-target: the OLED UI, joystick/button mapping, display idle/wake/refresh state
 machine, buzzer patterns, flash layout and the settings-to-SX1262 mapping. The firmware crate
 re-exports these modules, so there is one copy of the code.
 
-- The UI is checked against golden frames in `logic/tests/golden/*.txt` (128x64, `#` = lit).
+- The UI is checked against 27 golden frames in `logic/tests/golden/*.txt` (128x64, `#` = lit).
   After an intentional UI change, regenerate and review the diff:
   `BLESS=1 cargo test -p ferrix-wio-tracker-l1-pro-logic --target "$(rustc -vV | sed -n 's/host: //p')" --test snapshots`
 - `layout.rs` tests parse `memory.x`, so the linker script and the storage regions cannot drift.
@@ -89,6 +89,8 @@ own logic against a fake device and is run in CI.
 
 > **Before your first flash:** Ferrix uses its own on-flash storage format, so do a full flash erase before the first Ferrix flash and again if you return to stock MeshCore. Back up your private key first if you want to keep your node identity.
 
+Prebuilt `ferrix-wio-tracker-l1-pro-companion-v<version>.uf2` and `ferrix-wio-tracker-l1-pro-companion-v<version>.zip` artifacts are published on GitHub Releases, or build locally:
+
 ```sh
 # UF2: double-tap reset, then drag the file onto the mounted drive
 ./tools/build_uf2.sh wio-tracker-l1-pro release
@@ -102,7 +104,7 @@ The UF2 base address is `0x27000` and the DFU package targets SoftDevice ID `0x0
 
 ## Verified on hardware
 
-Confirmed on a real board with `hil` (firmware 1.18.2-ferrix, 2026-11-21): 32.768 kHz LFXO and REG1 DC/DC active, P25Q16H QSPI flash (JEDEC `856015`), battery ADC, companion handshake, config persistence across a reboot, a 5-minute CLI/watchdog soak, and the pins below.
+Confirmed on a real board with `hil` (firmware 1.18.2-ferrix, 2026-11-21): SoftDevice boot with `0x20006000` RAM origin, 32.768 kHz LFXO and REG1 DC-DC active, P25Q16H QSPI flash (JEDEC `856015`), battery ADC, companion handshake, config persistence across a reboot, a 5-minute CLI/watchdog soak, and the pins below.
 
 - **GPS wiring and polarity.** MCU RX P0.26, MCU TX P0.27, standby/enable P1.09 active-high: the L76K streamed NMEA (33,200 bytes, 609 lines) and reached a fix with 10 satellites.
 - **SX1262 transmit path.** A zero-hop advert was transmitted (TCXO, DC/DC, SPI).
@@ -111,8 +113,7 @@ Confirmed on a real board with `hil` (firmware 1.18.2-ferrix, 2026-11-21): 32.76
 
 These were taken from MeshCore's variant files and have not been verified on hardware:
 
-1. **USB PID.** Ferrix reports Seeed VID `0x2886`, PID `0x1668` (from MeshCore's board definition, where `0x1667` is the bootloader). Check that companion apps detect the port.
+1. **USB PID auto-detection.** Ferrix reports Seeed VID `0x2886`, PID `0x1668` (from MeshCore's board definition, where `0x1667` is the bootloader). Check that MeshCore companion apps auto-detect the port.
 2. **OLED bus.** The OLED is assumed to be on P0.06 / P0.05 at `0x3D`. A blank screen with a normal boot means the bus or address is wrong (the firmware logs an OLED init failure but keeps running).
 3. **RF switch (RX).** Transmit is verified; receive needs a second node. If RX sensitivity is poor, check the `RXEN` handling in `src/radio.rs`.
-4. **SoftDevice RAM.** If the node shows 10 fast blinks at boot, raise the RAM origin in `memory.x` to `0x20008000`.
-5. **BLE OTA DFU name.** The on-screen DFU notice is generic because the bootloader's advertised name is not confirmed.
+4. **BLE OTA DFU name.** The on-screen DFU notice is generic because the bootloader's advertised name is not confirmed.
