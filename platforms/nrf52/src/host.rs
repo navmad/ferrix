@@ -268,6 +268,10 @@ impl EngineContext for NrfEngineContext {
         ferrix_core::state::FORWARD_SCHEDULED.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn is_pending_ack(&self, crc: u32) -> bool {
+        ferrix_runtime::app::is_pending_ack(crc)
+    }
+
     fn note_tx_queue_full(&self, lane: meshcore_wire::tx::TxLane) {
         ferrix_core::state::TX_QUEUE_FULL[lane as usize].fetch_add(1, Ordering::Relaxed);
     }

@@ -197,6 +197,11 @@ fn track_pending_ack(crc: u32, dest_pub: [u8; 32]) {
     });
 }
 
+/// True while a DM we sent is still waiting for the ACK with this CRC.
+pub fn is_pending_ack(crc: u32) -> bool {
+    PENDING_MESSAGE_ACKS.lock(|a| a.borrow().iter().any(|p| p.crc == crc))
+}
+
 fn handle_direct_message_confirmed(crc: u32) -> Option<[u8; 32]> {
     let now = Instant::now().as_millis();
     let matched = PENDING_MESSAGE_ACKS.lock(|a| {

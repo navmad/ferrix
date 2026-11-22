@@ -68,6 +68,13 @@ pub trait EngineContext: Send + Sync {
     /// Ask the scheduler to drop a scheduled flood.
     fn cancel_flood(&self, _hash: [u8; 8]) {}
 
+    /// Whether `crc` is the ACK of a message this node is still waiting on.
+    ///
+    /// A flooded ACK that confirms our own send is consumed, not re-flooded
+    /// (MeshCore `markDoNotRetransmit`). Nodes that send no DMs, such as a
+    /// pure repeater, keep the default and relay every ACK.
+    fn is_pending_ack(&self, _crc: u32) -> bool { false }
+
     /// Account for a packet dropped because the transmit queue was full.
     fn note_tx_queue_full(&self, _lane: TxLane) {}
 }
@@ -565,6 +572,9 @@ impl<'a> MeshEngine<'a> {
                     return InboundAction::DropDuplicate;
                 }
                 if let Ok(ack) = AckPacket::decode(&pkt.payload[..pkt.payload_len]) {
+                    if self.context.is_pending_ack(ack.crc) {
+                        consumed = true;
+                    }
                     let mut arrival_path = heapless::Vec::<u8, 64>::new();
                     let an = pkt.path_byte_len();
                     let _ = arrival_path.extend_from_slice(&pkt.path[..an]);
@@ -596,6 +606,9 @@ impl<'a> MeshEngine<'a> {
                                 && self.seen_filter.check_and_mark(&inner_pkt)
                             {
                                 return InboundAction::DropDuplicate;
+                            }
+                            if self.context.is_pending_ack(ack.crc) {
+                                consumed = true;
                             }
                             let mut arrival_path = heapless::Vec::<u8, 64>::new();
                             let an = pkt.path_byte_len();
