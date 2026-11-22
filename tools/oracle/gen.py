@@ -288,6 +288,24 @@ def build() -> dict:
         route=1,
     )
 
+    # Attempt-number boundaries. The ACK CRC hashes ts || (txt_type<<2 | attempt&3)
+    # || text and never the NUL + attempt tail that attempts > 3 append
+    # (BaseChatMesh::composeMsgPacket), so attempt 4 has the same CRC as attempt 0
+    # even though its ciphertext differs. attempt&3 wraps, so 255 behaves like 3.
+    crc_attempt3 = add_txt("txt_attempt3", "alice", "bob", 3, b"Hello Bob")
+    crc_attempt4 = add_txt("txt_attempt4", "alice", "bob", 4, b"Hello Bob")
+    crc_attempt255 = add_txt("txt_attempt255", "alice", "bob", 255, b"Hello Bob")
+    assert crc_attempt4 == crc_flood, "attempt 4 must reuse attempt 0's ACK CRC"
+    assert crc_attempt255 == crc_attempt3, "attempt 255 must reuse attempt 3's ACK CRC"
+    assert crc_attempt3 != crc_flood, "attempts 0 and 3 must differ"
+
+    # AES-128 block edges. The plaintext is 5 + len bytes (+2 once attempt > 3),
+    # zero-padded to 16, so these land exactly on a block and one byte over it.
+    add_txt("txt_block_exact", "alice", "bob", 0, b"x" * 11)  # 16 bytes
+    add_txt("txt_block_over", "alice", "bob", 0, b"x" * 12)  # 17 bytes
+    add_txt("txt_attempt4_block_exact", "alice", "bob", 4, b"y" * 9)  # 5 + 9 + 2 = 16
+    add_txt("txt_attempt4_block_over", "alice", "bob", 4, b"y" * 10)  # 17
+
     ack_extra = ack_payload(crc_flood, 0, 0x5A)
     add_packet(v, "ack_direct", 2, 3, ack_extra, b"\xA1", 1)
     v["ack"].append(
