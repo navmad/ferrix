@@ -368,6 +368,7 @@ pub async fn ble_companion_task(
     hw_model: &'static str,
     capabilities: u32,
     model_name: &'static str,
+    manufacturer: &'static str,
     host: &'static dyn CliHost,
 ) {
     info!("Starting MeshCore BLE companion advertising...");
@@ -418,7 +419,8 @@ pub async fn ble_companion_task(
     let _ = server.dis.firmware_revision_set(&fw);
 
     let mut mfg = Vec::<u8, 32>::new();
-    let _ = mfg.extend_from_slice(b"Elecrow");
+    let mfr = manufacturer.as_bytes();
+    let _ = mfg.extend_from_slice(&mfr[..mfr.len().min(32)]);
     let _ = server.dis.manufacturer_name_set(&mfg);
 
     let mut dfu_rev = Vec::<u8, 2>::new();
@@ -641,6 +643,7 @@ pub async fn ble_companion_supervisor_task(
     hw_model: &'static str,
     capabilities: u32,
     model_name: &'static str,
+    manufacturer: &'static str,
     host: &'static dyn CliHost,
     fault_led: Option<crate::fault::FaultLed>,
     storage_spawn: fn(embassy_executor::Spawner, &'static Softdevice),
@@ -751,6 +754,7 @@ pub async fn ble_companion_supervisor_task(
                     hw_model,
                     capabilities,
                     model_name,
+                    manufacturer,
                     host,
                 ))
                 .is_ok()
@@ -772,6 +776,7 @@ pub fn init_ble_companion(
     hw_model: &'static str,
     capabilities: u32,
     model_name: &'static str,
+    manufacturer: &'static str,
     host: &'static dyn CliHost,
     fault_led: Option<crate::fault::FaultLed>,
     storage_spawn: fn(embassy_executor::Spawner, &'static Softdevice),
@@ -784,6 +789,7 @@ pub fn init_ble_companion(
             hw_model,
             capabilities,
             model_name,
+            manufacturer,
             host,
             fault_led,
             storage_spawn,

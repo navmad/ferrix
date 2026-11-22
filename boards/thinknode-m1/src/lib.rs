@@ -188,7 +188,7 @@ impl CompanionBoard for ThinkNodeBoard {
     type Radio = ChannelRadio;
 
     fn name(&self) -> &'static str {
-        NAME
+        ferrix_thinknode_m1_logic::config::DEVICE_MODEL
     }
 
     fn capabilities(&self) -> u32 {
@@ -209,6 +209,10 @@ impl CompanionBoard for ThinkNodeBoard {
 
     fn ble_model(&self) -> &'static str {
         NAME
+    }
+
+    fn ble_manufacturer(&self) -> &'static str {
+        ferrix_thinknode_m1_logic::config::MANUFACTURER
     }
 
     fn companion_host(&self) -> &'static dyn CompanionHost {
@@ -371,6 +375,7 @@ impl CompanionBoard for ThinkNodeBoard {
             self.name(),
             self.capabilities(),
             self.ble_model(),
+            self.ble_manufacturer(),
             self.cli_host(),
             Some(BLUE_FAULT_LED),
             crate::storage::spawn_storage,
