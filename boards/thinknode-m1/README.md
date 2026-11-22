@@ -16,6 +16,17 @@ Board support package (`ferrix-thinknode-m1`) for the **Elecrow ThinkNode M1** n
 
 ---
 
+## Controls
+
+| Input | Action |
+| :--- | :--- |
+| Top button (`FK`) single click | Primary page action |
+| Top button (`FK`) double click | Secondary page action |
+| Bottom button (`TK`) single click | Next page |
+| Bottom button (`TK`) double click | Previous page |
+
+---
+
 ## Building & Testing
 
 ```sh
@@ -25,17 +36,47 @@ Board support package (`ferrix-thinknode-m1`) for the **Elecrow ThinkNode M1** n
 # Release build storing everything in internal flash (no QSPI init)
 ./tools/build.sh thinknode-m1 build --release --features internal-storage
 
-# Run host unit tests
-./tools/build.sh thinknode-m1 test
+# Run all host unit tests (shared across workspace crates and board logic)
+./tools/build.sh test
 ```
+
+**Host tests** (`./tools/build.sh test`, also run in CI) include the
+`ferrix-thinknode-m1-logic` crate (`logic/`), which holds the board's pure
+logic off-target: the 200x200 e-paper UI, single/double-click button mapping,
+display refresh/sleep state machine, buzzer patterns, flash layout, and
+settings-to-SX1262 mapping.
+
+- The UI is checked against 27 golden frames in `logic/tests/golden/*.txt`
+  (200x200, `#` = ink). After an intentional UI change, regenerate and review
+  the diff:
+  `BLESS=1 cargo test -p ferrix-thinknode-m1-logic --target "$(rustc -vV | sed -n 's/host: //p')" --test snapshots`
+- `layout.rs` tests parse `memory.x`, so the linker script and storage regions
+  cannot drift.
+
+**Hardware-in-the-loop smoke test** (needs a board on USB, not run in CI):
+
+```sh
+./tools/build.sh thinknode-m1 hil                      # auto-detects the port
+./tools/build.sh thinknode-m1 hil --port /dev/cu.usbmodemXXXX --gps-timeout 60
+./tools/build.sh thinknode-m1 hil --internal-storage   # for --features internal-storage builds
+./tools/build.sh thinknode-m1 hil --tx --soak 600      # also transmit one advert; 10 min stability soak
+```
+
+Checks clocks/regulators (`xtal(50ppm)` LFXO + REG1 DC-DC), MX25R1635F QSPI
+flash (`c22815`), battery ADC, radio settings, the binary companion handshake,
+GPS UART traffic, and config persistence across a reboot. Pass `--flash` to
+build and flash first; `hil --self-test` verifies the script against a fake
+device in CI.
 
 ---
 
 ## Flashing
 
+> **Before your first flash:** Ferrix uses its own on-flash storage format instead of standard MeshCore's LittleFS layout. Perform a **full flash erase** before flashing Ferrix for the first time, and again if you ever return to stock MeshCore. Back up your private key first if you want to keep your node identity.
+
 ### 1. UF2 Drag-and-Drop
 
-Builds the release binary and packages a UF2 image (family ID `0xADA52840`, base `0x26000`) at `target/thumbv7em-none-eabihf/release/ferrix-thinknode-m1.uf2` (or download `ferrix-thinknode-m1-companion.uf2` from GitHub Releases):
+Builds the release binary and packages a UF2 image (family ID `0xADA52840`, base `0x26000`) at `target/thumbv7em-none-eabihf/release/ferrix-thinknode-m1.uf2` (or download `ferrix-thinknode-m1-companion-v<version>.uf2` from GitHub Releases):
 
 ```sh
 ./tools/build_uf2.sh thinknode-m1 release
@@ -56,7 +97,17 @@ Auto-detects the ThinkNode M1 USB port, triggers 1200-baud DFU touch, packages a
 ./tools/flash_serial.sh /dev/cu.usbmodem1101
 ```
 
-### 3. SWD Debug Probe
+### 3. BLE OTA DFU
+
+Builds a Nordic/Adafruit DFU `.zip` targeting SoftDevice ID `0x00B6` (S140 v6.1.1) — or download `ferrix-thinknode-m1-companion-v<version>.zip` from GitHub Releases:
+
+```sh
+./tools/build_ota.sh thinknode-m1 release
+```
+
+On boards with an OTAFIX-compatible bootloader, enter BLE DFU via `start ota` in the CLI or Legacy Buttonless DFU from an nRF DFU app.
+
+### 4. SWD Debug Probe
 
 Configured in `.cargo/config.toml` for `probe-rs run --chip nRF52840_xxAA`:
 

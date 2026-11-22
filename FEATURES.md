@@ -18,10 +18,11 @@ apps and the v1.18 over-the-air protocol.
 | Feature | Status |
 |---|---|
 | nRF52840 + SX1262 (SPI, DIO1, BUSY, TCXO 1.8 V, REG1 DC-DC, 32.768 kHz LFXO, RX boost) | Yes |
-| 1.54" 200x200 e-paper (SSD1681, idle sleep, configurable refresh interval) | Yes |
-| Two buttons + frontlight idle timeout | Yes |
-| Passive buzzer on P0.06 (GPIO square wave, UI/CLI toggle) | Yes |
-| MX25R1635F 2 MB external QSPI flash (or `--features internal-storage` profile) | Yes |
+| ThinkNode M1: 1.54" 200x200 e-paper (SSD1681, idle sleep, configurable refresh interval) + frontlight | Yes |
+| Wio Tracker L1 Pro: 1.3" 128x64 OLED (SH1106 I2C, sleeps after 30 s idle) | Yes |
+| Controls: two buttons with single/double-click (ThinkNode M1) or 5-way joystick + user button (Wio Tracker L1 Pro) | Yes |
+| Passive buzzer (GPIO square wave on `P0.06` ThinkNode / `P1.00` Wio, UI/CLI toggle) | Yes |
+| 2 MB external QSPI flash (`MX25R1635F` ThinkNode / `P25Q16H` Wio), or `--features internal-storage` profile | Yes |
 | Battery voltage/percentage (averaged SAADC reads, EMA smoothing, 11-point LiPo curve) | Yes |
 | USB CDC-ACM (text CLI + binary companion framing) | Yes |
 | BLE Nordic UART Service companion | Yes |
@@ -92,9 +93,11 @@ for Wio Tracker L1 Pro pinouts and memory mapping.
 ### Routing and management
 
 - Direct and flood routing, packet forwarding in repeater/client-repeat mode.
-- Flooded unicast and anonymous requests decrypted/consumed by this node are
-  not re-relayed (matching MeshCore `routeRecvPacket`); un-decryptable hash
-  matches and group/advert/ACK traffic still follow normal forwarding rules.
+- Flooded unicast and anonymous requests decrypted/consumed by this node — and
+  flooded ACKs matching a pending DM send — are not re-relayed (matching
+  MeshCore `routeRecvPacket` / `markDoNotRetransmit`); un-decryptable hash
+  matches and unrelated group/advert/ACK traffic still follow normal forwarding
+  rules.
 - Trace route request and response forwarding.
 - Path discovery request, response push, and RTT.
 - Control data, raw packets, RAW_CUSTOM data.
@@ -120,8 +123,7 @@ for Wio Tracker L1 Pro pinouts and memory mapping.
 
 ### Commands
 
-All **58** commands from the v1.18 `CompanionProtocol.h` are implemented,
-including:
+The full MeshCore v1.18 companion command set is implemented, including:
 
 - app start / device query / battery / storage
 - send direct and channel text, channel data
@@ -175,9 +177,11 @@ The radio task owns all transmission timing.
 - **Staleness & preamble gating**: stale floods (older than 8 slots) are
   evicted before budget checks, and pending transmits are deferred while a
   LoRa preamble is actively being received (up to a bounded hold window).
-- **Budget**: the one-hour duty-cycle budget is split 25% control / 75% flood,
-  refilled independently with sub-millisecond remainder tracking, so
-  management and ACK traffic cannot be starved.
+- **Budget**: the one-hour duty-cycle budget is split 25% control / 75% flood
+  and refilled with sub-millisecond remainder tracking. The control lane spends
+  its own 25% share first and can borrow unused flood budget so ACKs are not
+  held back while flood budget sits idle; floods never borrow from the control
+  reserve.
 - **Retries**: up to 4 attempts with backoff; failed floods are rescheduled.
 
 Inspect with `stats-tx` and `stats-fwd`; override the slot width with `set tx.slot <ms>`
@@ -220,8 +224,7 @@ Storage is selected at compile time between two statically dispatched profiles:
 
 ## 6. Dashboard and controls
 
-Nine pages, selected with the bottom button; the top button performs the
-page action:
+Both boards share the same nine pages:
 
 0. Mesh / connection status
 1. Inbox
@@ -233,11 +236,19 @@ page action:
 7. Settings (LEDs and sound)
 8. System (battery, RX duty, path hash, firmware)
 
-The frontlight turns off after an idle period and wakes on any input. The
-e-paper panel enters deep sleep when idle, performs a full clear every 16
-partial updates to prevent ghosting, and refreshes periodically according to
-`refresh.interval` (default 10 minutes; idle telemetry updates are rate-limited
-when set to `0`).
+- **ThinkNode M1 (200x200 e-paper, two buttons):** bottom button (`TK`)
+  single-click advances to the next page, double-click goes to the previous
+  page; top button (`FK`) single-click runs the primary page action,
+  double-click runs the secondary page action. The frontlight turns off after an
+  idle period and wakes on any input. The e-paper panel enters deep sleep when
+  idle, performs a full clear every 16 partial updates to prevent ghosting, and
+  refreshes periodically according to `refresh.interval` (default 10 minutes;
+  idle telemetry updates are rate-limited when set to `0`).
+- **Wio Tracker L1 Pro (128x64 OLED, 5-way joystick + user button):** joystick
+  left/up selects the previous page, right/down selects the next page, joystick
+  press (`OK`) runs the primary page action, and the user button (`BTN`) runs
+  the secondary page action. The SH1106 OLED sleeps after 30 s idle and wakes on
+  any input or message.
 
 ### LED patterns
 
@@ -260,6 +271,7 @@ get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq, tx, sf, bw, cr
 get/set path.hash.mode (or hash-mode), get/set repeat (off-grid), get/set sound
 get/set leds, get/set refresh.interval, rxduty, af, dutycycle
 get/set autoadd, get/set multiacks, get companion
+send <text>, msg <hex_id> <text>
 contacts, clear contacts
 messages, clear messages, channels
 advert, advert.zerohop, gps advert, clock / time, clock sync
@@ -286,8 +298,11 @@ stats-power
 
 ## 8. Diagnostics
 
-All `stats-*` commands return compact single-line JSON designed to fit within
-the 175-byte `PACKET_CLI_REPLY` (`0x1D`) binary companion frame limit:
+All `stats-*` commands return compact single-line JSON over USB text CLI and
+`PACKET_CLI_REPLY` (`0x1D`). Reply sizes are enforced by unit tests:
+`stats-core`, `stats-radio`, and `stats-packets` (which also exist in upstream
+MeshCore) stay within 176 bytes including the `XX|` tag; Ferrix-only `stats-*`
+replies stay within one companion frame (255 bytes):
 
 - `stats-radio` — airtime, RSSI/SNR, sent count, retries/drops.
 - `stats-flash` — active storage profile, QSPI availability/skipped ops,
@@ -299,9 +314,6 @@ the 175-byte `PACKET_CLI_REPLY` (`0x1D`) binary companion frame limit:
   sends evicted).
 - `stats-fwd` — forwards scheduled/sent, longest TX queue wait (`wait_ms`) and
   the duplicate-delay histogram.
-- Reply size: `stats-core`, `stats-radio` and `stats-packets` also exist in
-  MeshCore and stay within 176 bytes (tag included); Ferrix-only `stats-*`
-  replies stay within one companion frame (255 bytes). Unit tests enforce both.
 - `stats-packets` — received/sent flood/direct counters.
 - `stats-power` — LFCLK source (`LFXO` vs `LFRC`) and REG1 DC-DC regulator status.
 - `stats-gps` (or `gps`) — fix status, satellites, coordinates, and UART activity.
@@ -330,11 +342,12 @@ the 175-byte `PACKET_CLI_REPLY` (`0x1D`) binary companion frame limit:
 # Package Nordic/Adafruit DFU .zip for BLE OTA or web/serial flashing
 ./tools/build_ota.sh thinknode-m1 release
 
-# Host tests (wire codecs, message queue, contact map, scheduler, vectors,
-# plus the Wio Tracker L1 Pro board logic and OLED golden frames)
-./tools/build.sh thinknode-m1 test
+# Host tests (wire codecs, message queue, contact map, scheduler, mesh sim,
+# vectors, plus both ThinkNode M1 and Wio Tracker L1 Pro logic & golden frames)
+./tools/build.sh test
 
-# Hardware-in-the-loop smoke test on a connected Wio Tracker L1 Pro
+# Hardware-in-the-loop smoke tests on a connected board
+./tools/build.sh thinknode-m1 hil
 ./tools/build.sh wio-tracker-l1-pro hil
 
 # Flash over USB serial DFU
@@ -345,12 +358,13 @@ Every firmware build and release script runs `tools/check_task_arena.py` against
 the compiled ELF to ensure all Embassy `TaskPool` allocations fit inside the
 static task arena before flashing.
 
-Set `FERRIX_VERSION` (e.g. `v1.18.2`) and optionally `FERRIX_BUILD_DATE` /
+Set `FERRIX_VERSION` (e.g. `v1.18.4`) and optionally `FERRIX_BUILD_DATE` /
 `SOURCE_DATE_EPOCH` to override the compiled version/date metadata. Pushing a
 `v*` tag triggers [`.github/workflows/release.yml`](.github/workflows/release.yml),
 which runs the host test suite, verifies the task arena, and publishes
-`ferrix-thinknode-m1-companion.uf2` / `.zip` and
-`ferrix-wio-tracker-l1-pro-companion.uf2` / `.zip` (BLE OTA / webflasher / serial DFU package) to GitHub Releases.
+versioned `ferrix-thinknode-m1-companion-v<version>.uf2` / `.zip` and
+`ferrix-wio-tracker-l1-pro-companion-v<version>.uf2` / `.zip` (BLE OTA /
+webflasher / serial DFU packages) to GitHub Releases.
 
 To enter the USB bootloader from the CLI, run `dfu` (`start dfu`), double-click
 reset, or trigger a 1200-baud touch on the CDC port. To enter BLE OTA DFU mode
