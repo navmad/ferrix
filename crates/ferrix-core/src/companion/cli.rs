@@ -21,6 +21,16 @@ pub trait TextSink {
     async fn send(&mut self, data: &[u8]) -> Result<(), ()>;
 }
 
+/// Reply budget for `stats-*` commands that also exist in MeshCore
+/// (`stats-core`, `stats-radio`, `stats-packets`), in bytes as the app receives
+/// them, including the echoed `"XX|"` tag. Keeps Ferrix-specific fields from
+/// growing replies that stock MeshCore tooling parses.
+pub const MESHCORE_STATS_REPLY_MAX: usize = 176;
+
+/// Reply budget for Ferrix-only `stats-*` commands: the largest
+/// `PACKET_CLI_REPLY` body that fits one companion frame.
+pub const FERRIX_STATS_REPLY_MAX: usize = crate::companion::framing::MAX_FRAME_PAYLOAD_SIZE - 1;
+
 /// Collect CLI output into a bounded string for `PACKET_CLI_REPLY`.
 pub struct TextBuffer<'a>(pub &'a mut String<256>);
 
@@ -1244,8 +1254,6 @@ pub async fn handle_text_cli<W: TextSink>(
             let override_ms = radio.override_ms;
             let slot_ms = radio.slot_ms;
             let used = radio.used;
-            let scheduled = radio.forward_scheduled;
-            let sent = radio.forward_sent;
             let (control, flood, background, stale, cancelled) =
                 RADIO_TELEMETRY.lock(|t| {
                     let tel = t.borrow();
@@ -1257,11 +1265,10 @@ pub async fn handle_text_cli<W: TextSink>(
                         tel.tx_cancelled,
                     )
                 });
-            let d = radio.duplicate_deltas;
-            let mut s: heapless::String<384> = heapless::String::new();
+            let mut s: heapless::String<256> = heapless::String::new();
             let _ = write!(
                 s,
-                "  -> {{\"slot_ms\":{},\"auto\":{},\"used\":{},\"ctrl\":{},\"flood\":{},\"bg\":{},\"stale\":{},\"cancel\":{},\"fwd_sched\":{},\"fwd_sent\":{},\"qfull\":[{},{},{}],\"ack\":[{},{},{}],\"dup\":[{},{},{},{},{},{}]}}\r\n",
+                "  -> {{\"slot_ms\":{},\"auto\":{},\"used\":{},\"ctrl\":{},\"flood\":{},\"bg\":{},\"stale\":{},\"cancel\":{},\"qfull\":[{},{},{}],\"ack\":[{},{},{}]}}\r\n",
                 slot_ms,
                 override_ms == 0,
                 used,
@@ -1270,16 +1277,27 @@ pub async fn handle_text_cli<W: TextSink>(
                 background,
                 stale,
                 cancelled,
-                scheduled,
-                sent,
                 radio.queue_full[0], radio.queue_full[1], radio.queue_full[2],
                 radio.ack_stats[0], radio.ack_stats[1], radio.ack_stats[2],
+            );
+            let _ = sender.send(s.as_bytes()).await;
+        }
+        "stats-fwd" => {
+            let d = radio.duplicate_deltas;
+            let wait_ms = RADIO_TELEMETRY.lock(|t| t.borrow().tx_wait_max_ms);
+            let mut s: heapless::String<192> = heapless::String::new();
+            let _ = write!(
+                s,
+                "  -> {{\"fwd_sched\":{},\"fwd_sent\":{},\"wait_ms\":{},\"dup\":[{},{},{},{},{},{}]}}\r\n",
+                radio.forward_scheduled,
+                radio.forward_sent,
+                wait_ms,
                 d[0], d[1], d[2], d[3], d[4], d[5]
             );
             let _ = sender.send(s.as_bytes()).await;
         }
         "stats-radio" => {
-            let (tx_ms, rx_ms, rssi, snr, wait_ms, retries, dropped, sent) =
+            let (tx_ms, rx_ms, rssi, snr, retries, dropped, sent) =
                 RADIO_TELEMETRY.lock(|t| {
                     let tel = t.borrow();
                     (
@@ -1287,22 +1305,20 @@ pub async fn handle_text_cli<W: TextSink>(
                         tel.rx_air_ms,
                         tel.last_rssi,
                         tel.last_snr,
-                        tel.tx_wait_max_ms,
                         tel.tx_retries,
                         tel.tx_dropped,
                         tel.tx_beacons,
                     )
                 });
-            let mut s: heapless::String<256> = heapless::String::new();
+            let mut s: heapless::String<192> = heapless::String::new();
             let _ = write!(
                 s,
-                "  -> {{\"noise_floor\":-118,\"last_rssi\":{},\"last_snr\":{:.2},\"tx_air_secs\":{},\"rx_air_secs\":{},\"tx_sent\":{},\"tx_wait_ms\":{},\"retries\":{},\"dropped\":{}}}\r\n",
+                "  -> {{\"noise_floor\":-118,\"last_rssi\":{},\"last_snr\":{:.2},\"tx_air_secs\":{},\"rx_air_secs\":{},\"tx_sent\":{},\"retries\":{},\"dropped\":{}}}\r\n",
                 rssi,
                 snr as f32,
                 tx_ms / 1000,
                 rx_ms / 1000,
                 sent,
-                wait_ms,
                 retries,
                 dropped
             );
@@ -1588,7 +1604,7 @@ pub async fn handle_text_cli<W: TextSink>(
         "stats-ble" | "get ble" => {
             use core::sync::atomic::Ordering;
             let st = crate::state::BLE_STATUS.load(Ordering::Relaxed);
-            let mut s: heapless::String<224> = heapless::String::new();
+            let mut s: heapless::String<256> = heapless::String::new();
             match st {
                 0 => {
                     let _ = write!(s, "  -> {{\"state\":\"stopped\"}}\r\n");
@@ -1791,7 +1807,7 @@ pub async fn handle_text_cli<W: TextSink>(
             let _ = sender.send( b"  -> OK (Config saved to flash)\r\n").await;
         }
         "help" => {
-            let _ = sender.send( b"  -> Commands:\r\n  ->   Identity: get/set name, get role, get/set lat/lon, get/set prv.key, get public.key\r\n  ->   Radio:    get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq/tx/sf/bw/cr, get/set repeat, get/set rxduty, get/set af, get/set dutycycle, get/set hash-mode, stats-radio\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, get/set autoadd, get/set multiacks, advert, advert.zerohop, gps advert, clock/time, channels\r\n  ->   System:   save, ver, board, get/set leds, get/set sound, get/set refresh.interval, stats-core, stats-ble, stats-gps, stats-power, stats-packets, clear stats/contacts/messages, start dfu, start ota, reboot\r\n").await;
+            let _ = sender.send( b"  -> Commands:\r\n  ->   Identity: get/set name, get role, get/set lat/lon, get/set prv.key, get public.key\r\n  ->   Radio:    get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq/tx/sf/bw/cr, get/set repeat, get/set rxduty, get/set af, get/set dutycycle, get/set hash-mode, stats-radio, stats-tx, stats-fwd\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, get/set autoadd, get/set multiacks, advert, advert.zerohop, gps advert, clock/time, channels\r\n  ->   System:   save, ver, board, get/set leds, get/set sound, get/set refresh.interval, stats-core, stats-ble, stats-gps, stats-power, stats-packets, clear stats/contacts/messages, start dfu, start ota, reboot\r\n").await;
         }
         _ => {
             let _ = sender.send( b"  -> Unknown command\r\n").await;
@@ -1852,5 +1868,301 @@ mod tests {
         assert_eq!(parse_signed_coord("180.1", 180.0), None);
         assert_eq!(parse_signed_coord("NaN", 90.0), None);
         assert_eq!(parse_signed_coord("abc", 90.0), None);
+    }
+
+    // ---- stats-* reply size guards --------------------------------------
+
+    use crate::companion::protocol::{self as proto, CompanionHost};
+    use core::sync::atomic::{AtomicU32, AtomicU8, Ordering::Relaxed};
+
+    /// `(command, budget, extra)`: `extra` is the number of bytes the test
+    /// cannot saturate because the value comes from a clock or private static
+    /// (e.g. uptime), so it is added to the measured length.
+    const STATS_REPLY_BUDGETS: &[(&str, usize, usize)] = &[
+        // Also in MeshCore: keep short.
+        ("stats-core", MESHCORE_STATS_REPLY_MAX, 18),
+        ("stats-radio", MESHCORE_STATS_REPLY_MAX, 0),
+        ("stats-packets", MESHCORE_STATS_REPLY_MAX, 0),
+        // Ferrix only.
+        ("stats-tx", FERRIX_STATS_REPLY_MAX, 0),
+        ("stats-fwd", FERRIX_STATS_REPLY_MAX, 0),
+        ("stats-flash", FERRIX_STATS_REPLY_MAX, 0),
+        ("stats-qspi", FERRIX_STATS_REPLY_MAX, 0),
+        ("stats-disc", FERRIX_STATS_REPLY_MAX, 0),
+        ("stats-binary", FERRIX_STATS_REPLY_MAX, 0),
+        ("stats-login", FERRIX_STATS_REPLY_MAX, 0),
+        ("stats-scope", FERRIX_STATS_REPLY_MAX, 0),
+        ("stats-trace", FERRIX_STATS_REPLY_MAX, 0),
+        ("stats-adverts", FERRIX_STATS_REPLY_MAX, 0),
+        ("stats-wdt", FERRIX_STATS_REPLY_MAX, 0),
+        ("stats-gps", FERRIX_STATS_REPLY_MAX, 9),
+        ("stats-ble", FERRIX_STATS_REPLY_MAX, 0),
+        ("stats-power", FERRIX_STATS_REPLY_MAX, 0),
+    ];
+
+    /// Host whose stats are all at their largest.
+    struct MaxHost {
+        vectors: bool,
+    }
+
+    impl CompanionHost for MaxHost {
+        fn battery_millivolts(&self) -> u16 {
+            u16::MAX
+        }
+        fn set_callsign(&self, _name: &str) {}
+        fn set_custom_priv_key(&self, _key: [u8; 64]) {}
+        fn set_path_hash_mode(&self, _mode: u8) {}
+        fn request_save_config(&self) {}
+        fn request_radio_config(&self) {}
+        fn request_factory_reset(&self) {}
+        fn queue_consume_now(&self) {}
+        fn advert_remember(&self, _pub_key: &[u8; 32], _payload: &[u8]) {}
+        fn reboot(&self) -> ! {
+            panic!("reboot in test")
+        }
+    }
+
+    impl CliHost for MaxHost {
+        fn leds_disabled(&self) -> bool { false }
+        fn set_leds_disabled(&self, _disabled: bool) {}
+        fn storage_stats(&self) -> StorageStats {
+            StorageStats {
+                contact_saves: u32::MAX,
+                contact_erases: u32::MAX,
+                message_records: u32::MAX,
+                message_page_erases: u32::MAX,
+                message_queued: u32::MAX,
+                advert_records: u32::MAX,
+                advert_erases: u32::MAX,
+                config_saves: u32::MAX,
+                config_erases: u32::MAX,
+                external_profile: true,
+                external_unavailable: true,
+                external_drops: u32::MAX,
+            }
+        }
+        fn radio_stats(&self) -> RadioStats {
+            RadioStats {
+                override_ms: u32::MAX,
+                slot_ms: u32::MAX,
+                used: u32::MAX,
+                forward_scheduled: u32::MAX,
+                forward_sent: u32::MAX,
+                queue_full: [u32::MAX; 3],
+                ack_stats: [u32::MAX; 3],
+                duplicate_deltas: [u32::MAX; 6],
+            }
+        }
+        fn power_clock_stats(&self) -> Option<PowerClockStats> {
+            Some(PowerClockStats {
+                lfclk_config: "xtal(20ppm)",
+                lfclk_running: false,
+                lfclk_src: "LFSYNTH",
+                lfclkstat_raw: u32::MAX,
+                dcdc_reg1_configured: false,
+                dcdc_reg1_active: false,
+                dcdc_reg0_active: false,
+                // `u32::MAX` prints as `null`, which is shorter.
+                sd_dcdc_result: u32::MAX - 1,
+            })
+        }
+        fn softdevice_vectors(&self) -> Option<(u32, u32)> {
+            self.vectors.then_some((u32::MAX, u32::MAX))
+        }
+        fn set_tx_slot_override(&self, _ms: u32) {}
+        fn clear_radio_stats(&self) {}
+        fn advert_stats(&self) -> (usize, usize, bool) { (u32::MAX as usize, u32::MAX as usize, false) }
+        fn advert_slots(&self) -> usize { 0 }
+        fn gps_enabled(&self) -> bool { false }
+        fn set_gps_enabled(&self, _on: bool) {}
+        fn reboot_to_bootloader(&self) -> ! { panic!("bootloader") }
+        fn reboot_to_ota_dfu(&self) -> ! { panic!("ota") }
+        fn board_line(&self) -> &'static str { "test" }
+    }
+
+    /// Unbounded text sink, to compare against the bounded app reply.
+    struct VecSink(std::string::String);
+
+    impl TextSink for VecSink {
+        async fn send(&mut self, data: &[u8]) -> Result<(), ()> {
+            self.0.push_str(core::str::from_utf8(data).map_err(|_| ())?);
+            Ok(())
+        }
+    }
+
+    fn poll_now<F: core::future::Future>(fut: F) -> F::Output {
+        use core::task::{Context, Poll, Waker};
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut fut = core::pin::pin!(fut);
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(out) => out,
+            Poll::Pending => panic!("unexpected Pending"),
+        }
+    }
+
+    /// Set every counter a stats command reads to `v` (`u32::MAX` or 0).
+    /// Booleans stay `false`, the longer spelling.
+    fn set_stat_counters(v: u32) {
+        let u32s: &[&AtomicU32] = &[
+            &proto::ADVERT_COUNT, &proto::ADVERT_LAST_KEY, &proto::ADVERT_LAST_TS,
+            &proto::LOGIN_TX_COUNT, &proto::LOGIN_TX_TAG, &proto::LOGIN_TX_KEY,
+            &proto::LOGIN_RX_COUNT, &proto::LOGIN_RX_TAG, &proto::LOGIN_RX_LEN,
+            &proto::REQ_TX_COUNT, &proto::REQ_TX_TAG, &proto::REQ_RX_COUNT,
+            &proto::REQ_RX_TAG, &proto::REQ_RX_LEN,
+            &proto::DISC_TX_COUNT, &proto::DISC_TX_TAG, &proto::DISC_RX_COUNT,
+            &proto::DISC_RX_TAG, &proto::DISC_RX_RTT_MS,
+            &proto::TRACE_TX_COUNT, &proto::TRACE_TX_TAG, &proto::TRACE_TX_PATH,
+            &proto::TRACE_RX_COUNT, &proto::TRACE_RX_TAG,
+            &SCOPED_FLOODS, &GPS_BYTES, &GPS_SENTENCES, &APP_HEARTBEAT, &STORAGE_HEARTBEAT,
+            &WDT_PETS, &RESET_REASON, &QSPI_STATUS, &QSPI_ID,
+            &crate::storage::bonds::BOND_LOADED, &crate::storage::bonds::BOND_SAVES,
+            &crate::storage::bonds::BOND_SAVE_ERRORS, &crate::storage::bonds::BOND_LAST_ERROR,
+            &crate::storage::bonds::BOND_RECOVERIES,
+        ];
+        for a in u32s {
+            a.store(v, Relaxed);
+        }
+        let u8s: &[&AtomicU8] = &[
+            &proto::LOGIN_RESULT, &proto::REQ_TX_TYPE, &proto::DISC_RX_OUT,
+            &proto::DISC_RX_IN, &proto::TRACE_TX_FLAGS, &proto::TRACE_TX_PATH_LEN,
+            &proto::TRACE_RX_FLAGS, &proto::TRACE_RX_HASHES, &proto::TRACE_RX_SNRS,
+        ];
+        for a in u8s {
+            a.store(v as u8, Relaxed);
+        }
+    }
+
+    /// Run `cmd` the way the app does (`CMD_RUN_CLI_COMMAND` with an echoed tag)
+    /// and as an unbounded sink. Returns `(app reply, full reply)`, both
+    /// normalised.
+    fn stats_reply(cmd: &str, host: &MaxHost) -> (std::string::String, std::string::String) {
+        let mut node = CompanionNode::new("n", "b", 0, [1; 32], [2; 64], host);
+        let mut out = String::<256>::new();
+        poll_now(reply(&std::format!("XX|{cmd}"), &mut node, host, &mut out));
+
+        let mut sink = VecSink(std::string::String::new());
+        poll_now(handle_text_cli(&mut sink, cmd, &mut node, host, false));
+        let full = sink.0.trim_end_matches(['\r', '\n']).trim_start_matches("  -> ");
+        (out.as_str().to_string(), std::format!("XX|{full}"))
+    }
+
+    /// Every counter at its maximum, then every stats reply must fit its
+    /// budget and must not have been cut short, either by an undersized
+    /// `heapless::String` in the handler or by the 256-byte reply buffer.
+    #[test]
+    fn stats_replies_fit_their_budget_at_counter_max() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved_tel = RADIO_TELEMETRY.lock(|t| *t.borrow());
+        let saved_name = crate::storage::get_callsign();
+        let saved_prefs = crate::state::prefs();
+        set_stat_counters(u32::MAX);
+        RADIO_TELEMETRY.lock(|t| {
+            let mut t = t.borrow_mut();
+            t.tx_beacons = u32::MAX;
+            t.rx_packets = u32::MAX;
+            t.last_rssi = i16::MIN;
+            t.last_snr = i8::MIN;
+            t.tx_air_ms = u32::MAX;
+            t.rx_air_ms = u32::MAX;
+            t.tx_wait_max_ms = u32::MAX;
+            t.tx_control = u32::MAX;
+            t.tx_flood = u32::MAX;
+            t.tx_background = u32::MAX;
+            t.tx_stale = u32::MAX;
+            t.tx_cancelled = u32::MAX;
+            t.tx_retries = u32::MAX;
+            t.tx_dropped = u32::MAX;
+            t.rx_dropped = u32::MAX;
+        });
+        // Quotes cost two bytes each once JSON-escaped.
+        NODE_CALLSIGN.lock(|c| {
+            let mut c = c.borrow_mut();
+            c.clear();
+            for _ in 0..32 {
+                let _ = c.push('"');
+            }
+        });
+        crate::state::update_prefs(|p| p.scope_name = [b'"'; 31]);
+
+        let mut failures = std::vec::Vec::new();
+        for (cmd, budget, extra) in STATS_REPLY_BUDGETS {
+            // `stats-ble` has one shape per state; the rest have one.
+            let ble_states: &[(u32, bool)] = if *cmd == "stats-ble" {
+                &[(0, false), (1, false), (2, false), (3, false), (0x1FFF, true), (0x1FFF, false), (0xFFF, false)]
+            } else {
+                &[(0, false)]
+            };
+            for (state, vectors) in ble_states {
+                BLE_STATUS.store(*state, Relaxed);
+                let (app, full) = stats_reply(cmd, &MaxHost { vectors: *vectors });
+                if app != full {
+                    failures.push(std::format!(
+                        "{cmd} (ble {state:#x}): reply cut short at {} B of {} B",
+                        app.len(), full.len()
+                    ));
+                }
+                if !(full.starts_with("XX|{") && full.ends_with('}')) {
+                    failures.push(std::format!("{cmd}: not a JSON object: {full}"));
+                }
+                if full.len() + extra > *budget {
+                    failures.push(std::format!(
+                        "{cmd} (ble {state:#x}): {} B + {extra} B unmeasured exceeds the {budget} B budget",
+                        full.len()
+                    ));
+                }
+            }
+        }
+
+        BLE_STATUS.store(0, Relaxed);
+        set_stat_counters(0);
+        RADIO_TELEMETRY.lock(|t| *t.borrow_mut() = saved_tel);
+        NODE_CALLSIGN.lock(|c| *c.borrow_mut() = saved_name);
+        crate::state::update_prefs(|p| *p = saved_prefs);
+        assert!(failures.is_empty(), "stats replies over budget:\n{}", failures.join("\n"));
+    }
+
+    /// A new `stats-*` command must be added to `STATS_REPLY_BUDGETS`, or the
+    /// test above would silently skip it.
+    #[test]
+    fn every_stats_command_has_a_budget() {
+        let src = include_str!("cli.rs");
+        let mut missing = std::vec::Vec::new();
+        for line in src.lines() {
+            let t = line.trim_start();
+            if !(t.starts_with('"') && t.ends_with("=> {")) {
+                continue;
+            }
+            for part in t.split('"').skip(1).step_by(2) {
+                if part.starts_with("stats-")
+                    && !STATS_REPLY_BUDGETS.iter().any(|(c, _, _)| *c == part)
+                {
+                    missing.push(part);
+                }
+            }
+        }
+        assert!(missing.is_empty(), "add to STATS_REPLY_BUDGETS: {missing:?}");
+        // The scan must see the commands it is guarding.
+        assert!(src.contains("\"stats-tx\" => {"));
+    }
+
+    /// Replies must stay short by dropping Ferrix fields, never by renaming
+    /// the keys MeshCore tooling reads (`StatsFormatHelper.h`).
+    #[test]
+    fn upstream_stats_keys_are_unchanged() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let expect: &[(&str, &[&str])] = &[
+            ("stats-core", &["battery_mv", "uptime_secs", "errors", "queue_len"]),
+            ("stats-radio", &["noise_floor", "last_rssi", "last_snr", "tx_air_secs", "rx_air_secs"]),
+            (
+                "stats-packets",
+                &["recv", "sent", "flood_tx", "direct_tx", "flood_rx", "direct_rx", "recv_errors"],
+            ),
+        ];
+        for (cmd, keys) in expect {
+            let (_, full) = stats_reply(cmd, &MaxHost { vectors: false });
+            for key in *keys {
+                assert!(full.contains(&std::format!("\"{key}\":")), "{cmd} lost \"{key}\": {full}");
+            }
+        }
     }
 }
