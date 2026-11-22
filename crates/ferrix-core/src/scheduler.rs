@@ -208,7 +208,7 @@ pub fn rebase_floods(
     stale
 }
 
-/// Refill control (25%) and flood (75%) duty-cycle airtime budgets using
+/// Refill control (25%) and flood (75%) duty-cycle airtime budgets (control may borrow unused flood budget, see `control_can_send`) using
 /// sub-millisecond remainders (`1 / 10_000` ms units) so frequent wakeups never
 /// truncate accrued airtime to zero.
 pub fn refill_budgets(
@@ -242,9 +242,50 @@ pub fn refill_budgets(
     *flood_budget_ms = (*flood_budget_ms).min(flood_max);
 }
 
+/// Whether a control-lane packet needing `airtime_ms` fits the duty-cycle
+/// budget. The control lane spends its own 25% share first and borrows the
+/// unused remainder from the flood share, so an ACK is not held back while
+/// flood budget sits idle. Floods never borrow from the control share, which
+/// keeps ACK headroom reserved.
+pub fn control_can_send(control_budget_ms: i64, flood_budget_ms: i64, airtime_ms: i64) -> bool {
+    control_budget_ms.max(0) + flood_budget_ms.max(0) >= airtime_ms
+}
+
+/// Charge a sent control packet: own budget first, then the flood budget.
+pub fn charge_control(control_budget_ms: &mut i64, flood_budget_ms: &mut i64, airtime_ms: i64) {
+    let from_control = airtime_ms.min((*control_budget_ms).max(0));
+    *control_budget_ms -= from_control;
+    *flood_budget_ms = (*flood_budget_ms - (airtime_ms - from_control)).max(0);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_borrows_idle_flood_budget() {
+        // 25% share is exhausted but the flood share is full: the ACK may go.
+        assert!(control_can_send(0, 300, 120));
+        assert!(!control_can_send(0, 100, 120));
+        assert!(control_can_send(40, 80, 120));
+    }
+
+    #[test]
+    fn control_spends_its_own_budget_before_borrowing() {
+        let (mut c, mut f) = (50, 300);
+        charge_control(&mut c, &mut f, 120);
+        assert_eq!((c, f), (0, 230));
+        let (mut c, mut f) = (200, 300);
+        charge_control(&mut c, &mut f, 120);
+        assert_eq!((c, f), (80, 300));
+    }
+
+    #[test]
+    fn charge_never_drives_budgets_negative() {
+        let (mut c, mut f) = (0, 10);
+        charge_control(&mut c, &mut f, 120);
+        assert_eq!((c, f), (0, 0));
+    }
 
     fn packet(hash: u8) -> TxPacket {
         TxPacket {

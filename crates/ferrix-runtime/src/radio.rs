@@ -9,7 +9,7 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Instant, Timer};
 use ferrix_core::scheduler::{
-    assign_flood, cancel_slot, due_flood, next_flood_due, packet_wait_ms, preamble_for,
+    assign_flood, cancel_slot, charge_control, control_can_send, due_flood, next_flood_due, packet_wait_ms, preamble_for,
     preamble_wait_ms, rebase_floods, refill_budgets, remember_cancel, slot_width_ms,
     take_cancelled, FloodSlot, TxPacket, CONTROL_QUEUE, FLOOD_MAX_AGE_SLOTS, FLOOD_SLOTS,
     SLOT_MIN_MS, TX_GAP_MS, TX_MAX_ATTEMPTS,
@@ -341,12 +341,16 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
                     current_cfg.4,
                     preamble,
                 );
-                if duty_pct >= 100 || control_budget_ms >= airtime as i64 {
+                if duty_pct >= 100
+                    || control_can_send(control_budget_ms, flood_budget_ms, airtime as i64)
+                {
                     let req = control.remove(idx);
                     pick = Some((req, TxLane::Control, airtime));
                 } else if duty_pct > 0 {
-                    let deficit = airtime as i64 - control_budget_ms;
-                    budget_wait_ms = (deficit * 10_000 / (duty_pct * 25)).max(1) as u64;
+                    // Both shares refill, so the deficit closes at the full rate.
+                    let deficit =
+                        airtime as i64 - control_budget_ms.max(0) - flood_budget_ms.max(0);
+                    budget_wait_ms = (deficit * 10_000 / (duty_pct * 100)).max(1) as u64;
                 }
             }
 
@@ -412,7 +416,7 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
                 next_tx_allowed_ms = after_tx + TX_GAP_MS;
                 if duty_pct < 100 {
                     if lane == TxLane::Control {
-                        control_budget_ms = (control_budget_ms - airtime as i64).max(0);
+                        charge_control(&mut control_budget_ms, &mut flood_budget_ms, airtime as i64);
                     } else {
                         flood_budget_ms = (flood_budget_ms - airtime as i64).max(0);
                     }
