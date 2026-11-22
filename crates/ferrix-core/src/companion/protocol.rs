@@ -3943,6 +3943,223 @@ mod tests {
         drain_usb_commands();
     }
 
+    /// `EngineContext` for a two-party round trip: one known peer at a fixed path.
+    struct PairContext {
+        peer: [u8; 32],
+        out_path_len: u8,
+    }
+
+    impl crate::engine::EngineContext for PairContext {
+        fn peers_by_hash(&self, hash: u8) -> heapless::Vec<[u8; 32], 32> {
+            let mut peers = heapless::Vec::new();
+            if self.peer[0] == hash {
+                let _ = peers.push(self.peer);
+            }
+            peers
+        }
+
+        fn peer_path(&self, _pub_key: &[u8; 32]) -> (u8, [u8; 64]) {
+            (self.out_path_len, [0x77; 64])
+        }
+    }
+
+    /// What the companion tells the phone about a send must match what goes on
+    /// the air: `RESP_CODE_SENT` carries `expected_ack` (the phone waits for that
+    /// CRC) and `est_timeout` (its retry timer). Both are computed in the
+    /// companion, independently of the engine that builds the packet and of the
+    /// receiver that builds the ACK, so check all three agree.
+    #[test]
+    fn sent_response_matches_the_engine_packet_and_the_receivers_ack() {
+        use crate::engine::{InboundAction, MeshEngine};
+        use meshcore_wire::identity::LocalIdentity;
+        use meshcore_wire::packet::{Packet, PAYLOAD_TYPE_ACK, ROUTE_TYPE_DIRECT};
+        use meshcore_wire::packets::advert::ADV_TYPE_CHAT;
+        use meshcore_wire::packets::txtmsg::TXT_TYPE_PLAIN;
+        use meshcore_wire::packets::AckPacket;
+
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let alice = LocalIdentity::from_seed("alice", &[1u8; 32]);
+        let bob = LocalIdentity::from_seed("bob", &[2u8; 32]);
+        let alice_pub = alice.pub_key_bytes();
+        let bob_pub = bob.pub_key_bytes();
+        assert_ne!(alice_pub[..6], bob_pub[..6]);
+
+        let mut node = CompanionNode::new("alice", "b", 0, [1u8; 32], [2u8; 64], &TestHost);
+        node.public_key = alice_pub;
+
+        // Text lengths either side of the 16-byte AES block boundaries for the
+        // normal (5 + len) and extended-attempt (7 + len) plaintext layouts.
+        let lengths = [1usize, 9, 10, 11, 12, 26, 27, 28, 100];
+        let attempts = [0u8, 1, 3, 4, 5];
+        // Unknown path (flood), zero-hop direct, and one-hop direct.
+        let paths = [0xFFu8, 0, 1];
+
+        let mut ts = 1_700_000_000u32;
+        for &out_path_len in &paths {
+            // Fresh engines per path so duplicate suppression never interferes.
+            let ctx_a = PairContext { peer: bob_pub, out_path_len };
+            let ctx_b = PairContext { peer: alice_pub, out_path_len: 0 };
+            let mut engine_a = MeshEngine::new(
+                LocalIdentity::from_seed("alice", &[1u8; 32]),
+                ADV_TYPE_CHAT,
+                &ctx_a,
+            );
+            let mut engine_b = MeshEngine::new(
+                LocalIdentity::from_seed("bob", &[2u8; 32]),
+                ADV_TYPE_CHAT,
+                &ctx_b,
+            );
+
+            crate::state::DISCOVERED_CONTACTS.lock(|c| {
+                let mut list = c.borrow_mut();
+                list.clear();
+                let _ = list.push(crate::types::DiscoveredContact {
+                    pub_key: bob_pub,
+                    callsign: String::new(),
+                    node_id: [bob_pub[0]; 4],
+                    last_seen_epoch: 100,
+                    rssi: 0,
+                    snr: 0,
+                    latitude: 0,
+                    longitude: 0,
+                    flags: 0,
+                    contact_type: 1,
+                    out_path: [0x77; 64],
+                    out_path_len,
+                    last_advert_ts: 0,
+                    saved_hash: 0,
+                    sync_since: 0,
+                });
+            });
+
+            for &len in &lengths {
+                for &attempt in &attempts {
+                    ts += 1;
+                    let text: std::string::String = (0..len)
+                        .map(|i| (b'a' + (i % 26) as u8) as char)
+                        .collect();
+                    let case = format!("path_len={out_path_len:#x} attempt={attempt} len={len}");
+
+                    // 1. Companion command -> RESP_CODE_SENT.
+                    drain_usb_commands();
+                    let mut frame = Vec::<u8, 200>::new();
+                    let _ = frame.push(CMD_SEND_MSG);
+                    let _ = frame.push(TXT_TYPE_PLAIN);
+                    let _ = frame.push(attempt);
+                    let _ = frame.extend_from_slice(&ts.to_le_bytes());
+                    let _ = frame.extend_from_slice(&bob_pub[..6]);
+                    let _ = frame.extend_from_slice(text.as_bytes());
+                    let mut resp = Vec::<u8, 16>::new();
+                    poll_sync(node.handle_command(&frame, |r| {
+                        let _ = resp.extend_from_slice(r);
+                    }));
+                    assert_eq!(resp.len(), 10, "{case}: {:02x?}", resp.as_slice());
+                    assert_eq!(resp[0], RESP_CODE_SENT, "{case}");
+                    let is_flood = resp[1] == 1;
+                    assert_eq!(is_flood, out_path_len == 0xFF, "{case}");
+                    let expected_ack = u32::from_le_bytes(resp[2..6].try_into().unwrap());
+                    let est_timeout = u32::from_le_bytes(resp[6..10].try_into().unwrap());
+
+                    // 2. The command handed to the app loop carries the same fields.
+                    let Ok(crate::command::UsbCommand::SendDirectText {
+                        dest_prefix,
+                        timestamp,
+                        txt_type,
+                        attempt: queued_attempt,
+                        text: queued_text,
+                    }) = crate::command::USB_COMMAND_CHANNEL.try_receive()
+                    else {
+                        panic!("{case}: no SendDirectText queued");
+                    };
+                    assert_eq!(dest_prefix, bob_pub[..6]);
+                    assert_eq!((timestamp, txt_type, queued_attempt), (ts, TXT_TYPE_PLAIN, attempt));
+                    assert_eq!(queued_text.as_str(), text);
+
+                    // 3. The engine, given that command, tracks the same CRC.
+                    let hop_path = [0x77u8; 64];
+                    let engine_crc = engine_a
+                        .queue_direct_text(
+                            &bob_pub,
+                            queued_text.as_str(),
+                            timestamp,
+                            txt_type,
+                            queued_attempt,
+                            out_path_len,
+                            &hop_path,
+                        )
+                        .unwrap_or_else(|_| panic!("{case}: queue_direct_text failed"));
+                    assert_eq!(engine_crc, expected_ack, "{case}: expected_ack vs engine CRC");
+
+                    // 4. est_timeout is derived from the packet length the
+                    //    companion predicts; it must match the packet we built.
+                    let tx = engine_a.tx_queue.pop().expect("DM queued");
+                    let mut buf = [0u8; 256];
+                    let wire_len = tx.packet.write_to(&mut buf).expect("serialise");
+                    let (sf, bw_khz, cr) = crate::state::RADIO_SETTINGS.lock(|r| {
+                        let s = r.borrow();
+                        (s.sf, s.bw_khz, s.cr)
+                    });
+                    let air_ms = crate::airtime::estimate_airtime_ms(
+                        wire_len,
+                        sf,
+                        bw_khz,
+                        cr,
+                        if sf <= 8 { 32 } else { 16 },
+                    );
+                    let expected_timeout = if is_flood {
+                        500 + 16 * air_ms
+                    } else {
+                        500 + (air_ms * 6 + 250) * ((out_path_len & 63) as u32 + 1)
+                    };
+                    assert_eq!(
+                        est_timeout, expected_timeout,
+                        "{case}: est_timeout does not match the formula applied to the \
+                         {wire_len}-byte packet actually sent (wrong length estimate or \
+                         wrong formula)"
+                    );
+
+                    // 5. The receiver's ACK carries that CRC.
+                    let mut rx = Packet::read_from(&buf[..wire_len]).expect("parse");
+                    for _ in 0..(out_path_len & 63) {
+                        // Stand in for the repeaters on the path.
+                        if out_path_len != 0xFF {
+                            assert!(rx.pop_front_hop(), "{case}");
+                        }
+                    }
+                    match engine_b.handle_inbound_packet(rx, 0) {
+                        InboundAction::ReceivedDirectText { msg, .. } => {
+                            assert_eq!(msg.text.as_str(), text, "{case}");
+                            assert_eq!(msg.ack_crc, expected_ack, "{case}: decoded CRC");
+                        }
+                        _ => panic!("{case}: receiver did not accept the DM"),
+                    }
+                    let reply = engine_b.tx_queue.pop().expect("receiver replies").packet;
+                    if is_flood {
+                        // A flooded DM is answered with PATH+ACK.
+                        match engine_a.handle_inbound_packet(reply, 0) {
+                            InboundAction::ReceivedPath { packet, .. } => {
+                                let ack = AckPacket::decode(packet.extra.as_slice())
+                                    .unwrap_or_else(|_| panic!("{case}: no ACK in PATH extra"));
+                                assert_eq!(ack.crc, expected_ack, "{case}: PATH+ACK CRC");
+                            }
+                            _ => panic!("{case}: sender did not accept the PATH"),
+                        }
+                    } else {
+                        assert_eq!(reply.route_type(), ROUTE_TYPE_DIRECT, "{case}");
+                        assert_eq!(reply.payload_type(), PAYLOAD_TYPE_ACK, "{case}");
+                        let ack = AckPacket::decode(&reply.payload[..reply.payload_len])
+                            .expect("ACK payload");
+                        assert_eq!(ack.crc, expected_ack, "{case}: ACK CRC");
+                    }
+                    engine_a.tx_queue.clear();
+                    engine_b.tx_queue.clear();
+                }
+            }
+        }
+        drain_usb_commands();
+    }
+
     #[test]
     fn cmd_get_stats_packets_and_set_device_time_monotonic() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());

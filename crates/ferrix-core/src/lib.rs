@@ -12,6 +12,8 @@ pub mod command;
 pub mod companion;
 pub mod engine;
 pub mod gps;
+#[cfg(test)]
+mod mesh_sim;
 pub mod scheduler;
 pub mod state;
 pub mod storage;

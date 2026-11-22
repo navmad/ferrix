@@ -136,6 +136,76 @@ payload = "2c5368e40a603d569ee88ae5c804569db7010a00"
 hash = "728fa5acad9a4e15"
 
 [[packet]]
+name = "txt_attempt3"
+raw = "09002c5391efdca4d9cf2bf1d4470baaea652c84a903"
+route = 1
+ptype = 2
+path_len = 0
+path = ""
+payload = "2c5391efdca4d9cf2bf1d4470baaea652c84a903"
+hash = "0d88bebc79f7adf4"
+
+[[packet]]
+name = "txt_attempt4"
+raw = "09002c53254f862a4d19897c8a70982243a9b6527d71"
+route = 1
+ptype = 2
+path_len = 0
+path = ""
+payload = "2c53254f862a4d19897c8a70982243a9b6527d71"
+hash = "ff29a5bd2e4fc86c"
+
+[[packet]]
+name = "txt_attempt255"
+raw = "09002c531227b7b28a78e4e066a3b2acf749b0b7ae6b"
+route = 1
+ptype = 2
+path_len = 0
+path = ""
+payload = "2c531227b7b28a78e4e066a3b2acf749b0b7ae6b"
+hash = "b8df8156e38c3e18"
+
+[[packet]]
+name = "txt_block_exact"
+raw = "09002c537adeb9528ecefc2d249c75dadf03b97efbe9"
+route = 1
+ptype = 2
+path_len = 0
+path = ""
+payload = "2c537adeb9528ecefc2d249c75dadf03b97efbe9"
+hash = "c81bae403d2dd111"
+
+[[packet]]
+name = "txt_block_over"
+raw = "09002c53b023b9528ecefc2d249c75dadf03b97efbe9ad643a427c200e922379d9613ce069c7"
+route = 1
+ptype = 2
+path_len = 0
+path = ""
+payload = "2c53b023b9528ecefc2d249c75dadf03b97efbe9ad643a427c200e922379d9613ce069c7"
+hash = "713960e0b55f37cd"
+
+[[packet]]
+name = "txt_attempt4_block_exact"
+raw = "09002c539d7dbfffad4d97af429c7a85557b334da3fd"
+route = 1
+ptype = 2
+path_len = 0
+path = ""
+payload = "2c539d7dbfffad4d97af429c7a85557b334da3fd"
+hash = "991967cb31ed17fa"
+
+[[packet]]
+name = "txt_attempt4_block_over"
+raw = "09002c5305a2a8babb97b8f658a2c469de482f1167331139a09520082d11b5d8997666b9b0b8"
+route = 1
+ptype = 2
+path_len = 0
+path = ""
+payload = "2c5305a2a8babb97b8f658a2c469de482f1167331139a09520082d11b5d8997666b9b0b8"
+hash = "9419b8fcf22fdd61"
+
+[[packet]]
 name = "ack_direct"
 raw = "0e01a123be38ec005a"
 route = 2
@@ -363,6 +433,76 @@ attempt = 0
 text = "434c49206f7574707574"
 plain = "e0bdec6a00434c49206f7574707574"
 ack = 1254070283
+
+[[txt]]
+packet = "txt_attempt3"
+from = "alice"
+to = "bob"
+ts = 1793900000
+attempt = 3
+text = "48656c6c6f20426f62"
+plain = "e0bdec6a0348656c6c6f20426f62"
+ack = 2210439720
+
+[[txt]]
+packet = "txt_attempt4"
+from = "alice"
+to = "bob"
+ts = 1793900000
+attempt = 4
+text = "48656c6c6f20426f62"
+plain = "e0bdec6a0048656c6c6f20426f620004"
+ack = 3963141667
+
+[[txt]]
+packet = "txt_attempt255"
+from = "alice"
+to = "bob"
+ts = 1793900000
+attempt = 255
+text = "48656c6c6f20426f62"
+plain = "e0bdec6a0348656c6c6f20426f6200ff"
+ack = 2210439720
+
+[[txt]]
+packet = "txt_block_exact"
+from = "alice"
+to = "bob"
+ts = 1793900000
+attempt = 0
+text = "7878787878787878787878"
+plain = "e0bdec6a007878787878787878787878"
+ack = 4280089657
+
+[[txt]]
+packet = "txt_block_over"
+from = "alice"
+to = "bob"
+ts = 1793900000
+attempt = 0
+text = "787878787878787878787878"
+plain = "e0bdec6a00787878787878787878787878"
+ack = 359336070
+
+[[txt]]
+packet = "txt_attempt4_block_exact"
+from = "alice"
+to = "bob"
+ts = 1793900000
+attempt = 4
+text = "797979797979797979"
+plain = "e0bdec6a007979797979797979790004"
+ack = 3789265254
+
+[[txt]]
+packet = "txt_attempt4_block_over"
+from = "alice"
+to = "bob"
+ts = 1793900000
+attempt = 4
+text = "79797979797979797979"
+plain = "e0bdec6a00797979797979797979790004"
+ack = 2912232752
 
 [[ack]]
 packet = "ack_direct"
