@@ -67,6 +67,9 @@ pub trait EngineContext: Send + Sync {
 
     /// Ask the scheduler to drop a scheduled flood.
     fn cancel_flood(&self, _hash: [u8; 8]) {}
+
+    /// Account for a packet dropped because the transmit queue was full.
+    fn note_tx_queue_full(&self, _lane: TxLane) {}
 }
 
 /// Context for host tests and nodes that do not forward or scope floods.
@@ -270,6 +273,13 @@ impl<'a> MeshEngine<'a> {
         self.context.peers_by_hash(hash)
     }
 
+    /// Count a dropped packet when a transmit-queue push was rejected.
+    fn note_push(&self, lane: TxLane, result: Result<(), meshcore_wire::queue::QueuedPacket>) {
+        if result.is_err() {
+            self.context.note_tx_queue_full(lane);
+        }
+    }
+
     /// Queue a flood packet for forwarding.
     fn queue_forward(&mut self, pkt: Packet) {
         let now = now_ms();
@@ -281,7 +291,8 @@ impl<'a> MeshEngine<'a> {
             hash,
             queued_at_ms: now,
         });
-        let _ = self.tx_queue.push_flood(pkt, now);
+        let r = self.tx_queue.push_flood(pkt, now);
+        self.note_push(TxLane::Flood, r);
         self.context.note_forward_scheduled();
     }
 
@@ -396,7 +407,8 @@ impl<'a> MeshEngine<'a> {
                 if relay.path_len < 64 {
                     relay.path[relay.path_len as usize] = (snr.saturating_mul(4)) as u8;
                     relay.path_len += 1;
-                    let _ = self.tx_queue.push_control(relay, now_ms());
+                    let r = self.tx_queue.push_control(relay, now_ms());
+                    self.note_push(TxLane::Control, r);
                 }
                 return InboundAction::Forwarded;
             }
@@ -981,7 +993,8 @@ impl<'a> MeshEngine<'a> {
             pkt.path_len = 0;
         }
         self.seen_filter.mark_seen(pkt.calculate_packet_hash());
-        let _ = self.tx_queue.push_background(pkt.clone(), now_ms());
+        let r = self.tx_queue.push_background(pkt.clone(), now_ms());
+        self.note_push(TxLane::Background, r);
         Ok(pkt)
     }
 
@@ -992,7 +1005,8 @@ impl<'a> MeshEngine<'a> {
         pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
         self.context.apply_flood_scope(&mut pkt);
         self.seen_filter.mark_seen(pkt.calculate_packet_hash());
-        let _ = self.tx_queue.push_control(pkt.clone(), now_ms());
+        let r = self.tx_queue.push_control(pkt.clone(), now_ms());
+        self.note_push(TxLane::Control, r);
         Ok(pkt)
     }
 
@@ -1013,7 +1027,8 @@ impl<'a> MeshEngine<'a> {
             pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
             self.context.apply_flood_scope(&mut pkt);
             self.seen_filter.mark_seen(pkt.calculate_packet_hash());
-            let _ = self.tx_queue.push_control(pkt.clone(), now_ms());
+            let r = self.tx_queue.push_control(pkt.clone(), now_ms());
+            self.note_push(TxLane::Control, r);
             Ok(pkt)
         } else {
             let mut pkt = grp.to_packet(channel_secret, ROUTE_TYPE_DIRECT)?;
@@ -1021,7 +1036,8 @@ impl<'a> MeshEngine<'a> {
             let n = pkt.path_byte_len();
             pkt.path[..n].copy_from_slice(&path[..n]);
             self.seen_filter.mark_seen(pkt.calculate_packet_hash());
-            let _ = self.tx_queue.push_control(pkt.clone(), now_ms());
+            let r = self.tx_queue.push_control(pkt.clone(), now_ms());
+            self.note_push(TxLane::Control, r);
             Ok(pkt)
         }
     }
@@ -1114,15 +1130,17 @@ impl<'a> MeshEngine<'a> {
             let n = mp_pkt.path_byte_len();
             mp_pkt.path[..n].copy_from_slice(&ack_pkt.path[..n]);
             self.seen_filter.mark_seen(mp_pkt.calculate_packet_hash());
-            let _ = self
+            let r = self
                 .tx_queue
                 .push_control_at(mp_pkt, now, now.saturating_add(offset));
+            self.note_push(TxLane::Control, r);
             offset = offset.saturating_add(MULTI_ACK_SPACING_MS);
         }
 
-        let _ = self
+        let r = self
             .tx_queue
             .push_control_at(ack_pkt.clone(), now, now.saturating_add(offset));
+        self.note_push(TxLane::Control, r);
         Ok(ack_pkt)
     }
 
@@ -1240,9 +1258,10 @@ impl<'a> MeshEngine<'a> {
         }
         self.seen_filter.mark_seen(pkt.calculate_packet_hash());
         let now = now_ms();
-        let _ = self
+        let r = self
             .tx_queue
             .push_control_at(pkt.clone(), now, now.saturating_add(delay_ms));
+        self.note_push(TxLane::Control, r);
         pkt
     }
 }
@@ -1473,6 +1492,49 @@ mod tests {
         let mut pkt = msg.to_packet(ROUTE_TYPE_DIRECT, &secret).unwrap();
         pkt.set_path_hash_size_and_count(1, 0);
         pkt
+    }
+
+    struct FullCounterContext {
+        inner: MultiAckContext,
+        full: [core::sync::atomic::AtomicU32; 3],
+    }
+
+    impl EngineContext for FullCounterContext {
+        fn peers_by_hash(&self, hash: u8) -> heapless::Vec<[u8; 32], 32> {
+            self.inner.peers_by_hash(hash)
+        }
+
+        fn peer_path(&self, pk: &[u8; 32]) -> (u8, [u8; 64]) {
+            self.inner.peer_path(pk)
+        }
+
+        fn note_tx_queue_full(&self, lane: TxLane) {
+            self.full[lane as usize].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn ack_dropped_on_a_full_tx_queue_is_counted() {
+        use core::sync::atomic::{AtomicU32, Ordering};
+        let id = identity();
+        let mut out_path = [0u8; 64];
+        out_path[0] = 0xAA;
+        let ctx = FullCounterContext {
+            inner: MultiAckContext { extra_acks: 0, out_path_len: 1, out_path },
+            full: [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)],
+        };
+        let mut engine = MeshEngine::new(identity(), ADV_TYPE_REPEATER, &ctx);
+        let filler = make_direct_txt_to(&id, 0x33, "fill");
+        while engine.tx_queue.len() < meshcore_wire::queue::OUTBOUND_QUEUE_SIZE {
+            engine.tx_queue.push_control(filler.clone(), 0).unwrap();
+        }
+        let pkt = make_direct_txt_to(&id, 0x33, "hi");
+        assert!(matches!(
+            engine.handle_inbound_packet(pkt, 6),
+            InboundAction::ReceivedDirectText { .. }
+        ));
+        assert_eq!(ctx.full[TxLane::Control as usize].load(Ordering::Relaxed), 1);
+        assert_eq!(ctx.full[TxLane::Flood as usize].load(Ordering::Relaxed), 0);
     }
 
     #[test]
