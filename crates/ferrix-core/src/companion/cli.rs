@@ -69,6 +69,8 @@ pub struct RadioStats {
     pub forward_sent: u32,
     /// Queue-full drops: control, flood, background.
     pub queue_full: [u32; 3],
+    /// DM ACK accounting: matched, unmatched, pending sends evicted.
+    pub ack_stats: [u32; 3],
     pub duplicate_deltas: [u32; 6],
 }
 
@@ -1256,10 +1258,10 @@ pub async fn handle_text_cli<W: TextSink>(
                     )
                 });
             let d = radio.duplicate_deltas;
-            let mut s: heapless::String<320> = heapless::String::new();
+            let mut s: heapless::String<384> = heapless::String::new();
             let _ = write!(
                 s,
-                "  -> {{\"slot_ms\":{},\"auto\":{},\"used\":{},\"ctrl\":{},\"flood\":{},\"bg\":{},\"stale\":{},\"cancel\":{},\"fwd_sched\":{},\"fwd_sent\":{},\"qfull\":[{},{},{}],\"dup\":[{},{},{},{},{},{}]}}\r\n",
+                "  -> {{\"slot_ms\":{},\"auto\":{},\"used\":{},\"ctrl\":{},\"flood\":{},\"bg\":{},\"stale\":{},\"cancel\":{},\"fwd_sched\":{},\"fwd_sent\":{},\"qfull\":[{},{},{}],\"ack\":[{},{},{}],\"dup\":[{},{},{},{},{},{}]}}\r\n",
                 slot_ms,
                 override_ms == 0,
                 used,
@@ -1271,6 +1273,7 @@ pub async fn handle_text_cli<W: TextSink>(
                 scheduled,
                 sent,
                 radio.queue_full[0], radio.queue_full[1], radio.queue_full[2],
+                radio.ack_stats[0], radio.ack_stats[1], radio.ack_stats[2],
                 d[0], d[1], d[2], d[3], d[4], d[5]
             );
             let _ = sender.send(s.as_bytes()).await;

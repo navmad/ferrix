@@ -122,6 +122,11 @@ impl CliHost for NrfCompanionHost {
             used: ferrix_core::state::TX_SLOT_USED.load(Ordering::Relaxed),
             forward_scheduled: ferrix_core::state::FORWARD_SCHEDULED.load(Ordering::Relaxed),
             forward_sent: ferrix_core::state::FORWARD_SENT.load(Ordering::Relaxed),
+            ack_stats: [
+                ferrix_core::state::ACK_RX_MATCHED.load(Ordering::Relaxed),
+                ferrix_core::state::ACK_RX_UNMATCHED.load(Ordering::Relaxed),
+                ferrix_core::state::PENDING_ACK_EVICTED.load(Ordering::Relaxed),
+            ],
             queue_full: core::array::from_fn(|i| {
                 ferrix_core::state::TX_QUEUE_FULL[i].load(Ordering::Relaxed)
             }),
@@ -168,6 +173,9 @@ impl CliHost for NrfCompanionHost {
     fn clear_radio_stats(&self) {
         ferrix_core::state::FORWARD_SCHEDULED.store(0, Ordering::Relaxed);
         ferrix_core::state::FORWARD_SENT.store(0, Ordering::Relaxed);
+        ferrix_core::state::ACK_RX_MATCHED.store(0, Ordering::Relaxed);
+        ferrix_core::state::ACK_RX_UNMATCHED.store(0, Ordering::Relaxed);
+        ferrix_core::state::PENDING_ACK_EVICTED.store(0, Ordering::Relaxed);
         for c in &ferrix_core::state::TX_QUEUE_FULL {
             c.store(0, Ordering::Relaxed);
         }

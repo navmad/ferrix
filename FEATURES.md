@@ -294,7 +294,9 @@ the 175-byte `PACKET_CLI_REPLY` (`0x1D`) binary companion frame limit:
   per-store saves/erases, queued messages.
 - `stats-qspi` (or `qspi`) — QSPI JEDEC ID, status, and flash health.
 - `stats-tx` — slot width/occupancy, control/flood/background counts,
-  cancelled/stale floods, duplicate-delay histogram.
+  cancelled/stale floods, duplicate-delay histogram, `qfull` (packets dropped
+  by a full TX queue: control/flood/background) and `ack` (DM ACKs matched,
+  unmatched, pending sends evicted).
 - `stats-packets` — received/sent flood/direct counters.
 - `stats-power` — LFCLK source (`LFXO` vs `LFRC`) and REG1 DC-DC regulator status.
 - `stats-gps` (or `gps`) — fix status, satellites, coordinates, and UART activity.
