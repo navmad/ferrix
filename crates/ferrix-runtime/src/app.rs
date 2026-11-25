@@ -451,19 +451,7 @@ fn push_inbound_text<B: AppBoard>(
     message: ReceivedMessage,
     msg_epoch: &mut u32,
 ) {
-    let dropped = MESSAGE_LOG.lock(|m| {
-        let mut list = m.borrow_mut();
-        let dropped = list.is_full();
-        if dropped {
-            list.remove(0);
-        }
-        let _ = list.push(InboxItem::Text(message.clone()));
-        dropped
-    });
-    if dropped {
-        storage::messages::queue_consume_now();
-    }
-    let _ = storage::messages::try_queue_append(message);
+    storage::messages::push_inbox(InboxItem::Text(message));
     *msg_epoch = msg_epoch.wrapping_add(1);
     board.beep(UiSound::Notify);
 
@@ -643,19 +631,7 @@ fn dispatch_inbound_action<B: AppBoard>(
                     data_type: packet.data_type,
                     data: packet.data.clone(),
                 };
-                let dropped = MESSAGE_LOG.lock(|m| {
-                    let mut list = m.borrow_mut();
-                    let dropped = list.is_full();
-                    if dropped {
-                        list.remove(0);
-                    }
-                    let _ = list.push(InboxItem::ChannelData(item.clone()));
-                    dropped
-                });
-                if dropped {
-                    storage::messages::queue_consume_now();
-                }
-                let _ = storage::messages::try_queue_append_channel_data(item);
+                storage::messages::push_inbox(InboxItem::ChannelData(item));
                 *msg_epoch = msg_epoch.wrapping_add(1);
 
                 let mut msg_wait = heapless::Vec::<u8, 256>::new();

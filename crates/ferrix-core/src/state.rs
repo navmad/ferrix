@@ -333,6 +333,22 @@ pub fn init_display_refresh_interval_secs(secs: u16) {
     DISPLAY_REFRESH_INTERVAL_SECS.store(valid, Ordering::Relaxed);
 }
 
+/// Persist offline inbox messages to flash (default `false`: RAM-only).
+pub static PERSIST_MESSAGES: AtomicBool = AtomicBool::new(false);
+
+pub fn persist_messages() -> bool {
+    PERSIST_MESSAGES.load(Ordering::Acquire)
+}
+
+pub fn init_persist_messages(enabled: bool) {
+    PERSIST_MESSAGES.store(enabled, Ordering::Release);
+}
+
+/// Update the message persistence flag; returns `true` if the value changed.
+pub fn set_persist_messages(enabled: bool) -> bool {
+    PERSIST_MESSAGES.swap(enabled, Ordering::AcqRel) != enabled
+}
+
 pub const DEFAULT_PUBLIC_SECRET: [u8; 16] = [
     0x8b, 0x33, 0x87, 0xe9, 0xc5, 0xcd, 0xea, 0x6a, 0xc9, 0xe5, 0xed, 0xba, 0xa1, 0x15, 0xcd, 0x72,
 ];

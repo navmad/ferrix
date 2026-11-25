@@ -466,7 +466,7 @@ pub async fn ble_companion_task(
         let conn = match embassy_futures::select::select(advertise_fut, fast_window).await {
             embassy_futures::select::Either::First(Ok(mut c)) => {
                 info!("BLE: Phone connected & pairing!");
-                BLE_CONNECTED.store(true, Ordering::Relaxed);
+                BLE_CONNECTED.store(true, Ordering::Release);
                 // Request maximum BLE data length (251 bytes) instead of the default 27 bytes.
                 // This increases throughput for channel sync and other large responses.
                 let _ = c.data_length_update(None);
@@ -615,7 +615,8 @@ pub async fn ble_companion_task(
         match session_result {
             embassy_futures::select::Either3::First(e) => {
                 info!("BLE: Phone disconnected ({:?}), resuming advertising...", e);
-                BLE_CONNECTED.store(false, Ordering::Relaxed);
+                BLE_CONNECTED.store(false, Ordering::Release);
+                ferrix_core::storage::messages::on_ble_disconnected();
                 // Drop anything left over from the closed connection so the
                 // next app session never receives stale responses.
                 while cmd_rx.dequeue().is_some() {}
@@ -624,8 +625,11 @@ pub async fn ble_companion_task(
                 adv_config.interval = ADVERTISING_SLOW_INTERVAL;
                 info!("BLE: resumed advertising at 1s interval");
             }
-            embassy_futures::select::Either3::Second(_) => {}
-            embassy_futures::select::Either3::Third(_) => {}
+            embassy_futures::select::Either3::Second(_)
+            | embassy_futures::select::Either3::Third(_) => {
+                BLE_CONNECTED.store(false, Ordering::Release);
+                ferrix_core::storage::messages::on_ble_disconnected();
+            }
         }
     }
 }

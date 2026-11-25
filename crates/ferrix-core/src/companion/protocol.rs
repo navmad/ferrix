@@ -1578,14 +1578,7 @@ impl<'a> CompanionNode<'a> {
             }
 
             CMD_SYNC_NEXT_MESSAGE => {
-                let next_item = crate::state::MESSAGE_LOG.lock(|m| {
-                    let mut list = m.borrow_mut();
-                    if !list.is_empty() {
-                        Some(list.remove(0))
-                    } else {
-                        None
-                    }
-                });
+                let next_item = crate::storage::messages::pop_inbox();
 
                 if let Some(item) = next_item {
                     let mut resp = Vec::<u8, 256>::new();

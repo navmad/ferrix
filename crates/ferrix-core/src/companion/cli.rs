@@ -1013,6 +1013,35 @@ pub async fn handle_text_cli<W: TextSink>(
             )
             .await;
         }
+        "get msg.persist" | "get msgpersist" => {
+            let on = crate::state::persist_messages();
+            let mut s: heapless::String<32> = heapless::String::new();
+            let _ = write!(s, "  -> > {}\r\n", if on { "on" } else { "off" });
+            let _ = sender.send(s.as_bytes()).await;
+        }
+        s if s.starts_with("set msg.persist ") || s.starts_with("set msgpersist ") => {
+            let val = s.rsplit_once(' ').map(|(_, v)| v.trim()).unwrap_or("");
+            let on = val.eq_ignore_ascii_case("on")
+                || val == "1"
+                || val.eq_ignore_ascii_case("true");
+            let off = val.eq_ignore_ascii_case("off")
+                || val == "0"
+                || val.eq_ignore_ascii_case("false");
+            if !on && !off {
+                let _ = sender.send(b"  -> Error: must be on or off\r\n").await;
+            } else {
+                if crate::storage::messages::set_persist_messages(on) {
+                    let _ = crate::storage::config::request_save_config_and_wait().await;
+                }
+                let _ = sender
+                    .send(if on {
+                        b"  -> OK (message persistence on)\r\n" as &[u8]
+                    } else {
+                        b"  -> OK (message persistence off)\r\n" as &[u8]
+                    })
+                    .await;
+            }
+        }
         "get af" => {
             let af = RADIO_SETTINGS.lock(|r| r.borrow().airtime_factor_tenths);
             let mut s: heapless::String<32> = heapless::String::new();
@@ -1220,11 +1249,8 @@ pub async fn handle_text_cli<W: TextSink>(
             }
         }
         "clear messages" => {
-            MESSAGE_LOG.lock(|m| {
-                m.borrow_mut().clear();
-            });
-            crate::storage::messages::queue_clear().await;
-            let _ = sender.send( b"  -> OK (Messages cleared)\r\n").await;
+            crate::storage::messages::clear_inbox();
+            let _ = sender.send(b"  -> OK (Messages cleared)\r\n").await;
         }
         "get tx.slot" => {
             let override_ms = radio.override_ms;
@@ -1821,7 +1847,7 @@ pub async fn handle_text_cli<W: TextSink>(
             let _ = sender.send( b"  -> OK (Config saved to flash)\r\n").await;
         }
         "help" => {
-            let _ = sender.send( b"  -> Commands:\r\n  ->   Identity: get/set name, get role, get/set lat/lon, get/set prv.key, get public.key\r\n  ->   Radio:    get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq/tx/sf/bw/cr, get/set repeat, get/set rxduty, get/set af, get/set dutycycle, get/set hash-mode, stats-radio, stats-tx, stats-fwd\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, get/set autoadd, get/set multiacks, advert, advert.zerohop, gps advert, clock/time, channels\r\n  ->   System:   save, ver, board, get/set leds, get/set sound, get/set refresh.interval, stats-core, stats-ble, stats-gps, stats-power, stats-packets, clear stats/contacts/messages, start dfu, start ota, reboot\r\n").await;
+            let _ = sender.send( b"  -> Commands:\r\n  ->   Identity: get/set name, get role, get/set lat/lon, get/set prv.key, get public.key\r\n  ->   Radio:    get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq/tx/sf/bw/cr, get/set repeat, get/set rxduty, get/set af, get/set dutycycle, get/set hash-mode, stats-radio, stats-tx, stats-fwd\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, get/set autoadd, get/set multiacks, advert, advert.zerohop, gps advert, clock/time, channels\r\n  ->   System:   save, ver, board, get/set leds, get/set sound, get/set refresh.interval, get/set msg.persist, stats-core, stats-ble, stats-gps, stats-power, stats-packets, clear stats/contacts/messages, start dfu, start ota, reboot\r\n").await;
         }
         _ => {
             let _ = sender.send( b"  -> Unknown command\r\n").await;
@@ -2183,5 +2209,30 @@ mod tests {
                 assert!(full.contains(&std::format!("\"{key}\":")), "{cmd} lost \"{key}\": {full}");
             }
         }
+    }
+
+    #[test]
+    fn msg_persist_cli_toggle() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        crate::state::init_persist_messages(false);
+        let host = MaxHost { vectors: false };
+
+        let (_, got) = stats_reply("get msg.persist", &host);
+        assert_eq!(got, "XX|> off");
+
+        let (_, got) = stats_reply("set msg.persist on", &host);
+        assert!(got.contains("OK"));
+        assert!(crate::state::persist_messages());
+
+        let (_, got) = stats_reply("get msgpersist", &host);
+        assert_eq!(got, "XX|> on");
+
+        let (_, got) = stats_reply("set msg.persist maybe", &host);
+        assert!(got.contains("Error"));
+        assert!(crate::state::persist_messages());
+
+        let (_, got) = stats_reply("set msg.persist off", &host);
+        assert!(got.contains("OK"));
+        assert!(!crate::state::persist_messages());
     }
 }

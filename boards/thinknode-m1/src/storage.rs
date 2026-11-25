@@ -11,7 +11,7 @@
 pub use ferrix_core::storage::{
     adverts, config, contacts, counted_flash, get_callsign, get_path_hash_mode, messages,
     request_contacts, request_factory_reset, request_save_config, set_callsign,
-    set_custom_priv_key, set_path_hash_mode, util, MappedFlash, MessageCommand, StorageRegions,
+    set_custom_priv_key, set_path_hash_mode, util, MappedFlash, StorageRegions,
 };
 
 pub use ferrix_nrf52::flash::{capture_softdevice_vectors, softdevice_vectors};
