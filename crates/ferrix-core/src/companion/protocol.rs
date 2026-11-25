@@ -8,8 +8,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
-use embassy_sync::signal::Signal;
-use heapless::{Deque, String, Vec};
+use heapless::{String, Vec};
 
 use meshcore_wire::packet::{
     Packet, PAYLOAD_TYPE_ADVERT, PAYLOAD_TYPE_REQ, ROUTE_TYPE_DIRECT, ROUTE_TYPE_FLOOD,
@@ -31,8 +30,8 @@ pub static LAST_CMD: AtomicU8 = AtomicU8::new(0);
 /// Diagnostics for advert processing and blob backfill.
 pub static ADVERT_COUNT: AtomicU32 = AtomicU32::new(0);
 
-/// Tag of the outstanding status/ping request, if any.
-static PENDING_STATUS: Mutex<CriticalSectionRawMutex, RefCell<Option<(u32, [u8; 32])>>> =
+/// Peer public key of the outstanding status/ping request, if any.
+static PENDING_STATUS: Mutex<CriticalSectionRawMutex, RefCell<Option<[u8; 32]>>> =
     Mutex::new(RefCell::new(None));
 static LAST_TAG: AtomicU32 = AtomicU32::new(0);
 const REQ_TYPE_GET_STATUS: u8 = 0x01;
@@ -57,8 +56,8 @@ fn next_tag() -> u32 {
     }
 }
 
-fn note_status(tag: u32, pub_key: [u8; 32]) {
-    PENDING_STATUS.lock(|p| *p.borrow_mut() = Some((tag, pub_key)));
+fn note_status(pub_key: [u8; 32]) {
+    PENDING_STATUS.lock(|p| *p.borrow_mut() = Some(pub_key));
 }
 
 use crate::state::{Connection, CONNECTIONS, MAX_CONNECTIONS, PENDING_LOGIN};
@@ -77,67 +76,6 @@ pub static LOGIN_RX_LEN: AtomicU32 = AtomicU32::new(0);
 pub static LOGIN_RESULT: AtomicU8 = AtomicU8::new(0);
 pub static LOGIN_PENDING: AtomicBool = AtomicBool::new(false);
 
-/// Settling delay before emitting request responses so clients registering
-/// their pending matcher right after `RESP_CODE_SENT` do not miss them.
-const DELAYED_PUSH_SETTLE_MS: u64 = 800;
-
-static DELAYED_PUSH: Mutex<CriticalSectionRawMutex, RefCell<Deque<(u64, Vec<u8, 256>), 4>>> =
-    Mutex::new(RefCell::new(Deque::new()));
-static DELAYED_PUSH_SIG: Signal<CriticalSectionRawMutex, ()> = Signal::new();
-
-fn enqueue_delayed_push(frame: Vec<u8, 256>) {
-    let due_ms = now_ms().saturating_add(DELAYED_PUSH_SETTLE_MS);
-    DELAYED_PUSH.lock(|q| {
-        let mut q = q.borrow_mut();
-        if q.is_full() {
-            let _ = q.pop_front();
-        }
-        let _ = q.push_back((due_ms, frame));
-    });
-    DELAYED_PUSH_SIG.signal(());
-}
-
-/// Wait until a deferred push frame's settling delay has elapsed.
-///
-/// Cancel-safe: nothing is removed from the queue until the caller invokes
-/// [`take_ready_delayed_push`].
-pub async fn wait_delayed_push() {
-    loop {
-        let wait_ms = DELAYED_PUSH.lock(|q| {
-            q.borrow()
-                .front()
-                .map(|(due_ms, _)| due_ms.saturating_sub(now_ms()))
-        });
-        match wait_ms {
-            Some(0) => return,
-            Some(ms) => embassy_time::Timer::after_millis(ms).await,
-            None => DELAYED_PUSH_SIG.wait().await,
-        }
-    }
-}
-
-/// Pop the next deferred push frame whose settling delay has elapsed.
-pub fn take_ready_delayed_push() -> Option<Vec<u8, 256>> {
-    let now = now_ms();
-    DELAYED_PUSH.lock(|q| {
-        let mut q = q.borrow_mut();
-        if q.front().is_some_and(|(due_ms, _)| now >= *due_ms) {
-            q.pop_front().map(|(_, frame)| frame)
-        } else {
-            None
-        }
-    })
-}
-
-/// Wait for the next deferred push frame and its settling delay.
-pub async fn next_delayed_push() -> Vec<u8, 256> {
-    loop {
-        wait_delayed_push().await;
-        if let Some(frame) = take_ready_delayed_push() {
-            return frame;
-        }
-    }
-}
 // Binary/anonymous request diagnostics.
 pub static REQ_TX_COUNT: AtomicU32 = AtomicU32::new(0);
 pub static REQ_TX_TAG: AtomicU32 = AtomicU32::new(0);
@@ -199,6 +137,19 @@ fn now_ms() -> u64 {
     embassy_time::Instant::now().as_millis()
 }
 
+/// Clear all pending request slots when dispatching a new companion request so
+/// stale matchers from earlier uncompleted requests cannot misclassify replies.
+#[inline(never)]
+fn clear_pending_reqs() {
+    PENDING_LOGIN.lock(|p| *p.borrow_mut() = None);
+    LOGIN_PENDING.store(false, Ordering::Relaxed);
+    PENDING_STATUS.lock(|p| *p.borrow_mut() = None);
+    PENDING_TELEMETRY.lock(|p| *p.borrow_mut() = None);
+    PENDING_DISCOVERY.lock(|p| *p.borrow_mut() = None);
+    DISC_PENDING.store(false, Ordering::Relaxed);
+    PENDING_REQ.lock(|p| *p.borrow_mut() = None);
+}
+
 fn note_pending_login(pub_key: [u8; 32]) {
     PENDING_LOGIN.lock(|p| *p.borrow_mut() = Some((pub_key, now_ms() + 15000)));
     LOGIN_PENDING.store(true, Ordering::Relaxed);
@@ -229,6 +180,14 @@ pub fn handle_path_discovery(
     in_path_len: u8,
     in_path: &[u8],
 ) -> bool {
+    if !Packet::is_valid_path_len(out_path_len) || !Packet::is_valid_path_len(in_path_len) {
+        return false;
+    }
+    let on = (out_path_len & 63) as usize * (((out_path_len >> 6) & 3) as usize + 1);
+    let inn = (in_path_len & 63) as usize * (((in_path_len >> 6) & 3) as usize + 1);
+    if out_path.len() < on || in_path.len() < inn {
+        return false;
+    }
     let matched = PENDING_DISCOVERY.lock(|p| {
         let mut pending = p.borrow_mut();
         if pending.map_or(false, |(t, k)| t == tag && k == *sender_pub) {
@@ -256,12 +215,10 @@ pub fn handle_path_discovery(
     let _ = push.push(0);
     let _ = push.extend_from_slice(&sender_pub[..6]);
     let _ = push.push(out_path_len);
-    let on = (out_path_len & 63) as usize * (((out_path_len >> 6) & 3) as usize + 1);
-    let _ = push.extend_from_slice(&out_path[..on.min(out_path.len())]);
+    let _ = push.extend_from_slice(&out_path[..on]);
     let _ = push.push(in_path_len);
-    let inn = (in_path_len & 63) as usize * (((in_path_len >> 6) & 3) as usize + 1);
-    let _ = push.extend_from_slice(&in_path[..inn.min(in_path.len())]);
-    enqueue_delayed_push(push);
+    let _ = push.extend_from_slice(&in_path[..inn]);
+    crate::command::push_companion(&push);
     true
 }
 
@@ -448,7 +405,7 @@ pub fn handle_response(plain: &[u8], sender_pub: &[u8; 32]) -> bool {
         let _ = push.extend_from_slice(&tag.to_le_bytes());
         let data = &plain[4..];
         let _ = push.extend_from_slice(&data[..data.len().min(256 - push.len())]);
-        enqueue_delayed_push(push);
+        crate::command::push_companion(&push);
         return true;
     }
 
@@ -468,19 +425,22 @@ pub fn handle_response(plain: &[u8], sender_pub: &[u8; 32]) -> bool {
         let _ = push.extend_from_slice(&sender_pub[..6]);
         let data = &plain[4..];
         let _ = push.extend_from_slice(&data[..data.len().min(256 - push.len())]);
-        enqueue_delayed_push(push);
+        crate::command::push_companion(&push);
         return true;
     }
 
-    let matched = PENDING_STATUS.lock(|p| {
-        let mut pending = p.borrow_mut();
-        if pending.map_or(false, |(t, k)| t == tag && k == *sender_pub) {
-            *pending = None;
-            true
-        } else {
-            false
-        }
-    });
+    // Status reply: servers may put their own clock in bytes 0..4 rather than
+    // echoing the request tag, so match by sender key and require status bytes.
+    let matched = plain.len() > 4
+        && PENDING_STATUS.lock(|p| {
+            let mut pending = p.borrow_mut();
+            if pending.map_or(false, |k| k == *sender_pub) {
+                *pending = None;
+                true
+            } else {
+                false
+            }
+        });
     if matched {
         let mut push = Vec::<u8, 256>::new();
         let _ = push.push(PUSH_CODE_STATUS_RESPONSE);
@@ -488,7 +448,7 @@ pub fn handle_response(plain: &[u8], sender_pub: &[u8; 32]) -> bool {
         let _ = push.extend_from_slice(&sender_pub[..6]);
         let data = &plain[4..];
         let _ = push.extend_from_slice(&data[..data.len().min(256 - push.len())]);
-        enqueue_delayed_push(push);
+        crate::command::push_companion(&push);
         return true;
     }
 
@@ -538,7 +498,7 @@ pub fn handle_response(plain: &[u8], sender_pub: &[u8; 32]) -> bool {
             let _ = push.push(0);
             let _ = push.extend_from_slice(&sender_pub[..6]);
         }
-        enqueue_delayed_push(push);
+        crate::command::push_companion(&push);
         return true;
     }
 
@@ -550,7 +510,7 @@ pub fn handle_response(plain: &[u8], sender_pub: &[u8; 32]) -> bool {
         let _ = push.push(PUSH_CODE_BINARY_RESPONSE);
         let _ = push.push(0);
         let _ = push.extend_from_slice(&plain[..plain.len().min(256 - push.len())]);
-        enqueue_delayed_push(push);
+        crate::command::push_companion(&push);
         return true;
     }
 
@@ -1841,6 +1801,7 @@ impl<'a> CompanionNode<'a> {
                                             } else {
                                                 500 + 16 * air_ms
                                             };
+                                            clear_pending_reqs();
                                             note_pending_req(tag, dest_key);
                                             reply = Some((direct, tag, est_timeout));
                                         }
@@ -2817,6 +2778,7 @@ impl<'a> CompanionNode<'a> {
                                                 // direct request; give clients more
                                                 // time than the ACK formula.
                                                 let est_timeout = est_timeout.max(8000);
+                                                clear_pending_reqs();
                                                 note_pending_login(dest_key);
                                                 LOGIN_TX_COUNT.fetch_add(1, Ordering::Relaxed);
                                                 LOGIN_TX_TAG.store(tag, Ordering::Relaxed);
@@ -2983,6 +2945,7 @@ impl<'a> CompanionNode<'a> {
                                                 } else {
                                                     500 + 16 * air_ms
                                                 };
+                                                clear_pending_reqs();
                                                 note_pending_telemetry(tag, dest_key);
                                                 reply = Some((direct, tag, est_timeout.max(6000)));
                                             }
@@ -3092,6 +3055,7 @@ impl<'a> CompanionNode<'a> {
                                                     crate::scheduler::preamble_for(sf),
                                                 );
                                                 let est_timeout = 500 + 16 * air_ms;
+                                                clear_pending_reqs();
                                                 note_pending_discovery(tag, dest_key);
                                                 reply = Some((tag, est_timeout.max(15000)));
                                             }
@@ -3205,6 +3169,7 @@ impl<'a> CompanionNode<'a> {
                                                     req_data.first().copied().unwrap_or(0),
                                                     Ordering::Relaxed,
                                                 );
+                                                clear_pending_reqs();
                                                 note_pending_req(tag, dest_key);
                                                 reply = Some((direct, tag, est_timeout.max(6000)));
                                             }
@@ -3314,7 +3279,8 @@ impl<'a> CompanionNode<'a> {
                                                 } else {
                                                     500 + 16 * air_ms
                                                 };
-                                                note_status(tag, dest_key);
+                                                clear_pending_reqs();
+                                                note_status(dest_key);
                                                 reply = Some((direct, tag, est_timeout));
                                             }
                                         }
@@ -3844,18 +3810,14 @@ mod tests {
     #[test]
     fn unhandled_response_forwards_as_binary_response() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        DELAYED_PUSH.lock(|q| q.borrow_mut().clear());
-        PENDING_REQ.lock(|p| *p.borrow_mut() = None);
-        PENDING_TELEMETRY.lock(|p| *p.borrow_mut() = None);
-        PENDING_STATUS.lock(|p| *p.borrow_mut() = None);
-        PENDING_LOGIN.lock(|p| *p.borrow_mut() = None);
+        clear_pushes();
+        clear_pending_reqs();
         let sender = [0x99u8; 32];
         let plain = [0x11, 0x22, 0x33, 0x44, 0x01, 0x74, 0x01, 0x90];
         assert!(handle_response(&plain, &sender));
-        let (due_ms, pushed) = DELAYED_PUSH
-            .lock(|q| q.borrow_mut().pop_front())
-            .expect("pushed binary response");
-        assert!(due_ms >= now_ms());
+        let pushes = take_pushes();
+        assert_eq!(pushes.len(), 1);
+        let pushed = &pushes[0];
         assert_eq!(pushed[0], PUSH_CODE_BINARY_RESPONSE);
         assert_eq!(pushed[1], 0);
         assert_eq!(&pushed[2..], &plain[..]);
@@ -3864,11 +3826,8 @@ mod tests {
     #[test]
     fn login_fail_push_and_response_slot_precedence() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        DELAYED_PUSH.lock(|q| q.borrow_mut().clear());
-        PENDING_REQ.lock(|p| *p.borrow_mut() = None);
-        PENDING_TELEMETRY.lock(|p| *p.borrow_mut() = None);
-        PENDING_STATUS.lock(|p| *p.borrow_mut() = None);
-        PENDING_LOGIN.lock(|p| *p.borrow_mut() = None);
+        clear_pushes();
+        clear_pending_reqs();
 
         let peer = [0x7Au8; 32];
         let req_tag = 0x1234_5678u32;
@@ -3882,9 +3841,9 @@ mod tests {
         req_reply[4] = 0xAA;
         req_reply[5] = 0xBB;
         assert!(handle_response(&req_reply, &peer));
-        let (_, pushed) = DELAYED_PUSH
-            .lock(|q| q.borrow_mut().pop_front())
-            .expect("binary response pushed");
+        let pushes = take_pushes();
+        assert_eq!(pushes.len(), 1);
+        let pushed = &pushes[0];
         assert_eq!(pushed[0], PUSH_CODE_BINARY_RESPONSE);
         assert_eq!(&pushed[2..6], &req_tag.to_le_bytes());
         assert_eq!(&pushed[6..8], &[0xAA, 0xBB]);
@@ -3892,13 +3851,235 @@ mod tests {
         // Now deliver a failed server login response (status byte != 0 and != "OK").
         let login_fail = [0x10, 0x00, 0x00, 0x00, 0x01];
         assert!(handle_response(&login_fail, &peer));
-        let (_, fail_push) = DELAYED_PUSH
-            .lock(|q| q.borrow_mut().pop_front())
-            .expect("login fail pushed");
+        let pushes = take_pushes();
+        assert_eq!(pushes.len(), 1);
+        let fail_push = &pushes[0];
         assert_eq!(fail_push[0], PUSH_CODE_LOGIN_FAIL);
         assert_eq!(fail_push[1], 0);
         assert_eq!(&fail_push[2..8], &peer[..6]);
         assert_eq!(fail_push.len(), 8);
+    }
+
+    #[test]
+    fn status_response_matches_peer_with_repeater_clock_and_rejects_empty() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_pushes();
+        clear_pending_reqs();
+
+        let peer = [0x61u8; 32];
+        let other = [0x62u8; 32];
+        note_status(peer);
+
+        // A 4-byte reply with no status payload must not consume PENDING_STATUS or emit a push.
+        let empty = [0xDE, 0xAD, 0xBE, 0xEF];
+        assert!(!handle_response(&empty, &peer));
+        assert!(take_pushes().is_empty());
+
+        // A reply from a different sender falls through as binary response without consuming PENDING_STATUS.
+        let other_reply = [0x01, 0x02, 0x03, 0x04, 0xAA, 0xBB];
+        assert!(handle_response(&other_reply, &other));
+        let pushes = take_pushes();
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(pushes[0][0], PUSH_CODE_BINARY_RESPONSE);
+
+        // Repeater status reply with its own clock in bytes 0..4 matches by peer pub_key
+        // and immediately emits PUSH_CODE_STATUS_RESPONSE (0x87).
+        let repeater_reply = [0x78, 0x56, 0x34, 0x12, 0xE8, 0x0F, 0x01, 0x02];
+        assert!(handle_response(&repeater_reply, &peer));
+        let pushes = take_pushes();
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(pushes[0][0], PUSH_CODE_STATUS_RESPONSE);
+        assert_eq!(pushes[0][1], 0);
+        assert_eq!(&pushes[0][2..8], &peer[..6]);
+        assert_eq!(&pushes[0][8..], &repeater_reply[4..]);
+
+        // Slot was consumed; a subsequent reply does not emit another status response.
+        assert!(handle_response(&repeater_reply, &peer));
+        let pushes = take_pushes();
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(pushes[0][0], PUSH_CODE_BINARY_RESPONSE);
+    }
+
+    #[test]
+    fn request_commands_clear_stale_pending_slots() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        drain_usb_commands();
+        clear_pushes();
+        clear_pending_reqs();
+
+        let local = meshcore_wire::identity::LocalIdentity::from_seed("Node", &[0x41u8; 32]);
+        let peer_id = meshcore_wire::identity::LocalIdentity::from_seed("Peer", &[0x42u8; 32]);
+        let peer = *peer_id.pub_key();
+
+        crate::state::DISCOVERED_CONTACTS.lock(|c| {
+            let mut list = c.borrow_mut();
+            list.clear();
+            let _ = list.push(crate::types::DiscoveredContact {
+                pub_key: peer,
+                callsign: String::new(),
+                node_id: [peer[0], peer[1], peer[2], peer[3]],
+                last_seen_epoch: 100,
+                rssi: 0,
+                snr: 0,
+                latitude: 0,
+                longitude: 0,
+                flags: 0,
+                contact_type: meshcore_wire::packets::advert::ADV_TYPE_REPEATER,
+                out_path: [0u8; 64],
+                out_path_len: 0,
+                last_advert_ts: 100,
+                sync_since: 0,
+                saved_hash: 0,
+            });
+        });
+
+        let mut node = CompanionNode::new(
+            "Node",
+            "Board",
+            0,
+            local.pub_key_bytes(),
+            local.private_key_bytes(),
+            &TestHost,
+        );
+
+        let send_cmd = |node: &mut CompanionNode<'_>, cmd: &[u8]| {
+            let mut resp = Vec::<u8, 32>::new();
+            poll_sync(node.handle_command(cmd, |r| {
+                let _ = resp.extend_from_slice(r);
+            }));
+            assert_eq!(resp[0], RESP_CODE_SENT);
+            drain_usb_commands();
+        };
+
+        // 1. CMD_SEND_LOGIN sets PENDING_LOGIN + LOGIN_PENDING, clearing any stale status/disc/req/telem.
+        note_status(peer);
+        note_pending_telemetry(1, peer);
+        note_pending_discovery(2, peer);
+        note_pending_req(3, peer);
+        let mut login_cmd = [0u8; 37];
+        login_cmd[0] = CMD_SEND_LOGIN;
+        login_cmd[1..33].copy_from_slice(&peer);
+        login_cmd[33..37].copy_from_slice(b"pass");
+        send_cmd(&mut node, &login_cmd);
+        assert!(PENDING_LOGIN.lock(|p| p.borrow().is_some()));
+        assert!(LOGIN_PENDING.load(Ordering::Relaxed));
+        assert!(PENDING_STATUS.lock(|p| p.borrow().is_none()));
+        assert!(PENDING_TELEMETRY.lock(|p| p.borrow().is_none()));
+        assert!(PENDING_DISCOVERY.lock(|p| p.borrow().is_none()));
+        assert!(!DISC_PENDING.load(Ordering::Relaxed));
+        assert!(PENDING_REQ.lock(|p| p.borrow().is_none()));
+
+        // 2. CMD_SEND_STATUS_REQ clears PENDING_LOGIN and sets only PENDING_STATUS.
+        let mut status_cmd = [0u8; 33];
+        status_cmd[0] = CMD_SEND_STATUS_REQ;
+        status_cmd[1..33].copy_from_slice(&peer);
+        send_cmd(&mut node, &status_cmd);
+        assert!(PENDING_STATUS.lock(|p| *p.borrow() == Some(peer)));
+        assert!(PENDING_LOGIN.lock(|p| p.borrow().is_none()));
+        assert!(!LOGIN_PENDING.load(Ordering::Relaxed));
+
+        // 3. CMD_SEND_PATH_DISCOVERY_REQ clears PENDING_STATUS and sets PENDING_DISCOVERY + DISC_PENDING.
+        let mut disc_cmd = [0u8; 34];
+        disc_cmd[0] = CMD_SEND_PATH_DISCOVERY_REQ;
+        disc_cmd[1] = 0;
+        disc_cmd[2..34].copy_from_slice(&peer);
+        send_cmd(&mut node, &disc_cmd);
+        assert!(PENDING_DISCOVERY.lock(|p| p.borrow().is_some()));
+        assert!(DISC_PENDING.load(Ordering::Relaxed));
+        assert!(PENDING_STATUS.lock(|p| p.borrow().is_none()));
+
+        // 4. CMD_SEND_TELEMETRY_REQ clears PENDING_DISCOVERY + DISC_PENDING and sets PENDING_TELEMETRY.
+        let mut telem_cmd = [0u8; 36];
+        telem_cmd[0] = CMD_SEND_TELEMETRY_REQ;
+        telem_cmd[4..36].copy_from_slice(&peer);
+        send_cmd(&mut node, &telem_cmd);
+        assert!(PENDING_TELEMETRY.lock(|p| p.borrow().is_some()));
+        assert!(PENDING_DISCOVERY.lock(|p| p.borrow().is_none()));
+        assert!(!DISC_PENDING.load(Ordering::Relaxed));
+
+        // 5. CMD_SEND_BINARY_REQ clears PENDING_TELEMETRY and sets PENDING_REQ.
+        let mut bin_cmd = [0u8; 35];
+        bin_cmd[0] = CMD_SEND_BINARY_REQ;
+        bin_cmd[1..33].copy_from_slice(&peer);
+        bin_cmd[33] = 0x01;
+        bin_cmd[34] = 0x02;
+        send_cmd(&mut node, &bin_cmd);
+        assert!(PENDING_REQ.lock(|p| p.borrow().is_some()));
+        assert!(PENDING_TELEMETRY.lock(|p| p.borrow().is_none()));
+
+        // 6. CMD_SEND_ANON_REQ clears stale login/discovery/status and sets PENDING_REQ.
+        note_pending_login(peer);
+        note_status(peer);
+        let mut anon_cmd = [0u8; 35];
+        anon_cmd[0] = CMD_SEND_ANON_REQ;
+        anon_cmd[1..33].copy_from_slice(&peer);
+        anon_cmd[33] = 0xAA;
+        anon_cmd[34] = 0xBB;
+        send_cmd(&mut node, &anon_cmd);
+        assert!(PENDING_REQ.lock(|p| p.borrow().is_some()));
+        assert!(PENDING_LOGIN.lock(|p| p.borrow().is_none()));
+        assert!(!LOGIN_PENDING.load(Ordering::Relaxed));
+        assert!(PENDING_STATUS.lock(|p| p.borrow().is_none()));
+
+        clear_pending_reqs();
+    }
+
+    #[test]
+    fn path_discovery_validates_path_lens_and_slice_bounds() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_pushes();
+        clear_pending_reqs();
+
+        let peer = [0x88u8; 32];
+        let tag = 0xAABB_CCDDu32;
+        note_pending_discovery(tag, peer);
+
+        // Invalid path_len (hash_size == 4 -> 0xC0 / 0xFF, or byte_len > 64 -> 0x40 | 33 = 66 B).
+        assert!(!handle_path_discovery(tag, &peer, 0xFF, &[0; 64], 0x00, &[]));
+        assert!(!handle_path_discovery(tag, &peer, 0xC0, &[0; 64], 0x00, &[]));
+        assert!(!handle_path_discovery(tag, &peer, 0x40 | 33, &[0; 64], 0x00, &[]));
+        assert!(!handle_path_discovery(tag, &peer, 0x00, &[], 0xFF, &[0; 64]));
+        assert!(!handle_path_discovery(tag, &peer, 0x00, &[], 0x80 | 22, &[0; 64]));
+
+        // Truncated path slices (declared byte len exceeds provided slice).
+        assert!(!handle_path_discovery(tag, &peer, 0x02, &[0x11], 0x00, &[]));
+        assert!(!handle_path_discovery(tag, &peer, 0x42, &[0x11, 0x22, 0x33], 0x00, &[]));
+        assert!(!handle_path_discovery(tag, &peer, 0x00, &[], 0x02, &[0xAA]));
+
+        // None of the invalid attempts may consume PENDING_DISCOVERY or emit a push.
+        assert!(PENDING_DISCOVERY.lock(|p| *p.borrow() == Some((tag, peer))));
+        assert!(DISC_PENDING.load(Ordering::Relaxed));
+        assert!(take_pushes().is_empty());
+
+        // Valid multi-byte out_path (2 hops * 2 B = 4 B -> 0x42) and 1-byte in_path (1 hop -> 0x01).
+        let out_path = [0x11, 0x22, 0x33, 0x44, 0x99];
+        let in_path = [0x55, 0x77];
+        assert!(handle_path_discovery(tag, &peer, 0x42, &out_path, 0x01, &in_path));
+        assert!(PENDING_DISCOVERY.lock(|p| p.borrow().is_none()));
+        assert!(!DISC_PENDING.load(Ordering::Relaxed));
+
+        let pushes = take_pushes();
+        assert_eq!(pushes.len(), 1);
+        let p = &pushes[0];
+        assert_eq!(p[0], PUSH_CODE_PATH_DISCOVERY_RESP);
+        assert_eq!(p[1], 0);
+        assert_eq!(&p[2..8], &peer[..6]);
+        assert_eq!(p[8], 0x42);
+        assert_eq!(&p[9..13], &[0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(p[13], 0x01);
+        assert_eq!(&p[14..15], &[0x55]);
+        assert_eq!(p.len(), 15);
+
+        // Zero-hop discovery (out_path_len = 0, in_path_len = 0) is also valid.
+        note_pending_discovery(tag + 1, peer);
+        assert!(handle_path_discovery(tag + 1, &peer, 0, &[], 0, &[]));
+        let pushes = take_pushes();
+        assert_eq!(pushes.len(), 1);
+        assert_eq!(pushes[0].as_slice(), &[
+            PUSH_CODE_PATH_DISCOVERY_RESP, 0,
+            0x88, 0x88, 0x88, 0x88, 0x88, 0x88,
+            0, 0
+        ]);
     }
 
     #[test]

@@ -91,6 +91,10 @@ pub const DEFAULT_MAX_HOPS: u8 = 64;
 /// so the sender has time to finish TX->RX turnaround. Matches MeshCore.
 pub const TXT_ACK_DELAY_MS: u64 = 200;
 
+/// Delay before transmitting a reply to an inbound request so the requester
+/// has time to finish TX->RX turnaround.
+pub const SERVER_RESPONSE_DELAY_MS: u64 = 300;
+
 struct PendingForward {
     hash: [u8; 8],
     queued_at_ms: u64,
@@ -1237,13 +1241,25 @@ impl<'a> MeshEngine<'a> {
                 reply_plain,
             )?;
             let pkt = pp.to_packet(ROUTE_TYPE_FLOOD, &secret, &[0u8; 4])?;
-            Ok(self.finish_outbound(pkt, ROUTE_TYPE_FLOOD, 0, &[0u8; 64]))
+            Ok(self.finish_outbound_at(
+                pkt,
+                ROUTE_TYPE_FLOOD,
+                0,
+                &[0u8; 64],
+                SERVER_RESPONSE_DELAY_MS,
+            ))
         } else {
             let (out_path_len, out_path) = self.peer_path(sender_pub);
             let (route, path_len) = route_for(out_path_len);
             let addressed = AddressedPacket::new(dest, src, reply_plain)?;
             let pkt = addressed.to_packet(PAYLOAD_TYPE_RESPONSE, route, &secret)?;
-            Ok(self.finish_outbound(pkt, route, path_len, &out_path))
+            Ok(self.finish_outbound_at(
+                pkt,
+                route,
+                path_len,
+                &out_path,
+                SERVER_RESPONSE_DELAY_MS,
+            ))
         }
     }
 
@@ -1790,6 +1806,7 @@ mod tests {
             .unwrap();
 
         let queued = engine.tx_queue.pop().unwrap();
+        assert_eq!(queued.due_at_ms, queued.queued_at_ms + SERVER_RESPONSE_DELAY_MS);
         assert_eq!(queued.packet.route_type(), ROUTE_TYPE_FLOOD);
         assert_eq!(queued.packet.payload_type(), PAYLOAD_TYPE_PATH);
         let decoded = PathPacket::decode(
@@ -1850,6 +1867,7 @@ mod tests {
             .unwrap();
 
         let queued = engine.tx_queue.pop().unwrap();
+        assert_eq!(queued.due_at_ms, queued.queued_at_ms + SERVER_RESPONSE_DELAY_MS);
         assert_eq!(queued.packet.route_type(), ROUTE_TYPE_DIRECT);
         assert_eq!(queued.packet.payload_type(), PAYLOAD_TYPE_RESPONSE);
         assert_eq!(queued.packet.path_len, 1);
