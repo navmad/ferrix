@@ -1079,11 +1079,13 @@ impl<'a> CompanionNode<'a> {
 
             CMD_GET_BATT_AND_STORAGE => {
                 // [PACKET_BATTERY][mV u16][storage used KiB u32][storage total KiB u32]
+                let used_kb = crate::storage::used_kb();
+                let total_kb = crate::storage::total_kb();
                 let mut resp = Vec::<u8, 16>::new();
                 let _ = resp.push(RESP_CODE_BATTERY);
                 let _ = resp.extend_from_slice(&self.battery_millivolts.to_le_bytes());
-                let _ = resp.extend_from_slice(&0u32.to_le_bytes());
-                let _ = resp.extend_from_slice(&0u32.to_le_bytes());
+                let _ = resp.extend_from_slice(&used_kb.to_le_bytes());
+                let _ = resp.extend_from_slice(&total_kb.to_le_bytes());
                 emit(&resp);
             }
 
@@ -1390,13 +1392,15 @@ impl<'a> CompanionNode<'a> {
                     let kind = payload[1];
                     if kind == 0 {
                         let uptime = embassy_time::Instant::now().as_secs() as u32;
+                        let err_flags = crate::state::core_err_flags();
+                        let queue_len = crate::state::tx_queue_len();
                         let mut resp = Vec::<u8, 11>::new();
                         let _ = resp.push(RESP_CODE_STATS);
                         let _ = resp.push(0);
                         let _ = resp.extend_from_slice(&self.battery_millivolts.to_le_bytes());
                         let _ = resp.extend_from_slice(&uptime.to_le_bytes());
-                        let _ = resp.extend_from_slice(&0u16.to_le_bytes());
-                        let _ = resp.push(0);
+                        let _ = resp.extend_from_slice(&err_flags.to_le_bytes());
+                        let _ = resp.push(queue_len);
                         emit(&resp);
                         handled = true;
                     } else if kind == 1 {
@@ -4413,6 +4417,116 @@ mod tests {
         assert_eq!(u32::from_le_bytes(resp[18..22].try_into().unwrap()), 4);
         assert_eq!(u32::from_le_bytes(resp[22..26].try_into().unwrap()), 7);
         assert_eq!(u32::from_le_bytes(resp[26..30].try_into().unwrap()), 3);
+
+        // CMD_GET_STATS(0): real err_flags and live TX queue_len.
+        let saved_tel = crate::state::RADIO_TELEMETRY.lock(|t| *t.borrow());
+        crate::state::clear_core_err_flags();
+        crate::state::set_tx_queue_len(0);
+        crate::state::RADIO_TELEMETRY.lock(|t| {
+            let mut tel = t.borrow_mut();
+            tel.tx_dropped = 0;
+            tel.rx_dropped = 0;
+        });
+        for c in &crate::state::TX_QUEUE_FULL {
+            c.store(0, Ordering::Relaxed);
+        }
+        crate::storage::EXTERNAL_UNAVAILABLE.store(false, Ordering::Relaxed);
+        crate::storage::bonds::BOND_SAVE_ERRORS.store(0, Ordering::Relaxed);
+
+        crate::state::note_core_err(
+            crate::state::CORE_ERR_RADIO_RX | crate::state::CORE_ERR_TX_FAILED,
+        );
+        crate::state::RADIO_TELEMETRY.lock(|t| t.borrow_mut().tx_dropped = 1);
+        crate::state::set_tx_queue_len(5);
+
+        resp.clear();
+        poll_sync(node.handle_command(&[CMD_GET_STATS, 0], |r| {
+            let _ = resp.extend_from_slice(r);
+        }));
+        assert_eq!(resp.len(), 11);
+        assert_eq!(resp[0], RESP_CODE_STATS);
+        assert_eq!(resp[1], 0);
+        assert_eq!(u16::from_le_bytes(resp[2..4].try_into().unwrap()), 4_000);
+        let expected_err = crate::state::CORE_ERR_RADIO_RX
+            | crate::state::CORE_ERR_TX_FAILED
+            | crate::state::CORE_ERR_QUEUE_DROP;
+        assert_eq!(
+            u16::from_le_bytes(resp[8..10].try_into().unwrap()),
+            expected_err
+        );
+        assert_eq!(resp[10], 5);
+
+        // Storage unavailable sets CORE_ERR_STORAGE.
+        crate::storage::EXTERNAL_UNAVAILABLE.store(true, Ordering::Relaxed);
+        resp.clear();
+        poll_sync(node.handle_command(&[CMD_GET_STATS, 0], |r| {
+            let _ = resp.extend_from_slice(r);
+        }));
+        assert_ne!(
+            u16::from_le_bytes(resp[8..10].try_into().unwrap()) & crate::state::CORE_ERR_STORAGE,
+            0
+        );
+
+        // Restore core error and queue state.
+        crate::storage::EXTERNAL_UNAVAILABLE.store(false, Ordering::Relaxed);
+        crate::state::clear_core_err_flags();
+        crate::state::set_tx_queue_len(0);
+        crate::state::RADIO_TELEMETRY.lock(|t| *t.borrow_mut() = saved_tel);
+
+        // CMD_GET_BATT_AND_STORAGE: reports real storage used_kb / total_kb.
+        let saved_total = crate::storage::total_kb();
+        let saved_queued = crate::storage::messages::QUEUED.load(Ordering::Relaxed);
+        crate::storage::set_total_kb(0);
+        resp.clear();
+        poll_sync(node.handle_command(&[CMD_GET_BATT_AND_STORAGE], |r| {
+            let _ = resp.extend_from_slice(r);
+        }));
+        assert_eq!(resp.len(), 11);
+        assert_eq!(resp[0], RESP_CODE_BATTERY);
+        assert_eq!(u16::from_le_bytes(resp[1..3].try_into().unwrap()), 4_000);
+        assert_eq!(u32::from_le_bytes(resp[3..7].try_into().unwrap()), 0);
+        assert_eq!(u32::from_le_bytes(resp[7..11].try_into().unwrap()), 0);
+
+        crate::storage::set_total_kb(1360);
+        crate::state::DISCOVERED_CONTACTS.lock(|c| {
+            let mut list = c.borrow_mut();
+            list.clear();
+            for i in 0..10u8 {
+                let mut key = [0u8; 32];
+                key[0] = i + 1;
+                let _ = list.push(crate::types::DiscoveredContact {
+                    pub_key: key,
+                    callsign: String::new(),
+                    node_id: [i + 1; 4],
+                    last_seen_epoch: 100,
+                    rssi: 0,
+                    snr: 0,
+                    latitude: 0,
+                    longitude: 0,
+                    flags: 0,
+                    contact_type: 1,
+                    out_path: [0u8; 64],
+                    out_path_len: 0xFF,
+                    last_advert_ts: 100,
+                    sync_since: 0,
+                    saved_hash: 0x1234_5678,
+                });
+            }
+        });
+        crate::storage::messages::QUEUED.store(20, Ordering::Relaxed);
+        resp.clear();
+        poll_sync(node.handle_command(&[CMD_GET_BATT_AND_STORAGE], |r| {
+            let _ = resp.extend_from_slice(r);
+        }));
+        let used_kb = u32::from_le_bytes(resp[3..7].try_into().unwrap());
+        let total_kb = u32::from_le_bytes(resp[7..11].try_into().unwrap());
+        assert_eq!(total_kb, 1360);
+        assert!(used_kb >= 8 && used_kb <= total_kb, "unexpected used_kb={used_kb}");
+
+        // Restore storage globals.
+        crate::storage::set_total_kb(saved_total);
+        crate::storage::messages::QUEUED.store(saved_queued, Ordering::Relaxed);
+        crate::state::DISCOVERED_CONTACTS.lock(|c| c.borrow_mut().clear());
 
         resp.clear();
         poll_sync(node.handle_command(&[CMD_GET_STATS, 99], |r| {

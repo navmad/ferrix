@@ -76,6 +76,22 @@ impl StorageRegions {
             && contains(&self.factory_reset, &self.contacts)
             && contains(&self.factory_reset, &self.messages)
     }
+
+    /// Total configured persistent flash storage capacity in KiB.
+    ///
+    /// Pass `include_external = false` when an external QSPI profile could not
+    /// probe its chip so only internal config + bonds are counted.
+    pub const fn total_kb(&self, include_external: bool) -> u32 {
+        let internal = (self.config.end - self.config.start)
+            + (self.bonds.end - self.bonds.start);
+        let stores = if include_external {
+            (self.contacts.end - self.contacts.start)
+                + (self.messages.end - self.messages.start)
+        } else {
+            0
+        };
+        (internal + stores) / 1024
+    }
 }
 
 const fn range_valid(range: &Range<u32>) -> bool {
@@ -95,6 +111,42 @@ const fn contains(outer: &Range<u32>, inner: &Range<u32>) -> bool {
 pub static EXTERNAL_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
 /// External-store operations skipped because the flash is unavailable.
 pub static EXTERNAL_DROPS: AtomicU32 = AtomicU32::new(0);
+/// Active persistent flash storage capacity in KiB (`0` before storage init).
+static STORAGE_TOTAL_KB: AtomicU32 = AtomicU32::new(0);
+
+/// Record the active persistent flash storage capacity in KiB.
+pub fn set_total_kb(kb: u32) {
+    STORAGE_TOTAL_KB.store(kb, Ordering::Relaxed);
+}
+
+/// Active persistent flash storage capacity in KiB (`0` before storage init).
+pub fn total_kb() -> u32 {
+    STORAGE_TOTAL_KB.load(Ordering::Relaxed)
+}
+
+/// Estimated persistent flash usage in KiB across config, BLE bonds, saved
+/// contacts/adverts, and persisted offline messages, capped at [`total_kb`].
+#[inline(never)]
+pub fn used_kb() -> u32 {
+    let total = total_kb();
+    if total == 0 {
+        return 0;
+    }
+    let active_channels = crate::state::CHANNELS.lock(|c| {
+        c.borrow().iter().filter(|ch| ch.name[0] != 0).count() as u32
+    });
+    let mut used_bytes: u32 = 200 + active_channels * 60 + (bonds::count() as u32) * 136;
+    if !external_unavailable() {
+        let saved_contacts = crate::state::DISCOVERED_CONTACTS.lock(|c| {
+            c.borrow().iter().filter(|ct| ct.saved_hash != 0).count() as u32
+        });
+        let queued_msgs = messages::QUEUED.load(Ordering::Relaxed);
+        used_bytes = used_bytes
+            .saturating_add(saved_contacts.saturating_mul(384))
+            .saturating_add(queued_msgs.saturating_mul(200));
+    }
+    used_bytes.div_ceil(1024).min(total)
+}
 
 /// Mark external storage unavailable. Logs once, not per skipped operation.
 pub fn mark_external_unavailable() {
@@ -172,5 +224,34 @@ pub async fn flush_pending() -> bool {
             embassy_time::Timer::after_millis(5).await;
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_regions_total_kb_reflects_external_availability() {
+        let regions = StorageRegions {
+            config: 0x000A_0000..0x000B_0000,   // 64 KiB
+            bonds: 0x000B_0000..0x000B_4000,    // 16 KiB
+            contacts: 0x0000_0000..0x0004_0000, // 256 KiB
+            messages: 0x0004_0000..0x0014_0000, // 1024 KiB
+            factory_reset: 0x000A_0000..0x000B_4000,
+            factory_reset_external: 0x0000_0000..0x0014_0000,
+        };
+        assert_eq!(regions.total_kb(true), 1360);
+        assert_eq!(regions.total_kb(false), 80);
+
+        let internal = StorageRegions {
+            config: 0x000A_0000..0x000B_0000,   // 64 KiB
+            bonds: 0x000B_0000..0x000B_4000,    // 16 KiB
+            contacts: 0x000B_4000..0x000D_4000, // 128 KiB
+            messages: 0x000D_4000..0x000E_C000, // 96 KiB
+            factory_reset: 0x000A_0000..0x000E_D000,
+            factory_reset_external: 0..0,
+        };
+        assert_eq!(internal.total_kb(true), 304);
     }
 }

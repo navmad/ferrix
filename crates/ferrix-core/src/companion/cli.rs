@@ -1709,8 +1709,10 @@ pub async fn handle_text_cli<W: TextSink>(
             let uptime = embassy_time::Instant::now().as_secs();
             let mv = host.battery_millivolts();
             let pct = crate::battery::millivolts_to_percentage(host.battery_millivolts());
+            let errors = crate::state::core_err_flags();
+            let queue_len = crate::state::tx_queue_len();
             let mut s: heapless::String<160> = heapless::String::new();
-            let _ = write!(s, "  -> {{\"battery_mv\":{},\"battery_pct\":{},\"uptime_secs\":{},\"errors\":0,\"queue_len\":0,\"push_drops\":{}}}\r\n", mv, pct, uptime, crate::command::push_drops());
+            let _ = write!(s, "  -> {{\"battery_mv\":{},\"battery_pct\":{},\"uptime_secs\":{},\"errors\":{},\"queue_len\":{},\"push_drops\":{}}}\r\n", mv, pct, uptime, errors, queue_len, crate::command::push_drops());
             let _ = sender.send( s.as_bytes()).await;
         }
         "battery" | "get battery" | "batt" | "get batt" => {
@@ -1765,6 +1767,7 @@ pub async fn handle_text_cli<W: TextSink>(
                 tel.tx_dropped = 0;
                 tel.rx_dropped = 0;
             });
+            crate::state::clear_core_err_flags();
             host.clear_radio_stats();
             let _ = sender.send( b"  -> OK\r\n").await;
         }
@@ -2095,7 +2098,10 @@ mod tests {
         let saved_tel = RADIO_TELEMETRY.lock(|t| *t.borrow());
         let saved_name = crate::storage::get_callsign();
         let saved_prefs = crate::state::prefs();
+        let saved_qlen = crate::state::tx_queue_len();
         set_stat_counters(u32::MAX);
+        crate::state::note_core_err(u16::MAX);
+        crate::state::set_tx_queue_len(u8::MAX);
         RADIO_TELEMETRY.lock(|t| {
             let mut t = t.borrow_mut();
             t.tx_beacons = u32::MAX;
@@ -2160,6 +2166,8 @@ mod tests {
 
         BLE_STATUS.store(0, Relaxed);
         set_stat_counters(0);
+        crate::state::clear_core_err_flags();
+        crate::state::set_tx_queue_len(saved_qlen);
         RADIO_TELEMETRY.lock(|t| *t.borrow_mut() = saved_tel);
         NODE_CALLSIGN.lock(|c| *c.borrow_mut() = saved_name);
         crate::state::update_prefs(|p| *p = saved_prefs);
@@ -2234,5 +2242,41 @@ mod tests {
         let (_, got) = stats_reply("set msg.persist off", &host);
         assert!(got.contains("OK"));
         assert!(!crate::state::persist_messages());
+    }
+
+    #[test]
+    fn stats_core_reports_errors_and_queue_len_and_clears() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved_tel = RADIO_TELEMETRY.lock(|t| *t.borrow());
+        let saved_qlen = crate::state::tx_queue_len();
+        let host = MaxHost { vectors: false };
+
+        let _ = stats_reply("clear stats", &host);
+        let base_err = crate::state::core_err_flags();
+        let injected = crate::state::CORE_ERR_TX_FAILED | crate::state::CORE_ERR_AGC_RECOVERY;
+        crate::state::note_core_err(injected);
+        crate::state::set_tx_queue_len(7);
+
+        let (_, core_reply) = stats_reply("stats-core", &host);
+        assert!(
+            core_reply.contains(&std::format!("\"errors\":{}", base_err | injected)),
+            "unexpected errors in stats-core: {core_reply}"
+        );
+        assert!(
+            core_reply.contains("\"queue_len\":7"),
+            "unexpected queue_len in stats-core: {core_reply}"
+        );
+
+        let (_, clr) = stats_reply("clear stats", &host);
+        assert!(clr.contains("OK"));
+
+        let (_, cleared_reply) = stats_reply("stats-core", &host);
+        assert!(
+            cleared_reply.contains(&std::format!("\"errors\":{base_err}")),
+            "expected latched errors cleared: {cleared_reply}"
+        );
+
+        RADIO_TELEMETRY.lock(|t| *t.borrow_mut() = saved_tel);
+        crate::state::set_tx_queue_len(saved_qlen);
     }
 }
