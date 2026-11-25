@@ -112,6 +112,19 @@ pub trait RadioDevice {
 
     /// Re-arm reception after a watchdog timeout or error.
     async fn recover_receive(&mut self);
+
+    /// Take one idle instantaneous RSSI burst reading in half-dB units
+    /// (`-236` = `-118.0 dBm`), returning `None` if sampling was skipped
+    /// (duty-cycle sleep, active RX/TX, or radio error).
+    async fn sample_rssi_half_db(&mut self) -> Option<i16> {
+        None
+    }
+
+    /// Perform a Warm Sleep + recalibration AGC recovery and re-enter RX.
+    /// Returns `true` when recovery succeeded and RX is re-armed.
+    async fn reset_agc(&mut self) -> bool {
+        false
+    }
 }
 
 /// Generic channel-driven LoRa radio interface used by the mesh engine.

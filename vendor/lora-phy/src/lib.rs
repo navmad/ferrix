@@ -401,7 +401,6 @@ where
         self.radio_kind.set_irq_params(Some(self.radio_mode)).await?;
         self.radio_kind.do_rx(listen_mode).await
     }
-
     /// Non-destructively poll live RX IRQ status flags:
     /// `(header_valid, preamble_detected, header_err)`.
     pub async fn poll_rx_activity(&mut self) -> Result<(bool, bool, bool), RadioError> {
@@ -467,6 +466,27 @@ where
                 }
             }
         }
+    }
+
+    /// Read instantaneous RSSI in half-dB units (`-236` = `-118.0 dBm`) while
+    /// listening in continuous RX mode. Refuses duty-cycle, standby, sleep, or TX.
+    pub async fn get_rssi_inst_half_db(&mut self) -> Result<i16, RadioError> {
+        if self.radio_mode != RadioMode::Receive(RxMode::Continuous) {
+            return Err(RadioError::InvalidRadioMode);
+        }
+        self.radio_kind.get_rssi_inst_half_db().await
+    }
+
+    /// Reset a potentially latched receiver AGC via Warm Sleep + recalibration,
+    /// leaving the chip in `Standby` ready for [`Self::prepare_for_rx`].
+    pub async fn reset_agc(&mut self, mdltn_params: &ModulationParams) -> Result<(), RadioError> {
+        self.radio_kind.ensure_ready(self.radio_mode).await?;
+        self.radio_kind
+            .reset_agc(mdltn_params.frequency_in_hz, &mut self.delay)
+            .await?;
+        self.radio_mode = RadioMode::Standby;
+        self.calibrate_image = false;
+        Ok(())
     }
 
     /// Place radio in continuous wave mode, generally for regulatory testing

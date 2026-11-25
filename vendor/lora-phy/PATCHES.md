@@ -52,6 +52,12 @@ did not interoperate with MeshCore nodes.
     `SetRxDutyCycle`.
   - Use 4-symbol CAD (`CADSymbols::_4`) with Semtech AN1200.48 bandwidth- and
     SF-dependent `cadDetPeak` (`detMin = 10`) and an optional adaptive peak offset.
+  - Add `get_rssi_inst_half_db()` (`GetRSSIInst` `0x15` with RX chip-mode
+    check) for idle continuous-RX noise-floor sampling.
+  - Add `reset_agc()` (Warm Sleep `0x04` -> NSS wake to `STBY_RC` ->
+    `Calibrate(0x7F)` -> `CalibrateImage(freq)` -> retention list, DC-DC, DIO2
+    RF switch, fallback mode, and `Register::RxGain` restore) for SX126x
+    stuck-AGC recovery.
 
 ## Upstreaming
 

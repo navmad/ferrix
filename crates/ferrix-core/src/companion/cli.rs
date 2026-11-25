@@ -1324,10 +1324,11 @@ pub async fn handle_text_cli<W: TextSink>(
             let _ = sender.send(s.as_bytes()).await;
         }
         "stats-radio" => {
-            let (tx_ms, rx_ms, rssi, snr, retries, dropped, sent) =
+            let (noise_floor, tx_ms, rx_ms, rssi, snr, retries, dropped, sent) =
                 RADIO_TELEMETRY.lock(|t| {
                     let tel = t.borrow();
                     (
+                        tel.effective_noise_floor_dbm(),
                         tel.tx_air_ms,
                         tel.rx_air_ms,
                         tel.last_rssi,
@@ -1340,7 +1341,8 @@ pub async fn handle_text_cli<W: TextSink>(
             let mut s: heapless::String<192> = heapless::String::new();
             let _ = write!(
                 s,
-                "  -> {{\"noise_floor\":-118,\"last_rssi\":{},\"last_snr\":{:.2},\"tx_air_secs\":{},\"rx_air_secs\":{},\"tx_sent\":{},\"retries\":{},\"dropped\":{}}}\r\n",
+                "  -> {{\"noise_floor\":{},\"last_rssi\":{},\"last_snr\":{:.2},\"tx_air_secs\":{},\"rx_air_secs\":{},\"tx_sent\":{},\"retries\":{},\"dropped\":{}}}\r\n",
+                noise_floor,
                 rssi,
                 snr as f32,
                 tx_ms / 1000,
@@ -1350,6 +1352,15 @@ pub async fn handle_text_cli<W: TextSink>(
                 dropped
             );
             let _ = sender.send(s.as_bytes()).await;
+        }
+        "stats-agc" => {
+            let s = format_stats_agc();
+            let _ = sender.send(s.as_bytes()).await;
+        }
+        "agc-reset" => {
+            request_agc_reset();
+            host.request_radio_config();
+            let _ = sender.send(b"  -> OK (AGC reset scheduled)\r\n").await;
         }
         "stats-flash" => {
             let external = if !storage.external_profile {
@@ -1767,6 +1778,8 @@ pub async fn handle_text_cli<W: TextSink>(
                 tel.tx_retries = 0;
                 tel.tx_dropped = 0;
                 tel.rx_dropped = 0;
+                tel.agc_frozen_streak = 0;
+                tel.agc_resets = 0;
             });
             crate::state::clear_core_err_flags();
             host.clear_radio_stats();
@@ -1851,12 +1864,31 @@ pub async fn handle_text_cli<W: TextSink>(
             let _ = sender.send( b"  -> OK (Config saved to flash)\r\n").await;
         }
         "help" => {
-            let _ = sender.send( b"  -> Commands:\r\n  ->   Identity: get/set name, get role, get/set lat/lon, get/set prv.key, get public.key\r\n  ->   Radio:    get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq/tx/sf/bw/cr, get/set repeat, get/set rxduty, get/set af, get/set dutycycle, get/set hash-mode, stats-radio, stats-tx, stats-fwd\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, get/set autoadd, get/set multiacks, advert, advert.zerohop, gps advert, clock/time, channels\r\n  ->   System:   save, ver, board, get/set leds, get/set sound, get/set refresh.interval, get/set msg.persist, stats-core, stats-ble, stats-gps, stats-power, stats-packets, clear stats/contacts/messages, start dfu, start ota, reboot\r\n").await;
+            let _ = sender.send( b"  -> Commands:\r\n  ->   Identity: get/set name, get role, get/set lat/lon, get/set prv.key, get public.key\r\n  ->   Radio:    get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq/tx/sf/bw/cr, get/set repeat, get/set rxduty, get/set af, get/set dutycycle, get/set hash-mode, stats-radio, stats-agc, agc-reset, stats-tx, stats-fwd\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, get/set autoadd, get/set multiacks, advert, advert.zerohop, gps advert, clock/time, channels\r\n  ->   System:   save, ver, board, get/set leds, get/set sound, get/set refresh.interval, get/set msg.persist, stats-core, stats-ble, stats-gps, stats-power, stats-packets, clear stats/contacts/messages, start dfu, start ota, reboot\r\n").await;
         }
         _ => {
             let _ = sender.send( b"  -> Unknown command\r\n").await;
         }
     }
+}
+
+#[inline(never)]
+fn format_stats_agc() -> heapless::String<96> {
+    let (noise_floor, agc_resets, frozen) = RADIO_TELEMETRY.lock(|t| {
+        let tel = t.borrow();
+        (
+            tel.effective_noise_floor_dbm(),
+            tel.agc_resets,
+            tel.agc_frozen_streak,
+        )
+    });
+    let mut s: heapless::String<96> = heapless::String::new();
+    let _ = write!(
+        s,
+        "  -> {{\"agc_resets\":{},\"noise_floor\":{},\"frozen\":{}}}\r\n",
+        agc_resets, noise_floor, frozen
+    );
+    s
 }
 
 #[cfg(test)]
@@ -1928,6 +1960,7 @@ mod tests {
         ("stats-radio", MESHCORE_STATS_REPLY_MAX, 0),
         ("stats-packets", MESHCORE_STATS_REPLY_MAX, 0),
         // Ferrix only.
+        ("stats-agc", FERRIX_STATS_REPLY_MAX, 0),
         ("stats-tx", FERRIX_STATS_REPLY_MAX, 0),
         ("stats-fwd", FERRIX_STATS_REPLY_MAX, 0),
         ("stats-flash", FERRIX_STATS_REPLY_MAX, 0),
@@ -2125,6 +2158,9 @@ mod tests {
             t.tx_retries = u32::MAX;
             t.tx_dropped = u32::MAX;
             t.rx_dropped = u32::MAX;
+            t.noise_floor_dbm = i16::MIN;
+            t.agc_frozen_streak = u8::MAX;
+            t.agc_resets = u32::MAX;
         });
         // Quotes cost two bytes each once JSON-escaped.
         NODE_CALLSIGN.lock(|c| {
@@ -2279,5 +2315,48 @@ mod tests {
 
         RADIO_TELEMETRY.lock(|t| *t.borrow_mut() = saved_tel);
         crate::state::set_tx_queue_len(saved_qlen);
+    }
+
+    #[test]
+    fn noise_floor_and_agc_cli_commands() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved_tel = RADIO_TELEMETRY.lock(|t| *t.borrow());
+        let _ = crate::state::take_agc_reset_request();
+        let host = MaxHost { vectors: false };
+
+        RADIO_TELEMETRY.lock(|t| {
+            let mut t = t.borrow_mut();
+            t.noise_floor_dbm = 0;
+            t.agc_resets = 0;
+            t.agc_frozen_streak = 0;
+        });
+
+        let (_, radio_default) = stats_reply("stats-radio", &host);
+        assert!(radio_default.contains("\"noise_floor\":-118"));
+
+        RADIO_TELEMETRY.lock(|t| {
+            let mut t = t.borrow_mut();
+            t.noise_floor_dbm = -113;
+            t.agc_resets = 2;
+            t.agc_frozen_streak = 5;
+        });
+
+        let (_, radio_live) = stats_reply("stats-radio", &host);
+        assert!(radio_live.contains("\"noise_floor\":-113"));
+
+        let (_, agc) = stats_reply("stats-agc", &host);
+        assert_eq!(agc, "XX|{\"agc_resets\":2,\"noise_floor\":-113,\"frozen\":5}");
+
+        let (_, trig) = stats_reply("agc-reset", &host);
+        assert!(trig.contains("OK"));
+        assert!(crate::state::take_agc_reset_request());
+        assert!(!crate::state::take_agc_reset_request());
+
+        let (_, clr) = stats_reply("clear stats", &host);
+        assert!(clr.contains("OK"));
+        let (_, agc_cleared) = stats_reply("stats-agc", &host);
+        assert_eq!(agc_cleared, "XX|{\"agc_resets\":0,\"noise_floor\":-113,\"frozen\":0}");
+
+        RADIO_TELEMETRY.lock(|t| *t.borrow_mut() = saved_tel);
     }
 }

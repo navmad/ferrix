@@ -1072,6 +1072,110 @@ where
         ];
         self.intf.write(&clr, false).await
     }
+
+    async fn get_rssi_inst_half_db(&mut self) -> Result<i16, RadioError> {
+        let mut rssi_raw = [0x00u8; 1];
+        let status = self
+            .intf
+            .read_with_status(&[OpCode::GetRSSIInst.value()], &mut rssi_raw)
+            .await?;
+        if OpStatusErrorMask::is_error(status) {
+            return Err(RadioError::OpError(status));
+        }
+        // SX1261-2 Datasheet §13.5.1 Table 13-76: ChipMode bits [6:4] == 0x05 means RX.
+        if ((status >> 4) & 0x07) != 0x05 || rssi_raw[0] == 0 {
+            return Err(RadioError::InvalidRadioMode);
+        }
+        Ok(-(rssi_raw[0] as i16))
+    }
+
+    async fn reset_agc(
+        &mut self,
+        frequency_in_hz: u32,
+        delay: &mut impl DelayNs,
+    ) -> Result<(), RadioError> {
+        let cal_freq = if frequency_in_hz > 900_000_000 {
+            [0xE1u8, 0xE9]
+        } else if frequency_in_hz > 850_000_000 {
+            [0xD7, 0xDB]
+        } else if frequency_in_hz > 770_000_000 {
+            [0xC1, 0xC5]
+        } else if frequency_in_hz > 460_000_000 {
+            [0x75, 0x81]
+        } else if frequency_in_hz > 425_000_000 {
+            [0x6B, 0x6F]
+        } else {
+            [0x00, 0x00]
+        };
+
+        self.intf.iv.disable_rf_switch().await?;
+
+        let stby_rc = [OpCode::SetStandby.value(), StandbyMode::RC.value()];
+        let clr_irq = [OpCode::ClrIrqStatus.value(), 0xFF, 0xFF];
+        let warm_sleep = [
+            OpCode::SetSleep.value(),
+            SleepParams {
+                wakeup_rtc: false,
+                reset: false,
+                warm_start: true,
+            }
+            .value(),
+        ];
+        let nss_wake = [OpCode::GetStatus.value(), 0x00];
+        let clr_err = [OpCode::ClearDeviceErrors.value(), 0x00, 0x00];
+        let cal_all = [OpCode::Calibrate.value(), 0b0111_1111];
+        let cal_img = [OpCode::CalibrateImage.value(), cal_freq[0], cal_freq[1]];
+        let reg_dcdc = [OpCode::SetRegulatorMode.value(), RegulatorMode::UseDCDC.value()];
+        let dio2 = [
+            OpCode::SetDIO2AsRfSwitchCtrl.value(),
+            self.config.chip.use_dio2_as_rfswitch() as u8,
+        ];
+        let fallback_fs = [OpCode::SetTxFallbackMode.value(), 0x40];
+        let rx_gain = [
+            OpCode::WriteRegister.value(),
+            Register::RxGain.addr1(),
+            Register::RxGain.addr2(),
+            if self.config.rx_boost { 0x96 } else { 0x94 },
+        ];
+
+        // (bytes, enabled, skip_busy_in_write, delay_ms_after, wait_busy_after_delay)
+        let steps: [(&[u8], bool, bool, u8, bool); 12] = [
+            // Stand down into STBY_RC and clear any latched IRQs before Warm Sleep.
+            (&stby_rc, true, false, 0, false),
+            (&clr_irq, true, false, 0, false),
+            // Warm Sleep powers down the analog front end (releasing stuck AGC)
+            // while retaining digital configuration.
+            (&warm_sleep, true, true, 2, false),
+            // Wake via NSS edge to STBY_RC and wait for BUSY low.
+            (&nss_wake, true, false, 0, false),
+            (&stby_rc, true, false, 0, false),
+            // Clear transient device errors, then run full recalibration + band image cal.
+            (&clr_err, true, false, 0, false),
+            (&cal_all, true, true, 5, true),
+            (&cal_img, true, true, 2, true),
+            // Re-apply chip-level configuration.
+            (&reg_dcdc, self.config.use_dcdc, false, 0, false),
+            (&dio2, self.config.chip.use_dio2_as_rfswitch(), false, 0, false),
+            (&fallback_fs, true, false, 0, false),
+            (&rx_gain, true, false, 0, false),
+        ];
+
+        for (cmd, enabled, skip_busy, delay_ms, wait_busy_after) in steps {
+            if !enabled {
+                continue;
+            }
+            self.intf.write(cmd, skip_busy).await?;
+            if delay_ms > 0 {
+                delay.delay_ms(delay_ms as u32).await;
+            }
+            if wait_busy_after {
+                self.intf.iv.wait_on_busy().await?;
+            }
+        }
+
+        // Re-assert retention list (idempotent).
+        self.update_retention_list().await
+    }
 }
 
 #[cfg(test)]

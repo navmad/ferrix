@@ -130,4 +130,23 @@ pub struct RadioTelemetry {
     pub tx_retries: u32,
     pub tx_dropped: u32,
     pub rx_dropped: u32,
+    /// Live estimated idle noise floor in dBm (`0` = unseeded sentinel; use
+    /// [`Self::effective_noise_floor_dbm`] for reporting).
+    pub noise_floor_dbm: i16,
+    /// Consecutive identical idle RSSI samples seen by the AGC watchdog.
+    pub agc_frozen_streak: u8,
+    /// Total SX1262 stuck-AGC recoveries completed since boot or `clear stats`.
+    pub agc_resets: u32,
+}
+
+impl RadioTelemetry {
+    /// Return the live estimated noise floor, falling back to `-118 dBm` before
+    /// the first valid idle RSSI sample is captured.
+    pub fn effective_noise_floor_dbm(&self) -> i16 {
+        if self.noise_floor_dbm == 0 {
+            crate::noise_floor::DEFAULT_NOISE_FLOOR_DBM
+        } else {
+            self.noise_floor_dbm
+        }
+    }
 }

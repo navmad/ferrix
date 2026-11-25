@@ -1411,10 +1411,11 @@ impl<'a> CompanionNode<'a> {
                         emit(&resp);
                         handled = true;
                     } else if kind == 1 {
-                        let (rssi, snr, tx_air_s, rx_air_s) =
+                        let (noise_floor, rssi, snr, tx_air_s, rx_air_s) =
                             crate::state::RADIO_TELEMETRY.lock(|t| {
                                 let tel = t.borrow();
                                 (
+                                    tel.effective_noise_floor_dbm(),
                                     tel.last_rssi,
                                     tel.last_snr,
                                     tel.tx_air_ms / 1000,
@@ -1424,7 +1425,7 @@ impl<'a> CompanionNode<'a> {
                         let mut resp = Vec::<u8, 14>::new();
                         let _ = resp.push(RESP_CODE_STATS);
                         let _ = resp.push(1);
-                        let _ = resp.extend_from_slice(&(-118i16).to_le_bytes());
+                        let _ = resp.extend_from_slice(&noise_floor.to_le_bytes());
                         let _ = resp.push(rssi as i8 as u8);
                         let _ = resp.push((snr * 4) as u8);
                         let _ = resp.extend_from_slice(&tx_air_s.to_le_bytes());
@@ -4520,6 +4521,26 @@ mod tests {
         crate::storage::set_total_kb(saved_total);
         crate::storage::messages::QUEUED.store(saved_queued, Ordering::Relaxed);
         crate::state::DISCOVERED_CONTACTS.lock(|c| c.borrow_mut().clear());
+
+        // CMD_GET_STATS(1): default -118 when unseeded, then live noise_floor_dbm.
+        crate::state::RADIO_TELEMETRY.lock(|t| t.borrow_mut().noise_floor_dbm = 0);
+        resp.clear();
+        poll_sync(node.handle_command(&[CMD_GET_STATS, 1], |r| {
+            let _ = resp.extend_from_slice(r);
+        }));
+        assert_eq!(resp.len(), 14);
+        assert_eq!(resp[0], RESP_CODE_STATS);
+        assert_eq!(resp[1], 1);
+        assert_eq!(i16::from_le_bytes(resp[2..4].try_into().unwrap()), -118);
+
+        crate::state::RADIO_TELEMETRY.lock(|t| t.borrow_mut().noise_floor_dbm = -111);
+        resp.clear();
+        poll_sync(node.handle_command(&[CMD_GET_STATS, 1], |r| {
+            let _ = resp.extend_from_slice(r);
+        }));
+        assert_eq!(resp.len(), 14);
+        assert_eq!(i16::from_le_bytes(resp[2..4].try_into().unwrap()), -111);
+        crate::state::RADIO_TELEMETRY.lock(|t| t.borrow_mut().noise_floor_dbm = 0);
 
         resp.clear();
         poll_sync(node.handle_command(&[CMD_GET_STATS, 99], |r| {
