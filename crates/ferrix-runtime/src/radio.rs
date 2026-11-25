@@ -8,6 +8,7 @@ use embassy_futures::select::{select, select4, Either, Either4};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Instant, Timer};
+use ferrix_core::noise_floor::{AgcWatchdog, NoiseFloorEstimator, NOISE_SAMPLE_INTERVAL_MS};
 use ferrix_core::scheduler::{
     assign_flood, cancel_slot, charge_control, control_can_send, due_control, due_flood,
     next_flood_due, packet_wait_ms, preamble_for, preamble_wait_ms, rebase_floods, refill_budgets,
@@ -15,9 +16,9 @@ use ferrix_core::scheduler::{
     FLOOD_MAX_AGE_SLOTS, FLOOD_SLOTS, SLOT_MIN_MS, TX_GAP_MS, TX_MAX_ATTEMPTS,
 };
 use ferrix_core::state::{
-    current_public_key, note_core_err, set_tx_queue_len, CORE_ERR_RADIO_RX, CORE_ERR_TX_FAILED,
-    FORWARD_SENT, RADIO_SETTINGS, RADIO_TELEMETRY, TX_SLOT_MS_LAST, TX_SLOT_MS_OVERRIDE,
-    TX_SLOT_USED,
+    current_public_key, note_core_err, set_tx_queue_len, take_agc_reset_request,
+    CORE_ERR_AGC_RECOVERY, CORE_ERR_RADIO_RX, CORE_ERR_TX_FAILED, FORWARD_SENT, RADIO_SETTINGS,
+    RADIO_TELEMETRY, TX_SLOT_MS_LAST, TX_SLOT_MS_OVERRIDE, TX_SLOT_USED,
 };
 use ferrix_hal::radio::{LoraConfig, LoraRadio, RadioDevice, RxOutcome, RxState, TxOutcome};
 use heapless::{Deque, Vec};
@@ -140,6 +141,21 @@ fn add_telemetry(update: impl FnOnce(&mut ferrix_core::types::RadioTelemetry)) {
     RADIO_TELEMETRY.lock(|t| update(&mut t.borrow_mut()));
 }
 
+#[inline(never)]
+fn poll_noinline<F: core::future::Future>(
+    fut: core::pin::Pin<&mut F>,
+    cx: &mut core::task::Context<'_>,
+) -> core::task::Poll<F::Output> {
+    fut.poll(cx)
+}
+
+macro_rules! await_noinline {
+    ($fut:expr) => {{
+        let mut fut = core::pin::pin!($fut);
+        core::future::poll_fn(|cx| poll_noinline(fut.as_mut(), cx)).await
+    }};
+}
+
 /// Run the radio scheduler until the executor stops.
 pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> ! {
     info!("radio: scheduler started");
@@ -186,6 +202,9 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
     let mut slot_override_active = false;
     let mut last_adapt_ms = start_ms;
     let mut last_adapt_events = 0u32;
+    let mut noise_floor = NoiseFloorEstimator::new();
+    let mut agc_watchdog = AgcWatchdog::new(start_ms);
+    let mut next_noise_sample_ms = start_ms.saturating_add(1_000);
 
     loop {
         let mut now = Instant::now().as_millis() as u64;
@@ -337,6 +356,30 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
             }
         };
 
+        let manual_agc_reset = !rx_busy && take_agc_reset_request();
+        let auto_agc_reset = !current_cfg.5 && !rx_busy && agc_watchdog.should_reset(now);
+        if manual_agc_reset || auto_agc_reset {
+            if manual_agc_reset {
+                info!("radio: manual SX1262 AGC reset");
+            } else {
+                info!("radio: deaf-receiver watchdog resetting SX1262 AGC");
+                note_core_err(CORE_ERR_AGC_RECOVERY);
+            }
+            let ok = await_noinline!(device.reset_agc());
+            now = Instant::now().as_millis() as u64;
+            rx_active_since = None;
+            last_rx_activity_ms = now;
+            agc_watchdog.on_agc_reset(now);
+            next_noise_sample_ms = now.saturating_add(1_000);
+            add_telemetry(|tel| {
+                tel.agc_frozen_streak = 0;
+                if ok {
+                    tel.agc_resets = tel.agc_resets.saturating_add(1);
+                }
+            });
+            continue;
+        }
+
         if now >= next_tx_allowed_ms && !rx_busy {
             // Control lane first (highest-priority packet whose due_at_ms has arrived,
             // with FIFO tie-breaking within each priority class).
@@ -423,6 +466,8 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
                     channel_busy_since = None;
                     last_rx_activity_ms = after_tx;
                     next_tx_allowed_ms = after_tx + TX_GAP_MS;
+                    next_noise_sample_ms =
+                        next_noise_sample_ms.max(after_tx.saturating_add(1_000));
                     if duty_pct < 100 {
                         if lane == TxLane::Control {
                             charge_control(
@@ -565,6 +610,25 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
             continue;
         }
 
+        if !current_cfg.5 && !rx_busy && now >= next_noise_sample_ms {
+            device.arm_receive().await;
+            if let Some(burst_min_half_db) = await_noinline!(device.sample_rssi_half_db()) {
+                if let Some(floor_dbm) = noise_floor.update(burst_min_half_db) {
+                    agc_watchdog.on_rssi_sample(burst_min_half_db);
+                    let frozen = agc_watchdog.frozen_streak();
+                    add_telemetry(|tel| {
+                        tel.noise_floor_dbm = floor_dbm;
+                        tel.agc_frozen_streak = frozen;
+                    });
+                }
+            }
+            now = Instant::now().as_millis() as u64;
+            next_noise_sample_ms = now.saturating_add(NOISE_SAMPLE_INTERVAL_MS);
+        }
+
+        if !current_cfg.5 {
+            wake_at = wake_at.min(next_noise_sample_ms);
+        }
         if now < next_tx_allowed_ms {
             wake_at = wake_at.min(next_tx_allowed_ms);
         }
@@ -635,9 +699,14 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
                 } else {
                     match device.handle_rx_irq(&mut rx_buf).await {
                         Some(RxOutcome::Packet { len, rssi, snr }) => {
+                            let now_rx = Instant::now().as_millis() as u64;
                             rx_backoff_ms = 0;
                             rx_active_since = None;
-                            last_rx_activity_ms = Instant::now().as_millis() as u64;
+                            last_rx_activity_ms = now_rx;
+                            agc_watchdog.on_rx_proof(now_rx);
+                            add_telemetry(|tel| {
+                                tel.agc_frozen_streak = 0;
+                            });
                             info!("radio: RX {} bytes, RSSI: {} dBm, SNR: {} dB", len, rssi, snr);
                             let copy_len = len.min(256);
                             let mut packet_data = [0u8; 256];
@@ -686,6 +755,12 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
                             match device.rx_state() {
                                 RxState::Idle => rx_active_since = None,
                                 st => {
+                                    if st == RxState::Header {
+                                        agc_watchdog.on_rx_proof(now_irq);
+                                        add_telemetry(|tel| {
+                                            tel.agc_frozen_streak = 0;
+                                        });
+                                    }
                                     if !matches!(rx_active_since, Some((prev, _)) if prev == st) {
                                         rx_active_since = Some((st, now_irq));
                                     }
@@ -761,6 +836,13 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
                     rx_active_since = None;
                     channel_busy_since = None;
                     last_rx_activity_ms = now_cfg;
+                    noise_floor.reset();
+                    agc_watchdog.on_reconfigure(now_cfg);
+                    next_noise_sample_ms = now_cfg.saturating_add(1_000);
+                    add_telemetry(|tel| {
+                        tel.noise_floor_dbm = 0;
+                        tel.agc_frozen_streak = 0;
+                    });
                     info!(
                         "radio: reconfigured to {} Hz (SF{}, BW{}k, CR 4/{}), {} dBm",
                         cfg.frequency_hz,

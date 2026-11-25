@@ -637,7 +637,23 @@ pub static RADIO_TELEMETRY: Mutex<SharedRawMutex, RefCell<RadioTelemetry>> =
         tx_retries: 0,
         tx_dropped: 0,
         rx_dropped: 0,
+        noise_floor_dbm: 0,
+        agc_frozen_streak: 0,
+        agc_resets: 0,
     }));
+
+/// Pending manual SX1262 AGC reset requested from the CLI.
+pub static AGC_RESET_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Schedule a manual SX1262 Warm Sleep + recalibration AGC reset.
+pub fn request_agc_reset() {
+    AGC_RESET_REQUESTED.store(true, Ordering::Release);
+}
+
+/// Consume a pending manual AGC reset request, returning `true` if one was set.
+pub fn take_agc_reset_request() -> bool {
+    AGC_RESET_REQUESTED.swap(false, Ordering::AcqRel)
+}
 
 /// Latest GNSS solution shared by the UART task, UI and adverts.
 #[derive(Clone, Copy, Debug, Default)]

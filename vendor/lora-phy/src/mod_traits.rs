@@ -144,4 +144,20 @@ pub trait RadioKind {
     async fn clear_rx_activity_irqs(&mut self) -> Result<(), RadioError> {
         Ok(())
     }
+
+    /// Read instantaneous RSSI while in continuous receive mode, in half-dB units
+    /// (`-(raw as i16)`, e.g. `-236` for `-118.0 dBm`).
+    async fn get_rssi_inst_half_db(&mut self) -> Result<i16, RadioError> {
+        Err(RadioError::InvalidRadioMode)
+    }
+
+    /// Reset a potentially latched receiver AGC via Warm Sleep + full recalibration
+    /// and leave the chip in `STBY_RC` ready for `prepare_for_rx`.
+    async fn reset_agc(
+        &mut self,
+        _frequency_in_hz: u32,
+        _delay: &mut impl DelayNs,
+    ) -> Result<(), RadioError> {
+        Ok(())
+    }
 }

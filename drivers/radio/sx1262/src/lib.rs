@@ -639,6 +639,82 @@ where
         self.lbt.clear_starvation();
         self.reenter_rx().await;
     }
+
+    async fn sample_rssi_half_db(&mut self) -> Option<i16> {
+        // Never touch SPI during duty-cycle RX (NSS would abort sleep/sniff
+        // phase) or while a frame is in flight.
+        if !self.rx_armed
+            || self.rx_state != RxState::Idle
+            || !matches!(self.rx_mode, RxMode::Continuous)
+        {
+            return None;
+        }
+
+        if let Ok((header_valid, preamble_detected, _)) = self.lora.poll_rx_activity().await {
+            if header_valid {
+                self.rx_state = RxState::Header;
+                return None;
+            }
+            if preamble_detected {
+                return None;
+            }
+        }
+
+        // Burst of 8 instantaneous RSSI reads spaced 200 us apart; taking the
+        // minimum rejects transient interference spikes without leaving RX.
+        const BURST_SAMPLES: usize = 8;
+        let mut min_half_db: Option<i16> = None;
+        for i in 0..BURST_SAMPLES {
+            match self.lora.get_rssi_inst_half_db().await {
+                Ok(sample) => {
+                    min_half_db = Some(match min_half_db {
+                        Some(cur) => cur.min(sample),
+                        None => sample,
+                    });
+                }
+                Err(_) => return None,
+            }
+            if i + 1 < BURST_SAMPLES {
+                embassy_time::Timer::after_micros(200).await;
+            }
+        }
+
+        // Discard the burst if a LoRa preamble or header arrived mid-burst.
+        if let Ok((header_valid, preamble_detected, _)) = self.lora.poll_rx_activity().await {
+            if header_valid {
+                self.rx_state = RxState::Header;
+                return None;
+            }
+            if preamble_detected {
+                return None;
+            }
+        }
+
+        min_half_db
+    }
+
+    async fn reset_agc(&mut self) -> bool {
+        self.rx_armed = false;
+        self.rx_state = RxState::Idle;
+        let reset_ok = match embassy_time::with_timeout(
+            Duration::from_secs(1),
+            self.lora.reset_agc(&self.mdltn),
+        )
+        .await
+        {
+            Ok(Ok(())) => true,
+            Ok(Err(e)) => {
+                error!("sx1262: AGC reset failed: {:?}", e);
+                false
+            }
+            Err(_) => {
+                error!("sx1262: AGC reset timed out");
+                false
+            }
+        };
+        self.reenter_rx().await;
+        reset_ok && self.rx_armed
+    }
 }
 
 #[cfg(test)]
