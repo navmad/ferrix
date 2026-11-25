@@ -148,7 +148,15 @@ pub static NODE_PRIVATE_KEY: Mutex<SharedRawMutex, RefCell<[u8; 64]>> =
 
 pub fn set_identity(public_key: [u8; 32], private_key: [u8; 64]) {
     NODE_PUBLIC_KEY.lock(|k| *k.borrow_mut() = public_key);
-    NODE_PRIVATE_KEY.lock(|k| *k.borrow_mut() = private_key);
+    let key_changed = NODE_PRIVATE_KEY.lock(|k| {
+        let mut slot = k.borrow_mut();
+        let changed = *slot != private_key;
+        *slot = private_key;
+        changed
+    });
+    if key_changed {
+        crate::ecdh::invalidate();
+    }
 }
 
 pub fn current_public_key() -> [u8; 32] {

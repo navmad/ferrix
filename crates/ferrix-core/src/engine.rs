@@ -53,6 +53,15 @@ pub trait EngineContext: Send + Sync {
         (0xFF, [0u8; 64])
     }
 
+    /// Compute or retrieve a cached X25519 shared secret for `(prv, peer)`.
+    fn shared_secret(&self, prv: &[u8; 64], peer: &[u8; 32]) -> Option<[u8; 32]> {
+        meshcore_wire::identity::compute_shared_secret(prv, peer)
+    }
+
+    /// Notify the host that the engine's local private key changed so any
+    /// cached ECDH secrets can be invalidated immediately.
+    fn on_private_key_changed(&self) {}
+
     /// Attach the current send scope to a flood packet.
     fn apply_flood_scope(&self, _pkt: &mut Packet) {}
 
@@ -270,13 +279,25 @@ impl<'a> MeshEngine<'a> {
     /// Returns false if the key derives a reserved public key.
     #[inline]
     pub fn set_private_key(&mut self, prv: &[u8; 64]) -> bool {
-        self.identity.set_private_key(prv)
+        if self.identity.set_private_key(prv) {
+            self.context.on_private_key_changed();
+            true
+        } else {
+            false
+        }
     }
 
     /// Update from a 32-byte seed (kept for convenience).
     #[inline]
     pub fn set_secret_key(&mut self, seed: &[u8; 32]) {
         self.identity.set_secret_key(seed);
+        self.context.on_private_key_changed();
+    }
+
+    /// Compute or retrieve the cached X25519 shared secret for `peer`.
+    #[inline]
+    fn shared_secret(&self, peer: &[u8; 32]) -> Option<[u8; 32]> {
+        self.context.shared_secret(self.identity.private_key(), peer)
     }
 
     /// Contact public keys whose first byte matches `hash`.
@@ -648,7 +669,7 @@ impl<'a> MeshEngine<'a> {
                 }
                 let mut sender_pub = [0u8; 32];
                 sender_pub.copy_from_slice(&payload[1..33]);
-                if let Some(secret) = self.identity.shared_secret(&sender_pub) {
+                if let Some(secret) = self.shared_secret(&sender_pub) {
                     if let Ok(req) = AnonReqPacket::decode(payload, &secret) {
                         consumed = true;
                         return InboundAction::ReceivedAnonReq(req);
@@ -824,7 +845,7 @@ impl<'a> MeshEngine<'a> {
         // shared secret until one authenticates the MAC.
         let peers = self.peers_by_hash(src);
         for peer in peers.iter() {
-            let secret = match self.identity.shared_secret(peer) {
+            let secret = match self.shared_secret(peer) {
                 Some(secret) => secret,
                 None => continue,
             };
@@ -890,7 +911,7 @@ impl<'a> MeshEngine<'a> {
             return InboundAction::Unhandled;
         }
         for peer in self.peers_by_hash(payload[1]).iter() {
-            if let Some(secret) = self.identity.shared_secret(peer) {
+            if let Some(secret) = self.shared_secret(peer) {
                 if let Ok(path) = PathPacket::decode(payload, &secret) {
                     let mut arrival_path = heapless::Vec::<u8, 64>::new();
                     let an = pkt.path_byte_len();
@@ -931,7 +952,7 @@ impl<'a> MeshEngine<'a> {
         }
 
         for peer in self.peers_by_hash(src).iter() {
-            if let Some(secret) = self.identity.shared_secret(peer) {
+            if let Some(secret) = self.shared_secret(peer) {
                 if let Ok(ap) = AddressedPacket::decode(payload, &secret) {
                     *consumed = true;
                     return if pkt.payload_type() == PAYLOAD_TYPE_RESPONSE {
@@ -956,7 +977,7 @@ impl<'a> MeshEngine<'a> {
         }
         if pkt.payload_type() == PAYLOAD_TYPE_RESPONSE {
             if let Some(peer) = self.context.anon_peer_key(src) {
-                if let Some(secret) = self.identity.shared_secret(&peer) {
+                if let Some(secret) = self.shared_secret(&peer) {
                     if let Ok(ap) = AddressedPacket::decode(payload, &secret) {
                         *consumed = true;
                         return InboundAction::ReceivedResponse {
@@ -1074,7 +1095,7 @@ impl<'a> MeshEngine<'a> {
         out_path_len: u8,
         out_path: &[u8; 64],
     ) -> Result<u32, ()> {
-        let secret = self.identity.shared_secret(dest_pub).ok_or(())?;
+        let secret = self.shared_secret(dest_pub).ok_or(())?;
         let msg = TxtMsgPacket::new(
             dest_pub[0],
             self.identity.pub_key()[0],
@@ -1200,7 +1221,7 @@ impl<'a> MeshEngine<'a> {
         returned_path: &[u8],
         delay_ms: u64,
     ) -> Result<Packet, ()> {
-        let secret = self.identity.shared_secret(dest_pub).ok_or(())?;
+        let secret = self.shared_secret(dest_pub).ok_or(())?;
         let dest = dest_pub[0];
         let src = self.identity.pub_key()[0];
         let rand4 = self.next_salt().to_le_bytes();
@@ -1228,7 +1249,7 @@ impl<'a> MeshEngine<'a> {
         arrival_path: &[u8],
         reply_plain: &[u8],
     ) -> Result<Packet, ()> {
-        let secret = self.identity.shared_secret(sender_pub).ok_or(())?;
+        let secret = self.shared_secret(sender_pub).ok_or(())?;
         let dest = sender_pub[0];
         let src = self.identity.pub_key()[0];
         if is_flood {
