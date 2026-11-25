@@ -76,6 +76,7 @@ where
     EF::Error: defmt::Format,
 {
     async fn init(&mut self) {
+        storage::set_total_kb(self.regions.total_kb(self.external.is_some()));
         bonds::format_if_needed(self.internal, &self.regions.bonds).await;
         match self.external.as_deref_mut() {
             Some(flash) => {
@@ -199,6 +200,7 @@ where
     F::Error: defmt::Format,
 {
     async fn init(&mut self) {
+        storage::set_total_kb(self.regions.total_kb(true));
         bonds::format_if_needed(self.flash, &self.regions.bonds).await;
         contacts::load(self.flash, &self.regions.contacts).await;
         if ferrix_core::state::persist_messages() {

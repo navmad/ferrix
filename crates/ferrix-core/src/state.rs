@@ -5,7 +5,7 @@
 //! board/application coupling without changing behavior.
 
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU32, AtomicU8, Ordering};
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
@@ -238,6 +238,62 @@ pub static PENDING_ACK_EVICTED: AtomicU32 = AtomicU32::new(0);
 /// Packets dropped because the transmit queue was full: control, flood, background.
 pub static TX_QUEUE_FULL: [AtomicU32; 3] =
     [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+
+/// Radio RX hardware/IRQ error, header stall, or stuck-busy recovery occurred.
+pub const CORE_ERR_RADIO_RX: u16 = 1 << 0;
+/// Radio TX attempt failed at the hardware/timeout layer.
+pub const CORE_ERR_TX_FAILED: u16 = 1 << 1;
+/// Outbound TX, inbound RX, or companion push queue dropped a frame.
+pub const CORE_ERR_QUEUE_DROP: u16 = 1 << 2;
+/// Persistent storage is unavailable or encountered a flash error.
+pub const CORE_ERR_STORAGE: u16 = 1 << 3;
+/// Automatic SX1262 stuck-AGC recovery was triggered.
+pub const CORE_ERR_AGC_RECOVERY: u16 = 1 << 4;
+
+static CORE_ERR_FLAGS: AtomicU16 = AtomicU16::new(0);
+static TX_QUEUE_LEN: AtomicU8 = AtomicU8::new(0);
+
+/// Latch one or more `CORE_ERR_*` bits into the core error bitmask.
+pub fn note_core_err(flags: u16) {
+    CORE_ERR_FLAGS.fetch_or(flags, Ordering::Relaxed);
+}
+
+/// Clear latched transient `CORE_ERR_*` bits (called by `clear stats`).
+pub fn clear_core_err_flags() {
+    CORE_ERR_FLAGS.store(0, Ordering::Relaxed);
+}
+
+/// Effective core error bitmask reported by `CMD_GET_STATS(0)` and `stats-core`.
+#[inline(never)]
+pub fn core_err_flags() -> u16 {
+    let mut flags = CORE_ERR_FLAGS.load(Ordering::Relaxed);
+    let (tx_dropped, rx_dropped) = RADIO_TELEMETRY.lock(|t| {
+        let tel = t.borrow();
+        (tel.tx_dropped, tel.rx_dropped)
+    });
+    let tx_q_full = TX_QUEUE_FULL[0].load(Ordering::Relaxed)
+        | TX_QUEUE_FULL[1].load(Ordering::Relaxed)
+        | TX_QUEUE_FULL[2].load(Ordering::Relaxed);
+    if tx_dropped > 0 || rx_dropped > 0 || tx_q_full > 0 || crate::command::push_drops() > 0 {
+        flags |= CORE_ERR_QUEUE_DROP;
+    }
+    if crate::storage::external_unavailable()
+        || crate::storage::bonds::BOND_SAVE_ERRORS.load(Ordering::Relaxed) > 0
+    {
+        flags |= CORE_ERR_STORAGE;
+    }
+    flags
+}
+
+/// Update the live outbound radio TX queue depth.
+pub fn set_tx_queue_len(len: u8) {
+    TX_QUEUE_LEN.store(len, Ordering::Relaxed);
+}
+
+/// Live outbound radio TX queue depth reported by `CMD_GET_STATS(0)` and `stats-core`.
+pub fn tx_queue_len() -> u8 {
+    TX_QUEUE_LEN.load(Ordering::Relaxed)
+}
 
 const DUP_BUCKETS: [AtomicU32; 6] = [
     AtomicU32::new(0),

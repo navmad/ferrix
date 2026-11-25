@@ -15,8 +15,9 @@ use ferrix_core::scheduler::{
     FLOOD_MAX_AGE_SLOTS, FLOOD_SLOTS, SLOT_MIN_MS, TX_GAP_MS, TX_MAX_ATTEMPTS,
 };
 use ferrix_core::state::{
-    current_public_key, RADIO_SETTINGS, RADIO_TELEMETRY, TX_SLOT_MS_LAST, TX_SLOT_MS_OVERRIDE,
-    TX_SLOT_USED, FORWARD_SENT,
+    current_public_key, note_core_err, set_tx_queue_len, CORE_ERR_RADIO_RX, CORE_ERR_TX_FAILED,
+    FORWARD_SENT, RADIO_SETTINGS, RADIO_TELEMETRY, TX_SLOT_MS_LAST, TX_SLOT_MS_OVERRIDE,
+    TX_SLOT_USED,
 };
 use ferrix_hal::radio::{LoraConfig, LoraRadio, RadioDevice, RxOutcome, RxState, TxOutcome};
 use heapless::{Deque, Vec};
@@ -265,11 +266,11 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
                 last_adapt_ms = now;
             }
         }
+        let flood_used = floods.iter().filter(|slot| slot.is_some()).count();
         TX_SLOT_MS_LAST.store(slot_ms as u32, Ordering::Relaxed);
-        TX_SLOT_USED.store(
-            floods.iter().filter(|slot| slot.is_some()).count() as u32,
-            Ordering::Relaxed,
-        );
+        TX_SLOT_USED.store(flood_used as u32, Ordering::Relaxed);
+        let pending_tx = control.len() + flood_used + background.len() + LORA_TX_CHANNEL.len();
+        set_tx_queue_len(pending_tx.min(u8::MAX as usize) as u8);
 
         // Refill the duty-cycle budget.
         let af = airtime_factor();
@@ -325,6 +326,7 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
                     true
                 } else {
                     if tracked_state == RxState::Header {
+                        note_core_err(CORE_ERR_RADIO_RX);
                         device.recover_receive().await;
                         now = Instant::now().as_millis() as u64;
                         last_rx_activity_ms = now;
@@ -529,6 +531,7 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
                     rx_active_since = None;
                     channel_busy_since = None;
                     last_rx_activity_ms = after_tx;
+                    note_core_err(CORE_ERR_TX_FAILED);
                     add_telemetry(|tel| {
                         tel.tx_retries = tel.tx_retries.saturating_add(1);
                         if req.attempts + 1 >= TX_MAX_ATTEMPTS {
@@ -617,6 +620,7 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
             }
             Either::First(Either4::First(irq_ok)) => {
                 if !irq_ok {
+                    note_core_err(CORE_ERR_RADIO_RX);
                     if rx_backoff_ms > 0 {
                         Timer::after_millis(rx_backoff_ms).await;
                     }
@@ -661,6 +665,7 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
                             });
                         }
                         Some(RxOutcome::Error) => {
+                            note_core_err(CORE_ERR_RADIO_RX);
                             if rx_backoff_ms <= 50 {
                                 debug!("radio: RX error");
                             }
