@@ -23,7 +23,6 @@ pub use config::{
     set_path_hash_mode,
 };
 pub use contacts::request as request_contacts;
-pub use messages::MessageCommand;
 
 /// Flash regions reserved by the board for each store.
 ///

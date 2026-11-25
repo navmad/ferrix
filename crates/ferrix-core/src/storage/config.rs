@@ -75,6 +75,7 @@ struct SettingsRecord {
     radio_freq_hz: u32,
     radio_bw_khz: u32,
     display_refresh_interval_secs: u16,
+    persist_messages: u8,
 }
 
 impl SettingsRecord {
@@ -112,7 +113,8 @@ impl SettingsRecord {
         buf[180..184].copy_from_slice(&self.radio_freq_hz.to_le_bytes());
         buf[184..188].copy_from_slice(&self.radio_bw_khz.to_le_bytes());
         buf[188..190].copy_from_slice(&self.display_refresh_interval_secs.to_le_bytes());
-        // 190..192: _pad_after_refresh = 0
+        buf[190] = self.persist_messages;
+        // 191: _pad = 0
         buf
     }
 
@@ -159,6 +161,7 @@ impl SettingsRecord {
             radio_freq_hz: u32::from_le_bytes(raw[180..184].try_into().ok()?),
             radio_bw_khz: u32::from_le_bytes(raw[184..188].try_into().ok()?),
             display_refresh_interval_secs: u16::from_le_bytes(raw[188..190].try_into().ok()?),
+            persist_messages: raw[190],
         })
     }
 }
@@ -440,6 +443,7 @@ pub fn init_config(
         crate::state::init_leds_disabled(cfg.ui_disabled_flags & 1 != 0);
         crate::state::init_buzzer_enabled(cfg.ui_disabled_flags & 2 == 0);
         crate::state::init_display_refresh_interval_secs(cfg.display_refresh_interval_secs);
+        crate::state::init_persist_messages(cfg.persist_messages != 0);
 
         crate::state::update_prefs(|p| {
             p.scope_name = cfg.flood_scope_name;
@@ -476,6 +480,7 @@ pub fn init_config(
     } else {
         info!("Storage: No persistent config found; initializing defaults");
         crate::state::init_display_refresh_interval_secs(0);
+        crate::state::init_persist_messages(false);
         BLE_PIN.store(DEFAULT_BLE_PIN, core::sync::atomic::Ordering::Relaxed);
         let mut name = String::<32>::new();
         let _ = name.push_str(default_name);
@@ -550,6 +555,7 @@ fn assemble_settings() -> SettingsRecord {
         radio_freq_hz: freq,
         radio_bw_khz: bw,
         display_refresh_interval_secs: crate::state::display_refresh_interval_secs(),
+        persist_messages: if crate::state::persist_messages() { 1 } else { 0 },
     }
 }
 
@@ -649,12 +655,14 @@ mod tests {
             radio_freq_hz: 910_525_000,
             radio_bw_khz: 62_500,
             display_refresh_interval_secs: 300,
+            persist_messages: 1,
         };
         let bytes = rec.encode();
         assert_eq!(&bytes[0..4], &CONFIG_MAGIC.to_le_bytes());
         assert_eq!(&bytes[108..112], &910_525_000u32.to_le_bytes());
         assert_eq!(&bytes[176..180], &654_321u32.to_le_bytes());
         assert_eq!(&bytes[188..190], &300u16.to_le_bytes());
+        assert_eq!(bytes[190], 1);
 
         let decoded = SettingsRecord::decode(&bytes).expect("decode current");
         assert_eq!(decoded.offgrid_home_freq, 910_525_000);
@@ -662,12 +670,15 @@ mod tests {
         assert_eq!(decoded.ble_pin, 654_321);
         assert_eq!(decoded.radio_bw_khz, 62_500);
         assert_eq!(decoded.display_refresh_interval_secs, 300);
+        assert_eq!(decoded.persist_messages, 1);
 
-        // Legacy 188-byte v1 records decode with display_refresh_interval_secs == 0.
+        // Legacy 188-byte v1 records decode with display_refresh_interval_secs == 0
+        // and persist_messages == 0 (RAM-only default).
         let legacy = SettingsRecord::decode(&bytes[..LEGACY_SETTINGS_V1_SIZE]).expect("decode v1");
         assert_eq!(legacy.ble_pin, 654_321);
         assert_eq!(legacy.radio_bw_khz, 62_500);
         assert_eq!(legacy.display_refresh_interval_secs, 0);
+        assert_eq!(legacy.persist_messages, 0);
 
         let ch = ChannelData {
             name: fixed_str::<32>("#mesh"),

@@ -20,7 +20,7 @@ use ferrix_core::state::bump_storage_heartbeat;
 use ferrix_core::storage::adverts::FetchRequest;
 use ferrix_core::storage::contacts::ContactOp;
 use ferrix_core::storage::{
-    self, adverts, bonds, config, contacts, messages, MessageCommand, StorageRegions,
+    self, adverts, bonds, config, contacts, messages, StorageRegions,
 };
 
 /// Why the storage loop exited.
@@ -41,8 +41,7 @@ trait Stores {
     async fn save_adverts(&mut self);
     async fn save_bonds(&mut self);
     async fn handle_contact_op(&mut self, op: ContactOp);
-    async fn handle_message(&mut self, command: MessageCommand);
-    async fn consume_messages(&mut self, count: u32);
+    async fn sync_messages(&mut self, ignore_ble_connected: bool);
     async fn serve_advert(&mut self, request: FetchRequest);
     async fn flush(&mut self);
     async fn factory_reset(&mut self);
@@ -81,7 +80,9 @@ where
         match self.external.as_deref_mut() {
             Some(flash) => {
                 contacts::load(flash, &self.regions.contacts).await;
-                messages::load(flash, &self.regions.messages).await;
+                if ferrix_core::state::persist_messages() {
+                    messages::load(flash, &self.regions.messages).await;
+                }
             }
             None => storage::note_external_skip(),
         }
@@ -125,38 +126,15 @@ where
         }
     }
 
-    async fn handle_message(&mut self, command: MessageCommand) {
-        match command {
-            MessageCommand::Append(msg) => match self.external.as_deref_mut() {
-                Some(flash) => messages::append(flash, &self.regions.messages, &msg).await,
-                None => storage::note_external_skip(),
-            },
-            MessageCommand::AppendChannelData(data) => match self.external.as_deref_mut() {
-                Some(flash) => {
-                    messages::append_channel_data(flash, &self.regions.messages, &data).await
-                }
-                None => storage::note_external_skip(),
-            },
-            MessageCommand::Consume => {
-                let count = messages::take_pending_consumes();
-                self.consume_messages(count).await;
-            }
-            MessageCommand::Clear => match self.external.as_deref_mut() {
-                Some(flash) => messages::clear(flash, &self.regions.messages).await,
-                None => storage::note_external_skip(),
-            },
+    async fn sync_messages(&mut self, ignore_ble_connected: bool) {
+        if !messages::has_pending_sync(ignore_ble_connected) {
+            return;
         }
-    }
-
-    async fn consume_messages(&mut self, count: u32) {
-        for _ in 0..count {
-            match self.external.as_deref_mut() {
-                Some(flash) => messages::consume(flash, &self.regions.messages).await,
-                None => {
-                    storage::note_external_skip();
-                    return;
-                }
+        match self.external.as_deref_mut() {
+            Some(flash) => {
+                messages::sync(flash, &self.regions.messages, ignore_ble_connected).await
             }
+            None => storage::note_external_skip(),
         }
     }
 
@@ -178,6 +156,7 @@ where
         adverts::drain_save_requests();
         self.save_adverts().await;
         self.save_bonds().await;
+        self.sync_messages(true).await;
         storage::complete_flush();
     }
 
@@ -222,7 +201,9 @@ where
     async fn init(&mut self) {
         bonds::format_if_needed(self.flash, &self.regions.bonds).await;
         contacts::load(self.flash, &self.regions.contacts).await;
-        messages::load(self.flash, &self.regions.messages).await;
+        if ferrix_core::state::persist_messages() {
+            messages::load(self.flash, &self.regions.messages).await;
+        }
     }
 
     async fn save_config(&mut self, seq: u32) {
@@ -253,26 +234,8 @@ where
         }
     }
 
-    async fn handle_message(&mut self, command: MessageCommand) {
-        match command {
-            MessageCommand::Append(msg) => {
-                messages::append(self.flash, &self.regions.messages, &msg).await
-            }
-            MessageCommand::AppendChannelData(data) => {
-                messages::append_channel_data(self.flash, &self.regions.messages, &data).await
-            }
-            MessageCommand::Consume => {
-                let count = messages::take_pending_consumes();
-                self.consume_messages(count).await;
-            }
-            MessageCommand::Clear => messages::clear(self.flash, &self.regions.messages).await,
-        }
-    }
-
-    async fn consume_messages(&mut self, count: u32) {
-        for _ in 0..count {
-            messages::consume(self.flash, &self.regions.messages).await;
-        }
+    async fn sync_messages(&mut self, ignore_ble_connected: bool) {
+        messages::sync(self.flash, &self.regions.messages, ignore_ble_connected).await;
     }
 
     async fn serve_advert(&mut self, request: FetchRequest) {
@@ -290,6 +253,7 @@ where
         adverts::drain_save_requests();
         self.save_adverts().await;
         self.save_bonds().await;
+        self.sync_messages(true).await;
         storage::complete_flush();
     }
 
@@ -348,11 +312,6 @@ async fn run_loop<S: Stores>(stores: &mut S) -> StorageExit {
 
     loop {
         bump_storage_heartbeat();
-        // Drain consume requests even if their wake-up message was dropped.
-        let consumes = messages::take_pending_consumes();
-        if consumes > 0 {
-            stores.consume_messages(consumes).await;
-        }
 
         let advert_fut = select(
             adverts::wait_save_request(),
@@ -361,7 +320,7 @@ async fn run_loop<S: Stores>(stores: &mut S) -> StorageExit {
         let select5_fut = select5(
             config::wait_save_request(),
             contacts::wait_save_request(),
-            messages::next_command(),
+            messages::wait_sync(),
             advert_fut,
             bonds::wait_save_request(),
         );
@@ -387,7 +346,7 @@ async fn run_loop<S: Stores>(stores: &mut S) -> StorageExit {
                         contacts::drain_save_requests();
                         stores.save_contacts().await;
                     }
-                    Either5::Third(command) => stores.handle_message(command).await,
+                    Either5::Third(()) => stores.sync_messages(false).await,
                     Either5::Fourth(event) => match event {
                         Either::First(_) => {
                             // New contacts are rare; batch a discovery burst.
