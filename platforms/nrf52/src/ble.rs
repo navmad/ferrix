@@ -196,6 +196,7 @@ pub async fn contact_task() -> ! {
                     }
                 });
                 if removed {
+                    ferrix_core::ecdh::evict_peer(&pub_key);
                     ferrix_core::storage::adverts::forget(&pub_key);
                     ferrix_core::storage::contacts::queue_remove(pub_key).await;
                 }

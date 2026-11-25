@@ -10,6 +10,7 @@ pub mod airtime;
 pub mod battery;
 pub mod command;
 pub mod companion;
+pub mod ecdh;
 pub mod engine;
 pub mod gps;
 #[cfg(test)]

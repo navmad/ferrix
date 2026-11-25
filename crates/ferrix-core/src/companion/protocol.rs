@@ -288,16 +288,23 @@ pub fn handle_keepalive_ack(crc: u32) -> bool {
     })
 }
 
+fn shared_secret_for_keypair(
+    pub_key: &[u8; 32],
+    prv_key: &[u8; 64],
+    peer: &[u8; 32],
+) -> Option<[u8; 32]> {
+    if pub_key[0] == 0x00 || pub_key[0] == 0xFF {
+        return None;
+    }
+    crate::ecdh::shared_secret(prv_key, peer)
+}
+
 fn send_keepalive(tag: u32, dest_key: &[u8; 32], expected_ack: u32) -> bool {
-    let callsign = crate::state::NODE_CALLSIGN.lock(|c| c.borrow().clone());
     let private_key = crate::state::current_private_key();
     let public_key = crate::state::current_public_key();
-    let identity = meshcore_wire::identity::LocalIdentity::from_private(
-        callsign.as_str(),
-        &private_key,
-    );
-    let Some(id) = identity else { return false };
-    let Some(secret) = id.shared_secret(dest_key) else { return false };
+    let Some(secret) = shared_secret_for_keypair(&public_key, &private_key, dest_key) else {
+        return false;
+    };
     let contact = crate::state::DISCOVERED_CONTACTS.lock(|c| {
         c.borrow()
             .iter()
@@ -1731,73 +1738,71 @@ impl<'a> CompanionNode<'a> {
                     // Unknown contacts use a zero-hop direct anon request.
                     let (out_path_len, out_path) =
                         contact.unwrap_or((0, [0u8; 64]));
-                    let identity = meshcore_wire::identity::LocalIdentity::from_private(
-                        self.callsign.as_str(),
+                    if let Some(secret) = shared_secret_for_keypair(
+                        &self.public_key,
                         &self.private_key,
-                    );
-                    if let Some(id) = identity {
-                        if let Some(secret) = id.shared_secret(&dest_key) {
-                            let tag = next_tag();
-                            let mut plain = heapless::Vec::<u8, 144>::new();
-                            let _ = plain.extend_from_slice(&tag.to_le_bytes());
-                            let _ = plain.extend_from_slice(data);
-                            if let Ok(anon) =
-                                AnonReqPacket::new(dest_key[0], self.public_key, &plain)
-                            {
-                                let direct = out_path_len != 0xFF
-                                    && Packet::is_valid_path_len(out_path_len);
-                                let route = if direct {
-                                    ROUTE_TYPE_DIRECT
+                        &dest_key,
+                    ) {
+                        let tag = next_tag();
+                        let mut plain = heapless::Vec::<u8, 144>::new();
+                        let _ = plain.extend_from_slice(&tag.to_le_bytes());
+                        let _ = plain.extend_from_slice(data);
+                        if let Ok(anon) =
+                            AnonReqPacket::new(dest_key[0], self.public_key, &plain)
+                        {
+                            let direct = out_path_len != 0xFF
+                                && Packet::is_valid_path_len(out_path_len);
+                            let route = if direct {
+                                ROUTE_TYPE_DIRECT
+                            } else {
+                                ROUTE_TYPE_FLOOD
+                            };
+                            if let Ok(mut pkt) = anon.to_packet(&secret, route) {
+                                if direct {
+                                    pkt.path_len = out_path_len;
+                                    let pn = pkt.path_byte_len();
+                                    pkt.path[..pn].copy_from_slice(&out_path[..pn]);
                                 } else {
-                                    ROUTE_TYPE_FLOOD
-                                };
-                                if let Ok(mut pkt) = anon.to_packet(&secret, route) {
-                                    if direct {
-                                        pkt.path_len = out_path_len;
-                                        let pn = pkt.path_byte_len();
-                                        pkt.path[..pn].copy_from_slice(&out_path[..pn]);
-                                    } else {
-                                        pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
-                                        apply_flood_scope(&mut pkt);
-                                    }
-                                    let mut buf = [0u8; 255];
-                                    if let Ok(n) = pkt.write_to(&mut buf) {
-                                        let mut raw = heapless::Vec::<u8, 255>::new();
-                                        if raw.extend_from_slice(&buf[..n]).is_ok()
-                                            && crate::command::USB_COMMAND_CHANNEL
-                                                .try_send(
-                                                    crate::command::UsbCommand::SendRawPacket {
-                                                        raw,
-                                                    },
-                                                )
-                                                .is_ok()
-                                        {
-                                            let (sf, bw_khz, cr) =
-                                                crate::state::RADIO_SETTINGS.lock(|r| {
-                                                    let s = r.borrow();
-                                                    (s.sf, s.bw_khz, s.cr)
-                                                });
-                                            let air_ms = crate::airtime::estimate_airtime_ms(
-                                                n,
-                                                sf,
-                                                bw_khz,
-                                                cr,
-                                                crate::scheduler::preamble_for(sf),
-                                            );
-                                            let hops = if direct {
-                                                (out_path_len & 63) as u32
-                                            } else {
-                                                0
-                                            };
-                                            let est_timeout = if direct {
-                                                500 + (air_ms * 6 + 250) * (hops + 1)
-                                            } else {
-                                                500 + 16 * air_ms
-                                            };
-                                            clear_pending_reqs();
-                                            note_pending_req(tag, dest_key);
-                                            reply = Some((direct, tag, est_timeout));
-                                        }
+                                    pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
+                                    apply_flood_scope(&mut pkt);
+                                }
+                                let mut buf = [0u8; 255];
+                                if let Ok(n) = pkt.write_to(&mut buf) {
+                                    let mut raw = heapless::Vec::<u8, 255>::new();
+                                    if raw.extend_from_slice(&buf[..n]).is_ok()
+                                        && crate::command::USB_COMMAND_CHANNEL
+                                            .try_send(
+                                                crate::command::UsbCommand::SendRawPacket {
+                                                    raw,
+                                                },
+                                            )
+                                            .is_ok()
+                                    {
+                                        let (sf, bw_khz, cr) =
+                                            crate::state::RADIO_SETTINGS.lock(|r| {
+                                                let s = r.borrow();
+                                                (s.sf, s.bw_khz, s.cr)
+                                            });
+                                        let air_ms = crate::airtime::estimate_airtime_ms(
+                                            n,
+                                            sf,
+                                            bw_khz,
+                                            cr,
+                                            crate::scheduler::preamble_for(sf),
+                                        );
+                                        let hops = if direct {
+                                            (out_path_len & 63) as u32
+                                        } else {
+                                            0
+                                        };
+                                        let est_timeout = if direct {
+                                            500 + (air_ms * 6 + 250) * (hops + 1)
+                                        } else {
+                                            500 + 16 * air_ms
+                                        };
+                                        clear_pending_reqs();
+                                        note_pending_req(tag, dest_key);
+                                        reply = Some((direct, tag, est_timeout));
                                     }
                                 }
                             }
@@ -2342,10 +2347,10 @@ impl<'a> CompanionNode<'a> {
                     SIGN_BUFFER.lock(|b| {
                         let data = b.borrow();
                         if !data.is_empty() {
-                            let private_key = crate::state::current_private_key();
-                            if let Some(id) = meshcore_wire::identity::LocalIdentity::from_private(
+                            if let Some(id) = meshcore_wire::identity::LocalIdentity::from_keypair(
                                 self.callsign.as_str(),
-                                &private_key,
+                                &self.public_key,
+                                &self.private_key,
                             ) {
                                 signature = Some(id.sign(&data));
                             }
@@ -2373,10 +2378,10 @@ impl<'a> CompanionNode<'a> {
                 // return the signed advert blob retained when the contact was
                 // discovered, as MeshCore does.
                 if payload.len() < 33 {
-                    let private_key = crate::state::current_private_key();
-                    let id = meshcore_wire::identity::LocalIdentity::from_private(
+                    let id = meshcore_wire::identity::LocalIdentity::from_keypair(
                         self.callsign.as_str(),
-                        &private_key,
+                        &self.public_key,
+                        &self.private_key,
                     );
                     let mut sent = false;
                     if let Some(id) = id {
@@ -2691,109 +2696,107 @@ impl<'a> CompanionNode<'a> {
                             .map(|ct| (ct.out_path_len, ct.out_path, ct.contact_type, ct.sync_since))
                     });
                     if let Some((out_path_len, out_path, contact_type, sync_since)) = contact {
-                        let identity = meshcore_wire::identity::LocalIdentity::from_private(
-                            self.callsign.as_str(),
+                        if let Some(secret) = shared_secret_for_keypair(
+                            &self.public_key,
                             &self.private_key,
-                        );
-                        if let Some(id) = identity {
-                            if let Some(secret) = id.shared_secret(&dest_key) {
-                                let tag = next_tag();
-                                let pw = &password.as_bytes()[..password.len().min(15)];
-                                let mut plain = [0u8; 4 + 4 + 15];
-                                plain[..4].copy_from_slice(&tag.to_le_bytes());
-                                let n = if contact_type
-                                    == meshcore_wire::packets::advert::ADV_TYPE_ROOM
-                                {
-                                    // [tag][sync_since][password]
-                                    plain[4..8].copy_from_slice(&sync_since.to_le_bytes());
-                                    plain[8..8 + pw.len()].copy_from_slice(pw);
-                                    8 + pw.len()
+                            &dest_key,
+                        ) {
+                            let tag = next_tag();
+                            let pw = &password.as_bytes()[..password.len().min(15)];
+                            let mut plain = [0u8; 4 + 4 + 15];
+                            plain[..4].copy_from_slice(&tag.to_le_bytes());
+                            let n = if contact_type
+                                == meshcore_wire::packets::advert::ADV_TYPE_ROOM
+                            {
+                                // [tag][sync_since][password]
+                                plain[4..8].copy_from_slice(&sync_since.to_le_bytes());
+                                plain[8..8 + pw.len()].copy_from_slice(pw);
+                                8 + pw.len()
+                            } else {
+                                plain[4..4 + pw.len()].copy_from_slice(pw);
+                                4 + pw.len()
+                            };
+                            if let Ok(anon) = AnonReqPacket::new(
+                                dest_key[0],
+                                self.public_key,
+                                &plain[..n],
+                            ) {
+                                let direct = out_path_len != 0xFF
+                                    && Packet::is_valid_path_len(out_path_len);
+                                let route = if direct {
+                                    ROUTE_TYPE_DIRECT
                                 } else {
-                                    plain[4..4 + pw.len()].copy_from_slice(pw);
-                                    4 + pw.len()
+                                    ROUTE_TYPE_FLOOD
                                 };
-                                if let Ok(anon) = AnonReqPacket::new(
-                                    dest_key[0],
-                                    self.public_key,
-                                    &plain[..n],
-                                ) {
-                                    let direct = out_path_len != 0xFF
-                                        && Packet::is_valid_path_len(out_path_len);
-                                    let route = if direct {
-                                        ROUTE_TYPE_DIRECT
+                                if let Ok(mut pkt) = anon.to_packet(&secret, route) {
+                                    if direct {
+                                        pkt.path_len = out_path_len;
+                                        let pn = pkt.path_byte_len();
+                                        pkt.path[..pn].copy_from_slice(&out_path[..pn]);
                                     } else {
-                                        ROUTE_TYPE_FLOOD
-                                    };
-                                    if let Ok(mut pkt) = anon.to_packet(&secret, route) {
-                                        if direct {
-                                            pkt.path_len = out_path_len;
-                                            let pn = pkt.path_byte_len();
-                                            pkt.path[..pn].copy_from_slice(&out_path[..pn]);
-                                        } else {
-                                            pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
-                                            apply_flood_scope(&mut pkt);
-                                        }
-                                        let mut buf = [0u8; 255];
-                                        if let Ok(n) = pkt.write_to(&mut buf) {
-                                            let mut raw = heapless::Vec::<u8, 255>::new();
-                                            if raw.extend_from_slice(&buf[..n]).is_ok()
-                                                && crate::command::USB_COMMAND_CHANNEL
-                                                    .try_send(
-                                                        crate::command::UsbCommand::SendRawPacket {
-                                                            raw,
-                                                        },
-                                                    )
-                                                    .is_ok()
-                                            {
-                                                let (sf, bw_khz, cr) =
-                                                    crate::state::RADIO_SETTINGS.lock(|r| {
-                                                        let s = r.borrow();
-                                                        (s.sf, s.bw_khz, s.cr)
-                                                    });
-                                                let air_ms = crate::airtime::estimate_airtime_ms(
-                                                    n,
-                                                    sf,
-                                                    bw_khz,
-                                                    cr,
-                                                    crate::scheduler::preamble_for(sf),
-                                                );
-                                                let hops = if direct {
-                                                    (out_path_len & 63) as u32
-                                                } else {
-                                                    0
-                                                };
-                                                let est_timeout = if direct {
-                                                    500 + (air_ms * 6 + 250) * (hops + 1)
-                                                } else {
-                                                    500 + 16 * air_ms
-                                                };
-                                                // Login replies are flooded even for a
-                                                // direct request; give clients more
-                                                // time than the ACK formula.
-                                                let est_timeout = est_timeout.max(8000);
-                                                clear_pending_reqs();
-                                                note_pending_login(dest_key);
-                                                LOGIN_TX_COUNT.fetch_add(1, Ordering::Relaxed);
-                                                LOGIN_TX_TAG.store(tag, Ordering::Relaxed);
-                                                LOGIN_TX_KEY.store(
-                                                    u32::from_le_bytes([
-                                                        dest_key[0],
-                                                        dest_key[1],
-                                                        dest_key[2],
-                                                        dest_key[3],
-                                                    ]),
-                                                    Ordering::Relaxed,
-                                                );
-                                                LOGIN_TX_FLOOD.store(!direct, Ordering::Relaxed);
-                                                LOGIN_RESULT.store(0, Ordering::Relaxed);
-                                                let ack_tag = u32::from_le_bytes([
+                                        pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
+                                        apply_flood_scope(&mut pkt);
+                                    }
+                                    let mut buf = [0u8; 255];
+                                    if let Ok(n) = pkt.write_to(&mut buf) {
+                                        let mut raw = heapless::Vec::<u8, 255>::new();
+                                        if raw.extend_from_slice(&buf[..n]).is_ok()
+                                            && crate::command::USB_COMMAND_CHANNEL
+                                                .try_send(
+                                                    crate::command::UsbCommand::SendRawPacket {
+                                                        raw,
+                                                    },
+                                                )
+                                                .is_ok()
+                                        {
+                                            let (sf, bw_khz, cr) =
+                                                crate::state::RADIO_SETTINGS.lock(|r| {
+                                                    let s = r.borrow();
+                                                    (s.sf, s.bw_khz, s.cr)
+                                                });
+                                            let air_ms = crate::airtime::estimate_airtime_ms(
+                                                n,
+                                                sf,
+                                                bw_khz,
+                                                cr,
+                                                crate::scheduler::preamble_for(sf),
+                                            );
+                                            let hops = if direct {
+                                                (out_path_len & 63) as u32
+                                            } else {
+                                                0
+                                            };
+                                            let est_timeout = if direct {
+                                                500 + (air_ms * 6 + 250) * (hops + 1)
+                                            } else {
+                                                500 + 16 * air_ms
+                                            };
+                                            // Login replies are flooded even for a
+                                            // direct request; give clients more
+                                            // time than the ACK formula.
+                                            let est_timeout = est_timeout.max(8000);
+                                            clear_pending_reqs();
+                                            note_pending_login(dest_key);
+                                            LOGIN_TX_COUNT.fetch_add(1, Ordering::Relaxed);
+                                            LOGIN_TX_TAG.store(tag, Ordering::Relaxed);
+                                            LOGIN_TX_KEY.store(
+                                                u32::from_le_bytes([
                                                     dest_key[0],
                                                     dest_key[1],
                                                     dest_key[2],
                                                     dest_key[3],
-                                                ]);
-                                                reply = Some((direct, ack_tag, est_timeout));
-                                            }
+                                                ]),
+                                                Ordering::Relaxed,
+                                            );
+                                            LOGIN_TX_FLOOD.store(!direct, Ordering::Relaxed);
+                                            LOGIN_RESULT.store(0, Ordering::Relaxed);
+                                            let ack_tag = u32::from_le_bytes([
+                                                dest_key[0],
+                                                dest_key[1],
+                                                dest_key[2],
+                                                dest_key[3],
+                                            ]);
+                                            reply = Some((direct, ack_tag, est_timeout));
                                         }
                                     }
                                 }
@@ -2867,81 +2870,78 @@ impl<'a> CompanionNode<'a> {
                             .map(|ct| (ct.out_path_len, ct.out_path))
                     });
                     if let Some((out_path_len, out_path)) = contact {
-                        let identity =
-                            meshcore_wire::identity::LocalIdentity::from_private(
-                                self.callsign.as_str(),
-                                &self.private_key,
+                        if let Some(secret) = shared_secret_for_keypair(
+                            &self.public_key,
+                            &self.private_key,
+                            &dest_key,
+                        ) {
+                            let tag = next_tag();
+                            let mut plain = [0u8; 13];
+                            plain[..4].copy_from_slice(&tag.to_le_bytes());
+                            plain[4] = REQ_TYPE_GET_TELEMETRY_DATA;
+                            plain[9..13].copy_from_slice(
+                                &tag.wrapping_mul(0x9E37_79B1).to_le_bytes(),
                             );
-                        if let Some(id) = identity {
-                            if let Some(secret) = id.shared_secret(&dest_key) {
-                                let tag = next_tag();
-                                let mut plain = [0u8; 13];
-                                plain[..4].copy_from_slice(&tag.to_le_bytes());
-                                plain[4] = REQ_TYPE_GET_TELEMETRY_DATA;
-                                plain[9..13].copy_from_slice(
-                                    &tag.wrapping_mul(0x9E37_79B1).to_le_bytes(),
-                                );
-                                if let Ok(addressed) = AddressedPacket::new(
-                                    dest_key[0],
-                                    self.public_key[0],
-                                    &plain,
-                                ) {
-                                    let direct = out_path_len != 0xFF
-                                        && Packet::is_valid_path_len(out_path_len);
-                                    let route = if direct {
-                                        ROUTE_TYPE_DIRECT
+                            if let Ok(addressed) = AddressedPacket::new(
+                                dest_key[0],
+                                self.public_key[0],
+                                &plain,
+                            ) {
+                                let direct = out_path_len != 0xFF
+                                    && Packet::is_valid_path_len(out_path_len);
+                                let route = if direct {
+                                    ROUTE_TYPE_DIRECT
+                                } else {
+                                    ROUTE_TYPE_FLOOD
+                                };
+                                if let Ok(mut pkt) =
+                                    addressed.to_packet(PAYLOAD_TYPE_REQ, route, &secret)
+                                {
+                                    if direct {
+                                        pkt.path_len = out_path_len;
+                                        let n = pkt.path_byte_len();
+                                        pkt.path[..n].copy_from_slice(&out_path[..n]);
                                     } else {
-                                        ROUTE_TYPE_FLOOD
-                                    };
-                                    if let Ok(mut pkt) =
-                                        addressed.to_packet(PAYLOAD_TYPE_REQ, route, &secret)
-                                    {
-                                        if direct {
-                                            pkt.path_len = out_path_len;
-                                            let n = pkt.path_byte_len();
-                                            pkt.path[..n].copy_from_slice(&out_path[..n]);
-                                        } else {
-                                            pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
-                                            apply_flood_scope(&mut pkt);
-                                        }
-                                        let mut buf = [0u8; 255];
-                                        if let Ok(n) = pkt.write_to(&mut buf) {
-                                            let mut raw = heapless::Vec::<u8, 255>::new();
-                                            if raw.extend_from_slice(&buf[..n]).is_ok()
-                                                && crate::command::USB_COMMAND_CHANNEL
-                                                    .try_send(
-                                                        crate::command::UsbCommand::SendRawPacket {
-                                                            raw,
-                                                        },
-                                                    )
-                                                    .is_ok()
-                                            {
-                                                let (sf, bw_khz, cr) =
-                                                    crate::state::RADIO_SETTINGS.lock(|r| {
-                                                        let s = r.borrow();
-                                                        (s.sf, s.bw_khz, s.cr)
-                                                    });
-                                                let air_ms = crate::airtime::estimate_airtime_ms(
-                                                    n,
-                                                    sf,
-                                                    bw_khz,
-                                                    cr,
-                                                    crate::scheduler::preamble_for(sf),
-                                                );
-                                                let hops = if direct {
-                                                    (out_path_len & 63) as u32
-                                                } else {
-                                                    0
-                                                };
-                                                let est_timeout = if direct {
-                                                    500 + (air_ms * 6 + 250) * (hops + 1)
-                                                } else {
-                                                    500 + 16 * air_ms
-                                                };
-                                                clear_pending_reqs();
-                                                note_pending_telemetry(tag, dest_key);
-                                                reply = Some((direct, tag, est_timeout.max(6000)));
-                                            }
+                                        pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
+                                        apply_flood_scope(&mut pkt);
+                                    }
+                                    let mut buf = [0u8; 255];
+                                    if let Ok(n) = pkt.write_to(&mut buf) {
+                                        let mut raw = heapless::Vec::<u8, 255>::new();
+                                        if raw.extend_from_slice(&buf[..n]).is_ok()
+                                            && crate::command::USB_COMMAND_CHANNEL
+                                                .try_send(
+                                                    crate::command::UsbCommand::SendRawPacket {
+                                                        raw,
+                                                    },
+                                                )
+                                                .is_ok()
+                                        {
+                                            let (sf, bw_khz, cr) =
+                                                crate::state::RADIO_SETTINGS.lock(|r| {
+                                                    let s = r.borrow();
+                                                    (s.sf, s.bw_khz, s.cr)
+                                                });
+                                            let air_ms = crate::airtime::estimate_airtime_ms(
+                                                n,
+                                                sf,
+                                                bw_khz,
+                                                cr,
+                                                crate::scheduler::preamble_for(sf),
+                                            );
+                                            let hops = if direct {
+                                                (out_path_len & 63) as u32
+                                            } else {
+                                                0
+                                            };
+                                            let est_timeout = if direct {
+                                                500 + (air_ms * 6 + 250) * (hops + 1)
+                                            } else {
+                                                500 + 16 * air_ms
+                                            };
+                                            clear_pending_reqs();
+                                            note_pending_telemetry(tag, dest_key);
+                                            reply = Some((direct, tag, est_timeout.max(6000)));
                                         }
                                     }
                                 }
@@ -2993,65 +2993,62 @@ impl<'a> CompanionNode<'a> {
                     let known = crate::state::DISCOVERED_CONTACTS
                         .lock(|c| c.borrow().iter().any(|ct| ct.pub_key == dest_key));
                     if known {
-                        let identity =
-                            meshcore_wire::identity::LocalIdentity::from_private(
-                                self.callsign.as_str(),
-                                &self.private_key,
+                        if let Some(secret) = shared_secret_for_keypair(
+                            &self.public_key,
+                            &self.private_key,
+                            &dest_key,
+                        ) {
+                            let tag = next_tag();
+                            let mut req = [0u8; 9];
+                            req[0] = REQ_TYPE_GET_TELEMETRY_DATA;
+                            req[1] = !0x01; // inverse BASE permission mask
+                            req[5..9].copy_from_slice(
+                                &tag.wrapping_mul(0x9E37_79B1).to_le_bytes(),
                             );
-                        if let Some(id) = identity {
-                            if let Some(secret) = id.shared_secret(&dest_key) {
-                                let tag = next_tag();
-                                let mut req = [0u8; 9];
-                                req[0] = REQ_TYPE_GET_TELEMETRY_DATA;
-                                req[1] = !0x01; // inverse BASE permission mask
-                                req[5..9].copy_from_slice(
-                                    &tag.wrapping_mul(0x9E37_79B1).to_le_bytes(),
-                                );
-                                let mut plain = [0u8; 13];
-                                plain[..4].copy_from_slice(&tag.to_le_bytes());
-                                plain[4..].copy_from_slice(&req);
-                                if let Ok(addressed) = AddressedPacket::new(
-                                    dest_key[0],
-                                    self.public_key[0],
-                                    &plain,
+                            let mut plain = [0u8; 13];
+                            plain[..4].copy_from_slice(&tag.to_le_bytes());
+                            plain[4..].copy_from_slice(&req);
+                            if let Ok(addressed) = AddressedPacket::new(
+                                dest_key[0],
+                                self.public_key[0],
+                                &plain,
+                            ) {
+                                // Discovery always floods.
+                                if let Ok(mut pkt) = addressed.to_packet(
+                                    PAYLOAD_TYPE_REQ,
+                                    ROUTE_TYPE_FLOOD,
+                                    &secret,
                                 ) {
-                                    // Discovery always floods.
-                                    if let Ok(mut pkt) = addressed.to_packet(
-                                        PAYLOAD_TYPE_REQ,
-                                        ROUTE_TYPE_FLOOD,
-                                        &secret,
-                                    ) {
-                                        pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
-                                        apply_flood_scope(&mut pkt);
-                                        let mut buf = [0u8; 255];
-                                        if let Ok(n) = pkt.write_to(&mut buf) {
-                                            let mut raw = heapless::Vec::<u8, 255>::new();
-                                            if raw.extend_from_slice(&buf[..n]).is_ok()
-                                                && crate::command::USB_COMMAND_CHANNEL
-                                                    .try_send(
-                                                        crate::command::UsbCommand::SendRawPacket {
-                                                            raw,
-                                                        },
-                                                    )
-                                                    .is_ok()
-                                            {
-                                                let (sf, bw_khz, cr) =
-                                                    crate::state::RADIO_SETTINGS.lock(|r| {
-                                                        let s = r.borrow();
-                                                        (s.sf, s.bw_khz, s.cr)
-                                                    });
-                                                let air_ms = crate::airtime::estimate_airtime_ms(
-                                                    n,
-                                                    sf,
-                                                    bw_khz,
-                                                    cr,
-                                                    crate::scheduler::preamble_for(sf),
-                                                );
-                                                let est_timeout = 500 + 16 * air_ms;
-                                                clear_pending_reqs();
-                                                note_pending_discovery(tag, dest_key);
-                                                reply = Some((tag, est_timeout.max(15000)));
-                                            }
+                                    pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
+                                    apply_flood_scope(&mut pkt);
+                                    let mut buf = [0u8; 255];
+                                    if let Ok(n) = pkt.write_to(&mut buf) {
+                                        let mut raw = heapless::Vec::<u8, 255>::new();
+                                        if raw.extend_from_slice(&buf[..n]).is_ok()
+                                            && crate::command::USB_COMMAND_CHANNEL
+                                                .try_send(
+                                                    crate::command::UsbCommand::SendRawPacket {
+                                                        raw,
+                                                    },
+                                                )
+                                                .is_ok()
+                                        {
+                                            let (sf, bw_khz, cr) =
+                                                crate::state::RADIO_SETTINGS.lock(|r| {
+                                                    let s = r.borrow();
+                                                    (s.sf, s.bw_khz, s.cr)
+                                                });
+                                            let air_ms = crate::airtime::estimate_airtime_ms(
+                                                n,
+                                                sf,
+                                                bw_khz,
+                                                cr,
+                                                crate::scheduler::preamble_for(sf),
+                                            );
+                                            let est_timeout = 500 + 16 * air_ms;
+                                            clear_pending_reqs();
+                                            note_pending_discovery(tag, dest_key);
+                                            reply = Some((tag, est_timeout.max(15000)));
                                         }
                                     }
                                 }
@@ -3089,83 +3086,81 @@ impl<'a> CompanionNode<'a> {
                             .map(|ct| (ct.out_path_len, ct.out_path))
                     });
                     if let Some((out_path_len, out_path)) = contact {
-                        let identity = meshcore_wire::identity::LocalIdentity::from_private(
-                            self.callsign.as_str(),
+                        if let Some(secret) = shared_secret_for_keypair(
+                            &self.public_key,
                             &self.private_key,
-                        );
-                        if let Some(id) = identity {
-                            if let Some(secret) = id.shared_secret(&dest_key) {
-                                let tag = next_tag();
-                                let mut plain = heapless::Vec::<u8, 184>::new();
-                                let _ = plain.extend_from_slice(&tag.to_le_bytes());
-                                let _ = plain.extend_from_slice(req_data);
-                                if let Ok(addressed) = AddressedPacket::new(
-                                    dest_key[0],
-                                    self.public_key[0],
-                                    &plain,
-                                ) {
-                                    let direct = out_path_len != 0xFF
-                                        && Packet::is_valid_path_len(out_path_len);
-                                    let route = if direct {
-                                        ROUTE_TYPE_DIRECT
+                            &dest_key,
+                        ) {
+                            let tag = next_tag();
+                            let mut plain = heapless::Vec::<u8, 184>::new();
+                            let _ = plain.extend_from_slice(&tag.to_le_bytes());
+                            let _ = plain.extend_from_slice(req_data);
+                            if let Ok(addressed) = AddressedPacket::new(
+                                dest_key[0],
+                                self.public_key[0],
+                                &plain,
+                            ) {
+                                let direct = out_path_len != 0xFF
+                                    && Packet::is_valid_path_len(out_path_len);
+                                let route = if direct {
+                                    ROUTE_TYPE_DIRECT
+                                } else {
+                                    ROUTE_TYPE_FLOOD
+                                };
+                                if let Ok(mut pkt) =
+                                    addressed.to_packet(PAYLOAD_TYPE_REQ, route, &secret)
+                                {
+                                    if direct {
+                                        pkt.path_len = out_path_len;
+                                        let n = pkt.path_byte_len();
+                                        pkt.path[..n].copy_from_slice(&out_path[..n]);
                                     } else {
-                                        ROUTE_TYPE_FLOOD
-                                    };
-                                    if let Ok(mut pkt) =
-                                        addressed.to_packet(PAYLOAD_TYPE_REQ, route, &secret)
-                                    {
-                                        if direct {
-                                            pkt.path_len = out_path_len;
-                                            let n = pkt.path_byte_len();
-                                            pkt.path[..n].copy_from_slice(&out_path[..n]);
-                                        } else {
-                                            pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
-                                            apply_flood_scope(&mut pkt);
-                                        }
-                                        let mut buf = [0u8; 255];
-                                        if let Ok(n) = pkt.write_to(&mut buf) {
-                                            let mut raw = heapless::Vec::<u8, 255>::new();
-                                            if raw.extend_from_slice(&buf[..n]).is_ok()
-                                                && crate::command::USB_COMMAND_CHANNEL
-                                                    .try_send(
-                                                        crate::command::UsbCommand::SendRawPacket {
-                                                            raw,
-                                                        },
-                                                    )
-                                                    .is_ok()
-                                            {
-                                                let (sf, bw_khz, cr) =
-                                                    crate::state::RADIO_SETTINGS.lock(|r| {
-                                                        let s = r.borrow();
-                                                        (s.sf, s.bw_khz, s.cr)
-                                                    });
-                                                let air_ms = crate::airtime::estimate_airtime_ms(
-                                                    n,
-                                                    sf,
-                                                    bw_khz,
-                                                    cr,
-                                                    crate::scheduler::preamble_for(sf),
-                                                );
-                                                let hops = if direct {
-                                                    (out_path_len & 63) as u32
-                                                } else {
-                                                    0
-                                                };
-                                                let est_timeout = if direct {
-                                                    500 + (air_ms * 6 + 250) * (hops + 1)
-                                                } else {
-                                                    500 + 16 * air_ms
-                                                };
-                                                REQ_TX_COUNT.fetch_add(1, Ordering::Relaxed);
-                                                REQ_TX_TAG.store(tag, Ordering::Relaxed);
-                                                REQ_TX_TYPE.store(
-                                                    req_data.first().copied().unwrap_or(0),
-                                                    Ordering::Relaxed,
-                                                );
-                                                clear_pending_reqs();
-                                                note_pending_req(tag, dest_key);
-                                                reply = Some((direct, tag, est_timeout.max(6000)));
-                                            }
+                                        pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
+                                        apply_flood_scope(&mut pkt);
+                                    }
+                                    let mut buf = [0u8; 255];
+                                    if let Ok(n) = pkt.write_to(&mut buf) {
+                                        let mut raw = heapless::Vec::<u8, 255>::new();
+                                        if raw.extend_from_slice(&buf[..n]).is_ok()
+                                            && crate::command::USB_COMMAND_CHANNEL
+                                                .try_send(
+                                                    crate::command::UsbCommand::SendRawPacket {
+                                                        raw,
+                                                    },
+                                                )
+                                                .is_ok()
+                                        {
+                                            let (sf, bw_khz, cr) =
+                                                crate::state::RADIO_SETTINGS.lock(|r| {
+                                                    let s = r.borrow();
+                                                    (s.sf, s.bw_khz, s.cr)
+                                                });
+                                            let air_ms = crate::airtime::estimate_airtime_ms(
+                                                n,
+                                                sf,
+                                                bw_khz,
+                                                cr,
+                                                crate::scheduler::preamble_for(sf),
+                                            );
+                                            let hops = if direct {
+                                                (out_path_len & 63) as u32
+                                            } else {
+                                                0
+                                            };
+                                            let est_timeout = if direct {
+                                                500 + (air_ms * 6 + 250) * (hops + 1)
+                                            } else {
+                                                500 + 16 * air_ms
+                                            };
+                                            REQ_TX_COUNT.fetch_add(1, Ordering::Relaxed);
+                                            REQ_TX_TAG.store(tag, Ordering::Relaxed);
+                                            REQ_TX_TYPE.store(
+                                                req_data.first().copied().unwrap_or(0),
+                                                Ordering::Relaxed,
+                                            );
+                                            clear_pending_reqs();
+                                            note_pending_req(tag, dest_key);
+                                            reply = Some((direct, tag, est_timeout.max(6000)));
                                         }
                                     }
                                 }
@@ -3203,79 +3198,77 @@ impl<'a> CompanionNode<'a> {
                             .map(|ct| (ct.out_path_len, ct.out_path))
                     });
                     if let Some((out_path_len, out_path)) = contact {
-                        let identity = meshcore_wire::identity::LocalIdentity::from_private(
-                            self.callsign.as_str(),
+                        if let Some(secret) = shared_secret_for_keypair(
+                            &self.public_key,
                             &self.private_key,
-                        );
-                        if let Some(id) = identity {
-                            if let Some(secret) = id.shared_secret(&dest_key) {
-                                let tag = next_tag();
-                                let mut plain = [0u8; 13];
-                                plain[..4].copy_from_slice(&tag.to_le_bytes());
-                                plain[4] = REQ_TYPE_GET_STATUS;
-                                plain[9..13]
-                                    .copy_from_slice(&tag.wrapping_mul(0x9E37_79B1).to_le_bytes());
-                                if let Ok(addressed) = AddressedPacket::new(
-                                    dest_key[0],
-                                    self.public_key[0],
-                                    &plain,
-                                ) {
-                                    let direct = out_path_len != 0xFF
-                                        && Packet::is_valid_path_len(out_path_len);
-                                    let route = if direct {
-                                        ROUTE_TYPE_DIRECT
+                            &dest_key,
+                        ) {
+                            let tag = next_tag();
+                            let mut plain = [0u8; 13];
+                            plain[..4].copy_from_slice(&tag.to_le_bytes());
+                            plain[4] = REQ_TYPE_GET_STATUS;
+                            plain[9..13]
+                                .copy_from_slice(&tag.wrapping_mul(0x9E37_79B1).to_le_bytes());
+                            if let Ok(addressed) = AddressedPacket::new(
+                                dest_key[0],
+                                self.public_key[0],
+                                &plain,
+                            ) {
+                                let direct = out_path_len != 0xFF
+                                    && Packet::is_valid_path_len(out_path_len);
+                                let route = if direct {
+                                    ROUTE_TYPE_DIRECT
+                                } else {
+                                    ROUTE_TYPE_FLOOD
+                                };
+                                if let Ok(mut pkt) =
+                                    addressed.to_packet(PAYLOAD_TYPE_REQ, route, &secret)
+                                {
+                                    if direct {
+                                        pkt.path_len = out_path_len;
+                                        let n = pkt.path_byte_len();
+                                        pkt.path[..n].copy_from_slice(&out_path[..n]);
                                     } else {
-                                        ROUTE_TYPE_FLOOD
-                                    };
-                                    if let Ok(mut pkt) =
-                                        addressed.to_packet(PAYLOAD_TYPE_REQ, route, &secret)
-                                    {
-                                        if direct {
-                                            pkt.path_len = out_path_len;
-                                            let n = pkt.path_byte_len();
-                                            pkt.path[..n].copy_from_slice(&out_path[..n]);
-                                        } else {
-                                            pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
-                                            apply_flood_scope(&mut pkt);
-                                        }
-                                        let mut buf = [0u8; 255];
-                                        if let Ok(n) = pkt.write_to(&mut buf) {
-                                            let mut raw = heapless::Vec::<u8, 255>::new();
-                                            if raw.extend_from_slice(&buf[..n]).is_ok()
-                                                && crate::command::USB_COMMAND_CHANNEL
-                                                    .try_send(
-                                                        crate::command::UsbCommand::SendRawPacket {
-                                                            raw,
-                                                        },
-                                                    )
-                                                    .is_ok()
-                                            {
-                                                let (sf, bw_khz, cr) =
-                                                    crate::state::RADIO_SETTINGS.lock(|r| {
-                                                        let s = r.borrow();
-                                                        (s.sf, s.bw_khz, s.cr)
-                                                    });
-                                                let air_ms = crate::airtime::estimate_airtime_ms(
-                                                    n,
-                                                    sf,
-                                                    bw_khz,
-                                                    cr,
-                                                    crate::scheduler::preamble_for(sf),
-                                                );
-                                                let hops = if direct {
-                                                    (out_path_len & 63) as u32
-                                                } else {
-                                                    0
-                                                };
-                                                let est_timeout = if direct {
-                                                    500 + (air_ms * 6 + 250) * (hops + 1)
-                                                } else {
-                                                    500 + 16 * air_ms
-                                                };
-                                                clear_pending_reqs();
-                                                note_status(dest_key);
-                                                reply = Some((direct, tag, est_timeout));
-                                            }
+                                        pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
+                                        apply_flood_scope(&mut pkt);
+                                    }
+                                    let mut buf = [0u8; 255];
+                                    if let Ok(n) = pkt.write_to(&mut buf) {
+                                        let mut raw = heapless::Vec::<u8, 255>::new();
+                                        if raw.extend_from_slice(&buf[..n]).is_ok()
+                                            && crate::command::USB_COMMAND_CHANNEL
+                                                .try_send(
+                                                    crate::command::UsbCommand::SendRawPacket {
+                                                        raw,
+                                                    },
+                                                )
+                                                .is_ok()
+                                        {
+                                            let (sf, bw_khz, cr) =
+                                                crate::state::RADIO_SETTINGS.lock(|r| {
+                                                    let s = r.borrow();
+                                                    (s.sf, s.bw_khz, s.cr)
+                                                });
+                                            let air_ms = crate::airtime::estimate_airtime_ms(
+                                                n,
+                                                sf,
+                                                bw_khz,
+                                                cr,
+                                                crate::scheduler::preamble_for(sf),
+                                            );
+                                            let hops = if direct {
+                                                (out_path_len & 63) as u32
+                                            } else {
+                                                0
+                                            };
+                                            let est_timeout = if direct {
+                                                500 + (air_ms * 6 + 250) * (hops + 1)
+                                            } else {
+                                                500 + 16 * air_ms
+                                            };
+                                            clear_pending_reqs();
+                                            note_status(dest_key);
+                                            reply = Some((direct, tag, est_timeout));
                                         }
                                     }
                                 }
@@ -4894,6 +4887,135 @@ mod tests {
         set_autoadd(0, 0, 0);
         crate::state::DISCOVERED_CONTACTS.lock(|c| c.borrow_mut().clear());
         crate::state::clear_advert_paths();
+    }
+
+    #[test]
+    fn companion_tx_caches_ecdh_and_invalidates_on_key_import() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved_pub = crate::state::current_public_key();
+        let saved_prv = crate::state::current_private_key();
+        while crate::command::USB_COMMAND_CHANNEL.try_receive().is_ok() {}
+        crate::state::DISCOVERED_CONTACTS.lock(|c| c.borrow_mut().clear());
+        crate::ecdh::invalidate();
+
+        let local_a = meshcore_wire::identity::LocalIdentity::from_seed("NodeA", &[0x11; 32]);
+        let local_b = meshcore_wire::identity::LocalIdentity::from_seed("NodeB", &[0x22; 32]);
+        let peer = meshcore_wire::identity::LocalIdentity::from_seed("Peer", &[0x33; 32]);
+
+        crate::state::set_identity(*local_a.pub_key(), *local_a.private_key());
+        crate::state::DISCOVERED_CONTACTS.lock(|c| {
+            let mut cs = heapless::String::new();
+            let _ = cs.push_str("Peer");
+            let _ = c.borrow_mut().push(crate::types::DiscoveredContact {
+                pub_key: *peer.pub_key(),
+                callsign: cs,
+                node_id: peer.pub_key()[..4].try_into().unwrap(),
+                last_seen_epoch: 100,
+                rssi: -80,
+                snr: 5,
+                latitude: 0,
+                longitude: 0,
+                flags: 0,
+                contact_type: meshcore_wire::packets::advert::ADV_TYPE_REPEATER,
+                out_path: [0u8; 64],
+                out_path_len: 0xFF,
+                last_advert_ts: 100,
+                saved_hash: 0,
+                sync_since: 0,
+            });
+        });
+
+        let host = TestHost;
+        let mut node = CompanionNode::new(
+            "NodeA",
+            "TestBoard",
+            0,
+            *local_a.pub_key(),
+            *local_a.private_key(),
+            &host,
+        );
+
+        let mut status_req = [0u8; 33];
+        status_req[0] = CMD_SEND_STATUS_REQ;
+        status_req[1..33].copy_from_slice(peer.pub_key());
+
+        let (hits0, misses0) = crate::ecdh::stats();
+
+        // First status request: cache miss, encrypts with local_a <-> peer secret.
+        let mut resp1 = Vec::<u8, 32>::new();
+        poll_sync(node.handle_command(&status_req, |r| {
+            let _ = resp1.extend_from_slice(r);
+        }));
+        assert_eq!(resp1[0], RESP_CODE_SENT);
+        let (hits1, misses1) = crate::ecdh::stats();
+        assert_eq!(hits1, hits0);
+        assert_eq!(misses1, misses0 + 1);
+
+        let raw1 = match crate::command::USB_COMMAND_CHANNEL.try_receive().unwrap() {
+            crate::command::UsbCommand::SendRawPacket { raw } => raw,
+            _ => panic!("expected SendRawPacket"),
+        };
+        let pkt1 = Packet::read_from(&raw1).unwrap();
+        let secret_a = peer.shared_secret(local_a.pub_key()).unwrap();
+        assert!(AddressedPacket::decode(&pkt1.payload[..pkt1.payload_len], &secret_a).is_ok());
+
+        // Second status request: cache hit!
+        let mut resp2 = Vec::<u8, 32>::new();
+        poll_sync(node.handle_command(&status_req, |r| {
+            let _ = resp2.extend_from_slice(r);
+        }));
+        assert_eq!(resp2[0], RESP_CODE_SENT);
+        let (hits2, misses2) = crate::ecdh::stats();
+        assert_eq!(hits2, hits1 + 1);
+        assert_eq!(misses2, misses1);
+        let _ = crate::command::USB_COMMAND_CHANNEL.try_receive();
+
+        // Import new private key -> invalidates ECDH cache.
+        let mut import_cmd = [0u8; 65];
+        import_cmd[0] = CMD_IMPORT_PRIVATE_KEY;
+        import_cmd[1..65].copy_from_slice(local_b.private_key());
+        let mut import_resp = Vec::<u8, 8>::new();
+        poll_sync(node.handle_command(&import_cmd, |r| {
+            let _ = import_resp.extend_from_slice(r);
+        }));
+        assert_eq!(import_resp.as_slice(), &[RESP_CODE_OK]);
+        let _ = crate::command::USB_COMMAND_CHANNEL.try_receive();
+
+        // Next status request must miss cache and encrypt under local_b <-> peer secret.
+        let mut resp3 = Vec::<u8, 32>::new();
+        poll_sync(node.handle_command(&status_req, |r| {
+            let _ = resp3.extend_from_slice(r);
+        }));
+        assert_eq!(resp3[0], RESP_CODE_SENT);
+        let (hits3, misses3) = crate::ecdh::stats();
+        assert_eq!(hits3, hits2);
+        assert_eq!(misses3, misses2 + 1);
+
+        let raw3 = match crate::command::USB_COMMAND_CHANNEL.try_receive().unwrap() {
+            crate::command::UsbCommand::SendRawPacket { raw } => raw,
+            _ => panic!("expected SendRawPacket"),
+        };
+        let pkt3 = Packet::read_from(&raw3).unwrap();
+        let secret_b = peer.shared_secret(local_b.pub_key()).unwrap();
+        assert!(AddressedPacket::decode(&pkt3.payload[..pkt3.payload_len], &secret_b).is_ok());
+        assert!(AddressedPacket::decode(&pkt3.payload[..pkt3.payload_len], &secret_a).is_err());
+
+        // Self-export advert via from_keypair produces a valid signature under local_b.
+        let mut exp_resp = Vec::<u8, 200>::new();
+        poll_sync(node.handle_command(&[CMD_EXPORT_CONTACT], |r| {
+            let _ = exp_resp.extend_from_slice(r);
+        }));
+        assert_eq!(exp_resp[0], RESP_CODE_EXPORT_CONTACT);
+        let exp_pkt = Packet::read_from(&exp_resp[1..]).unwrap();
+        let exp_adv = AdvertPacket::decode(&exp_pkt.payload[..exp_pkt.payload_len]).unwrap();
+        assert_eq!(&exp_adv.pub_key, local_b.pub_key());
+        assert!(exp_adv.verify_signature());
+
+        // Restore global state.
+        crate::state::DISCOVERED_CONTACTS.lock(|c| c.borrow_mut().clear());
+        crate::state::set_identity(saved_pub, saved_prv);
+        crate::ecdh::invalidate();
+        while crate::command::USB_COMMAND_CHANNEL.try_receive().is_ok() {}
     }
 }
 

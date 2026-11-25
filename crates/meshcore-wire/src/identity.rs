@@ -112,6 +112,24 @@ impl LocalIdentity {
         })
     }
 
+    /// Reconstruct a [`LocalIdentity`] from an already-derived `(pub_key, prv)`
+    /// pair without repeating the Ed25519 basepoint scalar multiplication.
+    ///
+    /// Returns `None` if `pub_key` is reserved (`0x00` or `0xFF`).
+    pub fn from_keypair(
+        callsign: &str,
+        pub_key: &[u8; PUB_KEY_SIZE],
+        prv: &[u8; PRV_KEY_SIZE],
+    ) -> Option<Self> {
+        if pub_key[0] == 0x00 || pub_key[0] == 0xFF {
+            return None;
+        }
+        Some(Self {
+            base: Identity::new(*pub_key, callsign),
+            prv: *prv,
+        })
+    }
+
     /// Initialize from a 32-byte seed. In the rare reserved-key case, the
     /// seed is re-hashed deterministically, matching MeshCore's "regenerate"
     /// behaviour.
@@ -210,7 +228,8 @@ impl LocalIdentity {
     /// Sign a message with the expanded key.
     pub fn sign(&self, message: &[u8]) -> [u8; SIGNATURE_SIZE] {
         let esk = expanded(&self.prv);
-        let vk = VerifyingKey::from(&esk);
+        let vk = VerifyingKey::from_bytes(&self.base.pub_key)
+            .unwrap_or_else(|_| VerifyingKey::from(&esk));
         raw_sign::<Sha512>(&esk, message, &vk).to_bytes()
     }
 
@@ -218,10 +237,50 @@ impl LocalIdentity {
     /// public key mapped to Montgomery form. Returns `None` if the peer key
     /// does not decompress.
     pub fn shared_secret(&self, peer: &[u8; PUB_KEY_SIZE]) -> Option<[u8; 32]> {
-        let vk = VerifyingKey::from_bytes(peer).ok()?;
-        let point = vk.to_montgomery();
-        let mut scalar = [0u8; 32];
-        scalar.copy_from_slice(&self.prv[..32]);
-        Some(point.mul_clamped(scalar).to_bytes())
+        compute_shared_secret(&self.prv, peer)
+    }
+}
+
+/// MeshCore ECDH directly from a 64-byte expanded private key and a peer's
+/// 32-byte Ed25519 public key, without deriving the local public key.
+///
+/// Returns `None` if the peer public key does not decompress.
+pub fn compute_shared_secret(
+    prv: &[u8; PRV_KEY_SIZE],
+    peer: &[u8; PUB_KEY_SIZE],
+) -> Option<[u8; 32]> {
+    let vk = VerifyingKey::from_bytes(peer).ok()?;
+    let point = vk.to_montgomery();
+    let mut scalar = [0u8; 32];
+    scalar.copy_from_slice(&prv[..32]);
+    Some(point.mul_clamped(scalar).to_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_keypair_and_compute_shared_secret_match_from_private() {
+        let alice = LocalIdentity::from_seed("alice", &[0x11; 32]);
+        let bob = LocalIdentity::from_seed("bob", &[0x22; 32]);
+
+        let rebuilt = LocalIdentity::from_keypair("alice", alice.pub_key(), alice.private_key())
+            .expect("valid keypair");
+        let msg = b"hello meshcore";
+        let sig_orig = alice.sign(msg);
+        let sig_rebuilt = rebuilt.sign(msg);
+        assert_eq!(sig_orig, sig_rebuilt);
+        assert!(alice.base.verify(msg, &sig_rebuilt));
+
+        let s1 = alice.shared_secret(bob.pub_key()).unwrap();
+        let s2 = compute_shared_secret(alice.private_key(), bob.pub_key()).unwrap();
+        let s3 = compute_shared_secret(bob.private_key(), alice.pub_key()).unwrap();
+        assert_eq!(s1, s2);
+        assert_eq!(s1, s3);
+
+        // Reserved prefix rejected.
+        assert!(LocalIdentity::from_keypair("x", &[0x00; 32], alice.private_key()).is_none());
+        assert!(LocalIdentity::from_keypair("x", &[0xFF; 32], alice.private_key()).is_none());
     }
 }

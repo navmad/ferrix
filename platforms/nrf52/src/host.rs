@@ -256,6 +256,14 @@ impl EngineContext for NrfEngineContext {
         })
     }
 
+    fn shared_secret(&self, prv: &[u8; 64], peer: &[u8; 32]) -> Option<[u8; 32]> {
+        ferrix_core::ecdh::shared_secret(prv, peer)
+    }
+
+    fn on_private_key_changed(&self) {
+        ferrix_core::ecdh::invalidate();
+    }
+
     fn apply_flood_scope(&self, pkt: &mut Packet) {
         ferrix_core::state::apply_flood_scope(pkt);
     }

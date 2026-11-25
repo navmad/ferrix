@@ -1188,6 +1188,7 @@ pub async fn handle_text_cli<W: TextSink>(
             DISCOVERED_CONTACTS.lock(|c| {
                 c.borrow_mut().clear();
             });
+            crate::ecdh::invalidate();
             crate::storage::contacts::queue_clear().await;
             let _ = sender.send( b"  -> OK (Contacts cleared)\r\n").await;
         }
