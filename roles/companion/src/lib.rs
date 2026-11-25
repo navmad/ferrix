@@ -12,9 +12,8 @@
 use embassy_executor::Spawner;
 use heapless::String;
 
-use ferrix_core::command::push_companion;
 use ferrix_core::companion::cli::CliHost;
-use ferrix_core::companion::protocol::{next_delayed_push, CompanionHost, CompanionNode};
+use ferrix_core::companion::protocol::{CompanionHost, CompanionNode};
 use ferrix_core::engine::EngineContext;
 use ferrix_hal::radio::LoraRadio;
 use ferrix_runtime::app::AppBoard;
@@ -85,15 +84,6 @@ pub trait CompanionBoard {
     fn take_radio(&mut self) -> Self::Radio;
 }
 
-/// Forward deferred protocol pushes to the connected companion transport.
-#[embassy_executor::task]
-async fn delayed_push_task() -> ! {
-    loop {
-        let frame = next_delayed_push().await;
-        push_companion(&frame);
-    }
-}
-
 /// Poll a pinned future through a `#[inline(never)]` boundary so boot-phase
 /// stack frames stay disjoint from steady-state polling.
 #[inline(never)]
@@ -135,7 +125,6 @@ pub async fn run<B: CompanionBoard>(mut board: B, spawner: Spawner) -> ! {
     );
     mesh.allow_forward = board.forwarding_enabled();
 
-    spawner.spawn(delayed_push_task()).unwrap();
     board.start_transports(spawner, public_key, private_key);
 
     let mut node = CompanionNode::new(
