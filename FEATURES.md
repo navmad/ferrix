@@ -1,353 +1,189 @@
-# Ferrix feature guide
+# Ferrix Feature & Command Guide
 
-Ferrix is a MeshCore-compatible companion firmware for the
-Elecrow **ThinkNode M1** (nRF52840, SX1262 LoRa, 1.54" e-paper, two buttons) and
-the Seeed **Wio Tracker L1 Pro** (nRF52840, SX1262 LoRa, 1.3" OLED, five-way
-joystick), both with battery monitoring, USB CDC and BLE. It targets **MeshCore v1.18** companion
-apps and the v1.18 over-the-air protocol.
+Ferrix is a Rust (`no_std` + Embassy) **MeshCore v1.18** companion firmware for the **Elecrow ThinkNode M1** and **Seeed Wio Tracker L1 Pro** (nRF52840 + SX1262). It implements the standard MeshCore v1.18 over-the-air and companion protocol (BLE & USB) so it works out of the box with existing v1.18 companion apps.
 
-- Firmware version: `1.18.4-ferrix` (from root `Cargo.toml` `[workspace.package]`; overridable at build time via `FERRIX_VERSION` and `FERRIX_BUILD_DATE` / `SOURCE_DATE_EPOCH`)
-- USB product/vendor: `ThinkNode M1 Companion` / `MeshCore` (Wio Tracker L1 Pro: `Wio Tracker L1 Pro Companion` / `MeshCore`)
-- Board identity: `ThinkNode M1` or `Wio Tracker L1 Pro`
-- Companion DEVICE_INFO model: `Elecrow ThinkNode M1` or `Seeed Wio Tracker L1`; BLE Device Information manufacturer: `Elecrow` or `Seeed` (per-board `DEVICE_MODEL` / `MANUFACTURER` in the board logic crate's `config.rs`)
-- Configuration layout: version 1
+This guide highlights **what is different in Ferrix compared to stock MeshCore** and documents the available CLI commands.
 
 ---
 
-## 1. Hardware support
+## Differences vs. Stock MeshCore
 
-| Feature | Status |
+### Additions & Behavioral Differences
+
+| Area | Difference in Ferrix |
 |---|---|
-| nRF52840 + SX1262 (SPI, DIO1, BUSY, TCXO 1.8 V, REG1 DC-DC, 32.768 kHz LFXO, RX boost) | Yes |
-| ThinkNode M1: 1.54" 200x200 e-paper (SSD1681, idle sleep, configurable refresh interval) + frontlight | Yes |
-| Wio Tracker L1 Pro: 1.3" 128x64 OLED (SH1106 I2C, sleeps after 30 s idle) | Yes |
-| Controls: two buttons with single/double-click (ThinkNode M1) or 5-way joystick + user button (Wio Tracker L1 Pro) | Yes |
-| Passive buzzer (GPIO square wave on `P0.06` ThinkNode / `P1.00` Wio, UI/CLI toggle) | Yes |
-| 2 MB external QSPI flash (`MX25R1635F` ThinkNode / `P25Q16H` Wio), or `--features internal-storage` profile | Yes |
-| Battery voltage/percentage (averaged SAADC reads, EMA smoothing, 11-point LiPo curve) | Yes |
-| USB CDC-ACM (text CLI + binary companion framing) | Yes |
-| BLE Nordic UART Service companion | Yes |
-| Quectel L76K GNSS (idle-delimited UART DMA + event-driven wake) | Yes |
-| 1200-baud DFU touch, UF2 drag-and-drop, and Legacy Buttonless BLE DFU OTA (OTAFIX bootloader) | Yes |
+| **Rust / Embassy Runtime** | Written in `no_std` Rust with static allocation (no heap) and build-time task-arena verification. |
+| **Storage Layout & Flash Wear** | Uses wear-leveled `sequential-storage` instead of LittleFS. Default profile stores config and BLE bonds in internal flash and contacts/adverts/messages in external 2 MB QSPI flash (probed read-only at boot); an `--features internal-storage` build profile avoids QSPI altogether. Config and contacts write only on actual changes. |
+| **Offline Message Persistence** | Unread inbox messages stay in RAM (256-entry FIFO) by default (`msg.persist off`) to avoid routine flash wear. Enabling `set msg.persist on` persists unread messages across reboots while skipping flash writes whenever BLE is connected and reconciling on disconnect or clean reboot. |
+| **3-Lane TX Scheduler** | Separates transmits into **Control** (DMs, ACKs, replies), **Flood** (4-slot airtime-adaptive calendar with deterministic per-node placement, over-the-air duplicate cancellation, and stale-flood eviction), and **Background** (adverts when idle). Duty-cycle budget is split 25% Control / 75% Flood, and Control can borrow unused Flood budget. |
+| **Starvation-Gated LBT / CAD** | Runs 4-symbol hardware CAD before transmit and defers TX while an incoming preamble is active. Holds full CAD sensitivity during normal bursts, relaxes `detPeak` only after 60 s of continuous starvation, and tightens back after clear checks. |
+| **Automatic Stuck-AGC Recovery** | Watches for a deaf/locked SX1262 receiver (prolonged RX silence + frozen idle half-dB RSSI readings) and automatically recalibrates and re-arms receive mode without rebooting (`stats-agc`, `agc-reset`). |
+| **Live Noise Floor Sampling** | Samples idle RSSI every 5 s in continuous RX so `stats-radio` and companion stats report live RF noise floor rather than a static value. |
+| **RX Duty-Cycle Sniff Mode** | Optional cancel-safe RX duty-cycle mode (`set rxduty on`) supporting SF7–12 (including 16-symbol preambles) with an inactivity watchdog. |
+| **ECDH Shared-Secret Cache** | Caches X25519 peer shared secrets in a bounded 64-entry LRU table (computed outside critical sections so BLE and radio interrupts stay responsive), auto-invalidated on key change or contact removal. |
+| **Active-Contact Eviction Protection** | Refreshes a peer's `last_seen_epoch` in RAM on inbound DMs, PATHs, and confirmed ACKs without extra flash writes so active chat partners are not evicted when the contact table fills. |
+| **Immediate Request Pushes** | Delivers companion request response pushes (`0x85`–`0x8D`) immediately instead of buffering them behind a fixed delay, while keeping a 300 ms reply delay on inbound requests. |
+| **Unified 9-Page Dashboard** | Shared 9-screen UI across ThinkNode M1 (200×200 e-paper, configurable `refresh.interval` + periodic anti-ghosting clear) and Wio Tracker L1 Pro (128×64 OLED, 30 s idle sleep). |
+| **Extended JSON Diagnostics** | Adds 7 Ferrix-specific `stats-*` commands (`stats-tx`, `stats-agc`, `stats-flash`, `stats-ble`, `stats-gps`, `stats-power`, `stats-wdt`) alongside `stats-core`, `stats-radio`, and `stats-packets`. |
+| **Hardware Watchdog & Fault LEDs** | Hardware watchdog (`stats-wdt`) with distinct LED blink patterns for normal boot, panic, HardFault, and SoftDevice fault. |
 
-Radio parameters (frequency, bandwidth, spreading factor, coding rate, TX
-power) are configurable from the app or CLI, persisted, and applied without a
-reboot. Cancel-safe RX duty-cycle/sniff mode is supported across SF7-12
-(including SF9-12 16-symbol preambles), backed by a 60 s RX inactivity
-watchdog. See [boards/thinknode-m1/README.md](boards/thinknode-m1/README.md)
-for ThinkNode M1 and [boards/wio-tracker-l1-pro/README.md](boards/wio-tracker-l1-pro/README.md)
-for Wio Tracker L1 Pro pinouts and memory mapping.
+### Limitations & Incompatibilities vs. Stock MeshCore
 
----
-
-## 2. Mesh protocol (MeshCore v1.18)
-
-### Identity and crypto
-
-- 64-byte expanded MeshCore private key (scalar + nonce prefix).
-- 32-byte seed import/export, expanded-key import/export.
-- Ed25519 identities, X25519 shared secrets, reserved-key rejection.
-- CLI accepts a full 128-hex-character expanded key or a 64-hex seed.
-- Hardware seed fallback if no key is stored.
-- Identity is preserved across normal DFU/UF2 flashes (the config page is not
-  touched by application updates). A factory reset erases it.
-
-### Packet layer
-
-- All 13 OTA payload types: REQ, RESPONSE, TXT_MSG, ACK, ADVERT, GRP_TXT,
-  GRP_DATA, ANON_REQ, PATH, TRACE, MULTIPART, CONTROL, RAW_CUSTOM.
-- Path hash sizes 1-3 bytes; path validation and hop limits.
-- Transport codes / flood scopes, including a persisted default scope.
-- 8-byte dedup hash with a 160-entry seen cache.
-- Packet version validation, payload bounds, and malformed-frame rejection.
-
-### Messaging
-
-- Direct text messages with ACKs, retries driven by the app, and `PACKET_SENT`
-  timing.
-- Channel (group) text with flood scope.
-- V3 message frames with the real `txt_type` preserved:
-  - `0` plain, `1` CLI data, `2` signed, `3` CLI command.
-- Repeater/room CLI replies (`txt_type = 1`) are shown in the app's management
-  console.
-- Signed room posts (`txt_type = 2`): received posts parse the 4-byte signing
-  prefix, ACK with the signed hash, and deliver it to the app as the V3
-  `extra` field.
-- Per-contact `sync_since` advances from signed posts and is used in room
-  logins, so rooms do not replay their entire backlog.
-- Channel datagrams (`GRP_DATA`): send with `CMD_SEND_CHANNEL_DATA`, receive as
-  `PACKET_CHANNEL_DATA_RECV`, and persist in the same FIFO as text.
-- Multipart batched ACKs (`multi_acks`, `0` or `1` extra copy spaced 300 ms apart)
-  are sent for direct ACKs, forwarded along direct hops with collision-avoidance
-  delay, parsed, and deduplicated into the delivery-confirmation path.
-- Direct and channel ACKs, path returns, and companion retry support.
-
-### Adverts and contacts
-
-- Signed adverts with kind nibble, location policy, flood scope, feat fields.
-- Advert blob storage for contact sharing/export.
-- Up to 350 contacts, auto-add policy (chat/repeater/room/sensor), max-hop
-  filter, overwrite-oldest, favourites, manual-add mode.
-- Contact share/export/import, add/update/remove, lookup by key.
-- Path learning (PATH/PATH return) and `reset path`.
-
-### Routing and management
-
-- Direct and flood routing, packet forwarding in repeater/client-repeat mode.
-- Flooded unicast and anonymous requests decrypted/consumed by this node — and
-  flooded ACKs matching a pending DM send — are not re-relayed (matching
-  MeshCore `routeRecvPacket` / `markDoNotRetransmit`); un-decryptable hash
-  matches and unrelated group/advert/ACK traffic still follow normal forwarding
-  rules.
-- Trace route request and response forwarding.
-- Path discovery request, response push, and RTT.
-- Control data, raw packets, RAW_CUSTOM data.
-- Login to repeaters and room servers; status, telemetry, neighbours,
-  binary and anonymous requests; connection table, `HAS_CONNECTION`, logout.
-- Remote telemetry (LPP) and self battery telemetry.
+| Area | Limitation |
+|---|---|
+| **Supported Boards** | Currently supports **Elecrow ThinkNode M1** and **Seeed Wio Tracker L1 Pro** only. |
+| **Node Roles** | **Companion role only** (plus off-grid client repeat on allowed frequencies). Standalone repeater, room server, and sensor firmwares are not implemented. |
+| **Flash Compatibility** | Ferrix's `sequential-storage` layout is **incompatible with stock MeshCore LittleFS**. Switching between stock MeshCore and Ferrix requires a full flash erase — export your private key (`get prv.key`) first. Upgrades between Ferrix versions preserve identity, settings, and contacts. |
+| **Older Companion Apps** | Only protocol v3+ companion apps (targeting v1.18) are supported. |
+| **BLE OTA Updates** | Wireless BLE OTA DFU (`start ota`) requires an OTAFIX-compatible bootloader; stock bootloaders use USB UF2 drag-and-drop or serial DFU. |
 
 ---
 
-## 3. Companion protocol
+## CLI Command Reference
 
-### Transports
+Commands work over **USB serial** (plain text terminal) or from a companion app's CLI console (`CMD_RUN_CLI_COMMAND`). Commands marked *(Ferrix)* are Ferrix-specific extensions.
 
-- **BLE (Nordic UART Service)**, same command set as USB:
-  - Service UUID: `6E400001-B5A3-F393-E0A9-E50E24DCCA9E`
-  - RX (App -> Device): `6E400002-B5A3-F393-E0A9-E50E24DCCA9E`
-  - TX (Device -> App): `6E400003-B5A3-F393-E0A9-E50E24DCCA9E`
-- **USB CDC-ACM**:
-  - Inbound frame (App -> Radio): `'<'` (`0x3C`) + `u16` LE length + payload
-  - Outbound frame (Radio -> App): `'>'` (`0x3E`) + `u16` LE length + payload
-  - USB text CLI runs alongside the binary protocol; a text session does not
-    receive binary pushes.
+### Device Info & Identity
 
-### Commands
-
-The full MeshCore v1.18 companion command set is implemented, including:
-
-- app start / device query / battery / storage
-- send direct and channel text, channel data
-- contacts: get, add/update, remove, share, export, import, by-key
-- channels: get/set
-- messages: sync next, no-more
-- radio: set params, TX power, tuning, path hash mode, allowed repeat frequencies
-- adverts: self advert, name, position
-- identity: export/import private key
-- signing: start/data/finish
-- login/status/telemetry/anon/binary requests, has-connection, logout
-- flood scopes: set key, set/get default scope
-- auto-add config, stats, custom vars, device PIN
-- trace, path discovery, control data, raw packet/data
-- local CLI command (`0x42`) and its reply (`0x1D`), echoing optional `XX|` tag prefixes and stripping USB serial prompt markers
-- factory reset and reboot
-
-Errors are returned as `[0x01, code]` with codes for unsupported, not found,
-table full, bad state, and illegal argument; send commands validate the
-channel, type, and payload before reporting success.
-
-### Persistence of delivery
-
-- Text and channel datagrams are appended to flash on receive.
-- A record is popped only when the app syncs the message.
-- A reboot before sync redelivers the record.
-- `clear messages` erases both the RAM inbox and the flash queue.
-
----
-
-## 4. Transmit scheduling
-
-The radio task owns all transmission timing.
-
-| Lane | Contents | Timing |
+| Command | Arguments | What it does |
 |---|---|---|
-| Control | ACKs, path returns, admin replies, local sends | Next opportunity after a 30 ms gap |
-| Flood | Forwarded floods | Four-slot calendar, one frame per slot |
-| Background | Periodic adverts | Only when control and flood work is idle |
+| `help` | — | Prints a summary of available CLI commands. |
+| `ver` | — | Shows the running firmware version (e.g. `1.18.4-ferrix`). |
+| `board` | — | Shows the board model and hardware line. |
+| `get name` | — | Shows this node's callsign / display name. |
+| `set name <name>` | 1–31 printable ASCII chars (no `[ ] \ : , ? *`) | Sets this node's name and persists it. |
+| `get role` | — | Shows the node role (`companion`). |
+| `get public.key` | — | Prints this node's 32-byte public key in hex. |
+| `get prv.key` | — | Prints this node's 64-byte expanded private key in hex (for backups). |
+| `set prv.key <hex>` | 128 hex chars (expanded key) or 64 hex chars (32-byte seed) | Imports a private key, re-derives the public key, and saves it to flash. |
 
-- **Slot width** derives from modem airtime: a 128-byte reference frame plus a
-  50 ms guard, clamped to 100-1500 ms. It adapts every 30 s within half/double
-  the base: wider after stale/cancelled floods, narrower while idle.
-- **Slot assignment** is deterministic from the packet hash + node prefix.
-  The radio loop re-reads `current_public_key()` each iteration so runtime
-  private-key imports update flood placement without a reboot, and rebases
-  pending flood slots when slot width or radio settings change.
-- **Cancellation**: when a duplicate of a pending forward is heard, or when
-  forwarding is turned off, the scheduled slot is cleared. Cancellations are
-  remembered briefly for packets still in the radio channel.
-- **Staleness & preamble gating**: stale floods (older than 8 slots) are
-  evicted before budget checks, and pending transmits are deferred while a
-  LoRa preamble is actively being received (up to a bounded hold window).
-- **Budget**: the one-hour duty-cycle budget is split 25% control / 75% flood
-  and refilled with sub-millisecond remainder tracking. The control lane spends
-  its own 25% share first and can borrow unused flood budget so ACKs are not
-  held back while flood budget sits idle; floods never borrow from the control
-  reserve.
-- **Retries**: up to 4 attempts with backoff; failed floods are rescheduled.
+### Messaging, Contacts & Channels
 
-Inspect with `stats-tx` and `stats-fwd`; override the slot width with `set tx.slot <ms>`
-(`0` = automatic).
+| Command | Arguments | What it does |
+|---|---|---|
+| `send <text>` | Up to 160 bytes | Broadcasts a group text message on the default public channel (channel 0). |
+| `msg <hex_id> <text>` | `<hex_id>` = 8 hex chars (first 4 bytes of contact's public key) | Queues an encrypted direct message to a known contact. |
+| `messages` | — | Lists messages currently in the inbox with RSSI and SNR. |
+| `clear messages` | — | Clears the RAM inbox and erases any persisted offline messages in flash. |
+| `contacts` | — | Lists discovered contacts with ID, type (`CHAT`/`RPT`/`ROOM`/`SENS`), name, RSSI/SNR, position, and last-seen time. |
+| `clear contacts` | — | Removes all contacts from RAM and flash. |
+| `channels` | — | Lists configured group channels and their indices. |
+| `advert` | — | Queues a flood advert broadcasting your node across the mesh. |
+| `advert.zerohop` | — | Sends a zero-hop advert to direct neighbours only (not relayed). |
+| `get autoadd` | — | Shows whether auto-adding contacts from adverts is enabled, its type mask, and max-hop limit. |
+| `set autoadd <arg>` | `on`, `off`, or `<hex_mask>,<max_hops>` | Controls auto-add filtering. Mask bits: `0x01` overwrite oldest, `0x02` chat, `0x04` repeater, `0x08` room, `0x10` sensor (`0x00`–`0x1F`). `max_hops`: `0` (unlimited) to `64`. |
+| `get multiacks` | — | Shows whether duplicate direct ACKs are enabled (`0` or `1`). |
+| `set multiacks <on\|off>` | `on`/`off` or `1`/`0` | Enables or disables sending one extra direct ACK copy 300 ms later. |
 
----
+### Radio & Forwarding
 
-## 5. Storage and flash wear
+| Command | Arguments | What it does |
+|---|---|---|
+| `get radio` | — | Prints current LoRa parameters as `freq_MHz,bw_kHz,sf,cr`. |
+| `set radio <freq>,<bw>,<sf>,<cr>` | Or `set radio default` | Applies all four LoRa settings immediately without rebooting (`default` = `910.525,62.5,7,5`). |
+| `get freq` / `set freq <val>` | MHz (`910.525`), kHz (`910525`), or Hz (`910525000`); 150–960 MHz | Gets or sets the LoRa center frequency. |
+| `get bw` / `set bw <val>` | `7.8`, `10.4`, `15.6`, `20.8`, `31.25`, `41.67`, `62.5`, `125`, `250`, `500` (kHz or Hz) | Gets or sets the LoRa bandwidth. |
+| `get sf` / `set sf <5..12>` | `5`–`12` | Gets or sets the LoRa spreading factor. |
+| `get cr` / `set cr <5..8>` | `5`–`8` (or `4/5`–`4/8`) | Gets or sets the LoRa coding rate. |
+| `get tx` / `set tx <-9..22>` | Integer dBm (`-9` to `22`) | Gets or sets the LoRa transmit power. |
+| `get repeat` / `set repeat <on\|off>` | `on`/`off` | Gets or toggles off-grid client repeat mode on allowed frequencies. |
+| `get path.hash.mode` / `set path.hash.mode <0..2>` | `0` = 1-byte, `1` = 2-byte, `2` = 3-byte | Gets or sets the hop-hash size used in packet paths. |
+| `get af` / `set af <0..9>` | Decimal (`0.0`–`9.0`) | Gets or sets the airtime factor governing TX duty cycle. |
+| `get dutycycle` / `set dutycycle <10..100>` | Percentage (`10`–`100`) | Gets or sets the TX duty-cycle limit directly. |
+| `get rxduty` / `set rxduty <on\|off>` | `on`/`off` *(Ferrix)* | Gets or toggles power-saving RX duty-cycle sniff mode. |
+| `get tx.slot` / `set tx.slot <ms>` | `0` = auto, `1`–`5000` ms *(Ferrix)* | Gets or overrides the flood scheduler slot width. |
+| `agc-reset` | — *(Ferrix)* | Manually triggers an SX1262 receiver AGC reset and recalibration. |
 
-Storage is selected at compile time between two statically dispatched profiles:
+### GPS & Location
 
-| Profile | Store | Region | Design |
-|---|---|---|---|
-| Default (`ExternalStores`) | Config | internal `0xA0000..0xB0000` (64 KB) | `sequential-storage` map: settings + per-channel records |
-| | BLE bonds | internal `0xB0000..0xB4000` (16 KB) | `sequential-storage` map keyed by master ID (up to 4 bonds) |
-| | Contacts + adverts | QSPI `0x00000..0x40000` (256 KB) | One `sequential-storage` map keyed by public key; advert blobs share it |
-| | Messages | QSPI `0x40000..0x140000` (1 MB) | `sequential-storage` FIFO with variable-length records |
-| `--features internal-storage` (`InternalStores`) | Config + bonds | internal `0xA0000..0xB4000` (80 KB) | Same internal stores as above |
-| | Contacts + adverts | internal `0xB4000..0xD4000` (128 KB) | `sequential-storage` map in internal flash; no QSPI linked |
-| | Messages | internal `0xD4000..0xEC000` (96 KB) | `sequential-storage` FIFO in internal flash |
+| Command | Arguments | What it does |
+|---|---|---|
+| `gps on` / `gps off` | — | Powers the onboard L76K GPS module on or off. |
+| `gps advert` | — | Shows the advert location policy (`none`, `share`, or `prefs`). |
+| `gps advert <mode>` | `none`, `share`, or `prefs` | Sets whether outgoing adverts omit location, share coordinates, or follow app preferences. |
+| `get lat` / `set lat <deg>` | `-90.0` to `90.0` | Gets or sets static latitude for adverts. |
+| `get lon` / `set lon <deg>` | `-180.0` to `180.0` | Gets or sets static longitude for adverts. |
 
-- QSPI bring-up uses a read-only JEDEC probe (no erase/write self-test on
-  boot). If the external flash probe fails, external stores are marked
-  unavailable and skipped rather than falling back to internal flash.
-- A message costs one compact record (~20-60 bytes typical) and one page erase
-  per ~100 messages.
-- A contact change appends one deterministic 164-byte record instead of
-  rewriting the whole table.
-- Config setters only save when a value actually changes; boot performs no
-  config write.
-- `stats-flash` reports the active profile, QSPI availability/outage drops, and
-  per-store writes, erases, and queued messages.
-- Ferrix uses its own `sequential-storage` layout rather than standard
-  MeshCore's LittleFS filesystem. Switching between stock MeshCore and Ferrix
-  requires a full flash erase (back up your private key and contacts first);
-  normal upgrades between Ferrix releases preserve identity and settings.
-- Legacy snapshot banks from older Ferrix firmware are detected and cleared once.
+### Clock, Display, Audio, LEDs & Storage
 
----
+| Command | Arguments | What it does |
+|---|---|---|
+| `get time` / `set time <epoch>` | Unix timestamp (seconds) | Gets or sets the device clock. |
+| `clock sync` | — | Acknowledges a clock sync check (`OK`). |
+| `get battery` | — | Prints battery voltage (mV) and estimated percentage. |
+| `get sound` / `set sound <on\|off>` | `on`/`off` *(Ferrix)* | Gets or toggles the passive buzzer. |
+| `get leds` / `set leds <on\|off>` | `on`/`off` *(Ferrix)* | Gets or toggles onboard status LEDs. |
+| `get refresh.interval` / `set refresh.interval <sec>` | `0` (on update) or `300`–`3600` s *(Ferrix)* | Gets or sets the periodic e-paper refresh interval (default 600 s). |
+| `get msg.persist` / `set msg.persist <on\|off>` | `on`/`off` *(Ferrix)* | Gets or toggles persisting unread inbox messages to flash across reboots (default `off`). |
+| `save` | — | Flushes pending configuration changes to flash immediately. |
 
-## 6. Dashboard and controls
+### Diagnostics & Stats
 
-Both boards share the same nine pages:
+All `stats-*` commands return compact single-line JSON.
 
-0. Mesh / connection status
-1. Inbox
-2. Radar
-3. Radio and packet counters
-4. Signal history
-5. Position / GPS
-6. Off-grid client repeat
-7. Settings (LEDs and sound)
-8. System (battery, RX duty, path hash, firmware)
+| Command | Scope | What it reports |
+|---|---|---|
+| `stats-core` | Standard | Battery voltage/%, uptime, latched error flags (`errors`), live TX queue depth (`queue_len`), and companion push drops. |
+| `stats-radio` | Standard | Live `noise_floor` (dBm), last RSSI/SNR, TX/RX airtime (seconds), TX count, retries, and drops. |
+| `stats-packets` | Standard | Received/sent packet counts broken down by flood vs direct, receive errors, and RX drops. |
+| `stats-agc` | *(Ferrix)* | Live `noise_floor`, consecutive frozen half-dB idle RSSI readings (`frozen`), and `agc_resets` count. |
+| `stats-tx` | *(Ferrix)* | TX slot width, auto/manual mode, slot occupancy, Control/Flood/Background counts, stale/cancelled floods, queue-full drops, and DM ACK stats. |
+| `stats-flash` | *(Ferrix)* | Storage/QSPI status (`ready`, `id_mismatch`, `io_error`, `unavailable`, `internal`), 24-bit JEDEC ID, outage drops, and per-store write/erase/queue counts. |
+| `stats-ble` | *(Ferrix)* | BLE state, advertised name, connection status, saved bond count, and bond save/recovery counters. |
+| `stats-gps` | *(Ferrix)* | GPS power, fix status, satellites, coordinates, altitude, HDOP, age, and UART byte/sentence counts. |
+| `stats-power` | *(Ferrix)* | LFCLK source (`LFXO` crystal vs `LFRC`) and REG1/REG0 DC-DC regulator status. |
+| `stats-wdt` | *(Ferrix)* | Task heartbeats, watchdog pet count, and last MCU reset reason. |
+| `clear stats` | Standard | Resets runtime telemetry counters, AGC counters, and latched error flags. |
 
-- **ThinkNode M1 (200x200 e-paper, two buttons):** bottom button (`TK`)
-  single-click advances to the next page, double-click goes to the previous
-  page; top button (`FK`) single-click runs the primary page action,
-  double-click runs the secondary page action. The frontlight turns off after an
-  idle period and wakes on any input. The e-paper panel enters deep sleep when
-  idle, performs a full clear every 16 partial updates to prevent ghosting, and
-  refreshes periodically according to `refresh.interval` (default 10 minutes;
-  idle telemetry updates are rate-limited when set to `0`).
-- **Wio Tracker L1 Pro (128x64 OLED, 5-way joystick + user button):** joystick
-  left/up selects the previous page, right/down selects the next page, joystick
-  press (`OK`) runs the primary page action, and the user button (`BTN`) runs
-  the secondary page action. The SH1106 OLED sleeps after 30 s idle and wakes on
-  any input or message.
+### Power, Reboot & Firmware Updates
 
-### LED patterns
-
-- 3 quick blinks at boot: successful start.
-- 3 quick blinks repeating: Rust panic.
-- 6 quick blinks repeating: HardFault.
-- 10 quick blinks: SoftDevice fault.
-
----
-
-## 7. CLI
-
-USB text CLI and `CMD_RUN_CLI_COMMAND` (`0x42`) commands include:
-
-```
-ver, board, help
-get/set name, get role, get/set lat, get/set lon
-get public.key, get/set prv.key
-get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq, tx, sf, bw, cr
-get/set path.hash.mode (or hash-mode), get/set repeat (off-grid), get/set sound
-get/set leds, get/set refresh.interval, rxduty, af, dutycycle
-get/set autoadd, get/set multiacks, get companion
-send <text>, msg <hex_id> <text>
-contacts, clear contacts
-messages, clear messages, channels
-advert, advert.zerohop, gps advert, clock / time, clock sync
-battery
-stats-radio, stats-flash, stats-qspi, stats-tx, stats-fwd, stats-packets, stats-ble,
-stats-login, stats-scope, stats-trace, stats-adverts, stats-disc, stats-binary,
-stats-core, stats-gps, stats-wdt, stats-power
-clear stats
-get/set tx.slot
-save, reboot, dfu (or start dfu), start ota
-```
-
-Examples:
-
-```
-set name d1nk4n
-set prv.key <128 hex chars>
-set tx.slot 400
-stats-tx
-stats-power
-```
+| Command | What it does |
+|---|---|
+| `reboot` | Flushes pending storage writes and restarts the device cleanly. |
+| `start dfu` | Flushes storage and reboots into the USB UF2/serial bootloader. |
+| `start ota` | Flushes storage and reboots into BLE OTA DFU mode (requires an OTAFIX bootloader). |
 
 ---
 
-## 8. Diagnostics
+## On-Device Dashboard & Controls
 
-All `stats-*` commands return compact single-line JSON over USB text CLI and
-`PACKET_CLI_REPLY` (`0x1D`). Reply sizes are enforced by unit tests:
-`stats-core`, `stats-radio`, and `stats-packets` (which also exist in upstream
-MeshCore) stay within 176 bytes including the `XX|` tag; Ferrix-only `stats-*`
-replies stay within one companion frame (255 bytes):
+Both boards share the same 9 pages:
+**0** Status · **1** Inbox · **2** Radar · **3** Radio · **4** Signal History · **5** Position / GPS · **6** Client Repeat · **7** Settings (LEDs & sound) · **8** System (battery, RX duty, path hash, firmware).
 
-- `stats-radio` — airtime, RSSI/SNR, sent count, retries/drops.
-- `stats-flash` — active storage profile, QSPI availability/skipped ops,
-  per-store saves/erases, queued messages.
-- `stats-qspi` (or `qspi`) — QSPI JEDEC ID, status, and flash health.
-- `stats-tx` — slot width/occupancy, control/flood/background counts,
-  cancelled/stale floods, `qfull` (packets dropped by a full TX queue:
-  control/flood/background) and `ack` (DM ACKs matched, unmatched, pending
-  sends evicted).
-- `stats-fwd` — forwards scheduled/sent, longest TX queue wait (`wait_ms`) and
-  the duplicate-delay histogram.
-- `stats-packets` — received/sent flood/direct counters.
-- `stats-power` — LFCLK source (`LFXO` vs `LFRC`) and REG1 DC-DC regulator status.
-- `stats-gps` (or `gps`) — fix status, satellites, coordinates, and UART activity.
-- `stats-wdt` (or `watchdog`) — watchdog feed/timeout telemetry.
-- `stats-ble`, `stats-login`, `stats-scope`, `stats-trace`, `stats-adverts`,
-  `stats-disc`, `stats-binary`, `stats-core`.
-- `clear stats` resets the runtime counters.
+- **ThinkNode M1**: bottom button (`TK`) single-click = next page, double-click = previous page; top button (`FK`) single-click = primary action, double-click = secondary action. E-paper clears ghosting every 16 partial updates and sleeps when idle; frontlight wakes on input.
+- **Wio Tracker L1 Pro**: joystick Left/Up = previous page, Right/Down = next page, Press (`OK`) = primary action; user button (`BTN`) = secondary action. OLED sleeps after 30 s idle and wakes on input or incoming messages.
+
+### LED Fault & Boot Patterns
+
+- **3 quick blinks at boot**: normal startup succeeded.
+- **3 quick blinks repeating**: firmware panic.
+- **6 quick blinks repeating**: HardFault.
+- **10 quick blinks**: BLE SoftDevice fault.
 
 ---
 
-## 9. Build, test, flash
+## Build, Test & Flash
 
 ```sh
-# Release build (external QSPI + internal flash profile; runs task arena check)
+# Release build (default external QSPI + internal flash profile)
 ./tools/build.sh thinknode-m1 build --release
+./tools/build.sh wio-tracker-l1-pro build --release
 
-# Internal-flash-only release build (no QSPI)
+# Internal-flash-only release build (no QSPI flash required)
 ./tools/build.sh thinknode-m1 build --release --features internal-storage
 
-# Package UF2 image for drag-and-drop flashing
+# Package UF2 image for drag-and-drop USB flashing
 ./tools/build_uf2.sh thinknode-m1 release
-
-# Same for the Wio Tracker L1 Pro (board id `wio-tracker-l1-pro`)
 ./tools/build_uf2.sh wio-tracker-l1-pro release
 
-# Package Nordic/Adafruit DFU .zip for BLE OTA or web/serial flashing
+# Package DFU .zip for BLE OTA or web/serial flashing
 ./tools/build_ota.sh thinknode-m1 release
+./tools/build_ota.sh wio-tracker-l1-pro release
 
-# Host tests (wire codecs, message queue, contact map, scheduler, mesh sim,
-# vectors, plus both ThinkNode M1 and Wio Tracker L1 Pro logic & golden frames)
+# Run all host unit tests, wire vectors, mesh simulator, and UI golden tests
 ./tools/build.sh test
 
-# Hardware-in-the-loop smoke tests on a connected board
+# Hardware-in-the-loop USB smoke tests on a connected board
 ./tools/build.sh thinknode-m1 hil
 ./tools/build.sh wio-tracker-l1-pro hil
 
@@ -355,40 +191,15 @@ replies stay within one companion frame (255 bytes):
 ./tools/flash_serial.sh
 ```
 
-Every firmware build and release script runs `tools/check_task_arena.py` against
-the compiled ELF to ensure all Embassy `TaskPool` allocations fit inside the
-static task arena before flashing.
+Set `FERRIX_VERSION` (and optionally `FERRIX_BUILD_DATE` / `SOURCE_DATE_EPOCH`) to override version metadata. Pushing a `v*` tag triggers [`.github/workflows/release.yml`](.github/workflows/release.yml) to build, test, and publish `.uf2` and `.zip` release artifacts for both boards.
 
-Set `FERRIX_VERSION` (e.g. `v1.18.4`) and optionally `FERRIX_BUILD_DATE` /
-`SOURCE_DATE_EPOCH` to override the compiled version/date metadata. Pushing a
-`v*` tag triggers [`.github/workflows/release.yml`](.github/workflows/release.yml),
-which runs the host test suite, verifies the task arena, and publishes
-versioned `ferrix-thinknode-m1-companion-v<version>.uf2` / `.zip` and
-`ferrix-wio-tracker-l1-pro-companion-v<version>.uf2` / `.zip` (BLE OTA /
-webflasher / serial DFU packages) to GitHub Releases.
-
-To enter the USB bootloader from the CLI, run `dfu` (`start dfu`), double-click
-reset, or trigger a 1200-baud touch on the CDC port. To enter BLE OTA DFU mode
-on boards with an OTAFIX bootloader, run `start ota` or trigger Legacy
-Buttonless DFU from an nRF DFU app.
+To enter the bootloader manually: run `start dfu`, double-click reset, or touch the USB serial port at 1200 baud. For wireless BLE OTA updates (on OTAFIX bootloaders), run `start ota` or trigger Buttonless DFU from an nRF DFU app.
 
 ---
 
-## 10. Current limitations
+## Related Documents
 
-| Area | Limitation |
-|---|---|
-| Node roles | Only the `companion` role is implemented; repeater, room server, and sensor node roles are not implemented (`roles/repeater` is a placeholder). Off-grid client-repeat forwarding is supported on allowed frequencies. |
-| Storage format | Uses Ferrix's own `sequential-storage` layout rather than standard MeshCore's LittleFS layout; switching to or from stock MeshCore requires a full flash erase. |
-| Older app protocol | Message frames are always V3; apps that report protocol < 3 are not supported. |
-| Factory reset | Handler implemented; the destructive path has not been exercised on hardware. |
-| BLE OTA | Legacy Buttonless BLE DFU requires an OTAFIX-compatible bootloader; boards with a stock non-OTAFIX bootloader must use USB UF2 drag-and-drop or Serial DFU. |
-
----
-
-## 11. Related documents
-
-- [`README.md`](README.md) — workspace overview, architecture, and tooling.
-- [`boards/thinknode-m1/README.md`](boards/thinknode-m1/README.md) — ThinkNode M1 hardware specs, flashing, pinout, and memory map.
-- [`boards/wio-tracker-l1-pro/README.md`](boards/wio-tracker-l1-pro/README.md) — Wio Tracker L1 Pro hardware specs, flashing, pinout, controls, and items to confirm on hardware.
+- [`README.md`](README.md) — workspace architecture, crate layout, and developer setup.
+- [`boards/thinknode-m1/README.md`](boards/thinknode-m1/README.md) — ThinkNode M1 pinout, memory map, and board notes.
+- [`boards/wio-tracker-l1-pro/README.md`](boards/wio-tracker-l1-pro/README.md) — Wio Tracker L1 Pro pinout, controls, and board notes.
 - [`.github/workflows/release.yml`](.github/workflows/release.yml) — matrix firmware build and GitHub Release workflow.
