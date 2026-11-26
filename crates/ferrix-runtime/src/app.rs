@@ -505,12 +505,28 @@ fn handle_inbound_rx<B: AppBoard>(
     // Synchronize real radio telemetry to shared USB CLI status
     let rx_air = RADIO_SETTINGS.lock(|r| {
         let s = r.borrow();
-        estimate_airtime_ms(len, s.sf, s.bw_khz, s.cr, if s.sf <= 8 { 32 } else { 16 })
+        estimate_airtime_ms(
+            len,
+            s.sf,
+            s.bw_khz,
+            s.cr,
+            ferrix_core::scheduler::preamble_for(s.sf),
+        )
+    });
+    let is_flood_rx = raw.first().is_some_and(|h| {
+        let route = h & 0x03;
+        route == meshcore_wire::packet::ROUTE_TYPE_FLOOD
+            || route == meshcore_wire::packet::ROUTE_TYPE_TRANSPORT_FLOOD
     });
     RADIO_TELEMETRY.lock(|t| {
         let mut tel = t.borrow_mut();
         tel.rx_packets = tel.rx_packets.saturating_add(1);
         tel.rx_air_ms = tel.rx_air_ms.saturating_add(rx_air);
+        if is_flood_rx {
+            tel.rx_flood = tel.rx_flood.saturating_add(1);
+        } else {
+            tel.rx_direct = tel.rx_direct.saturating_add(1);
+        }
         tel.last_rssi = rssi;
         tel.last_snr = snr;
         tel.has_rx = true;
@@ -544,6 +560,15 @@ fn handle_inbound_rx<B: AppBoard>(
         );
     } else {
         info!("Received non-MeshCore or legacy beacon frame");
+    }
+}
+
+fn current_epoch(node: &CompanionNode<'_>) -> u32 {
+    let t = get_device_time();
+    if t != 0 {
+        t
+    } else {
+        node.epoch_time as u32
     }
 }
 
@@ -652,6 +677,7 @@ fn dispatch_inbound_action<B: AppBoard>(
                     sender_pub[5],
                     msg.text.as_str()
                 );
+                touch_contact_activity(&sender_pub, current_epoch(node), Some((rssi, snr)));
                 // Signed room posts advance the room-sync watermark so a
                 // later login does not replay the whole backlog.
                 if msg.txt_type == meshcore_wire::packets::txtmsg::TXT_TYPE_SIGNED_PLAIN {
@@ -719,6 +745,7 @@ fn dispatch_inbound_action<B: AppBoard>(
                 info!("MeshCore ACK received (crc {:08x})", ack.crc);
                 if !protocol::handle_keepalive_ack(ack.crc) {
                     if let Some(dest_pub) = handle_direct_message_confirmed(ack.crc) {
+                        touch_contact_activity(&dest_pub, current_epoch(node), None);
                         if is_flood {
                             let peer = DISCOVERED_CONTACTS.lock(|c| {
                                 c.borrow()
@@ -836,33 +863,63 @@ fn dispatch_inbound_action<B: AppBoard>(
                     path.hop_count(),
                     path.extra_type
                 );
-                let path_updated = DISCOVERED_CONTACTS.lock(|c| {
-                    if let Some(ct) = c
-                        .borrow_mut()
-                        .iter_mut()
-                        .find(|ct| ct.pub_key == sender_pub)
-                    {
-                        ct.out_path = path.path;
-                        ct.out_path_len = path.path_len;
-                        true
-                    } else {
-                        false
-                    }
-                });
-                if path_updated {
-                    push_path_updated(&sender_pub);
-                }
-                storage::request_contacts();
-                if is_flood && path_updated {
-                    let _ = mesh.queue_path_return_only(
+                let is_path_discovery = if path.extra_type & 0x0F == 1 && path.extra.len() >= 4 {
+                    let tag = u32::from_le_bytes([
+                        path.extra[0],
+                        path.extra[1],
+                        path.extra[2],
+                        path.extra[3],
+                    ]);
+                    protocol::handle_path_discovery(
+                        tag,
                         &sender_pub,
                         path.path_len,
                         &path.path,
                         arrival_path_len,
                         &arrival_path,
-                        500,
-                    );
+                    )
+                } else {
+                    false
+                };
+
+                let recv_ts = current_epoch(node);
+                if !is_path_discovery {
+                    let path_updated = DISCOVERED_CONTACTS.lock(|c| {
+                        if let Some(ct) = c
+                            .borrow_mut()
+                            .iter_mut()
+                            .find(|ct| ct.pub_key == sender_pub)
+                        {
+                            ct.out_path = path.path;
+                            ct.out_path_len = path.path_len;
+                            if recv_ts > ct.last_seen_epoch {
+                                ct.last_seen_epoch = recv_ts;
+                            }
+                            ct.rssi = rssi;
+                            ct.snr = snr;
+                            true
+                        } else {
+                            false
+                        }
+                    });
+                    if path_updated {
+                        push_path_updated(&sender_pub);
+                    }
+                    storage::request_contacts();
+                    if is_flood && path_updated {
+                        let _ = mesh.queue_path_return_only(
+                            &sender_pub,
+                            path.path_len,
+                            &path.path,
+                            arrival_path_len,
+                            &arrival_path,
+                            500,
+                        );
+                    }
+                } else {
+                    touch_contact_activity(&sender_pub, recv_ts, Some((rssi, snr)));
                 }
+
                 // A PATH return can carry an ACK or a RESPONSE as its
                 // extra. Flooded logins/requests use a RESPONSE extra.
                 if path.extra_type & 0x0F == 3 && path.extra.len() >= 4 {
@@ -870,25 +927,18 @@ fn dispatch_inbound_action<B: AppBoard>(
                         meshcore_wire::packets::AckPacket::decode(path.extra.as_slice())
                     {
                         if !protocol::handle_keepalive_ack(ack.crc) {
-                            handle_direct_message_confirmed(ack.crc);
+                            if let Some(dest_pub) = handle_direct_message_confirmed(ack.crc) {
+                                if dest_pub != sender_pub {
+                                    touch_contact_activity(&dest_pub, recv_ts, None);
+                                }
+                            }
                         }
                     }
-                } else if path.extra_type & 0x0F == 1 && !path.extra.is_empty() {
-                    let tag = u32::from_le_bytes([
-                        path.extra[0],
-                        path.extra[1],
-                        path.extra[2],
-                        path.extra[3],
-                    ]);
-                    if !protocol::handle_path_discovery(
-                        tag,
-                        &sender_pub,
-                        path.path_len,
-                        &path.path,
-                        arrival_path_len,
-                        &arrival_path,
-                    ) && !protocol::handle_response(&path.extra, &sender_pub)
-                    {
+                } else if !is_path_discovery
+                    && path.extra_type & 0x0F == 1
+                    && !path.extra.is_empty()
+                {
+                    if !protocol::handle_response(&path.extra, &sender_pub) {
                         info!(
                             "MeshCore PATH RESPONSE extra unhandled ({} bytes)",
                             path.extra.len()

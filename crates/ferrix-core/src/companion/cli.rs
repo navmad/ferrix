@@ -1695,15 +1695,24 @@ pub async fn handle_text_cli<W: TextSink>(
             let _ = sender.send( s.as_bytes()).await;
         }
         "stats-packets" => {
-            let (tx, rx, rx_drops) = RADIO_TELEMETRY.lock(|t| {
-                let tel = t.borrow();
-                (tel.tx_beacons, tel.rx_packets, tel.rx_dropped)
-            });
-            let mut s: heapless::String<160> = heapless::String::new();
+            let (tx, rx, flood_tx, direct_tx, flood_rx, direct_rx, recv_errors) =
+                RADIO_TELEMETRY.lock(|t| {
+                    let tel = t.borrow();
+                    (
+                        tel.tx_beacons,
+                        tel.rx_packets,
+                        tel.tx_flood_sent,
+                        tel.tx_direct,
+                        tel.rx_flood,
+                        tel.rx_direct,
+                        tel.rx_errors,
+                    )
+                });
+            let mut s: heapless::String<192> = heapless::String::new();
             let _ = write!(
                 s,
-                "  -> {{\"recv\":{},\"sent\":{},\"flood_tx\":{},\"direct_tx\":0,\"flood_rx\":{},\"direct_rx\":0,\"recv_errors\":0,\"rx_drops\":{}}}\r\n",
-                rx, tx, tx, rx, rx_drops
+                "  -> {{\"recv\":{},\"sent\":{},\"flood_tx\":{},\"direct_tx\":{},\"flood_rx\":{},\"direct_rx\":{},\"recv_errors\":{}}}\r\n",
+                rx, tx, flood_tx, direct_tx, flood_rx, direct_rx, recv_errors
             );
             let _ = sender.send( s.as_bytes()).await;
         }
@@ -1719,6 +1728,11 @@ pub async fn handle_text_cli<W: TextSink>(
                 tel.tx_control = 0;
                 tel.tx_flood = 0;
                 tel.tx_background = 0;
+                tel.tx_flood_sent = 0;
+                tel.tx_direct = 0;
+                tel.rx_flood = 0;
+                tel.rx_direct = 0;
+                tel.rx_errors = 0;
                 tel.tx_stale = 0;
                 tel.tx_cancelled = 0;
                 tel.tx_retries = 0;
@@ -2068,6 +2082,11 @@ mod tests {
             t.tx_control = u32::MAX;
             t.tx_flood = u32::MAX;
             t.tx_background = u32::MAX;
+            t.tx_flood_sent = u32::MAX;
+            t.tx_direct = u32::MAX;
+            t.rx_flood = u32::MAX;
+            t.rx_direct = u32::MAX;
+            t.rx_errors = u32::MAX;
             t.tx_stale = u32::MAX;
             t.tx_cancelled = u32::MAX;
             t.tx_retries = u32::MAX;

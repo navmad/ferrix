@@ -10,7 +10,7 @@
 #![forbid(unsafe_code)]
 #![allow(async_fn_in_trait)]
 
-use defmt::{debug, error, info};
+use defmt::{debug, error, info, warn};
 use embassy_time::Duration;
 use embedded_hal::digital::OutputPin;
 use embedded_hal_async::delay::DelayNs;
@@ -86,33 +86,54 @@ fn cr_from_u8(cr: u8) -> CodingRate {
     }
 }
 
-/// Estimate SX126x RX duty-cycle timings. The RX window only needs to catch
-/// a preamble (`SetStopRxTimerOnPreamble` keeps the radio listening once it
-/// does), while leaving margin for low-SNR correlation and TCXO wakeup.
+/// Compute SX126x RX duty-cycle timings per SX1261-2 Datasheet §13.1.7 and AN1200.36:
+///
+/// 1. Only the **deaf** phase (`sleep_time + wake_time`) must fit within the
+///    detectable preamble margin `(P - 2*D - 1) * T_sym` (derated by 10% for
+///    RC64k drift), where `D = 8` for `SF >= 7` and `12` for `SF < 7`.
+/// 2. `rx_time >= (D + 1) * T_sym` so at least one full detection window runs
+///    each wake cycle.
+/// 3. `2 * rx_time + sleep_time >= (P + 14) * T_sym` because on preamble
+///    detection the SX1262 restarts its internal timer with
+///    `2 * rxPeriod + sleepPeriod` and aborts reception (`RxTxTimeout`) if
+///    SyncWord + Header do not complete before that timer expires.
+///
+/// Returns `None` (falling back to continuous RX) whenever no valid `(rx, sleep)`
+/// pair satisfies all three constraints — for example at `SF9/SF10` with a
+/// 16-symbol preamble or at wide bandwidths where the deaf budget is smaller
+/// than the TCXO wakeup delay.
 fn duty_cycle_params(sf: u8, bw_khz: u32, preamble: u16) -> Option<DutyCycleParams> {
     let bw_hz = bw_khz_to_hz(bw_khz) as u64;
     if bw_hz == 0 {
         return None;
     }
     let sym_us = ((1u64 << sf) * 1_000_000) / bw_hz;
-    let detect = if sf >= 7 { 6u64 } else { 10u64 };
+    if sym_us == 0 {
+        return None;
+    }
+    let d = if sf >= 7 { 8u64 } else { 12u64 };
     let p = preamble as u64;
 
-    if p <= 2 * detect + 1 {
+    if p <= 2 * d + 1 {
         return None;
     }
 
-    let deaf_budget = (p - 2 * detect - 1) * sym_us;
-    let deaf_us = deaf_budget * 90 / 100; // 10% margin for RC timer drift
     // Match lora-phy's 10 ms TCXO wakeup delay (`BRD_TCXO_WAKEUP_TIME`) plus
-    // ~1 ms RC/PLL/RX settling so the real deaf window never exceeds `deaf_us`.
+    // ~1 ms RC/PLL/RX settling.
     let wake_us = 11_000u64;
+    let deaf_budget_us = (p - 2 * d - 1) * sym_us;
+    // Derate by 10% for RC64k oscillator drift.
+    let deaf_us = deaf_budget_us * 90 / 100;
     if deaf_us <= wake_us + 2_000 {
         return None;
     }
-
     let sleep_us = deaf_us - wake_us;
-    let rx_us = (detect + 2) * sym_us;
+
+    // SX1261-2 Datasheet §13.1.7:
+    //   2 * rx_us + sleep_us >= (preamble + 4.25 + 8 + margin) * T_sym
+    let complete_us = (p + 14) * sym_us;
+    let min_rx_us = (d + 1) * sym_us;
+    let rx_us = min_rx_us.max(complete_us.saturating_sub(sleep_us).div_ceil(2));
 
     // SetRxDutyCycle units are 15.625 us.
     let units = |us: u64| ((us * 64 + 500) / 1000).min(0xFF_FFFF) as u32;
@@ -122,6 +143,18 @@ fn duty_cycle_params(sf: u8, bw_khz: u32, preamble: u16) -> Option<DutyCyclePara
     })
 }
 
+fn preamble_grace_ms(sf: u8, bw_khz: u32, preamble: u16) -> u64 {
+    let bw_hz = bw_khz_to_hz(bw_khz) as u64;
+    if bw_hz == 0 {
+        return 200;
+    }
+    let sym_us = ((1u64 << sf.min(12)) * 1_000_000) / bw_hz;
+    // Preamble + syncword + SFD + header duration.
+    let coeff_x4 = if sf <= 6 { 25u64 } else { 17u64 };
+    let preamble_us = (((preamble as u64 + 8) * 4 + coeff_x4) * sym_us) / 4;
+    preamble_us.div_ceil(1_000).clamp(40, 2_500)
+}
+
 fn make_rx_mode(sf: u8, bw_khz: u32, preamble: u16, duty_cycle: bool) -> RxMode {
     if duty_cycle {
         if let Some(params) = duty_cycle_params(sf, bw_khz, preamble) {
@@ -129,6 +162,74 @@ fn make_rx_mode(sf: u8, bw_khz: u32, preamble: u16, duty_cycle: bool) -> RxMode 
         }
     }
     RxMode::Continuous
+}
+
+/// Continuous CAD-busy duration before relaxing LBT `detPeak` by one step.
+///
+/// Normal back-to-back LoRa packets last a few hundred milliseconds to a few
+/// seconds and must not desensitize LBT. Only prolonged starvation (elevated
+/// RF noise floor blocking every TX attempt for a full minute) relaxes `detPeak`.
+const LBT_STARVATION_MS: u64 = 60_000;
+const LBT_MAX_PEAK_OFFSET: i8 = 12;
+const LBT_RECOVER_CLEAN_COUNT: u8 = 16;
+
+#[derive(Clone, Copy, Debug)]
+struct LbtState {
+    peak_offset: i8,
+    clean_count: u8,
+    busy_since_ms: Option<u64>,
+}
+
+impl LbtState {
+    const fn new() -> Self {
+        Self {
+            peak_offset: 0,
+            clean_count: 0,
+            busy_since_ms: None,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.peak_offset = 0;
+        self.clean_count = 0;
+        self.busy_since_ms = None;
+    }
+
+    fn clear_starvation(&mut self) {
+        self.busy_since_ms = None;
+    }
+
+    fn offset(&self) -> i8 {
+        self.peak_offset
+    }
+
+    /// Record a CAD-busy deferral at `now_ms`. Returns `true` when sustained
+    /// starvation caused `peak_offset` to relax by +1.
+    fn on_busy(&mut self, now_ms: u64) -> bool {
+        self.clean_count = 0;
+        let since = *self.busy_since_ms.get_or_insert(now_ms);
+        if now_ms.saturating_sub(since) >= LBT_STARVATION_MS {
+            self.busy_since_ms = Some(now_ms);
+            if self.peak_offset < LBT_MAX_PEAK_OFFSET {
+                self.peak_offset += 1;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Record a clear CAD pass. Ends any starvation streak and gradually
+    /// restores sensitivity if `peak_offset` was previously relaxed.
+    fn on_clear(&mut self) {
+        self.busy_since_ms = None;
+        if self.peak_offset > 0 {
+            self.clean_count = self.clean_count.saturating_add(1);
+            if self.clean_count >= LBT_RECOVER_CLEAN_COUNT {
+                self.peak_offset -= 1;
+                self.clean_count = 0;
+            }
+        }
+    }
 }
 
 type InterfaceVariant<Reset, Pin> = GenericSx126xInterfaceVariant<Reset, Pin>;
@@ -148,6 +249,9 @@ where
     rx_pkt: PacketParams,
     rx_mode: RxMode,
     preamble: u16,
+    preamble_grace_ms: u64,
+    preamble_seen_at: Option<embassy_time::Instant>,
+    lbt: LbtState,
     tx_power_dbm: i8,
     rx_armed: bool,
     rx_state: RxState,
@@ -221,6 +325,13 @@ where
             rx_pkt,
             rx_mode,
             preamble,
+            preamble_grace_ms: preamble_grace_ms(
+                initial.spreading_factor,
+                initial.bandwidth_khz,
+                preamble,
+            ),
+            preamble_seen_at: None,
+            lbt: LbtState::new(),
             tx_power_dbm: initial.tx_power_dbm,
             rx_armed: false,
             rx_state: RxState::Idle,
@@ -230,16 +341,33 @@ where
     async fn reenter_rx(&mut self) {
         self.rx_armed = false;
         self.rx_state = RxState::Idle;
-        match embassy_time::with_timeout(
-            Duration::from_secs(1),
+        self.preamble_seen_at = None;
+        let res = embassy_time::with_timeout(Duration::from_secs(1), async {
             self.lora
-                .prepare_for_rx(self.rx_mode, &self.mdltn, &self.rx_pkt),
+                .prepare_for_rx(self.rx_mode, &self.mdltn, &self.rx_pkt)
+                .await?;
+            self.lora.start_rx().await
+        })
+        .await;
+        match res {
+            Ok(Ok(())) => self.rx_armed = true,
+            Ok(Err(e)) => error!("sx1262: re-enter RX failed: {:?}", e),
+            Err(_) => error!("sx1262: re-enter RX timed out"),
+        }
+    }
+
+    async fn rearm_rx_fast_or_recover(&mut self) {
+        self.rx_armed = false;
+        self.rx_state = RxState::Idle;
+        self.preamble_seen_at = None;
+        match embassy_time::with_timeout(
+            Duration::from_millis(500),
+            self.lora.rearm_rx_fast(self.rx_mode, &self.rx_pkt),
         )
         .await
         {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => error!("sx1262: re-enter RX failed: {:?}", e),
-            Err(_) => error!("sx1262: re-enter RX timed out"),
+            Ok(Ok(())) => self.rx_armed = true,
+            _ => self.reenter_rx().await,
         }
     }
 }
@@ -272,6 +400,12 @@ where
                         self.mdltn = new_mdltn;
                         self.rx_pkt = new_rx;
                         self.preamble = new_preamble;
+                        self.preamble_grace_ms = preamble_grace_ms(
+                            cfg.spreading_factor,
+                            cfg.bandwidth_khz,
+                            new_preamble,
+                        );
+                        self.lbt.reset();
                         self.tx_power_dbm = cfg.tx_power_dbm;
                         self.rx_mode = make_rx_mode(
                             cfg.spreading_factor,
@@ -298,6 +432,90 @@ where
     }
 
     async fn transmit(&mut self, payload: &[u8]) -> TxOutcome {
+        // 1. Never interrupt a confirmed incoming LoRa header.
+        if self.rx_state == RxState::Header {
+            return TxOutcome::ChannelBusy;
+        }
+
+        // 2. Non-destructive live GetIrqStatus check while in continuous RX:
+        // clear HeaderError immediately, defer on a live HeaderValid without
+        // disturbing RX, and give a fresh PreambleDetected one preamble window
+        // before clearing it as noise.
+        if self.rx_armed && matches!(self.rx_mode, RxMode::Continuous) {
+            if let Ok((header_valid, preamble_detected, header_err)) =
+                self.lora.poll_rx_activity().await
+            {
+                if header_err {
+                    let _ = self.lora.clear_rx_activity_irqs().await;
+                    self.rx_state = RxState::Idle;
+                    self.preamble_seen_at = None;
+                } else if header_valid {
+                    self.rx_state = RxState::Header;
+                    self.preamble_seen_at = None;
+                    return TxOutcome::ChannelBusy;
+                } else if preamble_detected {
+                    let now = embassy_time::Instant::now();
+                    match self.preamble_seen_at {
+                        None => {
+                            self.preamble_seen_at = Some(now);
+                            return TxOutcome::ChannelBusy;
+                        }
+                        Some(since)
+                            if now.saturating_duration_since(since).as_millis()
+                                < self.preamble_grace_ms =>
+                        {
+                            return TxOutcome::ChannelBusy;
+                        }
+                        Some(_) => {
+                            let _ = self.lora.clear_preamble_irq().await;
+                            self.preamble_seen_at = None;
+                        }
+                    }
+                } else {
+                    self.preamble_seen_at = None;
+                }
+            }
+        }
+
+        // 3. Fast 4-symbol hardware LBT CAD check from warm standby with
+        // starvation-gated `detPeak` relaxation: detects mid-payload LoRa chirp
+        // energy while holding full sensitivity during normal traffic bursts,
+        // relaxing only after 60 s of continuous LBT starvation.
+        self.rx_armed = false;
+        match embassy_time::with_timeout(
+            Duration::from_millis(500),
+            self.lora
+                .cad_fast_with_offset(&self.mdltn, self.lbt.offset()),
+        )
+        .await
+        {
+            Ok(Ok(true)) => {
+                let now_ms = embassy_time::Instant::now().as_millis();
+                if self.lbt.on_busy(now_ms) {
+                    warn!(
+                        "sx1262: LBT starved 60s; relaxing detPeak offset to {}",
+                        self.lbt.offset()
+                    );
+                } else {
+                    debug!("sx1262: CAD busy; deferring TX");
+                }
+                self.rearm_rx_fast_or_recover().await;
+                return TxOutcome::ChannelBusy;
+            }
+            Ok(Ok(false)) => {
+                self.lbt.on_clear();
+            }
+            Ok(Err(e)) => {
+                debug!("sx1262: CAD error ({:?}); proceeding with TX", e);
+            }
+            Err(_) => {
+                error!("sx1262: CAD timed out; recovering RX");
+                self.reenter_rx().await;
+                return TxOutcome::Failed;
+            }
+        }
+
+        // 4. Fast TX + sub-ms FS/STBY_XOSC->RX re-arm immediately after TxDone.
         let tx_result = embassy_time::with_timeout(Duration::from_secs(20), async {
             let mut tx_pkt = self.lora.create_tx_packet_params(
                 self.preamble,
@@ -307,7 +525,7 @@ where
                 &self.mdltn,
             )?;
             self.lora
-                .prepare_for_tx(
+                .prepare_for_tx_fast(
                     &self.mdltn,
                     &mut tx_pkt,
                     self.tx_power_dbm as i32,
@@ -318,17 +536,22 @@ where
         })
         .await;
 
-        let success = matches!(tx_result, Ok(Ok(())));
         match tx_result {
-            Ok(Ok(())) => info!("sx1262: transmission complete"),
-            Ok(Err(e)) => error!("sx1262: transmission failed: {:?}", e),
-            Err(_) => error!("sx1262: transmission timed out; recovering RX"),
-        }
-        self.reenter_rx().await;
-        if success {
-            TxOutcome::Sent
-        } else {
-            TxOutcome::Failed
+            Ok(Ok(())) => {
+                info!("sx1262: transmission complete");
+                self.rearm_rx_fast_or_recover().await;
+                TxOutcome::Sent
+            }
+            Ok(Err(e)) => {
+                error!("sx1262: transmission failed: {:?}", e);
+                self.reenter_rx().await;
+                TxOutcome::Failed
+            }
+            Err(_) => {
+                error!("sx1262: transmission timed out; recovering RX");
+                self.reenter_rx().await;
+                TxOutcome::Failed
+            }
         }
     }
 
@@ -341,11 +564,6 @@ where
             Err(e) => {
                 error!("sx1262: start_rx failed: {:?}", e);
                 self.reenter_rx().await;
-                if let Err(e) = self.lora.start_rx().await {
-                    error!("sx1262: retry start_rx failed: {:?}", e);
-                } else {
-                    self.rx_armed = true;
-                }
             }
         }
     }
@@ -364,10 +582,12 @@ where
             }
             Ok(RxIrqEvent::HeaderValid) => {
                 self.rx_state = RxState::Header;
+                self.preamble_seen_at = None;
                 None
             }
             Ok(RxIrqEvent::Packet(len, status)) => {
                 self.rx_state = RxState::Idle;
+                self.preamble_seen_at = None;
                 if matches!(self.rx_mode, RxMode::DutyCycle(_)) {
                     self.rx_armed = false;
                 }
@@ -377,20 +597,29 @@ where
                     snr: status.snr as i8,
                 })
             }
+            Ok(RxIrqEvent::RxError) => {
+                self.rx_state = RxState::Idle;
+                self.preamble_seen_at = None;
+                if matches!(self.rx_mode, RxMode::DutyCycle(_)) {
+                    self.rx_armed = false;
+                }
+                Some(RxOutcome::CrcError)
+            }
             Ok(RxIrqEvent::None) => {
                 self.rx_state = RxState::Idle;
+                self.preamble_seen_at = None;
                 if matches!(self.rx_mode, RxMode::DutyCycle(_)) {
                     self.rx_armed = false;
                 }
                 None
             }
             Err(RadioError::ReceiveTimeout) if matches!(self.rx_mode, RxMode::DutyCycle(_)) => {
-                self.rx_state = RxState::Idle;
-                self.reenter_rx().await;
+                self.rearm_rx_fast_or_recover().await;
                 Some(RxOutcome::DutyCycleEnd)
             }
             Err(e) => {
                 self.rx_state = RxState::Idle;
+                self.preamble_seen_at = None;
                 self.rx_armed = false;
                 debug!("sx1262: RX error or timeout: {:?}", e);
                 Some(RxOutcome::Error)
@@ -407,6 +636,7 @@ where
     }
 
     async fn recover_receive(&mut self) {
+        self.lbt.clear_starvation();
         self.reenter_rx().await;
     }
 }
@@ -443,33 +673,33 @@ mod tests {
 
     #[test]
     fn duty_cycle_rejects_short_preambles() {
-        // 2 * detect + 1 symbols (13 for SF >= 7) is the minimum detectable preamble.
-        assert!(duty_cycle_params(7, 62, 13).is_none());
-        assert!(duty_cycle_params(8, 62, 13).is_none());
-        // Just above it, or at fast bandwidths, the deaf window is <= wake cost (11 ms + 2 ms).
-        assert!(duty_cycle_params(8, 62, 16).is_none());
+        // 2 * D + 1 symbols (17 for SF >= 7) is the minimum preamble with positive deaf window.
+        assert!(duty_cycle_params(7, 62, 16).is_none());
+        assert!(duty_cycle_params(7, 62, 17).is_none());
+        assert!(duty_cycle_params(9, 62, 16).is_none());
+        assert!(duty_cycle_params(10, 62, 16).is_none());
+        // Wide bandwidths where deaf budget <= TCXO wake cost (11 ms + 2 ms).
         assert!(duty_cycle_params(7, 500, 32).is_none());
         assert!(duty_cycle_params(7, 0, 32).is_none());
     }
 
     #[test]
-    fn duty_cycle_accepts_meshcore_preamble() {
-        let sf7 = duty_cycle_params(7, 62, 32).expect("SF7 duty cycle params");
+    fn duty_cycle_accepts_32_symbol_preamble() {
+        // SF7 / BW 62.5 kHz / 32-symbol preamble fits cleanly with deaf-window math:
+        // sleep ~16.6 ms, rx ~38.8 ms, and 2*rx + sleep >= 46 * 2.048 ms = 94.2 ms (~6029 units).
+        let sf7 = duty_cycle_params(7, 62, 32).expect("SF7 32-sym duty cycle params");
         assert!(sf7.rx_time > 0);
         assert!(sf7.sleep_time > 0);
-        // SetStopRxTimerOnPreamble extends RX on preamble detection, so rx_time < sleep_time.
-        assert!(sf7.rx_time < sf7.sleep_time);
-        // 8 symbols (~16.4 ms) RX and ~24.0 ms sleep keeps ~30 ms margin on 32-symbol preambles.
-        assert!(sf7.rx_time >= 1_000);
-        assert!(sf7.sleep_time <= 1_600);
+        assert!(2 * sf7.rx_time + sf7.sleep_time >= 6_025);
 
-        // SF9-12 MeshCore preambles (16 symbols) also fit duty cycle.
-        let sf9 = duty_cycle_params(9, 62, 16).expect("SF9 duty cycle params");
-        assert!(sf9.rx_time > 0);
-        assert!(sf9.sleep_time > 0);
-        let sf10 = duty_cycle_params(10, 62, 16).expect("SF10 duty cycle params");
-        assert!(sf10.rx_time > 0);
-        assert!(sf10.sleep_time > 0);
+        let sf8 = duty_cycle_params(8, 62, 32).expect("SF8 32-sym duty cycle params");
+        assert!(sf8.rx_time > 0);
+        assert!(sf8.sleep_time > 0);
+        assert!(2 * sf8.rx_time + sf8.sleep_time >= 12_050);
+
+        // Longer preambles at SF9/10 also satisfy SX1261-2 §13.1.7.
+        assert!(duty_cycle_params(9, 62, 32).is_some());
+        assert!(duty_cycle_params(10, 62, 32).is_some());
     }
 
     #[test]
@@ -484,8 +714,69 @@ mod tests {
         ));
         // Too short a preamble falls back to continuous RX.
         assert!(matches!(
-            make_rx_mode(7, 62, 8, true),
+            make_rx_mode(9, 62, 16, true),
             RxMode::Continuous
         ));
+    }
+
+    #[test]
+    fn preamble_grace_scales_with_sf_and_preamble() {
+        // SF7 / BW 62.5 kHz / 32-symbol preamble: ((32+8)*4 + 17) * 2048us / 4 = 90.624 ms -> 91 ms.
+        assert_eq!(preamble_grace_ms(7, 62, 32), 91);
+        // SF10 / BW 62.5 kHz / 16-symbol preamble: ((16+8)*4 + 17) * 16384us / 4 = 462.848 ms -> 463 ms.
+        assert_eq!(preamble_grace_ms(10, 62, 16), 463);
+    }
+
+    #[test]
+    fn lbt_holds_sensitivity_through_normal_traffic_bursts() {
+        let mut lbt = LbtState::new();
+        // Repeated busy hits over 59.9 seconds (normal multi-packet bursts) must not relax detPeak.
+        for step in 0..400u64 {
+            assert!(!lbt.on_busy(1_000 + step * 149));
+            assert_eq!(lbt.offset(), 0);
+        }
+        // Any clear CAD resets the starvation timer.
+        lbt.on_clear();
+        assert!(!lbt.on_busy(1_000 + LBT_STARVATION_MS + 10_000));
+        assert_eq!(lbt.offset(), 0);
+    }
+
+    #[test]
+    fn lbt_relaxes_only_after_sustained_starvation_and_recovers_cleanly() {
+        let mut lbt = LbtState::new();
+        assert!(!lbt.on_busy(10_000));
+        assert!(!lbt.on_busy(10_000 + LBT_STARVATION_MS - 1));
+        assert_eq!(lbt.offset(), 0);
+
+        // Full 60 s starvation relaxes by +1 and restarts the 60 s window.
+        assert!(lbt.on_busy(10_000 + LBT_STARVATION_MS));
+        assert_eq!(lbt.offset(), 1);
+        assert!(!lbt.on_busy(10_000 + LBT_STARVATION_MS + 30_000));
+        assert_eq!(lbt.offset(), 1);
+        assert!(lbt.on_busy(10_000 + 2 * LBT_STARVATION_MS));
+        assert_eq!(lbt.offset(), 2);
+
+        // Gradual recovery after 16 consecutive clear passes; a busy hit resets the clean streak.
+        for _ in 0..(LBT_RECOVER_CLEAN_COUNT - 1) {
+            lbt.on_clear();
+        }
+        assert_eq!(lbt.offset(), 2);
+        assert!(!lbt.on_busy(500_000));
+        for _ in 0..(LBT_RECOVER_CLEAN_COUNT - 1) {
+            lbt.on_clear();
+        }
+        assert_eq!(lbt.offset(), 2);
+        lbt.on_clear();
+        assert_eq!(lbt.offset(), 1);
+
+        // Clamp at LBT_MAX_PEAK_OFFSET.
+        let mut t = 1_000_000u64;
+        for _ in 0..30 {
+            let _ = lbt.on_busy(t);
+            t += LBT_STARVATION_MS;
+        }
+        assert_eq!(lbt.offset(), LBT_MAX_PEAK_OFFSET);
+        assert!(!lbt.on_busy(t + LBT_STARVATION_MS));
+        assert_eq!(lbt.offset(), LBT_MAX_PEAK_OFFSET);
     }
 }

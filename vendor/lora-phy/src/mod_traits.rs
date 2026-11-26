@@ -26,6 +26,8 @@ pub enum IrqState {
     PreambleReceived,
     /// Runs the loop until a valid LoRa header has been decoded
     HeaderValid,
+    /// A payload CRC or header error occurred during reception
+    RxError,
     /// Runs the loop until the operation is fully complete
     Done,
 }
@@ -59,6 +61,11 @@ pub trait RadioKind {
     async fn ensure_ready(&mut self, mode: RadioMode) -> Result<(), RadioError>;
     /// Place the LoRa chip in standby mode
     async fn set_standby(&mut self) -> Result<(), RadioError>;
+    /// Place the LoRa chip in warm standby (e.g. STBY_XOSC) keeping the oscillator
+    /// running for fast transitions to CAD/TX/RX.
+    async fn set_standby_warm(&mut self) -> Result<(), RadioError> {
+        self.set_standby().await
+    }
     /// Place the LoRa chip in power-saving mode
     async fn set_sleep(&mut self, warm_start_if_possible: bool, delay: &mut impl DelayNs) -> Result<(), RadioError>;
     /// Set the LoRa chip send and receive buffer base addresses
@@ -98,6 +105,14 @@ pub trait RadioKind {
     async fn get_rx_packet_status(&mut self) -> Result<PacketStatus, RadioError>;
     /// Perform a channel activity detection operation
     async fn do_cad(&mut self, mdltn_params: &ModulationParams) -> Result<(), RadioError>;
+    /// Perform a channel activity detection operation with a `detPeak` threshold offset
+    async fn do_cad_with_offset(
+        &mut self,
+        mdltn_params: &ModulationParams,
+        _peak_offset: i8,
+    ) -> Result<(), RadioError> {
+        self.do_cad(mdltn_params).await
+    }
     /// Set the LoRa chip to provide notification of specific events based on radio state
     async fn set_irq_params(&mut self, radio_mode: Option<RadioMode>) -> Result<(), RadioError>;
     /// Set the LoRa chip into the TxContinuousWave mode
@@ -112,4 +127,21 @@ pub trait RadioKind {
         cad_activity_detected: Option<&mut bool>,
         clear_interrupts: bool,
     ) -> Result<Option<IrqState>, RadioError>;
+
+    /// Non-destructively poll live RX IRQ status flags:
+    /// `(header_valid, preamble_detected, header_err)`.
+    async fn poll_rx_activity(&mut self) -> Result<(bool, bool, bool), RadioError> {
+        Ok((false, false, false))
+    }
+
+    /// Clear only a stale `PreambleDetected` IRQ flag without leaving receive mode.
+    async fn clear_preamble_irq(&mut self) -> Result<(), RadioError> {
+        Ok(())
+    }
+
+    /// Clear `PreambleDetected | SyncwordValid | HeaderValid | HeaderError` IRQ flags
+    /// without leaving receive mode.
+    async fn clear_rx_activity_irqs(&mut self) -> Result<(), RadioError> {
+        Ok(())
+    }
 }

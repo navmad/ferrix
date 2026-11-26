@@ -35,9 +35,11 @@ pub enum RxIrqEvent {
     PreambleReceived,
     /// Valid LoRa header decoded; packet reception is in progress.
     HeaderValid,
+    /// A payload CRC or header error occurred during reception.
+    RxError,
     /// A complete packet was read into the caller's buffer.
     Packet(u8, PacketStatus),
-    /// An intermediate or ignored error IRQ occurred; keep listening.
+    /// An intermediate or ignored IRQ occurred; keep listening.
     None,
 }
 
@@ -215,7 +217,7 @@ where
                         self.radio_mode = RadioMode::Standby;
                         return Ok(());
                     }
-                    Ok(None) => continue,
+                    Ok(Some(IrqState::RxError)) | Ok(None) => continue,
                     Err(err) => {
                         self.radio_kind.ensure_ready(self.radio_mode).await?;
                         self.radio_kind.set_standby().await?;
@@ -262,7 +264,10 @@ where
         loop {
             self.wait_for_irq().await?;
             match self.handle_rx_irq(packet_params, receiving_buffer).await? {
-                RxIrqEvent::PreambleReceived | RxIrqEvent::HeaderValid | RxIrqEvent::None => continue,
+                RxIrqEvent::PreambleReceived
+                | RxIrqEvent::HeaderValid
+                | RxIrqEvent::RxError
+                | RxIrqEvent::None => continue,
                 RxIrqEvent::Packet(received_len, rx_pkt_status) => {
                     return Ok((received_len, rx_pkt_status));
                 }
@@ -294,6 +299,7 @@ where
                 Ok(Some(actual_state)) => match actual_state {
                     IrqState::PreambleReceived => Ok(RxIrqEvent::PreambleReceived),
                     IrqState::HeaderValid => Ok(RxIrqEvent::HeaderValid),
+                    IrqState::RxError => Ok(RxIrqEvent::RxError),
                     IrqState::Done => {
                         let received_len = self.radio_kind.get_rx_payload(packet_params, receiving_buffer).await?;
                         let rx_pkt_status = self.radio_kind.get_rx_packet_status().await?;
@@ -349,6 +355,117 @@ where
             }
         } else {
             Err(RadioError::InvalidRadioMode)
+        }
+    }
+
+    /// Prepare the Semtech chip for a send operation without leaving the warm
+    /// oscillator/modem configuration when modulation and frequency are already set.
+    pub async fn prepare_for_tx_fast(
+        &mut self,
+        mdltn_params: &ModulationParams,
+        tx_pkt_params: &mut PacketParams,
+        output_power: i32,
+        buffer: &[u8],
+    ) -> Result<(), RadioError> {
+        if self.cold_start || self.calibrate_image {
+            return self
+                .prepare_for_tx(mdltn_params, tx_pkt_params, output_power, buffer)
+                .await;
+        }
+        self.radio_kind.ensure_ready(self.radio_mode).await?;
+        if self.radio_mode != RadioMode::Standby {
+            self.radio_kind.set_standby_warm().await?;
+            self.radio_mode = RadioMode::Standby;
+        }
+        self.radio_kind
+            .set_tx_power_and_ramp_time(output_power, Some(mdltn_params), true)
+            .await?;
+        tx_pkt_params.set_payload_length(buffer.len())?;
+        self.radio_kind.set_packet_params(tx_pkt_params).await?;
+        self.radio_kind.set_payload(buffer).await?;
+        self.radio_mode = RadioMode::Transmit;
+        self.radio_kind.set_irq_params(Some(self.radio_mode)).await?;
+        Ok(())
+    }
+
+    /// Re-enter receive mode directly from a warm state (such as FS / STBY_XOSC after
+    /// `TxDone` or `CADDone`) without rewriting modulation/channel registers.
+    pub async fn rearm_rx_fast(
+        &mut self,
+        listen_mode: RxMode,
+        rx_pkt_params: &PacketParams,
+    ) -> Result<(), RadioError> {
+        self.radio_kind.ensure_ready(self.radio_mode).await?;
+        self.radio_kind.set_packet_params(rx_pkt_params).await?;
+        self.radio_mode = listen_mode.into();
+        self.radio_kind.set_irq_params(Some(self.radio_mode)).await?;
+        self.radio_kind.do_rx(listen_mode).await
+    }
+
+    /// Non-destructively poll live RX IRQ status flags:
+    /// `(header_valid, preamble_detected, header_err)`.
+    pub async fn poll_rx_activity(&mut self) -> Result<(bool, bool, bool), RadioError> {
+        self.radio_kind.poll_rx_activity().await
+    }
+
+    /// Clear only a stale `PreambleDetected` IRQ flag without disturbing receive mode.
+    pub async fn clear_preamble_irq(&mut self) -> Result<(), RadioError> {
+        self.radio_kind.clear_preamble_irq().await
+    }
+
+    /// Clear `PreambleDetected | SyncwordValid | HeaderValid | HeaderError` IRQ flags
+    /// without disturbing receive mode.
+    pub async fn clear_rx_activity_irqs(&mut self) -> Result<(), RadioError> {
+        self.radio_kind.clear_rx_activity_irqs().await
+    }
+
+    /// Perform a fast channel activity detection check assuming modulation and
+    /// channel frequency are already programmed.
+    pub async fn cad_fast(&mut self, mdltn_params: &ModulationParams) -> Result<bool, RadioError> {
+        self.cad_fast_with_offset(mdltn_params, 0).await
+    }
+
+    /// Perform a fast channel activity detection check with an adaptive `detPeak` offset
+    /// assuming modulation and channel frequency are already programmed.
+    pub async fn cad_fast_with_offset(
+        &mut self,
+        mdltn_params: &ModulationParams,
+        peak_offset: i8,
+    ) -> Result<bool, RadioError> {
+        if self.cold_start || self.calibrate_image {
+            self.prepare_for_cad(mdltn_params).await?;
+            return self.cad(mdltn_params).await;
+        }
+        self.radio_kind.ensure_ready(self.radio_mode).await?;
+        if self.radio_mode != RadioMode::Standby {
+            self.radio_kind.set_standby_warm().await?;
+            self.radio_mode = RadioMode::Standby;
+        }
+        self.radio_mode = RadioMode::ChannelActivityDetection;
+        self.radio_kind.set_irq_params(Some(self.radio_mode)).await?;
+        self.radio_kind
+            .do_cad_with_offset(mdltn_params, peak_offset)
+            .await?;
+        loop {
+            self.wait_for_irq().await?;
+            let mut cad_activity_detected = false;
+            match self
+                .radio_kind
+                .process_irq_event(self.radio_mode, Some(&mut cad_activity_detected), true)
+                .await
+            {
+                Ok(Some(IrqState::Done)) => {
+                    self.radio_mode = RadioMode::Standby;
+                    return Ok(cad_activity_detected);
+                }
+                Ok(_) => continue,
+                Err(err) => {
+                    self.radio_kind.ensure_ready(self.radio_mode).await?;
+                    self.radio_kind.set_standby().await?;
+                    self.radio_mode = RadioMode::Standby;
+                    return Err(err);
+                }
+            }
         }
     }
 

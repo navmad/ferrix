@@ -43,7 +43,7 @@ pub struct FloodSlot {
     pub slot_id: u64,
 }
 
-/// MeshCore parity: longer preamble for SF <= 8 (32 symbols), 16 otherwise.
+/// LoRa preamble length for a given spreading factor: 32 symbols for `sf <= 8`, 16 otherwise.
 pub fn preamble_for(sf: u8) -> u16 {
     if sf <= 8 {
         32
@@ -251,6 +251,61 @@ pub fn control_can_send(control_budget_ms: i64, flood_budget_ms: i64, airtime_ms
     control_budget_ms.max(0) + flood_budget_ms.max(0) >= airtime_ms
 }
 
+/// Priority rank (`0..=3`, lower is higher priority) for a packet in [`TxLane::Control`]:
+/// - `0`: direct `ACK`, `MULTIPART`, `TXT_MSG`, `REQ`, `RESPONSE`
+/// - `1`: direct `PATH`, or flood `ACK`, `MULTIPART`, `TXT_MSG`, `REQ`, `RESPONSE`, `ANON_REQ`
+/// - `2`: flood `PATH`, or `GRP_TXT`, `GRP_DATA`
+/// - `3`: `TRACE`, `CONTROL`, `RAW_CUSTOM`, and any other payload types
+pub fn control_priority(header: u8) -> u8 {
+    use meshcore_wire::packet::{
+        PAYLOAD_TYPE_ACK, PAYLOAD_TYPE_ANON_REQ, PAYLOAD_TYPE_GRP_DATA, PAYLOAD_TYPE_GRP_TXT,
+        PAYLOAD_TYPE_MULTIPART, PAYLOAD_TYPE_PATH, PAYLOAD_TYPE_REQ, PAYLOAD_TYPE_RESPONSE,
+        PAYLOAD_TYPE_TXT_MSG, ROUTE_TYPE_FLOOD, ROUTE_TYPE_TRANSPORT_FLOOD,
+    };
+    let route = header & 0x03;
+    let is_flood = route == ROUTE_TYPE_FLOOD || route == ROUTE_TYPE_TRANSPORT_FLOOD;
+    let payload_type = (header >> 2) & 0x0F;
+    match (is_flood, payload_type) {
+        (
+            false,
+            PAYLOAD_TYPE_ACK
+            | PAYLOAD_TYPE_MULTIPART
+            | PAYLOAD_TYPE_TXT_MSG
+            | PAYLOAD_TYPE_REQ
+            | PAYLOAD_TYPE_RESPONSE,
+        ) => 0,
+        (false, PAYLOAD_TYPE_PATH)
+        | (
+            true,
+            PAYLOAD_TYPE_ACK
+            | PAYLOAD_TYPE_MULTIPART
+            | PAYLOAD_TYPE_TXT_MSG
+            | PAYLOAD_TYPE_REQ
+            | PAYLOAD_TYPE_RESPONSE
+            | PAYLOAD_TYPE_ANON_REQ,
+        ) => 1,
+        (true, PAYLOAD_TYPE_PATH) | (_, PAYLOAD_TYPE_GRP_TXT | PAYLOAD_TYPE_GRP_DATA) => 2,
+        _ => 3,
+    }
+}
+
+/// Index of the highest-priority control-lane packet due at or before `now`.
+/// Ties within the same priority class are broken by `(due_at_ms, queued_at_ms)` (FIFO).
+pub fn due_control(control: &[TxPacket], now: u64) -> Option<usize> {
+    control
+        .iter()
+        .enumerate()
+        .filter(|(_, req)| req.due_at_ms <= now)
+        .min_by_key(|(_, req)| {
+            (
+                control_priority(req.data[0]),
+                req.due_at_ms,
+                req.queued_at_ms,
+            )
+        })
+        .map(|(idx, _)| idx)
+}
+
 /// Charge a sent control packet: own budget first, then the flood budget.
 pub fn charge_control(control_budget_ms: &mut i64, flood_budget_ms: &mut i64, airtime_ms: i64) {
     let from_control = airtime_ms.min((*control_budget_ms).max(0));
@@ -261,6 +316,10 @@ pub fn charge_control(control_budget_ms: &mut i64, flood_budget_ms: &mut i64, ai
 #[cfg(test)]
 mod tests {
     use super::*;
+    use meshcore_wire::packet::{
+        PAYLOAD_TYPE_ACK, PAYLOAD_TYPE_GRP_TXT, PAYLOAD_TYPE_PATH, PAYLOAD_TYPE_TXT_MSG,
+        ROUTE_TYPE_DIRECT, ROUTE_TYPE_FLOOD,
+    };
 
     #[test]
     fn control_borrows_idle_flood_budget() {
@@ -285,6 +344,31 @@ mod tests {
         let (mut c, mut f) = (0, 10);
         charge_control(&mut c, &mut f, 120);
         assert_eq!((c, f), (0, 0));
+    }
+
+    #[test]
+    fn due_control_prioritizes_direct_dm_and_ack_over_group_and_path() {
+        let make = |route: u8, payload: u8, queued_at_ms: u64, due_at_ms: u64| {
+            let mut req = packet(queued_at_ms as u8);
+            req.lane = TxLane::Control;
+            req.data[0] = (payload << 2) | (route & 0x03);
+            req.queued_at_ms = queued_at_ms;
+            req.due_at_ms = due_at_ms;
+            req
+        };
+        let queue = [
+            make(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_GRP_TXT, 10, 10), // prio 2
+            make(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_PATH, 20, 20),    // prio 2
+            make(ROUTE_TYPE_FLOOD, PAYLOAD_TYPE_TXT_MSG, 30, 30), // prio 1
+            make(ROUTE_TYPE_DIRECT, PAYLOAD_TYPE_ACK, 40, 40),    // prio 0
+            make(ROUTE_TYPE_DIRECT, PAYLOAD_TYPE_TXT_MSG, 50, 50), // prio 0 (later)
+        ];
+        // At t=50, direct ACK (queued at 40) beats earlier flooded packets and later direct DM.
+        assert_eq!(due_control(&queue, 50), Some(3));
+        // At t=35, direct ACK is not yet due (due at 40), so flooded TXT_MSG (prio 1) wins.
+        assert_eq!(due_control(&queue, 35), Some(2));
+        // At t=25, both prio 2 packets are due; earlier due/queued (index 0) wins FIFO tie-break.
+        assert_eq!(due_control(&queue, 25), Some(0));
     }
 
     fn packet(hash: u8) -> TxPacket {

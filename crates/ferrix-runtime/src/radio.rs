@@ -9,10 +9,10 @@ use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Instant, Timer};
 use ferrix_core::scheduler::{
-    assign_flood, cancel_slot, charge_control, control_can_send, due_flood, next_flood_due, packet_wait_ms, preamble_for,
-    preamble_wait_ms, rebase_floods, refill_budgets, remember_cancel, slot_width_ms,
-    take_cancelled, FloodSlot, TxPacket, CONTROL_QUEUE, FLOOD_MAX_AGE_SLOTS, FLOOD_SLOTS,
-    SLOT_MIN_MS, TX_GAP_MS, TX_MAX_ATTEMPTS,
+    assign_flood, cancel_slot, charge_control, control_can_send, due_control, due_flood,
+    next_flood_due, packet_wait_ms, preamble_for, preamble_wait_ms, rebase_floods, refill_budgets,
+    remember_cancel, slot_width_ms, take_cancelled, FloodSlot, TxPacket, CONTROL_QUEUE,
+    FLOOD_MAX_AGE_SLOTS, FLOOD_SLOTS, SLOT_MIN_MS, TX_GAP_MS, TX_MAX_ATTEMPTS,
 };
 use ferrix_core::state::{
     current_public_key, RADIO_SETTINGS, RADIO_TELEMETRY, TX_SLOT_MS_LAST, TX_SLOT_MS_OVERRIDE,
@@ -144,10 +144,10 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
     info!("radio: scheduler started");
 
     let mut rx_buf = [0u8; 256];
-    // If the radio starts returning immediate RX errors, never spin without
-    // yielding: the executor is cooperative, and a tight loop here starves the
-    // main loop, USB and BLE tasks.
-    let mut rx_backoff_ms = 50u64;
+    // If the radio starts returning consecutive immediate RX errors, back off
+    // before recovering so the cooperative executor is never starved, while
+    // recovering immediately (0 ms delay) on the first transient error.
+    let mut rx_backoff_ms = 0u64;
     let mut control: Vec<TxPacket, CONTROL_QUEUE> = Vec::new();
     let mut background: Deque<TxPacket, 2> = Deque::new();
     let mut floods: [Option<FloodSlot>; FLOOD_SLOTS] = [None; FLOOD_SLOTS];
@@ -164,6 +164,7 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
     let mut base_ms = start_ms;
     let mut last_rx_activity_ms = start_ms;
     let mut rx_active_since: Option<(RxState, u64)> = None;
+    let mut channel_busy_since: Option<u64> = None;
 
     let mut current_cfg = (
         initial.frequency_hz,
@@ -192,6 +193,7 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
             debug!("radio: RX watchdog re-arm");
             device.recover_receive().await;
             rx_active_since = None;
+            channel_busy_since = None;
             now = Instant::now().as_millis() as u64;
             last_rx_activity_ms = now;
         }
@@ -293,9 +295,9 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
         let mut budget_wait_ms = 0u64;
         let mut pick: Option<(TxPacket, TxLane, u32)> = None;
 
-        // Avoid transmitting on top of an inbound frame, distinguishing brief
-        // false-preamble detections from confirmed headers so noise cannot stall
-        // TX or wedge duty-cycle RX out of sleep.
+        // Avoid transmitting on top of an inbound frame with a valid header.
+        // Only recover RX when a confirmed Header stalls past packet_wait_ms;
+        // never tear down continuous RX on a transient Preamble latch.
         let current_rx_state = device.rx_state();
         let rx_busy = match current_rx_state {
             RxState::Idle => {
@@ -322,18 +324,21 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
                     wake_at = wake_at.min(until);
                     true
                 } else {
-                    device.recover_receive().await;
+                    if tracked_state == RxState::Header {
+                        device.recover_receive().await;
+                        now = Instant::now().as_millis() as u64;
+                        last_rx_activity_ms = now;
+                    }
                     rx_active_since = None;
-                    now = Instant::now().as_millis() as u64;
-                    last_rx_activity_ms = now;
                     false
                 }
             }
         };
 
         if now >= next_tx_allowed_ms && !rx_busy {
-            // Control lane first (earliest queued packet whose due_at_ms has arrived).
-            if let Some(idx) = control.iter().position(|req| req.due_at_ms <= now) {
+            // Control lane first (highest-priority packet whose due_at_ms has arrived,
+            // with FIFO tie-breaking within each priority class).
+            if let Some(idx) = due_control(&control, now) {
                 let airtime = ferrix_core::airtime::estimate_airtime_ms(
                     control[idx].len,
                     current_cfg.2,
@@ -408,62 +413,149 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
                 },
                 now.saturating_sub(req.queued_at_ms)
             );
-            let success = device.transmit(&req.data[..req.len]).await == TxOutcome::Sent;
+            let outcome = device.transmit(&req.data[..req.len]).await;
             let after_tx = Instant::now().as_millis() as u64;
-            rx_active_since = None;
-            last_rx_activity_ms = after_tx;
-            if success {
-                next_tx_allowed_ms = after_tx + TX_GAP_MS;
-                if duty_pct < 100 {
-                    if lane == TxLane::Control {
-                        charge_control(&mut control_budget_ms, &mut flood_budget_ms, airtime as i64);
-                    } else {
-                        flood_budget_ms = (flood_budget_ms - airtime as i64).max(0);
-                    }
-                }
-                if lane == TxLane::Flood {
-                    FORWARD_SENT.fetch_add(1, Ordering::Relaxed);
-                }
-                add_telemetry(|tel| {
-                    tel.tx_beacons = tel.tx_beacons.saturating_add(1);
-                    tel.tx_air_ms = tel.tx_air_ms.saturating_add(airtime);
-                    let wait = now.saturating_sub(req.queued_at_ms) as u32;
-                    tel.tx_wait_max_ms = tel.tx_wait_max_ms.max(wait);
-                    match lane {
-                        TxLane::Flood => tel.tx_flood = tel.tx_flood.saturating_add(1),
-                        TxLane::Background => {
-                            tel.tx_background = tel.tx_background.saturating_add(1)
+            match outcome {
+                TxOutcome::Sent => {
+                    rx_active_since = None;
+                    channel_busy_since = None;
+                    last_rx_activity_ms = after_tx;
+                    next_tx_allowed_ms = after_tx + TX_GAP_MS;
+                    if duty_pct < 100 {
+                        if lane == TxLane::Control {
+                            charge_control(
+                                &mut control_budget_ms,
+                                &mut flood_budget_ms,
+                                airtime as i64,
+                            );
+                        } else {
+                            flood_budget_ms = (flood_budget_ms - airtime as i64).max(0);
                         }
-                        TxLane::Control => tel.tx_control = tel.tx_control.saturating_add(1),
                     }
-                });
-            } else {
-                add_telemetry(|tel| {
-                    tel.tx_retries = tel.tx_retries.saturating_add(1);
-                    if req.attempts + 1 >= TX_MAX_ATTEMPTS {
-                        tel.tx_dropped = tel.tx_dropped.saturating_add(1);
+                    if lane == TxLane::Flood {
+                        FORWARD_SENT.fetch_add(1, Ordering::Relaxed);
                     }
-                });
-                if req.attempts + 1 < TX_MAX_ATTEMPTS {
+                    let route = req.data[0] & 0x03;
+                    let is_flood_route = route == meshcore_wire::packet::ROUTE_TYPE_FLOOD
+                        || route == meshcore_wire::packet::ROUTE_TYPE_TRANSPORT_FLOOD;
+                    add_telemetry(|tel| {
+                        tel.tx_beacons = tel.tx_beacons.saturating_add(1);
+                        tel.tx_air_ms = tel.tx_air_ms.saturating_add(airtime);
+                        let wait = now.saturating_sub(req.queued_at_ms) as u32;
+                        tel.tx_wait_max_ms = tel.tx_wait_max_ms.max(wait);
+                        if is_flood_route {
+                            tel.tx_flood_sent = tel.tx_flood_sent.saturating_add(1);
+                        } else {
+                            tel.tx_direct = tel.tx_direct.saturating_add(1);
+                        }
+                        match lane {
+                            TxLane::Flood => tel.tx_flood = tel.tx_flood.saturating_add(1),
+                            TxLane::Background => {
+                                tel.tx_background = tel.tx_background.saturating_add(1)
+                            }
+                            TxLane::Control => tel.tx_control = tel.tx_control.saturating_add(1),
+                        }
+                    });
+                }
+                TxOutcome::ChannelBusy => {
+                    let busy_since = *channel_busy_since.get_or_insert(after_tx);
+                    if after_tx.saturating_sub(busy_since) >= 4_000 {
+                        // After 4 s of consecutive busy checks, recover RX to clear any stuck
+                        // modem latch before retrying transmit.
+                        device.recover_receive().await;
+                        let recovered_at = Instant::now().as_millis() as u64;
+                        rx_active_since = None;
+                        channel_busy_since = None;
+                        last_rx_activity_ms = recovered_at;
+                        next_tx_allowed_ms = recovered_at;
+                    } else {
+                        // Preserve active Header tracking if live IRQ poll detected one.
+                        match device.rx_state() {
+                            RxState::Idle => rx_active_since = None,
+                            st => {
+                                if !matches!(rx_active_since, Some((prev, _)) if prev == st) {
+                                    rx_active_since = Some((st, after_tx));
+                                }
+                            }
+                        }
+                        let mix = after_tx
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(
+                                (req.hash[0] as u64)
+                                    ^ ((node_key[0] as u64) << 8)
+                                    ^ 0x9E37_79B9,
+                            );
+                        let backoff_ms = 100 + ((mix >> 16) % 101);
+                        next_tx_allowed_ms = after_tx.saturating_add(backoff_ms);
+                    }
+
                     let mut retry = req;
-                    retry.attempts += 1;
-                    let requeued = match lane {
-                        TxLane::Flood => assign_flood(
-                            &mut floods,
-                            retry,
-                            after_tx,
-                            base_ms,
-                            slot_ms,
-                            &node_key,
-                        )
-                        .is_ok(),
-                        TxLane::Background => background.push_back(retry).is_ok(),
-                        TxLane::Control => control.push(retry).is_ok(),
+                    let age_ms = after_tx.saturating_sub(retry.queued_at_ms);
+                    let keep = match lane {
+                        TxLane::Control => {
+                            retry.due_at_ms = next_tx_allowed_ms;
+                            if age_ms >= 8_000 {
+                                retry.attempts = retry.attempts.saturating_add(1);
+                            }
+                            retry.attempts < TX_MAX_ATTEMPTS
+                        }
+                        TxLane::Flood => true,
+                        TxLane::Background => age_ms < 10_000,
+                    };
+                    let requeued = if keep {
+                        match lane {
+                            TxLane::Flood => assign_flood(
+                                &mut floods,
+                                retry,
+                                after_tx,
+                                base_ms,
+                                slot_ms,
+                                &node_key,
+                            )
+                            .is_ok(),
+                            TxLane::Background => background.push_back(retry).is_ok(),
+                            TxLane::Control => control.push(retry).is_ok(),
+                        }
+                    } else {
+                        false
                     };
                     if !requeued {
                         add_telemetry(|tel| {
                             tel.tx_dropped = tel.tx_dropped.saturating_add(1);
                         });
+                    }
+                }
+                TxOutcome::Failed => {
+                    rx_active_since = None;
+                    channel_busy_since = None;
+                    last_rx_activity_ms = after_tx;
+                    add_telemetry(|tel| {
+                        tel.tx_retries = tel.tx_retries.saturating_add(1);
+                        if req.attempts + 1 >= TX_MAX_ATTEMPTS {
+                            tel.tx_dropped = tel.tx_dropped.saturating_add(1);
+                        }
+                    });
+                    if req.attempts + 1 < TX_MAX_ATTEMPTS {
+                        let mut retry = req;
+                        retry.attempts += 1;
+                        let requeued = match lane {
+                            TxLane::Flood => assign_flood(
+                                &mut floods,
+                                retry,
+                                after_tx,
+                                base_ms,
+                                slot_ms,
+                                &node_key,
+                            )
+                            .is_ok(),
+                            TxLane::Background => background.push_back(retry).is_ok(),
+                            TxLane::Control => control.push(retry).is_ok(),
+                        };
+                        if !requeued {
+                            add_telemetry(|tel| {
+                                tel.tx_dropped = tel.tx_dropped.saturating_add(1);
+                            });
+                        }
                     }
                 }
             }
@@ -525,15 +617,21 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
             }
             Either::First(Either4::First(irq_ok)) => {
                 if !irq_ok {
-                    Timer::after_millis(rx_backoff_ms).await;
-                    rx_backoff_ms = (rx_backoff_ms * 2).min(1000);
+                    if rx_backoff_ms > 0 {
+                        Timer::after_millis(rx_backoff_ms).await;
+                    }
+                    rx_backoff_ms = if rx_backoff_ms == 0 {
+                        50
+                    } else {
+                        (rx_backoff_ms * 2).min(1000)
+                    };
                     device.recover_receive().await;
                     rx_active_since = None;
                     last_rx_activity_ms = Instant::now().as_millis() as u64;
                 } else {
                     match device.handle_rx_irq(&mut rx_buf).await {
                         Some(RxOutcome::Packet { len, rssi, snr }) => {
-                            rx_backoff_ms = 50;
+                            rx_backoff_ms = 0;
                             rx_active_since = None;
                             last_rx_activity_ms = Instant::now().as_millis() as u64;
                             info!("radio: RX {} bytes, RSSI: {} dBm, SNR: {} dB", len, rssi, snr);
@@ -550,17 +648,30 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
                             }
                         }
                         Some(RxOutcome::DutyCycleEnd) => {
+                            rx_backoff_ms = 0;
                             rx_active_since = None;
                             last_rx_activity_ms = Instant::now().as_millis() as u64;
+                        }
+                        Some(RxOutcome::CrcError) => {
+                            rx_backoff_ms = 0;
+                            rx_active_since = None;
+                            last_rx_activity_ms = Instant::now().as_millis() as u64;
+                            add_telemetry(|tel| {
+                                tel.rx_errors = tel.rx_errors.saturating_add(1);
+                            });
                         }
                         Some(RxOutcome::Error) => {
                             if rx_backoff_ms <= 50 {
                                 debug!("radio: RX error");
                             }
-                            // Yield first. Without this, an immediate RX error after a
-                            // failed reconfiguration turns this task into a busy loop.
-                            Timer::after_millis(rx_backoff_ms).await;
-                            rx_backoff_ms = (rx_backoff_ms * 2).min(1000);
+                            if rx_backoff_ms > 0 {
+                                Timer::after_millis(rx_backoff_ms).await;
+                            }
+                            rx_backoff_ms = if rx_backoff_ms == 0 {
+                                50
+                            } else {
+                                (rx_backoff_ms * 2).min(1000)
+                            };
                             device.recover_receive().await;
                             rx_active_since = None;
                             last_rx_activity_ms = Instant::now().as_millis() as u64;
@@ -641,8 +752,9 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
                     slot_override_active = false;
                     base_ms = now_cfg;
                     last_adapt_ms = now_cfg;
-                    rx_backoff_ms = 50;
+                    rx_backoff_ms = 0;
                     rx_active_since = None;
+                    channel_busy_since = None;
                     last_rx_activity_ms = now_cfg;
                     info!(
                         "radio: reconfigured to {} Hz (SF{}, BW{}k, CR 4/{}), {} dBm",
@@ -654,6 +766,7 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
                     );
                 } else {
                     rx_active_since = None;
+                    channel_busy_since = None;
                     last_rx_activity_ms = Instant::now().as_millis() as u64;
                     error!("radio: reconfigure failed; keeping previous settings");
                 }

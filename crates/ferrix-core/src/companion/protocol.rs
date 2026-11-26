@@ -1461,11 +1461,26 @@ impl<'a> CompanionNode<'a> {
                         emit(&resp);
                         handled = true;
                     } else if kind == 2 {
-                        let (recv, sent, sent_flood, sent_direct) =
-                            crate::state::RADIO_TELEMETRY.lock(|t| {
-                                let tel = t.borrow();
-                                (tel.rx_packets, tel.tx_beacons, tel.tx_flood, tel.tx_control)
-                            });
+                        let (
+                            recv,
+                            sent,
+                            sent_flood,
+                            sent_direct,
+                            recv_flood,
+                            recv_direct,
+                            recv_errors,
+                        ) = crate::state::RADIO_TELEMETRY.lock(|t| {
+                            let tel = t.borrow();
+                            (
+                                tel.rx_packets,
+                                tel.tx_beacons,
+                                tel.tx_flood_sent,
+                                tel.tx_direct,
+                                tel.rx_flood,
+                                tel.rx_direct,
+                                tel.rx_errors,
+                            )
+                        });
                         let mut resp = Vec::<u8, 32>::new();
                         let _ = resp.push(RESP_CODE_STATS);
                         let _ = resp.push(2);
@@ -1473,9 +1488,9 @@ impl<'a> CompanionNode<'a> {
                         let _ = resp.extend_from_slice(&sent.to_le_bytes());
                         let _ = resp.extend_from_slice(&sent_flood.to_le_bytes());
                         let _ = resp.extend_from_slice(&sent_direct.to_le_bytes());
-                        let _ = resp.extend_from_slice(&0u32.to_le_bytes());
-                        let _ = resp.extend_from_slice(&0u32.to_le_bytes());
-                        let _ = resp.extend_from_slice(&0u32.to_le_bytes());
+                        let _ = resp.extend_from_slice(&recv_flood.to_le_bytes());
+                        let _ = resp.extend_from_slice(&recv_direct.to_le_bytes());
+                        let _ = resp.extend_from_slice(&recv_errors.to_le_bytes());
                         emit(&resp);
                         handled = true;
                     }
@@ -1789,6 +1804,7 @@ impl<'a> CompanionNode<'a> {
                                         let pn = pkt.path_byte_len();
                                         pkt.path[..pn].copy_from_slice(&out_path[..pn]);
                                     } else {
+                                        pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
                                         apply_flood_scope(&mut pkt);
                                     }
                                     let mut buf = [0u8; 255];
@@ -1813,7 +1829,7 @@ impl<'a> CompanionNode<'a> {
                                                 sf,
                                                 bw_khz,
                                                 cr,
-                                                if sf <= 8 { 32 } else { 16 },
+                                                crate::scheduler::preamble_for(sf),
                                             );
                                             let hops = if direct {
                                                 (out_path_len & 63) as u32
@@ -2029,7 +2045,7 @@ impl<'a> CompanionNode<'a> {
                         sf,
                         bw_khz,
                         cr,
-                        if sf <= 8 { 32 } else { 16 },
+                        crate::scheduler::preamble_for(sf),
                     );
                     let est_timeout = if is_direct {
                         500 + (air_ms * 6 + 250) * (hops + 1)
@@ -2563,7 +2579,7 @@ impl<'a> CompanionNode<'a> {
                 if payload.len() >= 2 && payload[1] == 0 {
                     SCOPE.lock(|s| {
                         let mut scope = s.borrow_mut();
-                        if payload.len() >= 18 {
+                        if payload.len() >= 18 && payload[2..18].iter().any(|&b| b != 0) {
                             let mut key = [0u8; 16];
                             key.copy_from_slice(&payload[2..18]);
                             scope.send_key = Some(key);
@@ -2760,6 +2776,7 @@ impl<'a> CompanionNode<'a> {
                                             let pn = pkt.path_byte_len();
                                             pkt.path[..pn].copy_from_slice(&out_path[..pn]);
                                         } else {
+                                            pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
                                             apply_flood_scope(&mut pkt);
                                         }
                                         let mut buf = [0u8; 255];
@@ -2784,7 +2801,7 @@ impl<'a> CompanionNode<'a> {
                                                     sf,
                                                     bw_khz,
                                                     cr,
-                                                    if sf <= 8 { 32 } else { 16 },
+                                                    crate::scheduler::preamble_for(sf),
                                                 );
                                                 let hops = if direct {
                                                     (out_path_len & 63) as u32
@@ -2929,6 +2946,7 @@ impl<'a> CompanionNode<'a> {
                                             let n = pkt.path_byte_len();
                                             pkt.path[..n].copy_from_slice(&out_path[..n]);
                                         } else {
+                                            pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
                                             apply_flood_scope(&mut pkt);
                                         }
                                         let mut buf = [0u8; 255];
@@ -2953,7 +2971,7 @@ impl<'a> CompanionNode<'a> {
                                                     sf,
                                                     bw_khz,
                                                     cr,
-                                                    if sf <= 8 { 32 } else { 16 },
+                                                    crate::scheduler::preamble_for(sf),
                                                 );
                                                 let hops = if direct {
                                                     (out_path_len & 63) as u32
@@ -3047,6 +3065,7 @@ impl<'a> CompanionNode<'a> {
                                         ROUTE_TYPE_FLOOD,
                                         &secret,
                                     ) {
+                                        pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
                                         apply_flood_scope(&mut pkt);
                                         let mut buf = [0u8; 255];
                                         if let Ok(n) = pkt.write_to(&mut buf) {
@@ -3070,7 +3089,7 @@ impl<'a> CompanionNode<'a> {
                                                     sf,
                                                     bw_khz,
                                                     cr,
-                                                    if sf <= 8 { 32 } else { 16 },
+                                                    crate::scheduler::preamble_for(sf),
                                                 );
                                                 let est_timeout = 500 + 16 * air_ms;
                                                 note_pending_discovery(tag, dest_key);
@@ -3143,6 +3162,7 @@ impl<'a> CompanionNode<'a> {
                                             let n = pkt.path_byte_len();
                                             pkt.path[..n].copy_from_slice(&out_path[..n]);
                                         } else {
+                                            pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
                                             apply_flood_scope(&mut pkt);
                                         }
                                         let mut buf = [0u8; 255];
@@ -3167,7 +3187,7 @@ impl<'a> CompanionNode<'a> {
                                                     sf,
                                                     bw_khz,
                                                     cr,
-                                                    if sf <= 8 { 32 } else { 16 },
+                                                    crate::scheduler::preamble_for(sf),
                                                 );
                                                 let hops = if direct {
                                                     (out_path_len & 63) as u32
@@ -3257,6 +3277,7 @@ impl<'a> CompanionNode<'a> {
                                             let n = pkt.path_byte_len();
                                             pkt.path[..n].copy_from_slice(&out_path[..n]);
                                         } else {
+                                            pkt.set_path_hash_size_and_count(self.path_hash_mode + 1, 0);
                                             apply_flood_scope(&mut pkt);
                                         }
                                         let mut buf = [0u8; 255];
@@ -3281,7 +3302,7 @@ impl<'a> CompanionNode<'a> {
                                                     sf,
                                                     bw_khz,
                                                     cr,
-                                                    if sf <= 8 { 32 } else { 16 },
+                                                    crate::scheduler::preamble_for(sf),
                                                 );
                                                 let hops = if direct {
                                                     (out_path_len & 63) as u32
@@ -3369,7 +3390,7 @@ impl<'a> CompanionNode<'a> {
                                 sf,
                                 bw_khz,
                                 cr,
-                                if sf <= 8 { 32 } else { 16 },
+                                crate::scheduler::preamble_for(sf),
                             );
                             let hops = (path_len >> (flags & 0x03)) as u32;
                             let est_timeout = 500 + (air_ms * 6 + 250) * (hops + 1);
@@ -4133,7 +4154,7 @@ mod tests {
                         sf,
                         bw_khz,
                         cr,
-                        if sf <= 8 { 32 } else { 16 },
+                        crate::scheduler::preamble_for(sf),
                     );
                     let expected_timeout = if is_flood {
                         500 + 16 * air_ms
@@ -4197,8 +4218,11 @@ mod tests {
             let mut tel = t.borrow_mut();
             tel.rx_packets = 11;
             tel.tx_beacons = 22;
-            tel.tx_flood = 7;
-            tel.tx_control = 15;
+            tel.tx_flood_sent = 7;
+            tel.tx_direct = 15;
+            tel.rx_flood = 4;
+            tel.rx_direct = 7;
+            tel.rx_errors = 3;
         });
 
         let mut resp = Vec::<u8, 64>::new();
@@ -4212,7 +4236,9 @@ mod tests {
         assert_eq!(u32::from_le_bytes(resp[6..10].try_into().unwrap()), 22);
         assert_eq!(u32::from_le_bytes(resp[10..14].try_into().unwrap()), 7);
         assert_eq!(u32::from_le_bytes(resp[14..18].try_into().unwrap()), 15);
-        assert_eq!(&resp[18..30], &[0u8; 12]);
+        assert_eq!(u32::from_le_bytes(resp[18..22].try_into().unwrap()), 4);
+        assert_eq!(u32::from_le_bytes(resp[22..26].try_into().unwrap()), 7);
+        assert_eq!(u32::from_le_bytes(resp[26..30].try_into().unwrap()), 3);
 
         resp.clear();
         poll_sync(node.handle_command(&[CMD_GET_STATS, 99], |r| {

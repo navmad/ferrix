@@ -52,6 +52,8 @@ pub enum RxOutcome {
     Packet { len: usize, rssi: i16, snr: i8 },
     /// Duty-cycle receive window ended without a preamble; already re-armed.
     DutyCycleEnd,
+    /// A received packet failed LoRa CRC or header check; radio remains armed.
+    CrcError,
     /// Radio error; the caller should back off and recover receive mode.
     Error,
 }
@@ -69,6 +71,8 @@ pub enum RxState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TxOutcome {
     Sent,
+    /// Live RX activity or hardware CAD detected an active carrier; back off and retry.
+    ChannelBusy,
     Failed,
 }
 

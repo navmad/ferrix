@@ -303,6 +303,16 @@ impl<'a> MeshEngine<'a> {
         self.context.note_forward_scheduled();
     }
 
+    /// Queue a direct-routed multi-hop packet for immediate forwarding on the
+    /// control lane (priority `0` for direct DM/REQ/RESPONSE/ACK traffic)
+    /// rather than delaying it in the flood TDMA calendar.
+    fn queue_direct_forward(&mut self, pkt: Packet) {
+        let now = now_ms();
+        let r = self.tx_queue.push_control(pkt, now);
+        self.note_push(TxLane::Control, r);
+        self.context.note_forward_scheduled();
+    }
+
     /// When a duplicate arrives, record how late the other copy was and stop
     /// tracking the pending forward.
     fn note_duplicate_of_pending(&mut self, pkt: &Packet) {
@@ -457,7 +467,7 @@ impl<'a> MeshEngine<'a> {
                                     arrival_path: heapless::Vec::new(),
                                 };
                             }
-                            self.queue_forward(fwd);
+                            self.queue_direct_forward(fwd);
                             return InboundAction::Forwarded;
                         }
                     }
@@ -465,32 +475,25 @@ impl<'a> MeshEngine<'a> {
                         if let Ok(mp) = MultipartPacket::decode(&pkt.payload[..pkt.payload_len]) {
                             if mp.inner_type == PAYLOAD_TYPE_ACK && mp.body.len() >= 4 {
                                 if let Ok(ack) = AckPacket::decode(&mp.body) {
-                                    let mut inner_pkt =
-                                        Packet::new(ROUTE_TYPE_DIRECT, PAYLOAD_TYPE_ACK);
-                                    if inner_pkt.set_payload(&mp.body).is_ok() {
-                                        let outer_dupe = self.seen_filter.check_and_mark(&pkt);
-                                        let inner_dupe =
-                                            self.seen_filter.check_and_mark(&inner_pkt);
-                                        if outer_dupe || inner_dupe {
-                                            return InboundAction::DropDuplicate;
-                                        }
-                                        let mut fwd = pkt.clone();
-                                        if fwd.pop_front_hop() {
-                                            let delay_ms =
-                                                (mp.remaining as u64 + 1) * MULTI_ACK_SPACING_MS;
-                                            let _ = self.emit_direct_ack_burst(
-                                                &mp.body,
-                                                fwd.path_len,
-                                                &fwd.path,
-                                                delay_ms,
-                                            );
-                                            return InboundAction::ReceivedAck {
-                                                ack,
-                                                is_flood: false,
-                                                arrival_path_len: 0,
-                                                arrival_path: heapless::Vec::new(),
-                                            };
-                                        }
+                                    if self.seen_filter.check_and_mark(&pkt) {
+                                        return InboundAction::DropDuplicate;
+                                    }
+                                    let mut fwd = pkt.clone();
+                                    if fwd.pop_front_hop() {
+                                        let delay_ms =
+                                            (mp.remaining as u64 + 1) * MULTI_ACK_SPACING_MS;
+                                        let _ = self.emit_direct_ack_burst(
+                                            &mp.body,
+                                            fwd.path_len,
+                                            &fwd.path,
+                                            delay_ms,
+                                        );
+                                        return InboundAction::ReceivedAck {
+                                            ack,
+                                            is_flood: false,
+                                            arrival_path_len: 0,
+                                            arrival_path: heapless::Vec::new(),
+                                        };
                                     }
                                 }
                                 return InboundAction::Unhandled;
@@ -501,7 +504,7 @@ impl<'a> MeshEngine<'a> {
                         }
                         let mut fwd = pkt.clone();
                         if fwd.pop_front_hop() {
-                            self.queue_forward(fwd);
+                            self.queue_direct_forward(fwd);
                             return InboundAction::Forwarded;
                         }
                     }
@@ -511,7 +514,7 @@ impl<'a> MeshEngine<'a> {
                         }
                         let mut fwd = pkt.clone();
                         if fwd.pop_front_hop() {
-                            self.queue_forward(fwd);
+                            self.queue_direct_forward(fwd);
                             return InboundAction::Forwarded;
                         }
                     }
@@ -1079,7 +1082,15 @@ impl<'a> MeshEngine<'a> {
         )?;
         let pkt = msg.to_packet(ROUTE_TYPE_FLOOD, &secret)?;
         let (route, path_len) = route_for(out_path_len);
-        let _ = self.finish_outbound(pkt, route, path_len, out_path);
+        // When a companion (non-forwarding node) originates a flooded DM,
+        // apply a small initial jitter (20..=150 ms) so two companions
+        // transmitting simultaneously after a channel event desynchronize.
+        let delay_ms = if route == ROUTE_TYPE_FLOOD && !self.allow_forward {
+            20 + ((self.next_salt() as u64) % 131)
+        } else {
+            0
+        };
+        let _ = self.finish_outbound_at(pkt, route, path_len, out_path, delay_ms);
         Ok(msg.ack_crc)
     }
 
@@ -1865,13 +1876,14 @@ mod tests {
         pkt.path[0] = self_hash;
         pkt.path[1] = 0x77;
 
-        // First copy is forwarded with our hop popped.
+        // First copy is forwarded with our hop popped on the high-priority Control lane.
         assert!(matches!(
             engine.handle_inbound_packet(pkt.clone(), 4),
             InboundAction::Forwarded
         ));
         assert_eq!(engine.tx_queue.len(), 1);
         let fwd = engine.tx_queue.pop().unwrap();
+        assert_eq!(fwd.lane, TxLane::Control);
         assert_eq!(fwd.packet.path_hash_count(), 1);
         assert_eq!(fwd.packet.path[0], 0x77);
 
