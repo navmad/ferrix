@@ -4,7 +4,7 @@
 //! and generates protocol response frames.
 
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
@@ -20,15 +20,6 @@ pub const MAX_SIGN_DATA: usize = 4096;
 static SIGN_ACTIVE: AtomicBool = AtomicBool::new(false);
 static SIGN_BUFFER: Mutex<CriticalSectionRawMutex, RefCell<Vec<u8, MAX_SIGN_DATA>>> =
     Mutex::new(RefCell::new(Vec::new()));
-
-/// Diagnostics for companion app capability negotiation. These are shared by
-/// every transport so `get companion` can show what the connected app asked.
-pub static DEVICE_QUERY_COUNT: AtomicU32 = AtomicU32::new(0);
-pub static GET_AUTOADD_COUNT: AtomicU32 = AtomicU32::new(0);
-pub static SET_AUTOADD_COUNT: AtomicU32 = AtomicU32::new(0);
-pub static LAST_CMD: AtomicU8 = AtomicU8::new(0);
-/// Diagnostics for advert processing and blob backfill.
-pub static ADVERT_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// Peer public key of the outstanding status/ping request, if any.
 static PENDING_STATUS: Mutex<CriticalSectionRawMutex, RefCell<Option<[u8; 32]>>> =
@@ -64,35 +55,6 @@ use crate::state::{Connection, CONNECTIONS, MAX_CONNECTIONS, PENDING_LOGIN};
 
 const RESP_SERVER_LOGIN_OK: u8 = 0;
 const REQ_TYPE_KEEP_ALIVE: u8 = 0x02;
-
-// Login diagnostics.
-pub static LOGIN_TX_COUNT: AtomicU32 = AtomicU32::new(0);
-pub static LOGIN_TX_TAG: AtomicU32 = AtomicU32::new(0);
-pub static LOGIN_TX_KEY: AtomicU32 = AtomicU32::new(0);
-pub static LOGIN_TX_FLOOD: AtomicBool = AtomicBool::new(false);
-pub static LOGIN_RX_COUNT: AtomicU32 = AtomicU32::new(0);
-pub static LOGIN_RX_TAG: AtomicU32 = AtomicU32::new(0);
-pub static LOGIN_RX_LEN: AtomicU32 = AtomicU32::new(0);
-pub static LOGIN_RESULT: AtomicU8 = AtomicU8::new(0);
-pub static LOGIN_PENDING: AtomicBool = AtomicBool::new(false);
-
-// Binary/anonymous request diagnostics.
-pub static REQ_TX_COUNT: AtomicU32 = AtomicU32::new(0);
-pub static REQ_TX_TAG: AtomicU32 = AtomicU32::new(0);
-pub static REQ_TX_TYPE: AtomicU8 = AtomicU8::new(0);
-pub static REQ_RX_COUNT: AtomicU32 = AtomicU32::new(0);
-pub static REQ_RX_TAG: AtomicU32 = AtomicU32::new(0);
-pub static REQ_RX_LEN: AtomicU32 = AtomicU32::new(0);
-
-pub static DISC_TX_COUNT: AtomicU32 = AtomicU32::new(0);
-pub static DISC_TX_TAG: AtomicU32 = AtomicU32::new(0);
-pub static DISC_RX_COUNT: AtomicU32 = AtomicU32::new(0);
-pub static DISC_RX_TAG: AtomicU32 = AtomicU32::new(0);
-pub static DISC_RX_OUT: AtomicU8 = AtomicU8::new(0);
-pub static DISC_RX_IN: AtomicU8 = AtomicU8::new(0);
-pub static DISC_PENDING: AtomicBool = AtomicBool::new(false);
-pub static DISC_TX_MS: AtomicU32 = AtomicU32::new(0);
-pub static DISC_RX_RTT_MS: AtomicU32 = AtomicU32::new(0);
 
 /// Outstanding path-discovery request: (tag, destination).
 static PENDING_DISCOVERY: Mutex<CriticalSectionRawMutex, RefCell<Option<(u32, [u8; 32])>>> =
@@ -142,17 +104,14 @@ fn now_ms() -> u64 {
 #[inline(never)]
 fn clear_pending_reqs() {
     PENDING_LOGIN.lock(|p| *p.borrow_mut() = None);
-    LOGIN_PENDING.store(false, Ordering::Relaxed);
     PENDING_STATUS.lock(|p| *p.borrow_mut() = None);
     PENDING_TELEMETRY.lock(|p| *p.borrow_mut() = None);
     PENDING_DISCOVERY.lock(|p| *p.borrow_mut() = None);
-    DISC_PENDING.store(false, Ordering::Relaxed);
     PENDING_REQ.lock(|p| *p.borrow_mut() = None);
 }
 
 fn note_pending_login(pub_key: [u8; 32]) {
     PENDING_LOGIN.lock(|p| *p.borrow_mut() = Some((pub_key, now_ms() + 15000)));
-    LOGIN_PENDING.store(true, Ordering::Relaxed);
 }
 
 fn note_pending_req(tag: u32, pub_key: [u8; 32]) {
@@ -165,10 +124,6 @@ fn note_pending_telemetry(tag: u32, pub_key: [u8; 32]) {
 
 fn note_pending_discovery(tag: u32, pub_key: [u8; 32]) {
     PENDING_DISCOVERY.lock(|p| *p.borrow_mut() = Some((tag, pub_key)));
-    DISC_TX_COUNT.fetch_add(1, Ordering::Relaxed);
-    DISC_TX_TAG.store(tag, Ordering::Relaxed);
-    DISC_TX_MS.store(embassy_time::Instant::now().as_millis() as u32, Ordering::Relaxed);
-    DISC_PENDING.store(true, Ordering::Relaxed);
 }
 
 /// Emit PATH_DISCOVERY_RESP when a PATH reply carries the pending tag.
@@ -200,16 +155,6 @@ pub fn handle_path_discovery(
     if !matched {
         return false;
     }
-    DISC_RX_COUNT.fetch_add(1, Ordering::Relaxed);
-    DISC_RX_TAG.store(tag, Ordering::Relaxed);
-    DISC_RX_OUT.store(out_path_len, Ordering::Relaxed);
-    DISC_RX_IN.store(in_path_len, Ordering::Relaxed);
-    DISC_RX_RTT_MS.store(
-        (embassy_time::Instant::now().as_millis() as u32)
-            .wrapping_sub(DISC_TX_MS.load(Ordering::Relaxed)),
-        Ordering::Relaxed,
-    );
-    DISC_PENDING.store(false, Ordering::Relaxed);
     let mut push = Vec::<u8, 256>::new();
     let _ = push.push(PUSH_CODE_PATH_DISCOVERY_RESP);
     let _ = push.push(0);
@@ -352,7 +297,6 @@ pub fn keepalive_tick() {
         let expired = pending.map_or(false, |(_, deadline)| now > deadline);
         if expired {
             *pending = None;
-            LOGIN_PENDING.store(false, Ordering::Relaxed);
         }
     });
     let public_key = crate::state::current_public_key();
@@ -403,9 +347,6 @@ pub fn handle_response(plain: &[u8], sender_pub: &[u8; 32]) -> bool {
         }
     });
     if req_match {
-        REQ_RX_COUNT.fetch_add(1, Ordering::Relaxed);
-        REQ_RX_TAG.store(tag, Ordering::Relaxed);
-        REQ_RX_LEN.store(plain.len() as u32, Ordering::Relaxed);
         let mut push = Vec::<u8, 256>::new();
         let _ = push.push(PUSH_CODE_BINARY_RESPONSE);
         let _ = push.push(0);
@@ -477,17 +418,12 @@ pub fn handle_response(plain: &[u8], sender_pub: &[u8; 32]) -> bool {
             }
         });
     if login {
-        LOGIN_RX_COUNT.fetch_add(1, Ordering::Relaxed);
-        LOGIN_RX_TAG.store(tag, Ordering::Relaxed);
-        LOGIN_RX_LEN.store(plain.len() as u32, Ordering::Relaxed);
-        LOGIN_PENDING.store(false, Ordering::Relaxed);
         let mut push = Vec::<u8, 256>::new();
         let _ = push.push(PUSH_CODE_LOGIN_SUCCESS);
         let reply = &plain[4..];
         if reply.len() >= 2 && &reply[..2] == b"OK" {
             let _ = push.push(0);
             let _ = push.extend_from_slice(&sender_pub[..6]);
-            LOGIN_RESULT.store(1, Ordering::Relaxed);
         } else if !reply.is_empty() && reply[0] == RESP_SERVER_LOGIN_OK {
             let keep_alive_secs = reply.get(1).copied().unwrap_or(0) as u16 * 16;
             if keep_alive_secs > 0 {
@@ -498,10 +434,8 @@ pub fn handle_response(plain: &[u8], sender_pub: &[u8; 32]) -> bool {
             let _ = push.extend_from_slice(&tag.to_le_bytes());
             let _ = push.push(reply.get(3).copied().unwrap_or(0));
             let _ = push.push(reply.get(8).copied().unwrap_or(0));
-            LOGIN_RESULT.store(1, Ordering::Relaxed);
         } else {
             push[0] = PUSH_CODE_LOGIN_FAIL;
-            LOGIN_RESULT.store(2, Ordering::Relaxed);
             let _ = push.push(0);
             let _ = push.extend_from_slice(&sender_pub[..6]);
         }
@@ -593,39 +527,6 @@ pub fn handle_contact_request(
     node.encode_self_telemetry_lpp(permissions, &mut reply);
     Some(reply)
 }
-pub static ADVERT_LAST_KEY: AtomicU32 = AtomicU32::new(0);
-pub static ADVERT_LAST_TS: AtomicU32 = AtomicU32::new(0);
-pub static ADVERT_LAST_HAD_BLOB: AtomicBool = AtomicBool::new(false);
-
-/// Last TRACE command sent to the app and last TRACE received.
-pub static TRACE_TX_COUNT: AtomicU32 = AtomicU32::new(0);
-pub static TRACE_TX_TAG: AtomicU32 = AtomicU32::new(0);
-pub static TRACE_TX_FLAGS: AtomicU8 = AtomicU8::new(0);
-pub static TRACE_TX_PATH_LEN: AtomicU8 = AtomicU8::new(0);
-pub static TRACE_TX_PATH: AtomicU32 = AtomicU32::new(0);
-pub static TRACE_RX_COUNT: AtomicU32 = AtomicU32::new(0);
-pub static TRACE_RX_TAG: AtomicU32 = AtomicU32::new(0);
-pub static TRACE_RX_FLAGS: AtomicU8 = AtomicU8::new(0);
-pub static TRACE_RX_HASHES: AtomicU8 = AtomicU8::new(0);
-pub static TRACE_RX_SNRS: AtomicU8 = AtomicU8::new(0);
-
-pub fn note_trace_rx(tag: u32, flags: u8, hashes: usize, snrs: usize) {
-    TRACE_RX_COUNT.fetch_add(1, Ordering::Relaxed);
-    TRACE_RX_TAG.store(tag, Ordering::Relaxed);
-    TRACE_RX_FLAGS.store(flags, Ordering::Relaxed);
-    TRACE_RX_HASHES.store(hashes.min(255) as u8, Ordering::Relaxed);
-    TRACE_RX_SNRS.store(snrs.min(255) as u8, Ordering::Relaxed);
-}
-
-pub fn note_advert(pub_key: &[u8; 32], timestamp: u32, had_blob: bool) {
-    ADVERT_COUNT.fetch_add(1, Ordering::Relaxed);
-    ADVERT_LAST_HAD_BLOB.store(had_blob, Ordering::Relaxed);
-    ADVERT_LAST_KEY.store(
-        u32::from_le_bytes([pub_key[0], pub_key[1], pub_key[2], pub_key[3]]),
-        Ordering::Relaxed,
-    );
-    ADVERT_LAST_TS.store(timestamp, Ordering::Relaxed);
-}
 
 pub use crate::companion::contacts::{
     encode_contacts_end, encode_contacts_start, RESP_CODE_CONTACT, RESP_CODE_CONTACTS_START,
@@ -635,8 +536,7 @@ pub(crate) use crate::companion::contacts::serialize_contact;
 
 pub use crate::state::{
     advert_location, apply_flood_scope, apply_flood_scope_default, flood_scope_default,
-    flood_scope_send, prefs, scope_override, update_prefs, CompanionPrefs, DEFAULT_PREFS, SCOPE,
-    SCOPED_FLOODS,
+    flood_scope_send, prefs, update_prefs, CompanionPrefs, DEFAULT_PREFS, SCOPE,
 };
 
 pub const CMD_APP_START: u8 = 1;
@@ -1020,19 +920,6 @@ impl<'a> CompanionNode<'a> {
         self.sync_from_shared();
 
         let cmd = payload[0];
-        LAST_CMD.store(cmd, Ordering::Relaxed);
-        match cmd {
-            CMD_DEVICE_QUERY => {
-                DEVICE_QUERY_COUNT.fetch_add(1, Ordering::Relaxed);
-            }
-            CMD_GET_AUTOADD_CONFIG => {
-                GET_AUTOADD_COUNT.fetch_add(1, Ordering::Relaxed);
-            }
-            CMD_SET_AUTOADD_CONFIG => {
-                SET_AUTOADD_COUNT.fetch_add(1, Ordering::Relaxed);
-            }
-            _ => {}
-        }
         // NOTE: this runs in `command_fut` (normal task context), never inside
         // the SoftDevice GATT callback. Logging is therefore safe here.
 
@@ -2782,19 +2669,6 @@ impl<'a> CompanionNode<'a> {
                                             let est_timeout = est_timeout.max(8000);
                                             clear_pending_reqs();
                                             note_pending_login(dest_key);
-                                            LOGIN_TX_COUNT.fetch_add(1, Ordering::Relaxed);
-                                            LOGIN_TX_TAG.store(tag, Ordering::Relaxed);
-                                            LOGIN_TX_KEY.store(
-                                                u32::from_le_bytes([
-                                                    dest_key[0],
-                                                    dest_key[1],
-                                                    dest_key[2],
-                                                    dest_key[3],
-                                                ]),
-                                                Ordering::Relaxed,
-                                            );
-                                            LOGIN_TX_FLOOD.store(!direct, Ordering::Relaxed);
-                                            LOGIN_RESULT.store(0, Ordering::Relaxed);
                                             let ack_tag = u32::from_le_bytes([
                                                 dest_key[0],
                                                 dest_key[1],
@@ -3157,12 +3031,6 @@ impl<'a> CompanionNode<'a> {
                                             } else {
                                                 500 + 16 * air_ms
                                             };
-                                            REQ_TX_COUNT.fetch_add(1, Ordering::Relaxed);
-                                            REQ_TX_TAG.store(tag, Ordering::Relaxed);
-                                            REQ_TX_TYPE.store(
-                                                req_data.first().copied().unwrap_or(0),
-                                                Ordering::Relaxed,
-                                            );
                                             clear_pending_reqs();
                                             note_pending_req(tag, dest_key);
                                             reply = Some((direct, tag, est_timeout.max(6000)));
@@ -3298,20 +3166,6 @@ impl<'a> CompanionNode<'a> {
             }
 
             CMD_SEND_TRACE_PATH => {
-                TRACE_TX_COUNT.fetch_add(1, Ordering::Relaxed);
-                if payload.len() >= 10 {
-                    TRACE_TX_TAG.store(
-                        u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]),
-                        Ordering::Relaxed,
-                    );
-                    TRACE_TX_FLAGS.store(payload[9], Ordering::Relaxed);
-                    let plen = payload.len() - 10;
-                    TRACE_TX_PATH_LEN.store(plen.min(255) as u8, Ordering::Relaxed);
-                    let mut path0 = [0u8; 4];
-                    let n = plen.min(4);
-                    path0[..n].copy_from_slice(&payload[10..10 + n]);
-                    TRACE_TX_PATH.store(u32::from_le_bytes(path0), Ordering::Relaxed);
-                }
                 let mut resp = Vec::<u8, 10>::new();
                 let mut reply = None;
                 if payload.len() > 10 {
@@ -3942,7 +3796,7 @@ mod tests {
             drain_usb_commands();
         };
 
-        // 1. CMD_SEND_LOGIN sets PENDING_LOGIN + LOGIN_PENDING, clearing any stale status/disc/req/telem.
+        // 1. CMD_SEND_LOGIN sets PENDING_LOGIN, clearing any stale status/disc/req/telem.
         note_status(peer);
         note_pending_telemetry(1, peer);
         note_pending_discovery(2, peer);
@@ -3953,11 +3807,9 @@ mod tests {
         login_cmd[33..37].copy_from_slice(b"pass");
         send_cmd(&mut node, &login_cmd);
         assert!(PENDING_LOGIN.lock(|p| p.borrow().is_some()));
-        assert!(LOGIN_PENDING.load(Ordering::Relaxed));
         assert!(PENDING_STATUS.lock(|p| p.borrow().is_none()));
         assert!(PENDING_TELEMETRY.lock(|p| p.borrow().is_none()));
         assert!(PENDING_DISCOVERY.lock(|p| p.borrow().is_none()));
-        assert!(!DISC_PENDING.load(Ordering::Relaxed));
         assert!(PENDING_REQ.lock(|p| p.borrow().is_none()));
 
         // 2. CMD_SEND_STATUS_REQ clears PENDING_LOGIN and sets only PENDING_STATUS.
@@ -3967,26 +3819,23 @@ mod tests {
         send_cmd(&mut node, &status_cmd);
         assert!(PENDING_STATUS.lock(|p| *p.borrow() == Some(peer)));
         assert!(PENDING_LOGIN.lock(|p| p.borrow().is_none()));
-        assert!(!LOGIN_PENDING.load(Ordering::Relaxed));
 
-        // 3. CMD_SEND_PATH_DISCOVERY_REQ clears PENDING_STATUS and sets PENDING_DISCOVERY + DISC_PENDING.
+        // 3. CMD_SEND_PATH_DISCOVERY_REQ clears PENDING_STATUS and sets PENDING_DISCOVERY.
         let mut disc_cmd = [0u8; 34];
         disc_cmd[0] = CMD_SEND_PATH_DISCOVERY_REQ;
         disc_cmd[1] = 0;
         disc_cmd[2..34].copy_from_slice(&peer);
         send_cmd(&mut node, &disc_cmd);
         assert!(PENDING_DISCOVERY.lock(|p| p.borrow().is_some()));
-        assert!(DISC_PENDING.load(Ordering::Relaxed));
         assert!(PENDING_STATUS.lock(|p| p.borrow().is_none()));
 
-        // 4. CMD_SEND_TELEMETRY_REQ clears PENDING_DISCOVERY + DISC_PENDING and sets PENDING_TELEMETRY.
+        // 4. CMD_SEND_TELEMETRY_REQ clears PENDING_DISCOVERY and sets PENDING_TELEMETRY.
         let mut telem_cmd = [0u8; 36];
         telem_cmd[0] = CMD_SEND_TELEMETRY_REQ;
         telem_cmd[4..36].copy_from_slice(&peer);
         send_cmd(&mut node, &telem_cmd);
         assert!(PENDING_TELEMETRY.lock(|p| p.borrow().is_some()));
         assert!(PENDING_DISCOVERY.lock(|p| p.borrow().is_none()));
-        assert!(!DISC_PENDING.load(Ordering::Relaxed));
 
         // 5. CMD_SEND_BINARY_REQ clears PENDING_TELEMETRY and sets PENDING_REQ.
         let mut bin_cmd = [0u8; 35];
@@ -4009,7 +3858,6 @@ mod tests {
         send_cmd(&mut node, &anon_cmd);
         assert!(PENDING_REQ.lock(|p| p.borrow().is_some()));
         assert!(PENDING_LOGIN.lock(|p| p.borrow().is_none()));
-        assert!(!LOGIN_PENDING.load(Ordering::Relaxed));
         assert!(PENDING_STATUS.lock(|p| p.borrow().is_none()));
 
         clear_pending_reqs();
@@ -4039,7 +3887,6 @@ mod tests {
 
         // None of the invalid attempts may consume PENDING_DISCOVERY or emit a push.
         assert!(PENDING_DISCOVERY.lock(|p| *p.borrow() == Some((tag, peer))));
-        assert!(DISC_PENDING.load(Ordering::Relaxed));
         assert!(take_pushes().is_empty());
 
         // Valid multi-byte out_path (2 hops * 2 B = 4 B -> 0x42) and 1-byte in_path (1 hop -> 0x01).
@@ -4047,7 +3894,6 @@ mod tests {
         let in_path = [0x55, 0x77];
         assert!(handle_path_discovery(tag, &peer, 0x42, &out_path, 0x01, &in_path));
         assert!(PENDING_DISCOVERY.lock(|p| p.borrow().is_none()));
-        assert!(!DISC_PENDING.load(Ordering::Relaxed));
 
         let pushes = take_pushes();
         assert_eq!(pushes.len(), 1);
@@ -5201,8 +5047,6 @@ pub fn process_inbound_advert(
     snr: i8,
 ) -> bool {
     defmt::info!("MeshCore Advert from: {}", adv.name.as_str());
-    let had_blob = crate::storage::adverts::has_blob(&adv.pub_key);
-    note_advert(&adv.pub_key, adv.timestamp, had_blob);
     let node_id = [
         adv.pub_key[0],
         adv.pub_key[1],

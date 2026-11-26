@@ -116,7 +116,6 @@ pub struct RadioTelemetry {
     pub has_rx: bool,
     pub tx_air_ms: u32,
     pub rx_air_ms: u32,
-    pub tx_wait_max_ms: u32,
     pub tx_control: u32,
     pub tx_flood: u32,
     pub tx_background: u32,

@@ -17,8 +17,8 @@ use ferrix_core::scheduler::{
 };
 use ferrix_core::state::{
     current_public_key, note_core_err, set_tx_queue_len, take_agc_reset_request,
-    CORE_ERR_AGC_RECOVERY, CORE_ERR_RADIO_RX, CORE_ERR_TX_FAILED, FORWARD_SENT, RADIO_SETTINGS,
-    RADIO_TELEMETRY, TX_SLOT_MS_LAST, TX_SLOT_MS_OVERRIDE, TX_SLOT_USED,
+    CORE_ERR_AGC_RECOVERY, CORE_ERR_RADIO_RX, CORE_ERR_TX_FAILED, RADIO_SETTINGS, RADIO_TELEMETRY,
+    TX_SLOT_MS_LAST, TX_SLOT_MS_OVERRIDE, TX_SLOT_USED,
 };
 use ferrix_hal::radio::{LoraConfig, LoraRadio, RadioDevice, RxOutcome, RxState, TxOutcome};
 use heapless::{Deque, Vec};
@@ -479,17 +479,12 @@ pub async fn radio_task<D: RadioDevice>(mut device: D, initial: LoraConfig) -> !
                             flood_budget_ms = (flood_budget_ms - airtime as i64).max(0);
                         }
                     }
-                    if lane == TxLane::Flood {
-                        FORWARD_SENT.fetch_add(1, Ordering::Relaxed);
-                    }
                     let route = req.data[0] & 0x03;
                     let is_flood_route = route == meshcore_wire::packet::ROUTE_TYPE_FLOOD
                         || route == meshcore_wire::packet::ROUTE_TYPE_TRANSPORT_FLOOD;
                     add_telemetry(|tel| {
                         tel.tx_beacons = tel.tx_beacons.saturating_add(1);
                         tel.tx_air_ms = tel.tx_air_ms.saturating_add(airtime);
-                        let wait = now.saturating_sub(req.queued_at_ms) as u32;
-                        tel.tx_wait_max_ms = tel.tx_wait_max_ms.max(wait);
                         if is_flood_route {
                             tel.tx_flood_sent = tel.tx_flood_sent.saturating_add(1);
                         } else {

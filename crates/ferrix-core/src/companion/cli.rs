@@ -75,13 +75,10 @@ pub struct RadioStats {
     pub override_ms: u32,
     pub slot_ms: u32,
     pub used: u32,
-    pub forward_scheduled: u32,
-    pub forward_sent: u32,
     /// Queue-full drops: control, flood, background.
     pub queue_full: [u32; 3],
     /// DM ACK accounting: matched, unmatched, pending sends evicted.
     pub ack_stats: [u32; 3],
-    pub duplicate_deltas: [u32; 6],
 }
 
 /// Live power regulator and low-frequency clock telemetry.
@@ -112,7 +109,6 @@ pub trait CliHost: CompanionHost {
     }
     fn set_tx_slot_override(&self, ms: u32);
     fn clear_radio_stats(&self);
-    fn advert_stats(&self) -> (usize, usize, bool);
     fn advert_slots(&self) -> usize;
     fn gps_enabled(&self) -> bool;
     fn set_gps_enabled(&self, on: bool);
@@ -1109,20 +1105,6 @@ pub async fn handle_text_cli<W: TextSink>(
             );
             let _ = sender.send( s.as_bytes()).await;
         }
-        "get companion" => {
-            use core::sync::atomic::Ordering;
-            let dq = crate::companion::protocol::DEVICE_QUERY_COUNT.load(Ordering::Relaxed);
-            let ga = crate::companion::protocol::GET_AUTOADD_COUNT.load(Ordering::Relaxed);
-            let sa = crate::companion::protocol::SET_AUTOADD_COUNT.load(Ordering::Relaxed);
-            let lc = crate::companion::protocol::LAST_CMD.load(Ordering::Relaxed);
-            let mut s: heapless::String<128> = heapless::String::new();
-            let _ = write!(
-                s,
-                "  -> device_query={} get_autoadd={} set_autoadd={} last_cmd=0x{:02X}\r\n",
-                dq, ga, sa, lc
-            );
-            let _ = sender.send( s.as_bytes()).await;
-        }
         s if s == "set autoadd" || s.starts_with("set autoadd ") => {
             let arg = s["set autoadd".len()..].trim();
             let (manual, config, max_hops, label) = if arg.eq_ignore_ascii_case("on") {
@@ -1309,20 +1291,6 @@ pub async fn handle_text_cli<W: TextSink>(
             );
             let _ = sender.send(s.as_bytes()).await;
         }
-        "stats-fwd" => {
-            let d = radio.duplicate_deltas;
-            let wait_ms = RADIO_TELEMETRY.lock(|t| t.borrow().tx_wait_max_ms);
-            let mut s: heapless::String<192> = heapless::String::new();
-            let _ = write!(
-                s,
-                "  -> {{\"fwd_sched\":{},\"fwd_sent\":{},\"wait_ms\":{},\"dup\":[{},{},{},{},{},{}]}}\r\n",
-                radio.forward_scheduled,
-                radio.forward_sent,
-                wait_ms,
-                d[0], d[1], d[2], d[3], d[4], d[5]
-            );
-            let _ = sender.send(s.as_bytes()).await;
-        }
         "stats-radio" => {
             let (noise_floor, tx_ms, rx_ms, rssi, snr, retries, dropped, sent) =
                 RADIO_TELEMETRY.lock(|t| {
@@ -1363,17 +1331,23 @@ pub async fn handle_text_cli<W: TextSink>(
             let _ = sender.send(b"  -> OK (AGC reset scheduled)\r\n").await;
         }
         "stats-flash" => {
+            use core::sync::atomic::Ordering;
             let external = if !storage.external_profile {
                 "internal"
             } else if storage.external_unavailable {
-                "unavailable"
+                match crate::state::QSPI_STATUS.load(Ordering::Relaxed) {
+                    2 => "id_mismatch",
+                    3 => "io_error",
+                    _ => "unavailable",
+                }
             } else {
                 "ready"
             };
+            let qspi_id = crate::state::QSPI_ID.load(Ordering::Relaxed);
             let mut s: heapless::String<256> = heapless::String::new();
             let _ = write!(
                 s,
-                "  -> {{\"contacts\":{{\"s\":{},\"e\":{}}},\"messages\":{{\"r\":{},\"e\":{},\"q\":{}}},\"adverts\":{{\"r\":{},\"e\":{}}},\"config\":{{\"s\":{},\"e\":{}}},\"ext\":\"{}\",\"ext_drops\":{}}}\r\n",
+                "  -> {{\"contacts\":{{\"s\":{},\"e\":{}}},\"messages\":{{\"r\":{},\"e\":{},\"q\":{}}},\"adverts\":{{\"r\":{},\"e\":{}}},\"config\":{{\"s\":{},\"e\":{}}},\"ext\":\"{}\",\"id\":\"{:06x}\",\"ext_drops\":{}}}\r\n",
                 storage.contact_saves,
                 storage.contact_erases,
                 storage.message_records,
@@ -1384,133 +1358,8 @@ pub async fn handle_text_cli<W: TextSink>(
                 storage.config_saves,
                 storage.config_erases,
                 external,
+                qspi_id,
                 storage.external_drops
-            );
-            let _ = sender.send(s.as_bytes()).await;
-        }
-        "qspi" | "stats-qspi" => {
-            use core::sync::atomic::Ordering;
-            let status = crate::state::QSPI_STATUS.load(Ordering::Relaxed);
-            let id = crate::state::QSPI_ID.load(Ordering::Relaxed);
-            let status_s = match status {
-                0 => "not_initialized",
-                1 => "ready",
-                2 => "id_mismatch",
-                _ => "io_error",
-            };
-            let mut s: heapless::String<96> = heapless::String::new();
-            let _ = write!(
-                s,
-                "  -> {{\"status\":\"{}\",\"id\":\"{:06x}\"}}\r\n",
-                status_s, id
-            );
-            let _ = sender.send(s.as_bytes()).await;
-        }
-        "stats-disc" => {
-            use core::sync::atomic::Ordering;
-            let mut s: heapless::String<192> = heapless::String::new();
-            let _ = write!(
-                s,
-                "  -> {{\"tx\":{},\"tx_tag\":\"{:08x}\",\"pending\":{},\"rx\":{},\"rx_tag\":\"{:08x}\",\"out\":\"0x{:02x}\",\"in\":\"0x{:02x}\",\"rtt_ms\":{}}}\r\n",
-                crate::companion::protocol::DISC_TX_COUNT.load(Ordering::Relaxed),
-                crate::companion::protocol::DISC_TX_TAG.load(Ordering::Relaxed),
-                crate::companion::protocol::DISC_PENDING.load(Ordering::Relaxed),
-                crate::companion::protocol::DISC_RX_COUNT.load(Ordering::Relaxed),
-                crate::companion::protocol::DISC_RX_TAG.load(Ordering::Relaxed),
-                crate::companion::protocol::DISC_RX_OUT.load(Ordering::Relaxed),
-                crate::companion::protocol::DISC_RX_IN.load(Ordering::Relaxed),
-                crate::companion::protocol::DISC_RX_RTT_MS.load(Ordering::Relaxed)
-            );
-            let _ = sender.send(s.as_bytes()).await;
-        }
-        "stats-binary" => {
-            use core::sync::atomic::Ordering;
-            let mut s: heapless::String<160> = heapless::String::new();
-            let _ = write!(
-                s,
-                "  -> {{\"tx\":{},\"tx_tag\":\"{:08x}\",\"type\":\"0x{:02x}\",\"rx\":{},\"rx_tag\":\"{:08x}\",\"len\":{}}}\r\n",
-                crate::companion::protocol::REQ_TX_COUNT.load(Ordering::Relaxed),
-                crate::companion::protocol::REQ_TX_TAG.load(Ordering::Relaxed),
-                crate::companion::protocol::REQ_TX_TYPE.load(Ordering::Relaxed),
-                crate::companion::protocol::REQ_RX_COUNT.load(Ordering::Relaxed),
-                crate::companion::protocol::REQ_RX_TAG.load(Ordering::Relaxed),
-                crate::companion::protocol::REQ_RX_LEN.load(Ordering::Relaxed)
-            );
-            let _ = sender.send(s.as_bytes()).await;
-        }
-        "stats-login" => {
-            use core::sync::atomic::Ordering;
-            let mut s: heapless::String<192> = heapless::String::new();
-            let _ = write!(
-                s,
-                "  -> {{\"tx\":{},\"key\":\"{:08x}\",\"tx_tag\":\"{:08x}\",\"flood\":{},\"pending\":{},\"rx\":{},\"rx_tag\":\"{:08x}\",\"len\":{},\"result\":{}}}\r\n",
-                crate::companion::protocol::LOGIN_TX_COUNT.load(Ordering::Relaxed),
-                crate::companion::protocol::LOGIN_TX_KEY.load(Ordering::Relaxed),
-                crate::companion::protocol::LOGIN_TX_TAG.load(Ordering::Relaxed),
-                crate::companion::protocol::LOGIN_TX_FLOOD.load(Ordering::Relaxed),
-                crate::companion::protocol::LOGIN_PENDING.load(Ordering::Relaxed),
-                crate::companion::protocol::LOGIN_RX_COUNT.load(Ordering::Relaxed),
-                crate::companion::protocol::LOGIN_RX_TAG.load(Ordering::Relaxed),
-                crate::companion::protocol::LOGIN_RX_LEN.load(Ordering::Relaxed),
-                crate::companion::protocol::LOGIN_RESULT.load(Ordering::Relaxed)
-            );
-            let _ = sender.send(s.as_bytes()).await;
-        }
-        "stats-scope" => {
-            let p = crate::companion::protocol::prefs();
-            let over = crate::companion::protocol::scope_override();
-            let scope_name = core::str::from_utf8(
-                &p.scope_name[..p.scope_name.iter().position(|&b| b == 0).unwrap_or(31)],
-            )
-            .unwrap_or("");
-            let mut s: heapless::String<192> = heapless::String::new();
-            let _ = write!(s, "  -> {{\"default\":\"");
-            write_json_escaped(&mut s, scope_name);
-            let _ = write!(
-                s,
-                "\",\"key\":\"{:02x}{:02x}\",\"scoped\":{},\"override\":{},\"force_unscoped\":{}}}\r\n",
-                p.scope_key[0],
-                p.scope_key[1],
-                crate::companion::protocol::SCOPED_FLOODS
-                    .load(core::sync::atomic::Ordering::Relaxed),
-                over.0,
-                over.1
-            );
-            let _ = sender.send(s.as_bytes()).await;
-        }
-        "stats-trace" => {
-            use core::sync::atomic::Ordering;
-            let mut s: heapless::String<192> = heapless::String::new();
-            let _ = write!(
-                s,
-                "  -> {{\"tx\":{},\"tx_tag\":\"{:08x}\",\"tx_flags\":{},\"path_len\":{},\"path0\":\"{:08x}\",\"rx\":{},\"rx_tag\":\"{:08x}\",\"rx_flags\":{},\"hashes\":{},\"snrs\":{}}}\r\n",
-                crate::companion::protocol::TRACE_TX_COUNT.load(Ordering::Relaxed),
-                crate::companion::protocol::TRACE_TX_TAG.load(Ordering::Relaxed),
-                crate::companion::protocol::TRACE_TX_FLAGS.load(Ordering::Relaxed),
-                crate::companion::protocol::TRACE_TX_PATH_LEN.load(Ordering::Relaxed),
-                crate::companion::protocol::TRACE_TX_PATH.load(Ordering::Relaxed),
-                crate::companion::protocol::TRACE_RX_COUNT.load(Ordering::Relaxed),
-                crate::companion::protocol::TRACE_RX_TAG.load(Ordering::Relaxed),
-                crate::companion::protocol::TRACE_RX_FLAGS.load(Ordering::Relaxed),
-                crate::companion::protocol::TRACE_RX_HASHES.load(Ordering::Relaxed),
-                crate::companion::protocol::TRACE_RX_SNRS.load(Ordering::Relaxed)
-            );
-            let _ = sender.send(s.as_bytes()).await;
-        }
-        "stats-adverts" => {
-            use core::sync::atomic::Ordering;
-            let (saved, pending, erase_pending) = host.advert_stats();
-            let mut s: heapless::String<192> = heapless::String::new();
-            let _ = write!(
-                s,
-                "  -> {{\"saved\":{},\"pending\":{},\"erase_pending\":{},\"adverts\":{},\"last_key\":\"{:08x}\",\"last_ts\":{},\"blob\":{}}}\r\n",
-                saved,
-                pending,
-                erase_pending,
-                crate::companion::protocol::ADVERT_COUNT.load(Ordering::Relaxed),
-                crate::companion::protocol::ADVERT_LAST_KEY.load(Ordering::Relaxed),
-                crate::companion::protocol::ADVERT_LAST_TS.load(Ordering::Relaxed),
-                crate::companion::protocol::ADVERT_LAST_HAD_BLOB.load(Ordering::Relaxed)
             );
             let _ = sender.send(s.as_bytes()).await;
         }
@@ -1764,7 +1613,6 @@ pub async fn handle_text_cli<W: TextSink>(
                 tel.tx_air_ms = 0;
                 tel.rx_air_ms = 0;
                 tel.has_rx = false;
-                tel.tx_wait_max_ms = 0;
                 tel.tx_control = 0;
                 tel.tx_flood = 0;
                 tel.tx_background = 0;
@@ -1864,7 +1712,7 @@ pub async fn handle_text_cli<W: TextSink>(
             let _ = sender.send( b"  -> OK (Config saved to flash)\r\n").await;
         }
         "help" => {
-            let _ = sender.send( b"  -> Commands:\r\n  ->   Identity: get/set name, get role, get/set lat/lon, get/set prv.key, get public.key\r\n  ->   Radio:    get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq/tx/sf/bw/cr, get/set repeat, get/set rxduty, get/set af, get/set dutycycle, get/set hash-mode, stats-radio, stats-agc, agc-reset, stats-tx, stats-fwd\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, get/set autoadd, get/set multiacks, advert, advert.zerohop, gps advert, clock/time, channels\r\n  ->   System:   save, ver, board, get/set leds, get/set sound, get/set refresh.interval, get/set msg.persist, stats-core, stats-ble, stats-gps, stats-power, stats-packets, clear stats/contacts/messages, start dfu, start ota, reboot\r\n").await;
+            let _ = sender.send( b"  -> Commands:\r\n  ->   Identity: get/set name, get role, get/set lat/lon, get/set prv.key, get public.key\r\n  ->   Radio:    get radio, set radio <freq>,<bw>,<sf>,<cr>, get/set freq/tx/sf/bw/cr, get/set repeat, get/set rxduty, get/set af, get/set dutycycle, get/set path.hash.mode, stats-radio, stats-agc, agc-reset, stats-tx\r\n  ->   Mesh:     send <text>, msg <hex_id> <text>, messages, contacts, get/set autoadd, get/set multiacks, advert, advert.zerohop, gps advert, get/set time, channels\r\n  ->   System:   save, ver, board, get/set leds, get/set sound, get/set refresh.interval, get/set msg.persist, stats-core, stats-packets, stats-flash, stats-ble, stats-gps, stats-power, stats-wdt, clear stats/contacts/messages, start dfu, start ota, reboot\r\n").await;
         }
         _ => {
             let _ = sender.send( b"  -> Unknown command\r\n").await;
@@ -1948,8 +1796,8 @@ mod tests {
 
     // ---- stats-* reply size guards --------------------------------------
 
-    use crate::companion::protocol::{self as proto, CompanionHost};
-    use core::sync::atomic::{AtomicU32, AtomicU8, Ordering::Relaxed};
+    use crate::companion::protocol::CompanionHost;
+    use core::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
     /// `(command, budget, extra)`: `extra` is the number of bytes the test
     /// cannot saturate because the value comes from a clock or private static
@@ -1962,15 +1810,7 @@ mod tests {
         // Ferrix only.
         ("stats-agc", FERRIX_STATS_REPLY_MAX, 0),
         ("stats-tx", FERRIX_STATS_REPLY_MAX, 0),
-        ("stats-fwd", FERRIX_STATS_REPLY_MAX, 0),
         ("stats-flash", FERRIX_STATS_REPLY_MAX, 0),
-        ("stats-qspi", FERRIX_STATS_REPLY_MAX, 0),
-        ("stats-disc", FERRIX_STATS_REPLY_MAX, 0),
-        ("stats-binary", FERRIX_STATS_REPLY_MAX, 0),
-        ("stats-login", FERRIX_STATS_REPLY_MAX, 0),
-        ("stats-scope", FERRIX_STATS_REPLY_MAX, 0),
-        ("stats-trace", FERRIX_STATS_REPLY_MAX, 0),
-        ("stats-adverts", FERRIX_STATS_REPLY_MAX, 0),
         ("stats-wdt", FERRIX_STATS_REPLY_MAX, 0),
         ("stats-gps", FERRIX_STATS_REPLY_MAX, 9),
         ("stats-ble", FERRIX_STATS_REPLY_MAX, 0),
@@ -2023,11 +1863,8 @@ mod tests {
                 override_ms: u32::MAX,
                 slot_ms: u32::MAX,
                 used: u32::MAX,
-                forward_scheduled: u32::MAX,
-                forward_sent: u32::MAX,
                 queue_full: [u32::MAX; 3],
                 ack_stats: [u32::MAX; 3],
-                duplicate_deltas: [u32::MAX; 6],
             }
         }
         fn power_clock_stats(&self) -> Option<PowerClockStats> {
@@ -2048,7 +1885,6 @@ mod tests {
         }
         fn set_tx_slot_override(&self, _ms: u32) {}
         fn clear_radio_stats(&self) {}
-        fn advert_stats(&self) -> (usize, usize, bool) { (u32::MAX as usize, u32::MAX as usize, false) }
         fn advert_slots(&self) -> usize { 0 }
         fn gps_enabled(&self) -> bool { false }
         fn set_gps_enabled(&self, _on: bool) {}
@@ -2081,16 +1917,7 @@ mod tests {
     /// Booleans stay `false`, the longer spelling.
     fn set_stat_counters(v: u32) {
         let u32s: &[&AtomicU32] = &[
-            &proto::ADVERT_COUNT, &proto::ADVERT_LAST_KEY, &proto::ADVERT_LAST_TS,
-            &proto::LOGIN_TX_COUNT, &proto::LOGIN_TX_TAG, &proto::LOGIN_TX_KEY,
-            &proto::LOGIN_RX_COUNT, &proto::LOGIN_RX_TAG, &proto::LOGIN_RX_LEN,
-            &proto::REQ_TX_COUNT, &proto::REQ_TX_TAG, &proto::REQ_RX_COUNT,
-            &proto::REQ_RX_TAG, &proto::REQ_RX_LEN,
-            &proto::DISC_TX_COUNT, &proto::DISC_TX_TAG, &proto::DISC_RX_COUNT,
-            &proto::DISC_RX_TAG, &proto::DISC_RX_RTT_MS,
-            &proto::TRACE_TX_COUNT, &proto::TRACE_TX_TAG, &proto::TRACE_TX_PATH,
-            &proto::TRACE_RX_COUNT, &proto::TRACE_RX_TAG,
-            &SCOPED_FLOODS, &GPS_BYTES, &GPS_SENTENCES, &APP_HEARTBEAT, &STORAGE_HEARTBEAT,
+            &GPS_BYTES, &GPS_SENTENCES, &APP_HEARTBEAT, &STORAGE_HEARTBEAT,
             &WDT_PETS, &RESET_REASON, &QSPI_STATUS, &QSPI_ID,
             &crate::storage::bonds::BOND_LOADED, &crate::storage::bonds::BOND_SAVES,
             &crate::storage::bonds::BOND_SAVE_ERRORS, &crate::storage::bonds::BOND_LAST_ERROR,
@@ -2098,14 +1925,6 @@ mod tests {
         ];
         for a in u32s {
             a.store(v, Relaxed);
-        }
-        let u8s: &[&AtomicU8] = &[
-            &proto::LOGIN_RESULT, &proto::REQ_TX_TYPE, &proto::DISC_RX_OUT,
-            &proto::DISC_RX_IN, &proto::TRACE_TX_FLAGS, &proto::TRACE_TX_PATH_LEN,
-            &proto::TRACE_RX_FLAGS, &proto::TRACE_RX_HASHES, &proto::TRACE_RX_SNRS,
-        ];
-        for a in u8s {
-            a.store(v as u8, Relaxed);
         }
     }
 
@@ -2131,7 +1950,6 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let saved_tel = RADIO_TELEMETRY.lock(|t| *t.borrow());
         let saved_name = crate::storage::get_callsign();
-        let saved_prefs = crate::state::prefs();
         let saved_qlen = crate::state::tx_queue_len();
         set_stat_counters(u32::MAX);
         crate::state::note_core_err(u16::MAX);
@@ -2144,7 +1962,6 @@ mod tests {
             t.last_snr = i8::MIN;
             t.tx_air_ms = u32::MAX;
             t.rx_air_ms = u32::MAX;
-            t.tx_wait_max_ms = u32::MAX;
             t.tx_control = u32::MAX;
             t.tx_flood = u32::MAX;
             t.tx_background = u32::MAX;
@@ -2170,7 +1987,6 @@ mod tests {
                 let _ = c.push('"');
             }
         });
-        crate::state::update_prefs(|p| p.scope_name = [b'"'; 31]);
 
         let mut failures = std::vec::Vec::new();
         for (cmd, budget, extra) in STATS_REPLY_BUDGETS {
@@ -2207,7 +2023,6 @@ mod tests {
         crate::state::set_tx_queue_len(saved_qlen);
         RADIO_TELEMETRY.lock(|t| *t.borrow_mut() = saved_tel);
         NODE_CALLSIGN.lock(|c| *c.borrow_mut() = saved_name);
-        crate::state::update_prefs(|p| *p = saved_prefs);
         assert!(failures.is_empty(), "stats replies over budget:\n{}", failures.join("\n"));
     }
 
@@ -2358,5 +2173,20 @@ mod tests {
         assert_eq!(agc_cleared, "XX|{\"agc_resets\":0,\"noise_floor\":-113,\"frozen\":0}");
 
         RADIO_TELEMETRY.lock(|t| *t.borrow_mut() = saved_tel);
+    }
+
+    #[test]
+    fn stats_flash_reports_qspi_id_and_failure_status() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        QSPI_ID.store(0x00C2_2815, Relaxed);
+        QSPI_STATUS.store(2, Relaxed);
+        let (_, full) = stats_reply("stats-flash", &MaxHost { vectors: false });
+        assert!(full.contains("\"ext\":\"id_mismatch\""), "unexpected: {full}");
+        assert!(full.contains("\"id\":\"c22815\""), "unexpected: {full}");
+        QSPI_STATUS.store(3, Relaxed);
+        let (_, full) = stats_reply("stats-flash", &MaxHost { vectors: false });
+        assert!(full.contains("\"ext\":\"io_error\""), "unexpected: {full}");
+        QSPI_ID.store(0, Relaxed);
+        QSPI_STATUS.store(0, Relaxed);
     }
 }
