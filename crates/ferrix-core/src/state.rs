@@ -509,6 +509,28 @@ pub static DISCOVERED_CONTACTS: Mutex<
     RefCell<Vec<DiscoveredContact, MAX_CONTACTS>>,
 > = Mutex::new(RefCell::new(Vec::new()));
 
+/// Refresh a known contact's `last_seen_epoch` (monotonically) and optional
+/// signal metrics on inbound DM, PATH, or confirmed ACK activity so active
+/// peers are not evicted when the contact table fills.
+#[inline(never)]
+pub fn touch_contact_activity(
+    pub_key: &[u8; 32],
+    now_epoch: u32,
+    rssi_snr: Option<(i16, i8)>,
+) {
+    DISCOVERED_CONTACTS.lock(|c| {
+        if let Some(ct) = c.borrow_mut().iter_mut().find(|ct| ct.pub_key == *pub_key) {
+            if now_epoch > ct.last_seen_epoch {
+                ct.last_seen_epoch = now_epoch;
+            }
+            if let Some((rssi, snr)) = rssi_snr {
+                ct.rssi = rssi;
+                ct.snr = snr;
+            }
+        }
+    });
+}
+
 pub static MESSAGE_LOG: Mutex<SharedRawMutex, RefCell<Vec<InboxItem, MAX_MESSAGES>>> =
     Mutex::new(RefCell::new(Vec::new()));
 
@@ -525,6 +547,11 @@ pub static RADIO_TELEMETRY: Mutex<SharedRawMutex, RefCell<RadioTelemetry>> =
         tx_control: 0,
         tx_flood: 0,
         tx_background: 0,
+        tx_flood_sent: 0,
+        tx_direct: 0,
+        rx_flood: 0,
+        rx_direct: 0,
+        rx_errors: 0,
         tx_stale: 0,
         tx_cancelled: 0,
         tx_retries: 0,
@@ -793,5 +820,76 @@ mod tests {
         assert_eq!(got17.path_len, 0);
 
         clear_advert_paths();
+    }
+
+    #[test]
+    fn touch_contact_activity_updates_monotonically_and_preserves_optional_signal() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = DISCOVERED_CONTACTS.lock(|c| c.borrow().clone());
+
+        let key = [0x42u8; 32];
+        let unknown = [0x99u8; 32];
+        DISCOVERED_CONTACTS.lock(|c| {
+            let mut list = c.borrow_mut();
+            list.clear();
+            let _ = list.push(DiscoveredContact {
+                pub_key: key,
+                callsign: heapless::String::new(),
+                node_id: [0x42; 4],
+                last_seen_epoch: 1000,
+                rssi: -95,
+                snr: 4,
+                latitude: 0,
+                longitude: 0,
+                flags: 0,
+                contact_type: 1,
+                out_path: [0u8; 64],
+                out_path_len: 0xFF,
+                last_advert_ts: 1000,
+                saved_hash: 0,
+                sync_since: 0,
+            });
+        });
+
+        // Newer timestamp with signal metrics updates all three fields.
+        touch_contact_activity(&key, 1500, Some((-82, 9)));
+        DISCOVERED_CONTACTS.lock(|c| {
+            let ct = &c.borrow()[0];
+            assert_eq!(ct.last_seen_epoch, 1500);
+            assert_eq!(ct.rssi, -82);
+            assert_eq!(ct.snr, 9);
+        });
+
+        // Older or zero timestamp does not regress last_seen_epoch, and None
+        // preserves existing RSSI/SNR (e.g. relayed ACK).
+        touch_contact_activity(&key, 0, None);
+        touch_contact_activity(&key, 1200, None);
+        DISCOVERED_CONTACTS.lock(|c| {
+            let ct = &c.borrow()[0];
+            assert_eq!(ct.last_seen_epoch, 1500);
+            assert_eq!(ct.rssi, -82);
+            assert_eq!(ct.snr, 9);
+        });
+
+        // Newer timestamp with None advances last_seen_epoch without touching RSSI/SNR.
+        touch_contact_activity(&key, 2000, None);
+        DISCOVERED_CONTACTS.lock(|c| {
+            let ct = &c.borrow()[0];
+            assert_eq!(ct.last_seen_epoch, 2000);
+            assert_eq!(ct.rssi, -82);
+            assert_eq!(ct.snr, 9);
+        });
+
+        // Unknown contact key is a no-op.
+        touch_contact_activity(&unknown, 3000, Some((-50, 12)));
+        DISCOVERED_CONTACTS.lock(|c| {
+            let list = c.borrow();
+            assert_eq!(list.len(), 1);
+            assert_eq!(list[0].last_seen_epoch, 2000);
+        });
+
+        DISCOVERED_CONTACTS.lock(|c| {
+            *c.borrow_mut() = saved;
+        });
     }
 }

@@ -120,7 +120,8 @@ where
 
     async fn update_retention_list(&mut self) -> Result<(), RadioError> {
         self.add_register_to_retention_list(Register::RxGain).await?;
-        self.add_register_to_retention_list(Register::TxModulation).await
+        self.add_register_to_retention_list(Register::TxModulation).await?;
+        self.add_register_to_retention_list(Register::OCP).await
     }
 
     // Set the number of symbols the radio will wait to detect a reception
@@ -250,6 +251,11 @@ where
         self.intf.write(&lora_syncword_set, false).await?;
 
         self.set_tx_rx_buffer_base_address(0, 0).await?;
+        // Keep both XOSC/TCXO and the PLL synthesiser locked across TX/RX/CAD turnaround
+        // (SX1261-2 Datasheet §13.1.11: 0x40 = FS mode).
+        self.intf
+            .write(&[OpCode::SetTxFallbackMode.value(), 0x40], false)
+            .await?;
         // Update register list to support warm starts from sleep mode
         self.update_retention_list().await?;
         Ok(())
@@ -334,6 +340,13 @@ where
         self.intf.iv.disable_rf_switch().await
     }
 
+    // Keep XOSC/TCXO running across fast RX->CAD/TX transitions.
+    async fn set_standby_warm(&mut self) -> Result<(), RadioError> {
+        let op_code_and_standby_mode = [OpCode::SetStandby.value(), StandbyMode::XOSC.value()];
+        self.intf.write(&op_code_and_standby_mode, false).await?;
+        self.intf.iv.disable_rf_switch().await
+    }
+
     async fn set_sleep(&mut self, warm_start_if_possible: bool, delay: &mut impl DelayNs) -> Result<(), RadioError> {
         self.intf.iv.disable_rf_switch().await?;
         let sleep_params = SleepParams {
@@ -364,11 +377,9 @@ where
         self.intf.write(&op_code_and_base_addrs, false).await
     }
 
-    // Set parameters associated with power for a send operation. Currently, over current protection (OCP) uses the default set automatically after set_pa_config()
-    //   output_power            desired RF output power (dBm)
-    //   mdltn_params            needed for a power vs channel frequency validation
-    //   tx_boosted_if_possible  not pertinent for sx126x
-    //   is_tx_prep              indicates which ramp up time to use
+    // Set parameters associated with power for a send operation, explicitly
+    // programming over-current protection (Register::OCP = 0x08E7) after
+    // set_pa_config() per SX1261-2 Datasheet §13.1.14 / Table 13-21.
     async fn set_tx_power_and_ramp_time(
         &mut self,
         output_power: i32,
@@ -376,6 +387,7 @@ where
         is_tx_prep: bool,
     ) -> Result<(), RadioError> {
         let tx_params_power;
+        let ocp_value;
         // 200 us matches the reference SX1262 configuration and is the safe
         // ramp for 22 dBm. The 40 us TX ramp caused weak output on the
         // ThinkNode M1's supply/PA path.
@@ -418,6 +430,8 @@ where
                     }
                     _ => unreachable!("Invalid output power value for low power PA!"),
                 }
+                // 60 mA (0x18 * 2.5 mA) for SX1261 low-power PA.
+                ocp_value = 0x18u8;
             }
             DeviceSel::HighPowerPA => {
                 const HIGH_POWER_MIN: i32 = -9;
@@ -450,7 +464,7 @@ where
                 match txp {
                     21..=HIGH_POWER_MAX => {
                         self.set_pa_config(0x04, 0x07, DeviceSel::HighPowerPA).await?;
-                        tx_params_power = 22;
+                        tx_params_power = txp as u8;
                     }
                     18..=20 => {
                         self.set_pa_config(0x03, 0x05, DeviceSel::HighPowerPA).await?;
@@ -471,8 +485,19 @@ where
                         unreachable!("Invalid output power value for high power PA!")
                     }
                 }
+                // 140 mA (0x38 * 2.5 mA) so the SX1262 HP PA is not current-limited
+                // at the 60 mA cold-reset default when transmitting at +22 dBm.
+                ocp_value = 0x38u8;
             }
         }
+        let ocp_cmd = [
+            OpCode::WriteRegister.value(),
+            Register::OCP.addr1(),
+            Register::OCP.addr2(),
+            ocp_value,
+        ];
+        self.intf.write(&ocp_cmd, false).await?;
+
         let op_code_and_tx_params = [OpCode::SetTxParams.value(), tx_params_power, ramp_time.value()];
         self.intf.write(&op_code_and_tx_params, false).await
     }
@@ -635,24 +660,20 @@ where
 
         self.intf.iv.enable_rf_switch_rx().await?;
 
-        // Stop the Rx timer on preamble detection
-        let op_code_and_true_flag = [OpCode::SetStopRxTimerOnPreamble.value(), 0x01u8];
-        self.intf.write(&op_code_and_true_flag, false).await?;
+        // Only stop the RX timer on preamble in DutyCycle mode (SX1261-2 Datasheet §13.4.9).
+        let stop_on_preamble = if matches!(rx_mode, RxMode::DutyCycle(_)) {
+            0x01u8
+        } else {
+            0x00u8
+        };
+        let op_code_and_flag = [OpCode::SetStopRxTimerOnPreamble.value(), stop_on_preamble];
+        self.intf.write(&op_code_and_flag, false).await?;
 
         let num_symbols = match rx_mode {
             RxMode::DutyCycle(_) | RxMode::Continuous => 0,
             RxMode::Single(n) => n,
         };
         self.set_lora_symbol_num_timeout(num_symbols).await?;
-
-        let rx_gain = if self.config.rx_boost { 0x96 } else { 0x94 };
-        let register_and_rx_gain = [
-            OpCode::WriteRegister.value(),
-            Register::RxGain.addr1(),
-            Register::RxGain.addr2(),
-            rx_gain,
-        ];
-        self.intf.write(&register_and_rx_gain, false).await?;
 
         match rx_mode {
             RxMode::DutyCycle(args) => {
@@ -665,7 +686,7 @@ where
                     Self::timeout_2(args.sleep_time),
                     Self::timeout_3(args.sleep_time),
                 ];
-                self.intf.write(&op, false).await
+                self.intf.write(&op, false).await?;
             }
             RxMode::Single(_) => {
                 let op = [
@@ -674,7 +695,7 @@ where
                     Self::timeout_2(0),
                     Self::timeout_3(0),
                 ];
-                self.intf.write(&op, false).await
+                self.intf.write(&op, false).await?;
             }
             RxMode::Continuous => {
                 let op = [
@@ -683,9 +704,20 @@ where
                     Self::timeout_2(RX_CONTINUOUS_TIMEOUT),
                     Self::timeout_3(RX_CONTINUOUS_TIMEOUT),
                 ];
-                self.intf.write(&op, false).await
+                self.intf.write(&op, false).await?;
             }
         }
+
+        // Write RxGain (0x08AC) after entering RX so BUSY has settled and LNA gain
+        // is applied cleanly on every RX entry.
+        let rx_gain = if self.config.rx_boost { 0x96 } else { 0x94 };
+        let register_and_rx_gain = [
+            OpCode::WriteRegister.value(),
+            Register::RxGain.addr1(),
+            Register::RxGain.addr2(),
+            rx_gain,
+        ];
+        self.intf.write(&register_and_rx_gain, false).await
     }
 
     async fn get_rx_payload(
@@ -752,14 +784,20 @@ where
     }
 
     async fn do_cad(&mut self, mdltn_params: &ModulationParams) -> Result<(), RadioError> {
+        self.do_cad_with_offset(mdltn_params, 0).await
+    }
+
+    async fn do_cad_with_offset(
+        &mut self,
+        mdltn_params: &ModulationParams,
+        peak_offset: i8,
+    ) -> Result<(), RadioError> {
+        let clr = [OpCode::ClrIrqStatus.value(), 0xFF, 0xFF];
+        self.intf.write(&clr, false).await?;
+
         self.intf.iv.enable_rf_switch_rx().await?;
 
-        let mut rx_gain_final = 0x94u8;
-        // if Rx boosted, set max LNA gain, increase current by ~2mA for around ~3dB in sensitivity
-        if self.config.rx_boost {
-            rx_gain_final = 0x96u8;
-        }
-
+        let rx_gain_final = if self.config.rx_boost { 0x96u8 } else { 0x94u8 };
         let register_and_rx_gain = [
             OpCode::WriteRegister.value(),
             Register::RxGain.addr1(),
@@ -768,17 +806,43 @@ where
         ];
         self.intf.write(&register_and_rx_gain, false).await?;
 
-        // See:
-        //  https://lora-developers.semtech.com/documentation/tech-papers-and-guides/channel-activity-detection-ensuring-your-lora-packets-are-sent/how-to-ensure-your-lora-packets-are-sent-properly
-        // for default values used here.
-        let spreading_factor_val = spreading_factor_value(mdltn_params.spreading_factor)?;
+        // 4-symbol CAD with Semtech AN1200.48 bandwidth-aware detPeak (detMin = 10):
+        // - sub-125 kHz narrowband (<125 kHz): base table [18, 19, 20, 22, 22, 23, 25, 25]
+        // - 125..250 kHz: base + 1
+        // - 500 kHz: Semtech 500 kHz 4-symbol table [21, 22, 24, 25, 29, 30, 32, 34]
+        let bw_hz = mdltn_params.bandwidth.hz();
+        let base_peak: i16 = if bw_hz >= 500_000 {
+            match mdltn_params.spreading_factor {
+                SpreadingFactor::_5 => 21,
+                SpreadingFactor::_6 => 22,
+                SpreadingFactor::_7 => 24,
+                SpreadingFactor::_8 => 25,
+                SpreadingFactor::_9 => 29,
+                SpreadingFactor::_10 => 30,
+                SpreadingFactor::_11 => 32,
+                SpreadingFactor::_12 => 34,
+            }
+        } else {
+            let narrow = match mdltn_params.spreading_factor {
+                SpreadingFactor::_5 => 18,
+                SpreadingFactor::_6 => 19,
+                SpreadingFactor::_7 => 20,
+                SpreadingFactor::_8 => 22,
+                SpreadingFactor::_9 => 22,
+                SpreadingFactor::_10 => 23,
+                SpreadingFactor::_11 => 25,
+                SpreadingFactor::_12 => 25,
+            };
+            if bw_hz >= 125_000 { narrow + 1 } else { narrow }
+        };
+        let det_peak = (base_peak + peak_offset as i16).clamp(12, 48) as u8;
         let op_code_and_cad_params = [
             OpCode::SetCADParams.value(),
-            CADSymbols::_8.value(),      // number of symbols for detection
-            spreading_factor_val + 13u8, // limit for detection of SNR peak
-            10u8,                        // minimum symbol recognition
-            0x00u8,                      // CAD exit mode without listen-before-send or subsequent receive processing
-            0x00u8,                      // no timeout
+            CADSymbols::_4.value(), // 4 symbols for LBT detection
+            det_peak,               // SNR peak detection threshold
+            10u8,                   // cadDetMin
+            0x00u8,                 // CAD_ONLY exit mode (return to fallback mode)
+            0x00u8,                 // no timeout
             0x00u8,
             0x00u8,
         ];
@@ -805,8 +869,16 @@ where
                 dio1_mask = IrqMask::TxDone.value() | IrqMask::RxTxTimeout.value();
             }
             Some(RadioMode::Receive(_)) => {
-                irq_mask = IrqMask::All.value();
-                dio1_mask = IrqMask::All.value();
+                let rx_dio1 = IrqMask::RxDone.value()
+                    | IrqMask::HeaderValid.value()
+                    | IrqMask::CRCError.value()
+                    | IrqMask::RxTxTimeout.value();
+                // Keep PreambleDetected and HeaderError in irq_mask for live non-destructive
+                // polling and RxDone co-fire checks, but mask them off DIO1 so noise preambles
+                // or corrupted headers do not wake the MCU on their own.
+                irq_mask =
+                    rx_dio1 | IrqMask::HeaderError.value() | IrqMask::PreambleDetected.value();
+                dio1_mask = rx_dio1;
             }
             Some(RadioMode::ChannelActivityDetection) => {
                 irq_mask = IrqMask::CADDone.value() | IrqMask::CADActivityDetected.value();
@@ -896,11 +968,11 @@ where
             RadioMode::Receive(rx_mode) => {
                 if (irq_flags & IrqMask::HeaderError.value()) == IrqMask::HeaderError.value() {
                     debug!("HeaderError in radio mode {}", radio_mode);
-                    return Ok(None);
+                    return Ok(Some(IrqState::RxError));
                 }
                 if (irq_flags & IrqMask::CRCError.value()) == IrqMask::CRCError.value() {
                     debug!("CRCError in radio mode {}", radio_mode);
-                    return Ok(None);
+                    return Ok(Some(IrqState::RxError));
                 }
                 if (irq_flags & IrqMask::RxDone.value()) == IrqMask::RxDone.value() {
                     debug!("RxDone in radio mode {}", radio_mode);
@@ -964,6 +1036,41 @@ where
 
         // If none of the specific conditions are met, return None to indicate no IRQ state change.
         Ok(None)
+    }
+
+    async fn poll_rx_activity(&mut self) -> Result<(bool, bool, bool), RadioError> {
+        let op_code = [OpCode::GetIrqStatus.value()];
+        let mut irq_status = [0x00u8, 0x00u8];
+        let _ = self.intf.read_with_status(&op_code, &mut irq_status).await?;
+        let irq_flags = ((irq_status[0] as u16) << 8) | (irq_status[1] as u16);
+        Ok((
+            IrqMask::HeaderValid.is_set_in(irq_flags),
+            IrqMask::PreambleDetected.is_set_in(irq_flags),
+            IrqMask::HeaderError.is_set_in(irq_flags),
+        ))
+    }
+
+    async fn clear_preamble_irq(&mut self) -> Result<(), RadioError> {
+        let mask = IrqMask::PreambleDetected.value();
+        let clr = [
+            OpCode::ClrIrqStatus.value(),
+            ((mask >> 8) & 0xFF) as u8,
+            (mask & 0xFF) as u8,
+        ];
+        self.intf.write(&clr, false).await
+    }
+
+    async fn clear_rx_activity_irqs(&mut self) -> Result<(), RadioError> {
+        let mask = IrqMask::PreambleDetected.value()
+            | IrqMask::SyncwordValid.value()
+            | IrqMask::HeaderValid.value()
+            | IrqMask::HeaderError.value();
+        let clr = [
+            OpCode::ClrIrqStatus.value(),
+            ((mask >> 8) & 0xFF) as u8,
+            (mask & 0xFF) as u8,
+        ];
+        self.intf.write(&clr, false).await
     }
 }
 
