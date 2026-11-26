@@ -2,13 +2,13 @@
 
 A native `no_std` embedded Rust firmware workspace for **MeshCore v1.18** LoRa mesh nodes, built on [Embassy](https://embassy.dev/).
 
-> **Firmware identity:** Ferrix reports `<version>-ferrix` (currently `1.18.4-ferrix`) in version strings and its boot splash while keeping per-board `MeshCore` USB (`ThinkNode M1 Companion` / `Wio Tracker L1 Pro Companion`) and protocol identifiers for drop-in compatibility with MeshCore companion apps (iOS, Android, Web, and CLI).
+> **Firmware identity:** Ferrix reports `<version>-ferrix` (currently `1.18.5-ferrix`) in version strings and its boot splash while keeping per-board `MeshCore` USB (`ThinkNode M1 Companion` / `Wio Tracker L1 Pro Companion`) and protocol identifiers for drop-in compatibility with MeshCore companion apps (iOS, Android, Web, and CLI).
 
 > **Important — Storage format & full erase required:** Ferrix **does not** follow the standard MeshCore on-flash storage format (it uses its own `sequential-storage` layout across internal flash and external QSPI flash rather than MeshCore's LittleFS layout). **Flashing Ferrix onto a device previously running stock MeshCore (or switching back from Ferrix to stock MeshCore) requires a full flash erase** so leftover filesystem/config sectors do not conflict. Export your private key and contacts beforehand if you want to keep your identity. Normal upgrades between Ferrix releases preserve your identity and configuration.
 
 > **Note:** This project is developed with the assistance of AI coding tools.
 
-For the full protocol matrix, CLI reference, and current limitations, see [FEATURES.md](FEATURES.md).
+For Ferrix differences vs. stock MeshCore, the CLI command reference, and current limitations, see [FEATURES.md](FEATURES.md).
 
 ---
 
@@ -16,8 +16,9 @@ For the full protocol matrix, CLI reference, and current limitations, see [FEATU
 
 - **MeshCore v1.18 Companion Protocol**: Implements the full MeshCore v1.18 companion command set (including `CMD_RUN_CLI_COMMAND` `0x42` / `PACKET_CLI_REPLY` `0x1D`) over **BLE Nordic UART Service** and **USB CDC-ACM**, alongside an interactive USB text CLI with `XX|` tag echo and compact JSON `stats-*` telemetry.
 - **Modular Workspace Architecture**: Cleanly separates pure wire codecs (`meshcore-wire`), protocol/state/storage (`ferrix-core`), async runtime loops (`ferrix-runtime`), HAL traits (`ferrix-hal`), drivers, MCU platform (`platforms/nrf52`), roles, and board packages (each paired with a host-testable `logic/` crate).
-- **Wear-Leveled Persistence**: Powered by `sequential-storage` across internal flash (config & BLE bonds) and external QSPI flash (contacts, adverts & message FIFO), with a compile-time `internal-storage` profile for boards without QSPI.
+- **Wear-Leveled Persistence**: Powered by `sequential-storage` across internal flash (config & BLE bonds) and external QSPI flash (contacts, adverts, and opt-in offline inbox messages via `set msg.persist on`), with a compile-time `internal-storage` profile for boards without QSPI.
 - **Deterministic TX Scheduler**: Separates control, flood, and background advert lanes with airtime-derived adaptive slot widths, duplicate cancellation, multipart ACK bursts (`multi_acks`), and split duty-cycle budgets where control traffic can borrow unused flood budget while keeping its own 25% reserve protected.
+- **SX1262 Radio Hardening & Cached Crypto**: Runs starvation-gated 4-symbol LBT/CAD, live 5 s noise-floor RSSI sampling, automatic stuck-AGC recovery (`stats-agc` / `agc-reset`), optional RX duty-cycle sniff mode (`set rxduty on`), and a 64-entry LRU X25519 ECDH shared-secret cache computed outside critical sections.
 - **Power & OTA Support**: Uses the nRF52840 32.768 kHz LFXO crystal, REG1 DC-DC buck regulator, idle display sleep, event-driven GNSS wake, smoothed SAADC battery telemetry, and Legacy Buttonless BLE DFU OTA (for OTAFIX bootloaders) alongside UF2 and serial DFU flashing.
 - **Board Support**: See each board's README for hardware specs, pinouts, and flashing steps ([ThinkNode M1](boards/thinknode-m1/README.md): 1.54" SSD1681 e-paper dashboard, L76K GNSS, battery telemetry, and buzzer; [Wio Tracker L1 Pro](boards/wio-tracker-l1-pro/README.md): 1.3" SH1106 OLED with joystick navigation, L76K GNSS, battery telemetry, and buzzer).
 

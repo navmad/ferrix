@@ -48,7 +48,7 @@ Commands work over **USB serial** (plain text terminal) or from a companion app'
 | Command | Arguments | What it does |
 |---|---|---|
 | `help` | — | Prints a summary of available CLI commands. |
-| `ver` | — | Shows the running firmware version (e.g. `1.18.4-ferrix`). |
+| `ver` | — | Shows the running firmware version (e.g. `1.18.5-ferrix`). |
 | `board` | — | Shows the board model and hardware line. |
 | `get name` | — | Shows this node's callsign / display name. |
 | `set name <name>` | 1–31 printable ASCII chars (no `[ ] \ : , ? *`) | Sets this node's name and persists it. |
