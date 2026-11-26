@@ -250,17 +250,13 @@ mod tests {
                 override_ms: 0,
                 slot_ms: 0,
                 used: 0,
-                forward_scheduled: 0,
-                forward_sent: 0,
                 queue_full: [0; 3],
                 ack_stats: [0; 3],
-                duplicate_deltas: [0; 6],
             }
         }
         fn power_clock_stats(&self) -> Option<PowerClockStats> { None }
         fn set_tx_slot_override(&self, _ms: u32) {}
         fn clear_radio_stats(&self) {}
-        fn advert_stats(&self) -> (usize, usize, bool) { (0, 0, false) }
         fn advert_slots(&self) -> usize { 0 }
         fn gps_enabled(&self) -> bool { false }
         fn set_gps_enabled(&self, _on: bool) {}

@@ -68,12 +68,6 @@ pub trait EngineContext: Send + Sync {
     /// Attach the persisted default scope to a self advert.
     fn apply_flood_scope_default(&self, _pkt: &mut Packet) {}
 
-    /// Account for one packet queued for forwarding.
-    fn note_forward_scheduled(&self) {}
-
-    /// Record how late a duplicate of a pending forward arrived.
-    fn note_duplicate_delta(&self, _ms: u64) {}
-
     /// Ask the scheduler to drop a scheduled flood.
     fn cancel_flood(&self, _hash: [u8; 8]) {}
 
@@ -325,7 +319,6 @@ impl<'a> MeshEngine<'a> {
         });
         let r = self.tx_queue.push_flood(pkt, now);
         self.note_push(TxLane::Flood, r);
-        self.context.note_forward_scheduled();
     }
 
     /// Queue a direct-routed multi-hop packet for immediate forwarding on the
@@ -335,11 +328,10 @@ impl<'a> MeshEngine<'a> {
         let now = now_ms();
         let r = self.tx_queue.push_control(pkt, now);
         self.note_push(TxLane::Control, r);
-        self.context.note_forward_scheduled();
     }
 
-    /// When a duplicate arrives, record how late the other copy was and stop
-    /// tracking the pending forward.
+    /// When a duplicate arrives, cancel any matching pending forward and stop
+    /// tracking it.
     fn note_duplicate_of_pending(&mut self, pkt: &Packet) {
         let now = now_ms();
         self.pending_forwards
@@ -351,7 +343,6 @@ impl<'a> MeshEngine<'a> {
             .position(|entry| entry.hash == hash)
         {
             let entry = self.pending_forwards.remove(index);
-            self.context.note_duplicate_delta(now.saturating_sub(entry.queued_at_ms));
             let _ = self.context.cancel_flood(entry.hash);
         }
     }

@@ -225,10 +225,6 @@ pub static TX_SLOT_MS_OVERRIDE: AtomicU32 = AtomicU32::new(0);
 pub static TX_SLOT_MS_LAST: AtomicU32 = AtomicU32::new(0);
 pub static TX_SLOT_USED: AtomicU32 = AtomicU32::new(0);
 
-/// Forwarding counters used to derive the spreading window on a live mesh.
-pub static FORWARD_SCHEDULED: AtomicU32 = AtomicU32::new(0);
-pub static FORWARD_SENT: AtomicU32 = AtomicU32::new(0);
-
 /// DM ACKs received that confirmed a pending send, ACKs with no pending send
 /// (stale, foreign or a second copy), and pending sends evicted by a full table.
 pub static ACK_RX_MATCHED: AtomicU32 = AtomicU32::new(0);
@@ -293,45 +289,6 @@ pub fn set_tx_queue_len(len: u8) {
 /// Live outbound radio TX queue depth reported by `CMD_GET_STATS(0)` and `stats-core`.
 pub fn tx_queue_len() -> u8 {
     TX_QUEUE_LEN.load(Ordering::Relaxed)
-}
-
-const DUP_BUCKETS: [AtomicU32; 6] = [
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-    AtomicU32::new(0),
-];
-
-/// Record how long after enqueueing a forward another copy was heard.
-pub fn record_duplicate_delta(ms: u64) {
-    let bucket = match ms {
-        0..=19 => 0,
-        20..=39 => 1,
-        40..=79 => 2,
-        80..=159 => 3,
-        160..=319 => 4,
-        _ => 5,
-    };
-    DUP_BUCKETS[bucket].fetch_add(1, Ordering::Relaxed);
-}
-
-pub fn duplicate_deltas() -> [u32; 6] {
-    [
-        DUP_BUCKETS[0].load(Ordering::Relaxed),
-        DUP_BUCKETS[1].load(Ordering::Relaxed),
-        DUP_BUCKETS[2].load(Ordering::Relaxed),
-        DUP_BUCKETS[3].load(Ordering::Relaxed),
-        DUP_BUCKETS[4].load(Ordering::Relaxed),
-        DUP_BUCKETS[5].load(Ordering::Relaxed),
-    ]
-}
-
-pub fn clear_duplicate_deltas() {
-    for bucket in &DUP_BUCKETS {
-        bucket.store(0, Ordering::Relaxed);
-    }
 }
 
 /// Blue status LED disabled by the user (persisted in the config page).
@@ -523,14 +480,6 @@ pub fn flood_scope_send() -> Option<[u8; 16]> {
     })
 }
 
-/// `(override set, force_unscoped)` for diagnostics.
-pub fn scope_override() -> (bool, bool) {
-    SCOPE.lock(|s| {
-        let scope = s.borrow();
-        (scope.send_key.is_some() || scope.force_unscoped, scope.force_unscoped)
-    })
-}
-
 /// Scope used for self adverts: always the persisted default.
 pub fn flood_scope_default() -> Option<[u8; 16]> {
     non_zero_key(&prefs().scope_key)
@@ -545,8 +494,6 @@ pub fn advert_location(lat: f32, lon: f32) -> (f32, f32) {
     }
 }
 
-pub static SCOPED_FLOODS: AtomicU32 = AtomicU32::new(0);
-
 fn scope_packet(pkt: &mut meshcore_wire::Packet, key: [u8; 16]) {
     let code = meshcore_wire::crypto::transport_code(
         &key,
@@ -555,7 +502,6 @@ fn scope_packet(pkt: &mut meshcore_wire::Packet, key: [u8; 16]) {
     );
     pkt.header = (pkt.header & !0x03) | meshcore_wire::packet::ROUTE_TYPE_TRANSPORT_FLOOD;
     pkt.transport_codes = [code, 0];
-    SCOPED_FLOODS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Attach the current send scope (override or default) to a flood packet.
@@ -623,7 +569,6 @@ pub static RADIO_TELEMETRY: Mutex<SharedRawMutex, RefCell<RadioTelemetry>> =
         has_rx: false,
         tx_air_ms: 0,
         rx_air_ms: 0,
-        tx_wait_max_ms: 0,
         tx_control: 0,
         tx_flood: 0,
         tx_background: 0,

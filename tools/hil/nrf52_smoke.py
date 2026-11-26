@@ -92,12 +92,10 @@ def check_storage(c):
     if c.args.internal_storage:
         assert flash.get("ext") == "internal", "stats-flash ext=%r" % flash.get("ext")
         return "internal-storage profile"
-    q = c.dev.json("stats-qspi")
-    assert q.get("status") == "ready", "QSPI status %r" % q.get("status")
-    assert q.get("id") == c.spec.qspi_id, "JEDEC id %r, expected %s (%s)" % (
-        q.get("id"), c.spec.qspi_id, c.spec.qspi_name)
     assert flash.get("ext") == "ready", "stats-flash ext=%r" % flash.get("ext")
-    return "%s %s ready" % (c.spec.qspi_name, q["id"])
+    assert flash.get("id") == c.spec.qspi_id, "JEDEC id %r, expected %s (%s)" % (
+        flash.get("id"), c.spec.qspi_id, c.spec.qspi_name)
+    return "%s %s ready" % (c.spec.qspi_name, flash["id"])
 
 
 def check_radio_config(c):
@@ -294,10 +292,11 @@ class FakeDevice:
             return {"lfclk_cfg": self.spec.lfclk_cfg, "lfclk_running": True,
                     "lfclk_src": self.o.get("lfclk_src", "xtal"), "lfclkstat": "0x00010001",
                     "dcdc_reg1_cfg": True, "dcdc_reg1": True, "dcdc_reg0": False}
-        if c == "stats-qspi":
-            return {"status": "ready", "id": self.o.get("qspi_id", self.spec.qspi_id)}
         if c == "stats-flash":
-            return {"ext": "internal" if self.o.get("internal") else "ready"}
+            return {
+                "ext": "internal" if self.o.get("internal") else "ready",
+                "id": self.o.get("qspi_id", self.spec.qspi_id),
+            }
         if c == "stats-radio":
             return {"noise_floor": -118, "tx_sent": self.sent}
         if c == "stats-packets":
