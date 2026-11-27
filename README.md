@@ -1,39 +1,122 @@
 # FerrixCore
 
-A native `no_std` embedded Rust firmware workspace for **MeshCore v1.18** LoRa mesh nodes, built on [Embassy](https://embassy.dev/).
+**Drop-in Rust firmware for MeshCore v1.18 companion nodes** — with a crisp on-device dashboard, hardened SX1262 radio handling, and static zero-heap reliability on [Embassy](https://embassy.dev/).
 
-> **Firmware identity:** Ferrix reports `<version>-ferrix` (currently `1.18.5-ferrix`) in version strings and its boot splash while keeping per-board `MeshCore` USB (`ThinkNode M1 Companion` / `Wio Tracker L1 Pro Companion`) and protocol identifiers for drop-in compatibility with MeshCore companion apps (iOS, Android, Web, and CLI).
+[![Latest Release](https://img.shields.io/github/v/release/navmad/FerrixCore?display_name=tag&label=release&color=2ea44f)](https://github.com/navmad/FerrixCore/releases/latest)
+[![CI](https://github.com/navmad/FerrixCore/actions/workflows/conformance.yml/badge.svg)](https://github.com/navmad/FerrixCore/actions/workflows/conformance.yml)
+![MeshCore v1.18](https://img.shields.io/badge/MeshCore-v1.18%20compatible-1f6feb)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-> **Important — Storage format & full erase required:** Ferrix **does not** follow the standard MeshCore on-flash storage format (it uses its own `sequential-storage` layout across internal flash and external QSPI flash rather than MeshCore's LittleFS layout). **Flashing Ferrix onto a device previously running stock MeshCore (or switching back from Ferrix to stock MeshCore) requires a full flash erase** so leftover filesystem/config sectors do not conflict. Export your private key and contacts beforehand if you want to keep your identity. Normal upgrades between Ferrix releases preserve your identity and configuration.
-
-> **Note:** This project is developed with the assistance of AI coding tools.
-
-For Ferrix differences vs. stock MeshCore, the CLI command reference, and current limitations, see [FEATURES.md](FEATURES.md).
+[Quick Flash](#quick-flash) · [On-Device Dashboard](#on-device-dashboard) · [Why Ferrix?](#why-flash-ferrix) · [Full Feature & CLI Guide](FEATURES.md) · [Build from Source](#development)
 
 ---
 
-## Highlights
+## On-Device Dashboard
 
-- **MeshCore v1.18 Companion Protocol**: Implements the full MeshCore v1.18 companion command set (including `CMD_RUN_CLI_COMMAND` `0x42` / `PACKET_CLI_REPLY` `0x1D`) over **BLE Nordic UART Service** and **USB CDC-ACM**, alongside an interactive USB text CLI with `XX|` tag echo and compact JSON `stats-*` telemetry.
-- **Modular Workspace Architecture**: Cleanly separates pure wire codecs (`meshcore-wire`), protocol/state/storage (`ferrix-core`), async runtime loops (`ferrix-runtime`), HAL traits (`ferrix-hal`), drivers, MCU platform (`platforms/nrf52`), roles, and board packages (each paired with a host-testable `logic/` crate).
-- **Wear-Leveled Persistence**: Powered by `sequential-storage` across internal flash (config & BLE bonds) and external QSPI flash (contacts, adverts, and opt-in offline inbox messages via `set msg.persist on`), with a compile-time `internal-storage` profile for boards without QSPI.
-- **Deterministic TX Scheduler**: Separates control, flood, and background advert lanes with airtime-derived adaptive slot widths, duplicate cancellation, multipart ACK bursts (`multi_acks`), and split duty-cycle budgets where control traffic can borrow unused flood budget while keeping its own 25% reserve protected.
-- **SX1262 Radio Hardening & Cached Crypto**: Runs starvation-gated 4-symbol LBT/CAD, live 5 s noise-floor RSSI sampling, automatic stuck-AGC recovery (`stats-agc` / `agc-reset`), optional RX duty-cycle sniff mode (`set rxduty on`), and a 64-entry LRU X25519 ECDH shared-secret cache computed outside critical sections.
-- **Power & OTA Support**: Uses the nRF52840 32.768 kHz LFXO crystal, REG1 DC-DC buck regulator, idle display sleep, event-driven GNSS wake, smoothed SAADC battery telemetry, and Legacy Buttonless BLE DFU OTA (for OTAFIX bootloaders) alongside UF2 and serial DFU flashing.
-- **Board Support**: See each board's README for hardware specs, pinouts, and flashing steps ([ThinkNode M1](boards/thinknode-m1/README.md): 1.54" SSD1681 e-paper dashboard, L76K GNSS, battery telemetry, and buzzer; [Wio Tracker L1 Pro](boards/wio-tracker-l1-pro/README.md): 1.3" SH1106 OLED with joystick navigation, L76K GNSS, battery telemetry, and buzzer).
+Ferrix turns your node's display into a live mesh instrument — check signal health, browse nearby nodes on a radar, read messages, toggle TX power / RX duty-cycle / GPS, switch 1B/2B/3B path hashing, or launch BLE OTA DFU without pulling out your phone.
+
+**Elecrow ThinkNode M1** *(1.54" 200×200 e-paper — anti-ghosting refresh, frontlight wake, 2-button navigation)*
+
+![ThinkNode M1 e-paper UI: Mesh Status, Radio, Signal History, and System](docs/assets/thinknode-m1-ui.png)
+
+**Seeed Wio Tracker L1 Pro** *(1.3" 128×64 OLED — 30 s idle sleep, wake on message, 5-way joystick)*
+
+![Wio Tracker L1 Pro OLED UI: Mesh Status, Radar, Signal History, and System](docs/assets/wio-tracker-l1-pro-ui.png)
+
+Built-in views across both boards: **Mesh Status**, **Inbox**, **Node Radar**, **Radio**, **Signal History**, **Position / GPS**, **Client Repeat**, **Settings** (LEDs & buzzer), and **System** (battery, RX duty, path hash, BLE OTA DFU).
+
+---
+
+## Why Flash Ferrix?
+
+Works out of the box with existing **MeshCore v1.18 companion apps** (iOS, Android, Web, and CLI) over BLE and USB — while adding RF, power, and reliability upgrades under the hood:
+
+| Feature | What it means in practice |
+| :--- | :--- |
+| **Drop-in Companion Compatibility** | Reports standard `MeshCore` USB/protocol identifiers and `<version>-ferrix` (e.g. `1.18.5-ferrix`) so your existing MeshCore v1.18 apps connect without changes. |
+| **Rich On-Device UI** | Read inbox messages, view neighbor radar and RSSI/SNR history, adjust TX power / RX duty / GPS / path hash, and start BLE OTA right from the board controls. |
+| **Auto Stuck-AGC Recovery** | Detects a deaf/locked SX1262 receiver and automatically recalibrates and re-arms RX without rebooting — plus live 5 s RF noise-floor sampling. |
+| **3-Lane TX Scheduler + Hardware CAD** | Separates **Control** (DMs/ACKs), **Flood**, and **Background** (adverts) with a protected 25% control reserve, 4-symbol starvation-gated LBT/CAD, and over-the-air duplicate cancellation. |
+| **RX Duty-Cycle Sniff Mode** | Optional `set rxduty on` (or right from the Radio page) saves battery on SF7–SF12 with an inactivity watchdog. |
+| **Zero-Heap Rust & Flash Longevity** | Static `no_std` Rust with build-time task-arena verification, wear-leveled `sequential-storage` (writes only on actual changes), and opt-in offline inbox persistence (`set msg.persist on`). |
+| **Deep Diagnostics** | 10 compact JSON `stats-*` commands over USB or app CLI (`stats-tx`, `stats-agc`, `stats-flash`, `stats-ble`, `stats-gps`, `stats-power`, `stats-wdt`, plus standard stats). |
+
+For the full comparison vs. stock MeshCore, every CLI command, and current limitations, see [FEATURES.md](FEATURES.md).
 
 ---
 
 ## Supported Boards
 
-| Board Target | Firmware Package | MCU | Radio | Board Docs |
-| :--- | :--- | :--- | :--- | :--- |
-| **Elecrow ThinkNode M1** | `ferrix-thinknode-m1-companion` | nRF52840 | Semtech SX1262 | [boards/thinknode-m1/README.md](boards/thinknode-m1/README.md) |
-| **Seeed Wio Tracker L1 Pro** | `ferrix-wio-tracker-l1-pro-companion` | nRF52840 | Semtech SX1262 | [boards/wio-tracker-l1-pro/README.md](boards/wio-tracker-l1-pro/README.md) |
+| Board | Display | Prebuilt Releases | Board Docs & Pinout |
+| :--- | :--- | :--- | :--- |
+| **Elecrow ThinkNode M1** | 1.54" SSD1681 e-paper | [`ferrix-thinknode-m1-companion-*.{uf2,zip}`](https://github.com/navmad/FerrixCore/releases/latest) | [boards/thinknode-m1/README.md](boards/thinknode-m1/README.md) |
+| **Seeed Wio Tracker L1 Pro** | 1.3" SH1106 OLED | [`ferrix-wio-tracker-l1-pro-companion-*.{uf2,zip}`](https://github.com/navmad/FerrixCore/releases/latest) | [boards/wio-tracker-l1-pro/README.md](boards/wio-tracker-l1-pro/README.md) |
+
+*(Companion role + off-grid client repeat on allowed frequencies. Standalone repeater, room server, and sensor roles are not yet implemented.)*
 
 ---
 
-## Workspace Architecture
+## Quick Flash
+
+> [!WARNING]
+> **First-time switch from stock MeshCore requires a full flash erase.**
+> Ferrix uses wear-leveled `sequential-storage` across internal flash and external QSPI flash instead of stock MeshCore's LittleFS layout. Back up your private key (`get prv.key`) and contacts, then run a full flash erase (e.g., via the MeshCore web flasher's erase option or an erase UF2) before flashing Ferrix for the first time — and again if you ever switch back to stock MeshCore.
+>
+> **Upgrading between Ferrix releases preserves your identity, settings, and contacts.**
+
+### UF2 Drag-and-Drop (Easiest)
+
+1. Download the latest `.uf2` for your board from **[GitHub Releases](https://github.com/navmad/FerrixCore/releases/latest)**.
+2. Connect your board over USB-C and **double-click the reset button** to mount the `NRF52BOOT` / `THINKNODE` drive.
+3. Drag the `.uf2` file onto the drive — the board reboots into Ferrix automatically.
+
+### Serial DFU & BLE OTA
+
+Prebuilt `.zip` packages are also attached to every release for `adafruit-nrfutil` serial DFU and wireless BLE OTA DFU (requires an OTAFIX-compatible bootloader; trigger via `start ota` or the System page). Full flashing instructions, pinouts, and memory maps live in each board's README:
+
+- [Elecrow ThinkNode M1 flashing guide](boards/thinknode-m1/README.md#flashing)
+- [Seeed Wio Tracker L1 Pro flashing guide](boards/wio-tracker-l1-pro/README.md#flashing)
+
+---
+
+## Development
+
+### Prerequisites
+
+- **Rust toolchain** with the Cortex-M4F target and LLVM tools (for `llvm-objcopy`):
+  ```bash
+  rustup target add thumbv7em-none-eabihf
+  rustup component add llvm-tools-preview
+  ```
+- **For serial / BLE OTA DFU packaging**: [`adafruit-nrfutil`](https://github.com/adafruit/Adafruit_nRF52_nrfutil) (`uv tool install adafruit-nrfutil` or `pipx install adafruit-nrfutil`).
+- **For SWD debugging (optional)**: [`probe-rs`](https://probe.rs/).
+
+### Build & Test
+
+Because `.cargo/config.toml` defaults to `thumbv7em-none-eabihf`, use `./tools/build.sh` so host unit tests and embedded builds target the right architecture (firmware builds automatically run `tools/check_task_arena.py` to verify all Embassy tasks fit inside the static task arena):
+
+```bash
+# Release build (default external QSPI + internal flash storage profile)
+./tools/build.sh thinknode-m1 build --release
+./tools/build.sh wio-tracker-l1-pro build --release
+
+# Release build keeping all stores in internal flash (no QSPI)
+./tools/build.sh thinknode-m1 build --release --features internal-storage
+
+# Run all host unit tests (wire codecs, storage, routing, mesh sim,
+# scheduler, board logic & golden UI snapshots, arena checker self-test)
+./tools/build.sh test
+
+# Hardware-in-the-loop smoke test against a connected board over USB
+./tools/build.sh thinknode-m1 hil
+./tools/build.sh wio-tracker-l1-pro hil
+```
+
+> [!NOTE]
+> Check or build workspace targets with `cargo check` from the root (defaults to `firmware/thinknode-m1-companion` for `thumbv7em-none-eabihf`). Avoid bare `cargo test` without `--target <host-triple>`, as embedded crates do not link `std` or `test`.
+
+<details>
+<summary><strong>Workspace Architecture & Adding a New Board</strong></summary>
 
 ```text
 FerrixCore/
@@ -65,65 +148,17 @@ FerrixCore/
 └── tools/                       # Build, UF2/OTA/serial DFU scripts, arena check, HIL smoke tests, CLI monitor, oracle
 ```
 
-### Adding a New Board
+#### Adding a New Board
 
 1. Create a library crate under `boards/<name>/` (plus a host-testable `boards/<name>/logic/` crate) containing its `memory.x`, pinout, display/UI bindings, storage layout, and a `README.md` documenting specs, pinout, and flashing.
 2. Implement the role trait from `roles/<role>/` (e.g., `CompanionBoard`) and the `ferrix-runtime` board traits.
 3. Add a binary crate under `firmware/<board>-<role>/` that selects the board and role.
 4. Register the crates in the root `Cargo.toml` workspace, `tools/build.sh` / `tools/build_uf2.sh` / `tools/build_ota.sh` / `tools/flash_serial.sh`, and `.github/workflows/conformance.yml` / `.github/workflows/release.yml`.
 
----
+</details>
 
-## Getting Started
-
-### Prerequisites
-
-- **Rust toolchain** with the Cortex-M4F target and LLVM tools (for `llvm-objcopy`):
-  ```bash
-  rustup target add thumbv7em-none-eabihf
-  rustup component add llvm-tools-preview
-  ```
-- **For serial / BLE OTA DFU packaging**: [`adafruit-nrfutil`](https://github.com/adafruit/Adafruit_nRF52_nrfutil) (`uv tool install adafruit-nrfutil` or `pipx install adafruit-nrfutil`).
-- **For SWD debugging (optional)**: [`probe-rs`](https://probe.rs/).
-
-### Build & Host Tests
-
-Because `.cargo/config.toml` defaults to `thumbv7em-none-eabihf`, use `./tools/build.sh` so host unit tests and embedded builds target the right architecture (firmware builds automatically run `tools/check_task_arena.py` to verify all Embassy tasks fit inside the static task arena):
-
-```bash
-# Release build (default external QSPI + internal flash storage profile)
-./tools/build.sh thinknode-m1 build --release
-# or, for the Wio Tracker L1 Pro:
-./tools/build.sh wio-tracker-l1-pro build --release
-
-# Release build keeping all stores in internal flash (no QSPI)
-./tools/build.sh thinknode-m1 build --release --features internal-storage
-
-# Run all host unit tests (wire codecs, storage formats, routing engine, mesh sim,
-# scheduler, board logic & golden UI snapshots, plus arena checker self-test)
-./tools/build.sh test
-
-# Hardware-in-the-loop smoke test against a connected board over USB
-./tools/build.sh thinknode-m1 hil
-./tools/build.sh wio-tracker-l1-pro hil
-```
-
-> **Note:** Check or build workspace targets with `cargo check` from the root (defaults to `firmware/thinknode-m1-companion` for `thumbv7em-none-eabihf`). Avoid `cargo test` without `--target <host-triple>`, as embedded crates do not link `std` or `test`.
-
----
-
-## Flashing
-
-> **Before your first flash:** Because Ferrix uses its own on-flash storage format instead of the standard MeshCore layout, perform a **full flash erase** (e.g., using the MeshCore flasher's erase option or an erase UF2) before flashing Ferrix for the first time, and again if you ever return to stock MeshCore. Back up your private key first if you want to restore your node identity.
-
-Prebuilt versioned `.uf2` (drag-and-drop) and `.zip` (Nordic/Adafruit serial & BLE OTA DFU) artifacts (`ferrix-<board>-companion-v<version>.{uf2,zip}`) are published on GitHub Releases. Detailed flashing steps (UF2 drag-and-drop, serial DFU, BLE OTA, or SWD) and board pinouts live in each board's README:
-
-- [Elecrow ThinkNode M1](boards/thinknode-m1/README.md)
-- [Seeed Wio Tracker L1 Pro](boards/wio-tracker-l1-pro/README.md)
-
----
-
-## Tooling (`tools/`)
+<details>
+<summary><strong>Tooling Reference (<code>tools/</code>)</strong></summary>
 
 - `tools/build.sh` — Unified wrapper for board builds (with Embassy task arena verification), `probe-rs` runs, host-target unit tests (`./tools/build.sh test`), and HIL smoke tests (`./tools/build.sh <board> hil`).
 - `tools/build_uf2.sh` & `tools/uf2conv.py` — ELF-to-UF2 packaging for bootloader drag-and-drop flashing.
@@ -133,3 +168,9 @@ Prebuilt versioned `.uf2` (drag-and-drop) and `.zip` (Nordic/Adafruit serial & B
 - `tools/hil/` — Hardware-in-the-loop USB smoke tests (`nrf52_smoke.py`, `thinknode_smoke.py`, `wio_smoke.py`) verifying clocks, regulators, QSPI, GPS, battery, companion framing, and reboot persistence.
 - `tools/cli_monitor.py` — Interactive USB serial monitor for the Ferrix text CLI.
 - `tools/oracle/` — Python reference/vector generator (`gen.py`, `selfcheck.py`) used to validate `meshcore-wire` packet and crypto codecs.
+
+</details>
+
+---
+
+> **Note:** This project is developed with the assistance of AI coding tools. Licensed under the [MIT License](LICENSE).
