@@ -1,4 +1,4 @@
-# Ferrix
+# FerrixCore
 
 A native `no_std` embedded Rust firmware workspace for **MeshCore v1.18** LoRa mesh nodes, built on [Embassy](https://embassy.dev/).
 
@@ -36,7 +36,7 @@ For Ferrix differences vs. stock MeshCore, the CLI command reference, and curren
 ## Workspace Architecture
 
 ```text
-ferrix/
+FerrixCore/
 ├── firmware/
 │   ├── thinknode-m1-companion/  # Binary crate (`ferrix`): binds board + role
 │   └── wio-tracker-l1-pro-companion/
