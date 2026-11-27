@@ -38,7 +38,8 @@ Works out of the box with existing **MeshCore v1.18 companion apps** (iOS, Andro
 | **Auto Stuck-AGC Recovery** | Detects a deaf/locked SX1262 receiver and automatically recalibrates and re-arms RX without rebooting — plus live 5 s RF noise-floor sampling. |
 | **3-Lane TX Scheduler + Hardware CAD** | Separates **Control** (DMs/ACKs), **Flood**, and **Background** (adverts) with a protected 25% control reserve, 4-symbol starvation-gated LBT/CAD, and over-the-air duplicate cancellation. |
 | **RX Duty-Cycle Sniff Mode** | Optional `set rxduty on` (or right from the Radio page) saves battery on SF7–SF12 with an inactivity watchdog. |
-| **Zero-Heap Rust & Flash Longevity** | Static `no_std` Rust with build-time task-arena verification, wear-leveled `sequential-storage` (writes only on actual changes), and opt-in offline inbox persistence (`set msg.persist on`). |
+| **Optional Offline Message Persistence** | Keep unread inbox messages in RAM by default to avoid routine flash wear, or enable `set msg.persist on` so unread messages survive reboots — skipping flash writes whenever BLE is connected and reconciling on disconnect or clean reboot. |
+| **Zero-Heap Rust & Flash Longevity** | Static `no_std` Rust with build-time task-arena verification and wear-leveled `sequential-storage` that writes config and contacts only on actual changes. |
 | **Deep Diagnostics** | 10 compact JSON `stats-*` commands over USB or app CLI (`stats-tx`, `stats-agc`, `stats-flash`, `stats-ble`, `stats-gps`, `stats-power`, `stats-wdt`, plus standard stats). |
 
 For the full comparison vs. stock MeshCore, every CLI command, and current limitations, see [FEATURES.md](FEATURES.md).
